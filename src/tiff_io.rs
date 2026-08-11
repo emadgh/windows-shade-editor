@@ -64,9 +64,6 @@ fn open_decoder(path: &Path) -> Result<Decoder<BufReader<File>>, String> {
     let reader = BufReader::new(file);
     let decoder = Decoder::new(reader)
         .map_err(|err| format!("Invalid/unsupported TIFF: {err}"))?
-        // The crate's default whole-image decode cap is intentionally modest.
-        // Production ceramic artwork routinely exceeds it. We still validate
-        // dimensions/sample counts below before allocating application buffers.
         .with_limits(Limits::unlimited());
     Ok(decoder)
 }
@@ -81,8 +78,6 @@ pub fn decode_full(path: &Path) -> Result<DecodedImage, String> {
     let expected = pixel_count
         .checked_mul(metadata.samples_per_pixel)
         .ok_or_else(|| "TIFF sample count is too large.".to_owned())?;
-    // Refuse obviously unreasonable/corrupt declarations before a second large
-    // application allocation. This is ~64 GiB at u16 and far above intended use.
     if expected > 32_000_000_000usize {
         return Err("TIFF declares an unreasonable number of samples.".to_owned());
     }
@@ -103,9 +98,6 @@ pub fn decode_full(path: &Path) -> Result<DecodedImage, String> {
         samples.truncate(expected);
     }
 
-    // read_image_to_buffer returns all planar planes when the configured limits
-    // permit it. Limits are unlimited above, so plane-consecutive data must be
-    // converted once into the application's canonical chunky representation.
     if planar_configuration == 2 || layout.planes > 1 {
         samples = planar_to_interleaved(&samples, pixel_count, metadata.samples_per_pixel);
     }
@@ -114,10 +106,6 @@ pub fn decode_full(path: &Path) -> Result<DecodedImage, String> {
 }
 
 pub fn load_preview(path: &Path, max_dimension: u32) -> Result<PreviewFace, String> {
-    // v0.2 removes the decoder's 256 MiB default ceiling. The decoder is also
-    // switched from deprecated read_image() to read_image_to_buffer(), which is
-    // required for correct multi-plane TIFFs. A future optimization can sample
-    // strips/tiles directly without changing this PreviewFace API.
     let decoded = decode_full(path)?;
     let source_width = decoded.metadata.width as usize;
     let source_height = decoded.metadata.height as usize;
@@ -174,9 +162,6 @@ fn read_metadata<R: std::io::Read + std::io::Seek>(
         ));
     }
 
-    // This is the critical Photoshop/spot-channel invariant: TIFF tag 277 is
-    // authoritative. ColorType may describe the base photometric model while
-    // SamplesPerPixel includes additional unspecified samples.
     let samples_per_pixel = decoder
         .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)
         .map_err(|err| format!("Cannot read TIFF SamplesPerPixel: {err}"))?
@@ -235,7 +220,6 @@ fn read_metadata<R: std::io::Read + std::io::Seek>(
 }
 
 fn infer_color_model(color_type: &ColorType, photometric: Option<u16>) -> (ColorModel, usize) {
-    // TIFF 6.0 PhotometricInterpretation: 0/1 gray, 2 RGB, 5 separated/CMYK.
     match photometric {
         Some(2) => return (ColorModel::Rgb, 3),
         Some(5) => return (ColorModel::Cmyk, 4),
@@ -293,10 +277,10 @@ fn channel_names(
     total_count: usize,
     photoshop: Option<&[u8]>,
 ) -> Vec<String> {
-    let mut names = match model {
-        ColorModel::Rgb => vec!["Red", "Green", "Blue"],
-        ColorModel::Cmyk => vec!["Cyan", "Magenta", "Yellow", "Black"],
-        ColorModel::Gray => vec!["Gray"],
+    let mut names: Vec<String> = match model {
+        ColorModel::Rgb => ["Red", "Green", "Blue"].into_iter().map(str::to_owned).collect(),
+        ColorModel::Cmyk => ["Cyan", "Magenta", "Yellow", "Black"].into_iter().map(str::to_owned).collect(),
+        ColorModel::Gray => vec!["Gray".to_owned()],
         ColorModel::Other => (0..base_count).map(|index| format!("Channel {}", index + 1)).collect(),
     };
     names.truncate(base_count);
@@ -334,10 +318,6 @@ fn unique_name(mut name: String, existing: &[String]) -> String {
     name
 }
 
-/// Extract Photoshop Image Resource alpha/spot channel names. Photoshop has
-/// used both Pascal-string resource 1006 and Unicode resource 1045. Some files
-/// contain more than one block, so resources are accumulated instead of the old
-/// last-block-wins behavior.
 fn parse_photoshop_channel_names(resources: &[u8]) -> Vec<String> {
     let mut offset = 0usize;
     let mut pascal_names = Vec::new();
