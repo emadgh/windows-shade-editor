@@ -1,5 +1,5 @@
 use crate::model::{ShadeProject, apply_curve, apply_levels};
-use crate::tiff_io::PreviewFace;
+use crate::tiff_io::{ColorModel, PreviewFace};
 
 pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u16>> {
     let channel_count = face.channels.len();
@@ -59,58 +59,120 @@ pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u1
     output
 }
 
+/// Build a display preview. This is not a press proof, but it must preserve the
+/// image geometry and base color model. v0.1 incorrectly treated every 4+
+/// channel file as CMYK, which corrupted RGB+spot previews.
 pub fn rgba_from_planes(
+    face: &PreviewFace,
     planes: &[Vec<u16>],
-    width: usize,
-    height: usize,
     solo_channel: Option<usize>,
 ) -> Vec<u8> {
+    let width = face.width;
+    let height = face.height;
     let pixel_count = width.saturating_mul(height);
     let mut rgba = Vec::with_capacity(pixel_count.saturating_mul(4));
 
     if let Some(channel) = solo_channel.filter(|index| *index < planes.len()) {
+        let invert = face.metadata.color_model == ColorModel::Cmyk
+            && channel < face.metadata.base_channel_count;
         for value in &planes[channel] {
-            let gray = 255u8.saturating_sub((*value >> 8) as u8);
+            let byte = (*value >> 8) as u8;
+            let gray = if invert { 255u8.saturating_sub(byte) } else { byte };
             rgba.extend_from_slice(&[gray, gray, gray, 255]);
         }
         return rgba;
     }
 
-    if planes.len() >= 4 {
-        for pixel in 0..pixel_count {
-            let c = planes[0][pixel] as f32 / 65535.0;
-            let m = planes[1][pixel] as f32 / 65535.0;
-            let y = planes[2][pixel] as f32 / 65535.0;
-            let k = planes[3][pixel] as f32 / 65535.0;
-            let mut r = 1.0 - (c + k).min(1.0);
-            let mut g = 1.0 - (m + k).min(1.0);
-            let mut b = 1.0 - (y + k).min(1.0);
-
-            if planes.len() > 4 {
-                let strongest_spot = planes[4..]
-                    .iter()
-                    .map(|plane| plane[pixel] as f32 / 65535.0)
-                    .fold(0.0f32, f32::max);
-                let neutral_preview = 1.0 - strongest_spot * 0.28;
-                r *= neutral_preview;
-                g *= neutral_preview;
-                b *= neutral_preview;
+    match face.metadata.color_model {
+        ColorModel::Rgb if planes.len() >= 3 => {
+            for pixel in 0..pixel_count {
+                let mut rgb = [
+                    planes[0][pixel] as f32 / 65535.0,
+                    planes[1][pixel] as f32 / 65535.0,
+                    planes[2][pixel] as f32 / 65535.0,
+                ];
+                composite_extra_channels(face, planes, pixel, &mut rgb);
+                push_rgb(&mut rgba, rgb);
             }
-
-            rgba.extend_from_slice(&[
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-                255,
-            ]);
         }
-    } else if let Some(first) = planes.first() {
-        for value in first {
-            let gray = 255u8.saturating_sub((*value >> 8) as u8);
-            rgba.extend_from_slice(&[gray, gray, gray, 255]);
+        ColorModel::Cmyk if planes.len() >= 4 => {
+            for pixel in 0..pixel_count {
+                let c = planes[0][pixel] as f32 / 65535.0;
+                let m = planes[1][pixel] as f32 / 65535.0;
+                let y = planes[2][pixel] as f32 / 65535.0;
+                let k = planes[3][pixel] as f32 / 65535.0;
+                let mut rgb = [
+                    1.0 - (c + k).min(1.0),
+                    1.0 - (m + k).min(1.0),
+                    1.0 - (y + k).min(1.0),
+                ];
+                composite_extra_channels(face, planes, pixel, &mut rgb);
+                push_rgb(&mut rgba, rgb);
+            }
+        }
+        ColorModel::Gray if !planes.is_empty() => {
+            for pixel in 0..pixel_count {
+                let gray = planes[0][pixel] as f32 / 65535.0;
+                let mut rgb = [gray, gray, gray];
+                composite_extra_channels(face, planes, pixel, &mut rgb);
+                push_rgb(&mut rgba, rgb);
+            }
+        }
+        _ => {
+            if let Some(first) = planes.first() {
+                for value in first.iter().take(pixel_count) {
+                    let gray = (*value >> 8) as u8;
+                    rgba.extend_from_slice(&[gray, gray, gray, 255]);
+                }
+            }
         }
     }
+
     rgba
+}
+
+fn composite_extra_channels(
+    face: &PreviewFace,
+    planes: &[Vec<u16>],
+    pixel: usize,
+    rgb: &mut [f32; 3],
+) {
+    let first_extra = face.metadata.base_channel_count.min(planes.len());
+    if first_extra >= planes.len() { return; }
+
+    // Photoshop spot channels are grayscale separations where dark values mean
+    // more visible spot ink. Until DisplayInfo 1077 colors are decoded, use a
+    // deterministic diagnostic tint per extra separation. Crucially, this never
+    // changes sample addressing or the TIFF data itself.
+    const TINTS: [[f32; 3]; 8] = [
+        [0.00, 0.90, 0.45],
+        [0.95, 0.15, 0.20],
+        [0.15, 0.55, 0.95],
+        [0.95, 0.15, 0.90],
+        [0.95, 0.75, 0.05],
+        [0.05, 0.80, 0.85],
+        [0.55, 0.25, 0.90],
+        [0.95, 0.45, 0.05],
+    ];
+    for (extra_index, plane) in planes[first_extra..].iter().enumerate() {
+        if pixel >= plane.len() { continue; }
+        let coverage = 1.0 - plane[pixel] as f32 / 65535.0;
+        if coverage <= 0.001 { continue; }
+        let tint = TINTS[extra_index % TINTS.len()];
+        let strength = (coverage * 0.72).clamp(0.0, 0.72);
+        for component in 0..3 {
+            rgb[component] = rgb[component] * (1.0 - strength) + tint[component] * strength;
+        }
+    }
+}
+
+fn push_rgb(rgba: &mut Vec<u8>, rgb: [f32; 3]) {
+    rgba.extend_from_slice(&[
+        (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        255,
+    ]);
 }
 
 pub fn histogram(values: &[u16]) -> [u32; 256] {

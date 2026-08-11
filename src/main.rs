@@ -53,6 +53,7 @@ struct ShadeApp {
     project_path: Option<PathBuf>,
     faces: Vec<RuntimeFace>,
     current_face: usize,
+    selected_channel: usize,
     solo_channel: Option<usize>,
     tool: ToolPanel,
     zoom: f32,
@@ -77,6 +78,7 @@ impl ShadeApp {
             project_path: None,
             faces: Vec::new(),
             current_face: 0,
+            selected_channel: 0,
             solo_channel: None,
             tool: ToolPanel::Levels,
             zoom: 1.0,
@@ -94,6 +96,7 @@ impl ShadeApp {
         self.project_path = None;
         self.faces.clear();
         self.current_face = 0;
+        self.selected_channel = 0;
         self.solo_channel = None;
         self.status_message = "New shade project".to_owned();
         self.project_dirty = false;
@@ -103,9 +106,7 @@ impl ShadeApp {
         let Some(paths) = rfd::FileDialog::new()
             .add_filter("TIFF images", &["tif", "tiff"])
             .pick_files()
-        else {
-            return;
-        };
+        else { return; };
 
         let mut added = 0usize;
         let mut last_error = None;
@@ -135,8 +136,9 @@ impl ShadeApp {
 
         if added > 0 {
             self.current_face = self.faces.len().saturating_sub(added);
-            self.project_dirty = true;
+            self.selected_channel = 0;
             self.solo_channel = None;
+            self.project_dirty = true;
             self.status_message = format!("Added {added} face(s)");
         }
         if let Some(err) = last_error {
@@ -148,9 +150,7 @@ impl ShadeApp {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Shade project", &["shade"])
             .pick_file()
-        else {
-            return;
-        };
+        else { return; };
         self.open_project(&path);
     }
 
@@ -186,6 +186,7 @@ impl ShadeApp {
         self.project_path = Some(path.to_path_buf());
         self.faces = runtime_faces;
         self.current_face = 0;
+        self.selected_channel = 0;
         self.solo_channel = None;
         self.project_dirty = false;
         self.status_message = if errors.is_empty() {
@@ -196,11 +197,7 @@ impl ShadeApp {
     }
 
     fn save_project(&mut self, save_as: bool) {
-        let target = if !save_as {
-            self.project_path.clone()
-        } else {
-            None
-        };
+        let target = if !save_as { self.project_path.clone() } else { None };
         let target = match target {
             Some(path) => Some(path),
             None => {
@@ -235,9 +232,7 @@ impl ShadeApp {
             .add_filter("TIFF image", &["tif", "tiff"])
             .set_file_name(format!("{stem}-shade.tif"))
             .save_file()
-        else {
-            return;
-        };
+        else { return; };
         match export::export_face(&face.path, &destination, &self.project) {
             Ok(()) => self.status_message = format!("Exported {}", destination.display()),
             Err(err) => self.status_message = format!("Export failed: {err}"),
@@ -270,15 +265,14 @@ impl ShadeApp {
             self.project.faces.remove(self.current_face);
         }
         self.current_face = self.current_face.min(self.faces.len().saturating_sub(1));
+        self.selected_channel = 0;
         self.solo_channel = None;
         self.project_dirty = true;
         self.status_message = "Face removed from project (source TIFF was not deleted)".to_owned();
     }
 
     fn mark_all_previews_dirty(&mut self) {
-        for face in &mut self.faces {
-            face.dirty = true;
-        }
+        for face in &mut self.faces { face.dirty = true; }
         self.project_dirty = true;
     }
 
@@ -286,12 +280,7 @@ impl ShadeApp {
         let Some(face) = self.faces.get_mut(self.current_face) else { return; };
         if !face.dirty && face.texture.is_some() { return; }
         face.adjusted = render::adjusted_planes(&face.preview, &self.project);
-        let rgba = render::rgba_from_planes(
-            &face.adjusted,
-            face.preview.width,
-            face.preview.height,
-            self.solo_channel,
-        );
+        let rgba = render::rgba_from_planes(&face.preview, &face.adjusted, self.solo_channel);
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [face.preview.width, face.preview.height],
             &rgba,
@@ -306,13 +295,24 @@ impl ShadeApp {
         face.dirty = false;
     }
 
-    fn set_solo_channel(&mut self, channel: Option<usize>) {
-        if self.solo_channel != channel {
-            self.solo_channel = channel;
-            if let Some(face) = self.faces.get_mut(self.current_face) {
-                face.dirty = true;
-            }
+    fn select_channel(&mut self, channel: usize, isolate: bool) {
+        self.selected_channel = channel;
+        let next_solo = if isolate { Some(channel) } else { None };
+        if self.solo_channel != next_solo {
+            self.solo_channel = next_solo;
+            if let Some(face) = self.faces.get_mut(self.current_face) { face.dirty = true; }
         }
+    }
+
+    fn show_composite(&mut self) {
+        if self.solo_channel.is_some() {
+            self.solo_channel = None;
+            if let Some(face) = self.faces.get_mut(self.current_face) { face.dirty = true; }
+        }
+    }
+
+    fn save_settings_quietly(&mut self) {
+        if let Err(err) = self.settings.save() { self.status_message = err; }
     }
 
     fn ui_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -321,19 +321,11 @@ impl ShadeApp {
             if ui.button("Open .shade").clicked() { self.open_project_dialog(); }
             if ui.button("Add TIFF faces").clicked() { self.add_faces_dialog(); }
             ui.separator();
-            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Save")).clicked() {
-                self.save_project(false);
-            }
-            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Save As")).clicked() {
-                self.save_project(true);
-            }
+            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Save")).clicked() { self.save_project(false); }
+            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Save As")).clicked() { self.save_project(true); }
             ui.separator();
-            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Export face")).clicked() {
-                self.export_current_dialog();
-            }
-            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Export all")).clicked() {
-                self.export_all_dialog();
-            }
+            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Export face")).clicked() { self.export_current_dialog(); }
+            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
             ui.separator();
             if ui.button("Settings").clicked() { self.show_settings = true; }
             if ui.button("About").clicked() { self.show_about = true; }
@@ -342,11 +334,8 @@ impl ShadeApp {
 
     fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
         match self.updater.status() {
-            UpdateStatus::Idle => {}
-            UpdateStatus::Checking => {
-                ui.horizontal(|ui| { ui.spinner(); ui.label("Checking for updates…"); });
-            }
-            UpdateStatus::UpToDate => {}
+            UpdateStatus::Idle | UpdateStatus::UpToDate => {}
+            UpdateStatus::Checking => { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking for updates…"); }); }
             UpdateStatus::Available(info) => {
                 ui.horizontal(|ui| {
                     ui.label(format!("Shade Editor {} is available.", info.version));
@@ -354,12 +343,7 @@ impl ShadeApp {
                     ui.hyperlink_to("Release", info.release_url);
                 });
             }
-            UpdateStatus::Downloading(info) => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Downloading Shade Editor {}…", info.version));
-                });
-            }
+            UpdateStatus::Downloading(info) => { ui.horizontal(|ui| { ui.spinner(); ui.label(format!("Downloading Shade Editor {}…", info.version)); }); }
             UpdateStatus::Ready(info, _) => {
                 ui.horizontal(|ui| {
                     ui.label(format!("Shade Editor {} is ready to install.", info.version));
@@ -392,12 +376,11 @@ impl ShadeApp {
             let label = self.project.faces.get(index)
                 .map(|item| item.label.as_str())
                 .unwrap_or_else(|| face.path.file_name().and_then(|name| name.to_str()).unwrap_or("Face"));
-            if ui.selectable_label(self.current_face == index, label).clicked() {
-                requested_face = Some(index);
-            }
+            if ui.selectable_label(self.current_face == index, label).clicked() { requested_face = Some(index); }
         }
         if let Some(index) = requested_face {
             self.current_face = index;
+            self.selected_channel = 0;
             self.solo_channel = None;
             if let Some(face) = self.faces.get_mut(index) { face.dirty = true; }
         }
@@ -414,46 +397,91 @@ impl ShadeApp {
         let channel_names = face.preview.metadata.channel_names.clone();
         let original_histograms = face.preview.histograms.clone();
         let adjusted_histograms = face.adjusted.iter().map(|values| render::histogram(values)).collect::<Vec<_>>();
+        let base_count = face.preview.metadata.base_channel_count;
+        let color_model = face.preview.metadata.color_model;
+        if channel_names.is_empty() { return; }
+        self.selected_channel = self.selected_channel.min(channel_names.len() - 1);
 
         ui.heading("Channels");
-        if ui.selectable_label(self.solo_channel.is_none(), "Composite").clicked() {
-            self.set_solo_channel(None);
-        }
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.solo_channel.is_none(), "Composite").clicked() { self.show_composite(); }
+            ui.label(format!("{} + {} extra", color_model.title(), channel_names.len().saturating_sub(base_count)));
+        });
         for (index, name) in channel_names.iter().enumerate() {
-            if ui.selectable_label(self.solo_channel == Some(index), name).clicked() {
-                self.set_solo_channel(Some(index));
+            let suffix = if index >= base_count { "  • extra/spot" } else { "" };
+            if ui.selectable_label(self.selected_channel == index, format!("{name}{suffix}")).clicked() {
+                self.select_channel(index, true);
             }
         }
-
-        let selected = self.solo_channel.unwrap_or(0).min(channel_names.len().saturating_sub(1));
-        if let Some(name) = channel_names.get(selected) {
-            ui.separator();
-            ui.strong(format!("Histogram — {name}"));
-            draw_histogram(
-                ui,
-                original_histograms.get(selected),
-                adjusted_histograms.get(selected),
-            );
+        if self.solo_channel.is_some() && ui.small_button("Return to composite (keep channel selected)").clicked() {
+            self.show_composite();
         }
 
         ui.separator();
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
-            ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
-            ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
+            ui.strong("Histogram");
+            let label = if self.settings.show_all_histograms { "All channels" } else { "Selected only" };
+            if ui.small_button(label).clicked() {
+                self.settings.show_all_histograms = !self.settings.show_all_histograms;
+                self.save_settings_quietly();
+            }
+        });
+        if self.settings.show_all_histograms {
+            for (index, name) in channel_names.iter().enumerate() {
+                ui.label(name);
+                draw_histogram(ui, original_histograms.get(index), adjusted_histograms.get(index));
+            }
+        } else {
+            let index = self.selected_channel;
+            ui.strong(format!("Histogram — {}", channel_names[index]));
+            draw_histogram(ui, original_histograms.get(index), adjusted_histograms.get(index));
+        }
+
+        ui.separator();
+        let output_name = channel_names[self.selected_channel].clone();
+        ui.horizontal(|ui| {
+            ui.strong(format!("Adjustments — {output_name}"));
+            let layout_label = if self.settings.adjustment_tabs { "Tabs" } else { "Stacked" };
+            if ui.small_button(layout_label).clicked() {
+                self.settings.adjustment_tabs = !self.settings.adjustment_tabs;
+                self.save_settings_quietly();
+            }
         });
 
-        let Some(output_name) = channel_names.get(selected).cloned() else { return; };
         let mut changed = false;
-        let adjustment = self.project.adjustments.entry(output_name.clone()).or_default();
-        changed |= ui.checkbox(&mut adjustment.enabled, "Enable adjustment").changed();
-        ui.add_enabled_ui(adjustment.enabled, |ui| {
-            changed |= match self.tool {
-                ToolPanel::Levels => levels_ui(ui, adjustment),
-                ToolPanel::Curves => curves_ui(ui, adjustment),
-                ToolPanel::Mixer => mixer_ui(ui, adjustment, &output_name, &channel_names),
-            };
-        });
+        {
+            let adjustment = self.project.adjustments.entry(output_name.clone()).or_default();
+            changed |= ui.checkbox(&mut adjustment.enabled, "Enable adjustment for this channel").changed();
+            ui.add_enabled_ui(adjustment.enabled, |ui| {
+                if self.settings.adjustment_tabs {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
+                        ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
+                        ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
+                    });
+                    changed |= match self.tool {
+                        ToolPanel::Levels => levels_ui(ui, adjustment),
+                        ToolPanel::Curves => curves_ui(ui, adjustment),
+                        ToolPanel::Mixer => mixer_ui(ui, adjustment, &output_name, &channel_names),
+                    };
+                } else {
+                    ui.group(|ui| {
+                        ui.strong("Levels");
+                        changed |= levels_ui(ui, adjustment);
+                    });
+                    ui.add_space(6.0);
+                    ui.group(|ui| {
+                        ui.strong("Curve");
+                        changed |= curves_ui(ui, adjustment);
+                    });
+                    ui.add_space(6.0);
+                    ui.group(|ui| {
+                        ui.strong("Channel Mixer");
+                        changed |= mixer_ui(ui, adjustment, &output_name, &channel_names);
+                    });
+                }
+            });
+        }
         if changed { self.mark_all_previews_dirty(); }
 
         ui.separator();
@@ -487,12 +515,17 @@ impl ShadeApp {
         let title = self.project.faces.get(self.current_face)
             .map(|item| item.label.clone())
             .unwrap_or_else(|| face.path.display().to_string());
-        ui.horizontal(|ui| {
+        let meta = &face.preview.metadata;
+        ui.horizontal_wrapped(|ui| {
             ui.strong(title);
             ui.separator();
-            ui.label(format!("{} × {} px", face.preview.metadata.width, face.preview.metadata.height));
-            ui.label(format!("{}-bit", face.preview.metadata.bit_depth));
-            ui.label(format!("{} channels", face.preview.metadata.samples_per_pixel));
+            ui.label(format!("{} × {} px", meta.width, meta.height));
+            ui.label(format!("{}-bit", meta.bit_depth));
+            ui.label(format!("{}", meta.color_model.title()));
+            ui.label(format!("{} channels", meta.samples_per_pixel));
+            if meta.samples_per_pixel > meta.base_channel_count {
+                ui.label(format!("{} extra/spot", meta.samples_per_pixel - meta.base_channel_count));
+            }
         });
         ui.separator();
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
@@ -509,9 +542,7 @@ impl ShadeApp {
             ui.label(format!("{}{}", self.status_message, dirty));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(egui::Slider::new(&mut self.zoom, 0.1..=4.0).logarithmic(true).text("Zoom"));
-                if let Some(path) = &self.project_path {
-                    ui.label(path.display().to_string());
-                }
+                if let Some(path) = &self.project_path { ui.label(path.display().to_string()); }
             });
         });
     }
@@ -529,9 +560,13 @@ impl ShadeApp {
                 let dark_changed = ui.checkbox(&mut self.settings.dark_mode, "Dark mode").changed();
                 changed |= dark_changed;
                 changed |= ui.add(
-                    egui::Slider::new(&mut self.settings.max_preview_dimension, 800..=4000)
+                    egui::Slider::new(&mut self.settings.max_preview_dimension, 600..=4000)
                         .text("Preview max dimension"),
                 ).changed();
+                ui.separator();
+                ui.heading("Editor layout");
+                changed |= ui.checkbox(&mut self.settings.show_all_histograms, "Show a histogram for every channel").changed();
+                changed |= ui.checkbox(&mut self.settings.adjustment_tabs, "Use tabs for Levels / Curve / Mixer").changed();
                 if dark_changed { apply_theme(ctx, self.settings.dark_mode); }
                 if changed {
                     if let Err(err) = self.settings.save() { self.status_message = err; }
@@ -584,15 +619,13 @@ impl eframe::App for ShadeApp {
             self.ui_toolbar(ui);
             self.ui_update_banner(ui);
         });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            self.ui_status(ui);
-        });
+        egui::Panel::bottom("status").show(ui, |ui| self.ui_status(ui));
         egui::Panel::left("faces")
             .default_size(200.0)
             .resizable(true)
             .show(ui, |ui| self.ui_faces(ui));
         egui::Panel::right("tools")
-            .default_size(340.0)
+            .default_size(360.0)
             .resizable(true)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.ui_channels_and_tools(ui));
@@ -620,7 +653,7 @@ fn levels_ui(ui: &mut egui::Ui, adjustment: &mut ChannelAdjustment) -> bool {
         levels.output_white = levels.output_black;
         changed = true;
     }
-    if ui.button("Reset Levels").clicked() {
+    if ui.small_button("Reset Levels").clicked() {
         adjustment.levels = model::Levels::default();
         changed = true;
     }
@@ -633,7 +666,7 @@ fn curves_ui(ui: &mut egui::Ui, adjustment: &mut ChannelAdjustment) -> bool {
     changed |= ui.add(egui::Slider::new(&mut adjustment.curve.black, 0.0..=1.0).text("Black output")).changed();
     changed |= ui.add(egui::Slider::new(&mut adjustment.curve.midpoint, 0.0..=1.0).text("Mid output")).changed();
     changed |= ui.add(egui::Slider::new(&mut adjustment.curve.white, 0.0..=1.0).text("White output")).changed();
-    if ui.button("Reset Curve").clicked() {
+    if ui.small_button("Reset Curve").clicked() {
         adjustment.curve = model::Curve::default();
         changed = true;
     }
@@ -654,7 +687,7 @@ fn mixer_ui(
         changed |= ui.add(egui::Slider::new(coefficient, -2.0..=2.0).text(name)).changed();
     }
     changed |= ui.add(egui::Slider::new(&mut adjustment.mixer.constant, -1.0..=1.0).text("Constant")).changed();
-    if ui.button("Reset Mixer").clicked() {
+    if ui.small_button("Reset Mixer").clicked() {
         adjustment.mixer.coefficients.clear();
         for name in channel_names {
             adjustment.mixer.coefficients.insert(name.clone(), if name == output_name { 1.0 } else { 0.0 });
@@ -666,7 +699,7 @@ fn mixer_ui(
 }
 
 fn draw_histogram(ui: &mut egui::Ui, original: Option<&[u32; 256]>, adjusted: Option<&[u32; 256]>) {
-    let desired = egui::vec2(ui.available_width().max(80.0), 120.0);
+    let desired = egui::vec2(ui.available_width().max(80.0), 105.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_stroke(rect, 2.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Inside);
@@ -696,34 +729,37 @@ fn draw_histogram(ui: &mut egui::Ui, original: Option<&[u32; 256]>, adjusted: Op
 }
 
 fn draw_curve(ui: &mut egui::Ui, curve: model::Curve) {
-    let desired = egui::vec2(ui.available_width().max(80.0), 150.0);
+    let desired = egui::vec2(ui.available_width().min(300.0).max(120.0), 150.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_stroke(rect, 2.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Inside);
-    let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
-    let mut previous = None;
+    painter.line_segment(
+        [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.top())],
+        egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+    );
+    let mut last = None;
     for step in 0..=64 {
         let x = step as f32 / 64.0;
         let y = model::apply_curve(x, curve);
         let point = egui::pos2(
             egui::lerp(rect.x_range(), x),
-            egui::lerp(rect.y_range(), 1.0 - y),
+            egui::lerp(rect.bottom()..=rect.top(), y),
         );
-        if let Some(previous) = previous {
-            painter.line_segment([previous, point], stroke);
+        if let Some(previous) = last {
+            painter.line_segment([previous, point], ui.visuals().selection.stroke);
         }
-        previous = Some(point);
+        last = Some(point);
     }
 }
 
 fn apply_theme(ctx: &egui::Context, dark: bool) {
-    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+    if dark { ctx.set_visuals(egui::Visuals::dark()); } else { ctx.set_visuals(egui::Visuals::light()); }
 }
 
 fn sanitize_filename(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() { return "shade-project".to_owned(); }
-    value.chars()
-        .map(|ch| if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') { '-' } else { ch })
-        .collect()
+    let filtered = value
+        .chars()
+        .map(|ch| if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') { '_' } else { ch })
+        .collect::<String>();
+    if filtered.trim().is_empty() { "shade-project".to_owned() } else { filtered }
 }
