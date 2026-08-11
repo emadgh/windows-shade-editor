@@ -4,10 +4,15 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppSettings {
     pub auto_update: bool,
     pub dark_mode: bool,
     pub max_preview_dimension: u32,
+    /// false = show Levels, Curve and Mixer vertically; true = compact tabs.
+    pub adjustment_tabs: bool,
+    /// false = selected channel histogram; true = one histogram per channel.
+    pub show_all_histograms: bool,
 }
 
 impl Default for AppSettings {
@@ -16,6 +21,8 @@ impl Default for AppSettings {
             auto_update: true,
             dark_mode: true,
             max_preview_dimension: 1800,
+            adjustment_tabs: false,
+            show_all_histograms: false,
         }
     }
 }
