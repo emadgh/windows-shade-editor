@@ -580,24 +580,24 @@ impl eframe::App for ShadeApp {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
         self.ensure_current_texture(ui.ctx());
 
-        egui::TopBottomPanel::top("toolbar").show_inside(ui, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             self.ui_toolbar(ui);
             self.ui_update_banner(ui);
         });
-        egui::TopBottomPanel::bottom("status").show_inside(ui, |ui| {
+        egui::Panel::bottom("status").show(ui, |ui| {
             self.ui_status(ui);
         });
-        egui::SidePanel::left("faces")
-            .default_width(200.0)
+        egui::Panel::left("faces")
+            .default_size(200.0)
             .resizable(true)
-            .show_inside(ui, |ui| self.ui_faces(ui));
-        egui::SidePanel::right("tools")
-            .default_width(340.0)
+            .show(ui, |ui| self.ui_faces(ui));
+        egui::Panel::right("tools")
+            .default_size(340.0)
             .resizable(true)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.ui_channels_and_tools(ui));
             });
-        egui::CentralPanel::default().show_inside(ui, |ui| self.ui_viewport(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.ui_viewport(ui));
 
         self.ui_settings_window(ui.ctx());
         self.ui_about_window(ui.ctx());
