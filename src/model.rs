@@ -203,27 +203,23 @@ pub fn apply_levels(value: f32, levels: Levels) -> f32 {
 }
 
 pub fn apply_curve(value: f32, curve: Curve) -> f32 {
-    // A continuous quadratic Bezier through black/mid/white controls. This is a
-    // compact first-version curve representation and is intentionally stored in
-    // the project format so a denser point model can be migrated later.
+    // Version 1 stores three fixed-x control points: (0, black),
+    // (0.5, midpoint), and (1, white). Piecewise linear interpolation makes
+    // the default 0/0.5/1 curve mathematically identical to the input while
+    // remaining deterministic for 8-bit and 16-bit export. A future schema can
+    // migrate this representation to arbitrary control points without changing
+    // the render/export boundary.
     let x = value.clamp(0.0, 1.0);
     let y = if x <= 0.5 {
-        let t = x * 2.0;
-        lerp(curve.black, curve.midpoint, smoothstep(t))
+        lerp(curve.black, curve.midpoint, x * 2.0)
     } else {
-        let t = (x - 0.5) * 2.0;
-        lerp(curve.midpoint, curve.white, smoothstep(t))
+        lerp(curve.midpoint, curve.white, (x - 0.5) * 2.0)
     };
     y.clamp(0.0, 1.0)
 }
 
-fn smoothstep(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
+    a + (b - a) * t.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -237,5 +233,13 @@ mod tests {
             let curved = apply_curve(leveled, Curve::default());
             assert!((value - curved).abs() < 0.0001);
         }
+    }
+
+    #[test]
+    fn curve_control_points_are_exact() {
+        let curve = Curve { black: 0.1, midpoint: 0.7, white: 0.9 };
+        assert!((apply_curve(0.0, curve) - 0.1).abs() < 0.0001);
+        assert!((apply_curve(0.5, curve) - 0.7).abs() < 0.0001);
+        assert!((apply_curve(1.0, curve) - 0.9).abs() < 0.0001);
     }
 }
