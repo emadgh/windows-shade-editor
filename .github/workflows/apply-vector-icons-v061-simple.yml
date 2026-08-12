@@ -1,0 +1,222 @@
+name: Apply Shade Editor v0.6.1 simple vector icons
+
+on:
+  push:
+    branches:
+      - fix/vector-icons-no-font
+    paths:
+      - .github/workflows/apply-vector-icons-v061-simple.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/vector-icons-no-font
+          fetch-depth: 0
+      - name: Apply vector widget patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          app_path = Path('src/app_main.rs')
+          app = app_path.read_text(encoding='utf-8')
+
+          marker = 'fn clickable_row(\n'
+          if app.count(marker) != 1:
+              raise SystemExit(f'clickable_row marker count = {app.count(marker)}')
+
+          helper = r'''#[derive(Clone, Copy)]
+          enum VectorIconKind {
+              Export,
+              Check,
+          }
+
+          struct VectorIconButton {
+              icon: VectorIconKind,
+              min_size: egui::Vec2,
+              frame: bool,
+              sense: egui::Sense,
+          }
+
+          impl VectorIconButton {
+              fn export() -> Self {
+                  Self {
+                      icon: VectorIconKind::Export,
+                      min_size: egui::vec2(20.0, 20.0),
+                      frame: true,
+                      sense: egui::Sense::click(),
+                  }
+              }
+
+              fn check() -> Self {
+                  Self {
+                      icon: VectorIconKind::Check,
+                      min_size: egui::vec2(20.0, 20.0),
+                      frame: true,
+                      sense: egui::Sense::click(),
+                  }
+              }
+
+              fn min_size(mut self, size: egui::Vec2) -> Self {
+                  self.min_size = size;
+                  self
+              }
+
+              fn frame(mut self, frame: bool) -> Self {
+                  self.frame = frame;
+                  self
+              }
+
+              fn sense(mut self, sense: egui::Sense) -> Self {
+                  self.sense = sense;
+                  self
+              }
+          }
+
+          impl egui::Widget for VectorIconButton {
+              fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+                  let (rect, response) = ui.allocate_exact_size(self.min_size, self.sense);
+                  let enabled = ui.is_enabled();
+                  let visuals = ui.style().interact(&response);
+
+                  if self.frame {
+                      ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+                      ui.painter().rect_stroke(
+                          rect,
+                          4.0,
+                          visuals.bg_stroke,
+                          egui::StrokeKind::Inside,
+                      );
+                  } else if enabled && response.hovered() {
+                      ui.painter()
+                          .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+                  }
+
+                  let color = if enabled {
+                      visuals.fg_stroke.color
+                  } else {
+                      ui.visuals().weak_text_color().gamma_multiply(0.45)
+                  };
+                  paint_vector_icon(ui.painter(), rect, self.icon, color);
+                  response
+              }
+          }
+
+          fn paint_vector_icon(
+              painter: &egui::Painter,
+              rect: egui::Rect,
+              icon: VectorIconKind,
+              color: egui::Color32,
+          ) {
+              let icon_rect = rect.shrink(5.0);
+              match icon {
+                  VectorIconKind::Export => {
+                      let stroke = egui::Stroke::new(1.8, color);
+                      let x = icon_rect.center().x;
+                      let top = icon_rect.top() + 0.5;
+                      let shaft_bottom = icon_rect.center().y + 1.5;
+                      painter.line_segment(
+                          [egui::pos2(x, shaft_bottom), egui::pos2(x, top)],
+                          stroke,
+                      );
+                      painter.line_segment(
+                          [egui::pos2(x, top), egui::pos2(x - 3.2, top + 3.2)],
+                          stroke,
+                      );
+                      painter.line_segment(
+                          [egui::pos2(x, top), egui::pos2(x + 3.2, top + 3.2)],
+                          stroke,
+                      );
+                      let bottom = icon_rect.bottom() - 0.5;
+                      let side_top = bottom - 4.0;
+                      painter.line_segment(
+                          [egui::pos2(icon_rect.left() + 0.5, side_top), egui::pos2(icon_rect.left() + 0.5, bottom)],
+                          stroke,
+                      );
+                      painter.line_segment(
+                          [egui::pos2(icon_rect.left() + 0.5, bottom), egui::pos2(icon_rect.right() - 0.5, bottom)],
+                          stroke,
+                      );
+                      painter.line_segment(
+                          [egui::pos2(icon_rect.right() - 0.5, bottom), egui::pos2(icon_rect.right() - 0.5, side_top)],
+                          stroke,
+                      );
+                  }
+                  VectorIconKind::Check => {
+                      let stroke = egui::Stroke::new(2.0, color);
+                      painter.line_segment(
+                          [
+                              egui::pos2(icon_rect.left() + 1.0, icon_rect.center().y),
+                              egui::pos2(icon_rect.center().x - 1.0, icon_rect.bottom() - 1.5),
+                          ],
+                          stroke,
+                      );
+                      painter.line_segment(
+                          [
+                              egui::pos2(icon_rect.center().x - 1.0, icon_rect.bottom() - 1.5),
+                              egui::pos2(icon_rect.right() - 0.5, icon_rect.top() + 1.0),
+                          ],
+                          stroke,
+                      );
+                  }
+              }
+          }
+
+          '''
+          app = app.replace(marker, helper + marker, 1)
+
+          export_count = app.count('egui::Button::new("⇧")')
+          if export_count == 0:
+              raise SystemExit('No export glyph buttons found')
+          app = app.replace('egui::Button::new("⇧")', 'VectorIconButton::export()')
+
+          check_button_count = app.count('egui::Button::new("✓")')
+          app = app.replace('egui::Button::new("✓")', 'VectorIconButton::check()')
+
+          small_check_count = app.count('ui.small_button("✓")')
+          app = app.replace(
+              'ui.small_button("✓")',
+              'ui.add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))',
+          )
+          if check_button_count + small_check_count == 0:
+              raise SystemExit('No check glyph buttons found')
+
+          app = app.replace('"Update ✓"', '"Update OK"')
+          app_path.write_text(app, encoding='utf-8')
+
+          cargo_path = Path('Cargo.toml')
+          cargo = cargo_path.read_text(encoding='utf-8')
+          if cargo.count('version = "0.6.0"') != 1:
+              raise SystemExit('Expected Cargo version 0.6.0 exactly once')
+          cargo_path.write_text(cargo.replace('version = "0.6.0"', 'version = "0.6.1"', 1), encoding='utf-8')
+
+          notes_path = Path('RELEASE_NOTES.md')
+          notes = notes_path.read_text(encoding='utf-8')
+          notes_path.write_text(
+              '# Shade Editor 0.6.1\n\n'
+              'Font-independent icon compatibility fix.\n\n'
+              '- Snapshot Export icons are now vector geometry drawn by `egui::Painter`.\n'
+              '- Export-success checkmarks are now vector geometry and no longer depend on a Unicode glyph.\n'
+              '- The same reusable vector widget is used for per-Snapshot, per-day and all-Snapshot actions.\n'
+              '- No icon font needs to be installed on Windows.\n\n'
+              + notes,
+              encoding='utf-8',
+          )
+
+          print(f'replaced {export_count} export glyph buttons')
+          print(f'replaced {check_button_count + small_check_count} check glyph buttons')
+          PY
+      - name: Format Rust
+        run: cargo fmt
+      - name: Commit vector icon source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app_main.rs Cargo.toml RELEASE_NOTES.md
+          git commit -m "Draw snapshot export and check icons as vectors"
+          git push origin HEAD:fix/vector-icons-no-font
