@@ -1,3 +1,12 @@
+# Shade Editor 0.6.1
+
+Font-independent icon compatibility fix.
+
+- Snapshot Export icons are now vector geometry drawn by `egui::Painter`.
+- Export-success checkmarks are now vector geometry and no longer depend on a Unicode glyph.
+- The same reusable vector widget is used for per-Snapshot, per-day and all-Snapshot actions.
+- No icon font needs to be installed on Windows.
+
 # Shade Editor 0.5.0
 
 Snapshot export workflow and expanded Curve controls.
