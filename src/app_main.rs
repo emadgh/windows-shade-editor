@@ -2,12 +2,13 @@
 
 mod app_log;
 mod dpi;
-#[path = "export_v4.rs"]
+#[path = "export_v6.rs"]
 mod export;
-#[path = "model_v5.rs"]
+#[path = "model_v6.rs"]
 mod model;
+mod palette;
 mod render;
-#[path = "settings_v4.rs"]
+#[path = "settings_v6.rs"]
 mod settings;
 #[path = "tiff_io.rs"]
 mod tiff_io;
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 use chrono::{Local, TimeZone};
 use eframe::egui;
 use model::{ChannelAdjustment, ShadeProject, TestCodePosition};
+use palette::ChannelPalette;
 use settings::AppSettings;
 use tiff_io::PreviewFace;
 use update::{UpdateManager, UpdateStatus};
@@ -171,13 +173,15 @@ impl ShadeApp {
             updater.start_check(true);
         }
         let (render_tx, render_rx) = mpsc::channel();
+        let mut project = ShadeProject::default();
+        project.channel_palette = settings.default_project_palette();
         let log = app_log::AppLog::default();
         log.info(&format!(
             "Shade Editor {} started",
             env!("CARGO_PKG_VERSION")
         ));
         Self {
-            project: ShadeProject::default(),
+            project,
             project_path: None,
             faces: Vec::new(),
             current_face: 0,
@@ -229,6 +233,7 @@ impl ShadeApp {
             return;
         }
         self.project = ShadeProject::default();
+        self.project.channel_palette = self.settings.default_project_palette();
         self.project_path = None;
         self.faces.clear();
         self.current_face = 0;
@@ -304,6 +309,7 @@ impl ShadeApp {
             return;
         }
         let max_dimension = self.settings.max_preview_dimension;
+        let default_dpi = self.settings.default_dpi;
         self.launch_job("Opening TIFF", move |progress| {
             let total = paths.len().max(1);
             let mut faces = Vec::new();
@@ -320,7 +326,7 @@ impl ShadeApp {
                 );
                 match tiff_io::load_preview(&path, max_dimension) {
                     Ok(preview) => faces.push(LoadedFace {
-                        dpi: dpi::read_dpi(&path),
+                        dpi: dpi::read_dpi(&path, default_dpi),
                         path,
                         preview,
                     }),
@@ -343,6 +349,7 @@ impl ShadeApp {
             return;
         };
         let max_dimension = self.settings.max_preview_dimension;
+        let default_dpi = self.settings.default_dpi;
         self.launch_job("Opening project", move |progress| {
             let result = (|| -> Result<OpenPayload, String> {
                 Self::set_progress(&progress, None, "Opening project", "Reading .shade");
@@ -365,7 +372,7 @@ impl ShadeApp {
                         Ok(preview) => {
                             project.ensure_channels(&preview.metadata.channel_names);
                             faces.push(LoadedFace {
-                                dpi: dpi::read_dpi(&source),
+                                dpi: dpi::read_dpi(&source, default_dpi),
                                 path: source,
                                 preview,
                             });
@@ -453,11 +460,13 @@ impl ShadeApp {
         };
         let source = face.path.clone();
         let project = self.project.clone();
+        let default_dpi = self.settings.default_dpi;
         self.launch_job("Exporting TIFF", move |progress| {
             let result = export::export_face_with_progress(
                 &source,
                 &destination,
                 &project,
+                default_dpi,
                 |fraction, detail| {
                     Self::set_progress(&progress, Some(fraction), "Exporting TIFF", detail);
                 },
@@ -483,6 +492,7 @@ impl ShadeApp {
             .map(|face| face.path.clone())
             .collect::<Vec<_>>();
         let project = self.project.clone();
+        let default_dpi = self.settings.default_dpi;
         self.launch_job("Exporting faces", move |progress| {
             let total = sources.len().max(1);
             let result = (|| -> Result<String, String> {
@@ -496,6 +506,7 @@ impl ShadeApp {
                         source,
                         &destination,
                         &project,
+                        default_dpi,
                         |inner, detail| {
                             let overall = (index as f32 + inner) / total as f32;
                             Self::set_progress(&progress, Some(overall), "Exporting faces", detail);
@@ -551,6 +562,7 @@ impl ShadeApp {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let mut project = self.project.clone();
+        let default_dpi = self.settings.default_dpi;
         project.adjustments = snapshot.adjustments.clone();
         project.active_snapshot_id = Some(snapshot.id);
         self.launch_job("Exporting snapshot", move |progress| {
@@ -558,6 +570,7 @@ impl ShadeApp {
                 &source,
                 &destination,
                 &project,
+                default_dpi,
                 |fraction, detail| {
                     Self::set_progress(&progress, Some(fraction), "Exporting snapshot", detail);
                 },
@@ -594,6 +607,7 @@ impl ShadeApp {
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "face".to_owned());
         let base_project = self.project.clone();
+        let default_dpi = self.settings.default_dpi;
         let snapshots = snapshot_ids
             .into_iter()
             .filter_map(|id| {
@@ -624,6 +638,7 @@ impl ShadeApp {
                         &source,
                         &destination,
                         &project,
+                        default_dpi,
                         |inner, detail| {
                             let overall = (index as f32 + inner) / total as f32;
                             Self::set_progress(
@@ -651,6 +666,36 @@ impl ShadeApp {
         });
     }
 
+    fn ensure_project_palette_for_model(&mut self, color_model: tiff_io::ColorModel) -> bool {
+        if self.project.channel_palette.is_some() {
+            return false;
+        }
+        let palette = self
+            .settings
+            .default_project_palette()
+            .or_else(|| match color_model {
+                tiff_io::ColorModel::Rgb => Some(palette::builtin_rgb()),
+                tiff_io::ColorModel::Cmyk => Some(palette::builtin_cmyk()),
+                _ => None,
+            });
+        if let Some(palette) = palette {
+            self.project.channel_palette = Some(palette);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_project_palette(&mut self, palette: ChannelPalette) {
+        if self.project.channel_palette.as_ref() == Some(&palette) {
+            return;
+        }
+        let name = palette.name.clone();
+        self.project.channel_palette = Some(palette);
+        self.project_dirty = true;
+        self.report_info(format!("Channel palette: {name}"));
+    }
+
     fn open_export_folder(&mut self, folder: &str) {
         if let Err(err) = open_folder(Path::new(folder)) {
             self.report_error(err);
@@ -666,6 +711,9 @@ impl ShadeApp {
         match result {
             JobResult::AddFaces { faces, errors } => {
                 let added = faces.len();
+                if let Some(first) = faces.first() {
+                    self.ensure_project_palette_for_model(first.preview.metadata.color_model);
+                }
                 for item in faces {
                     self.project
                         .ensure_channels(&item.preview.metadata.channel_names);
@@ -710,6 +758,10 @@ impl ShadeApp {
                     self.current_face = 0;
                     self.selected_channel = 0;
                     self.solo_channel = None;
+                    if let Some(first) = self.faces.first() {
+                        let color_model = first.preview.metadata.color_model;
+                        self.ensure_project_palette_for_model(color_model);
+                    }
                     self.adjustment_scope = AdjustmentScope::Selected;
                     self.fit_requested = true;
                     self.viewport_recenter = true;
@@ -1351,6 +1403,7 @@ impl ShadeApp {
             .get(self.current_face)
             .map(|face| face.preview.metadata.channel_names.clone())
             .unwrap_or_default();
+        let palette = self.project.channel_palette.clone();
         let fallback = self
             .project
             .active_snapshot_name()
@@ -1367,15 +1420,25 @@ impl ShadeApp {
                 )
                 .changed();
             if !channel_names.is_empty() {
+                let selected_index = channel_names
+                    .iter()
+                    .position(|name| name == &self.project.test_code.channel)
+                    .unwrap_or(0);
+                let selected_display = channel_display_name(
+                    palette.as_ref(),
+                    &channel_names[selected_index],
+                    selected_index,
+                );
                 egui::ComboBox::from_label("Ink / channel")
-                    .selected_text(&self.project.test_code.channel)
+                    .selected_text(selected_display)
                     .show_ui(ui, |ui| {
-                        for name in &channel_names {
+                        for (index, name) in channel_names.iter().enumerate() {
+                            let display = channel_display_name(palette.as_ref(), name, index);
                             changed |= ui
                                 .selectable_value(
                                     &mut self.project.test_code.channel,
                                     name.clone(),
-                                    name,
+                                    display,
                                 )
                                 .changed();
                         }
@@ -1460,8 +1523,39 @@ impl ShadeApp {
             return;
         }
         self.selected_channel = self.selected_channel.min(channel_names.len() - 1);
+        let mut active_palette = self.project.channel_palette.clone();
+        let palette_library = self.settings.palette_library();
 
-        ui.heading("Channels");
+        ui.horizontal(|ui| {
+            ui.heading("Channels");
+            let selected = active_palette
+                .as_ref()
+                .map(|palette| palette.name.as_str())
+                .unwrap_or("TIFF channel names");
+            let mut requested_palette = None;
+            egui::ComboBox::from_id_salt("project-channel-palette")
+                .selected_text(selected)
+                .width(155.0)
+                .show_ui(ui, |ui| {
+                    for palette in &palette_library {
+                        if ui
+                            .selectable_label(
+                                active_palette
+                                    .as_ref()
+                                    .is_some_and(|current| current.id == palette.id),
+                                &palette.name,
+                            )
+                            .clicked()
+                        {
+                            requested_palette = Some(palette.clone());
+                        }
+                    }
+                });
+            if let Some(palette) = requested_palette {
+                active_palette = Some(palette.clone());
+                self.select_project_palette(palette);
+            }
+        });
         if clickable_row(
             ui,
             self.solo_channel.is_none(),
@@ -1486,10 +1580,11 @@ impl ShadeApp {
             } else {
                 ""
             };
-            let accent = channel_color(name, index);
+            let accent = channel_color(active_palette.as_ref(), name, index);
             let is_solo = self.solo_channel == Some(index);
             let indicator = if is_solo { "■" } else { "□" };
-            let label = format!("{indicator}  {name}{suffix}");
+            let display_name = channel_display_name(active_palette.as_ref(), name, index);
+            let label = format!("{indicator}  {display_name}{suffix}");
             let response = clickable_row(
                 ui,
                 self.selected_channel == index,
@@ -1525,8 +1620,9 @@ impl ShadeApp {
                 let accent = self
                     .settings
                     .colorize_histograms
-                    .then(|| channel_color(name, index));
-                ui.colored_label(accent.unwrap_or(ui.visuals().text_color()), name);
+                    .then(|| channel_color(active_palette.as_ref(), name, index));
+                let display = channel_display_name(active_palette.as_ref(), name, index);
+                ui.colored_label(accent.unwrap_or(ui.visuals().text_color()), display);
                 draw_histogram(
                     ui,
                     original_histograms.get(index),
@@ -1539,8 +1635,10 @@ impl ShadeApp {
             let accent = self
                 .settings
                 .colorize_histograms
-                .then(|| channel_color(&channel_names[index], index));
-            ui.strong(format!("Histogram — {}", channel_names[index]));
+                .then(|| channel_color(active_palette.as_ref(), &channel_names[index], index));
+            let display =
+                channel_display_name(active_palette.as_ref(), &channel_names[index], index);
+            ui.strong(format!("Histogram — {display}"));
             draw_histogram(
                 ui,
                 original_histograms.get(index),
@@ -1561,6 +1659,9 @@ impl ShadeApp {
         }
         self.selected_channel = self.selected_channel.min(channel_names.len() - 1);
         let output_name = channel_names[self.selected_channel].clone();
+        let palette = self.project.channel_palette.clone();
+        let output_display =
+            channel_display_name(palette.as_ref(), &output_name, self.selected_channel);
         let all_adjusted_histograms = face
             .adjusted
             .iter()
@@ -1570,16 +1671,16 @@ impl ShadeApp {
         let control_accent = self
             .settings
             .colorize_adjustments
-            .then(|| channel_color(&output_name, self.selected_channel));
+            .then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));
         let panel_accent = (self.adjustment_scope == AdjustmentScope::Selected)
-            .then(|| channel_color(&output_name, self.selected_channel));
+            .then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));
 
         ui.horizontal_wrapped(|ui| {
             ui.heading("Adjustments");
             ui.selectable_value(
                 &mut self.adjustment_scope,
                 AdjustmentScope::Selected,
-                &output_name,
+                output_display,
             );
             ui.selectable_value(
                 &mut self.adjustment_scope,
@@ -1608,7 +1709,7 @@ impl ShadeApp {
                 if let Some(color) = panel_accent {
                     ui.visuals_mut().widgets.noninteractive.bg_stroke.color =
                         color.gamma_multiply(0.52);
-                    ui.colored_label(color, format!("Editing: {output_name}"));
+                    ui.colored_label(color, format!("Editing: {output_display}"));
                 }
                 if ui.button("Reset all adjustments").clicked() {
                     self.project.reset_adjustments(&channel_names);
@@ -1622,6 +1723,7 @@ impl ShadeApp {
                         &channel_names,
                         active_histogram.as_ref(),
                         control_accent,
+                        palette.as_ref(),
                     ),
                     AdjustmentScope::All => self.ui_all_adjustments(
                         ui,
@@ -1629,6 +1731,7 @@ impl ShadeApp {
                         &channel_names,
                         &all_adjusted_histograms,
                         control_accent,
+                        palette.as_ref(),
                     ),
                 }
             })
@@ -1644,6 +1747,7 @@ impl ShadeApp {
         channel_names: &[String],
         histogram: Option<&[u32; 256]>,
         accent: Option<egui::Color32>,
+        palette: Option<&ChannelPalette>,
     ) -> bool {
         let mut changed = false;
         let adjustment = self
@@ -1673,7 +1777,7 @@ impl ShadeApp {
                         accent,
                     ),
                     ToolPanel::Mixer => {
-                        mixer_ui(ui, adjustment, output_name, channel_names, accent)
+                        mixer_ui(ui, adjustment, output_name, channel_names, accent, palette)
                     }
                 };
             } else {
@@ -1700,7 +1804,8 @@ impl ShadeApp {
                     .id_salt(format!("selected-mixer-{output_name}"))
                     .default_open(true)
                     .show(ui, |ui| {
-                        changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent);
+                        changed |=
+                            mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);
                     });
             }
         });
@@ -1714,6 +1819,7 @@ impl ShadeApp {
         channel_names: &[String],
         histograms: &[[u32; 256]],
         accent: Option<egui::Color32>,
+        palette: Option<&ChannelPalette>,
     ) -> bool {
         let mut changed = false;
         let enabled_count = channel_names
@@ -1766,12 +1872,14 @@ impl ShadeApp {
                     histograms,
                     self.settings.colorize_adjustments,
                     self.settings.show_curve_histogram,
+                    palette,
                 ),
                 ToolPanel::Mixer => all_mixers_ui(
                     ui,
                     &mut self.project.adjustments,
                     channel_names,
                     self.settings.colorize_adjustments,
+                    palette,
                 ),
             };
         } else {
@@ -1800,6 +1908,7 @@ impl ShadeApp {
                         histograms,
                         self.settings.colorize_adjustments,
                         self.settings.show_curve_histogram,
+                        palette,
                     );
                 });
             ui.add_space(4.0);
@@ -1812,6 +1921,7 @@ impl ShadeApp {
                         &mut self.project.adjustments,
                         channel_names,
                         self.settings.colorize_adjustments,
+                        palette,
                     );
                 });
         }
@@ -1883,7 +1993,10 @@ impl ShadeApp {
             if dpi_info.has_physical_resolution {
                 ui.label(format!("{:.0} × {:.0} DPI", dpi_info.dpi_x, dpi_info.dpi_y));
             } else {
-                ui.label("DPI not set (72 used for test-code sizing)");
+                ui.label(format!(
+                    "{:.0} × {:.0} DPI (default)",
+                    dpi_info.dpi_x, dpi_info.dpi_y
+                ));
             }
         });
         ui.separator();
@@ -1970,8 +2083,10 @@ impl ShadeApp {
         let mut open = self.show_settings;
         egui::Window::new("Settings")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
+            .default_size([640.0, 760.0])
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Application");
                 let mut changed = false;
                 changed |= ui
@@ -1990,6 +2105,23 @@ impl ShadeApp {
                             .text("Preview max dimension"),
                     )
                     .changed();
+                let old_default_dpi = self.settings.default_dpi;
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.default_dpi, 72.0..=1200.0)
+                            .text("Default DPI")
+                            .suffix(" dpi"),
+                    )
+                    .changed();
+                ui.small("Used when a TIFF has no valid physical DPI. Default: 220. Exported TIFFs receive this DPI when the source does not provide one.");
+                let dpi_changed = (old_default_dpi - self.settings.default_dpi).abs() > f64::EPSILON;
+                if dpi_changed {
+                    for face in &mut self.faces {
+                        if face.dpi.used_default {
+                            face.dpi = dpi::DpiInfo::with_default(self.settings.default_dpi);
+                        }
+                    }
+                }
                 ui.separator();
                 ui.heading("Editor layout");
                 changed |= ui
@@ -2030,6 +2162,110 @@ impl ShadeApp {
                         "Show active histogram behind Curve",
                     )
                     .changed();
+                ui.separator();
+                ui.heading("Channel palettes");
+                ui.small("Palettes change only UI channel names/colors. TIFF channel names and separation order stay untouched. The active project palette is saved inside the .shade file.");
+                let palette_library = self.settings.palette_library();
+                let default_palette_name = if self.settings.default_palette_id == palette::AUTO_PALETTE_ID {
+                    "Automatic — CMYK/RGB from first Face".to_owned()
+                } else {
+                    palette_library
+                        .iter()
+                        .find(|palette| palette.id == self.settings.default_palette_id)
+                        .map(|palette| palette.name.clone())
+                        .unwrap_or_else(|| "Automatic — CMYK/RGB from first Face".to_owned())
+                };
+                egui::ComboBox::from_label("Default palette for new projects")
+                    .selected_text(default_palette_name)
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.settings.default_palette_id,
+                                palette::AUTO_PALETTE_ID.to_owned(),
+                                "Automatic — CMYK/RGB from first Face",
+                            )
+                            .changed();
+                        for palette in &palette_library {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.settings.default_palette_id,
+                                    palette.id.clone(),
+                                    &palette.name,
+                                )
+                                .changed();
+                        }
+                    });
+
+                ui.label("Built-in palettes (read-only)");
+                for builtin in palette::builtin_palettes() {
+                    egui::CollapsingHeader::new(&builtin.name)
+                        .id_salt(format!("builtin-palette-{}", builtin.id))
+                        .show(ui, |ui| {
+                            for entry in &builtin.channels {
+                                palette_entry_readonly(ui, entry);
+                            }
+                        });
+                }
+
+                let mut delete_palette = None;
+                let mut add_channel_to = None;
+                let mut remove_channel = None;
+                for custom in &mut self.settings.custom_palettes {
+                    let custom_id = custom.id.clone();
+                    egui::CollapsingHeader::new(format!("Custom — {}", custom.name))
+                        .id_salt(format!("custom-palette-{custom_id}"))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Palette name");
+                                changed |= ui.text_edit_singleline(&mut custom.name).changed();
+                                if ui.small_button("Delete palette").clicked() {
+                                    delete_palette = Some(custom_id.clone());
+                                }
+                            });
+                            ui.add_space(3.0);
+                            for (index, entry) in custom.channels.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{}", index + 1));
+                                    changed |= ui
+                                        .add(egui::TextEdit::singleline(&mut entry.name).desired_width(130.0))
+                                        .changed();
+                                    changed |= ui.color_edit_button_srgb(&mut entry.color).changed();
+                                    if ui.small_button("−").on_hover_text("Remove channel slot").clicked() {
+                                        remove_channel = Some((custom_id.clone(), index));
+                                    }
+                                });
+                            }
+                            if ui.small_button("+ Channel slot").clicked() {
+                                add_channel_to = Some(custom_id.clone());
+                            }
+                        });
+                }
+                if let Some((id, index)) = remove_channel {
+                    if let Some(custom) = self.settings.custom_palettes.iter_mut().find(|item| item.id == id) {
+                        if index < custom.channels.len() {
+                            custom.channels.remove(index);
+                            changed = true;
+                        }
+                    }
+                }
+                if let Some(id) = add_channel_to {
+                    if let Some(custom) = self.settings.custom_palettes.iter_mut().find(|item| item.id == id) {
+                        let number = custom.channels.len() + 1;
+                        let color = palette::fallback_channel_color("Spot", number - 1);
+                        custom.channels.push(palette::ChannelPaletteEntry {
+                            name: format!("Ink {number}"),
+                            color,
+                        });
+                        changed = true;
+                    }
+                }
+                if let Some(id) = delete_palette {
+                    changed |= self.settings.delete_custom_palette(&id);
+                }
+                if ui.button("+ New custom palette").clicked() {
+                    self.settings.create_custom_palette();
+                    changed = true;
+                }
                 if dark_changed {
                     apply_theme(ctx, self.settings.dark_mode);
                 }
@@ -2038,6 +2274,7 @@ impl ShadeApp {
                         self.report_error(err);
                     }
                 }
+                });
             });
         self.show_settings = open;
     }
@@ -2242,12 +2479,18 @@ fn mixer_ui(
     output_name: &str,
     channel_names: &[String],
     accent: Option<egui::Color32>,
+    palette: Option<&ChannelPalette>,
 ) -> bool {
     with_accent(ui, accent, |ui| {
+        let output_index = channel_names
+            .iter()
+            .position(|name| name == output_name)
+            .unwrap_or(0);
+        let output_display = channel_display_name(palette, output_name, output_index);
         if let Some(color) = accent {
-            ui.colored_label(color, format!("Output: {output_name}"));
+            ui.colored_label(color, format!("Output: {output_display}"));
         } else {
-            ui.label(format!("Output: {output_name}"));
+            ui.label(format!("Output: {output_display}"));
         }
         let mut changed = false;
         for (index, name) in channel_names.iter().enumerate() {
@@ -2257,10 +2500,10 @@ fn mixer_ui(
                 .coefficients
                 .entry(name.clone())
                 .or_insert(default);
-            let row_accent = accent.map(|_| channel_color(name, index));
+            let row_accent = accent.map(|_| channel_color(palette, name, index));
             changed |= with_accent(ui, row_accent, |ui| {
                 let mut slider = egui::Slider::new(coefficient, -2.0..=2.0)
-                    .text(name)
+                    .text(channel_display_name(palette, name, index))
                     .trailing_fill(true);
                 if let Some(color) = row_accent {
                     slider = slider.text_color(color);
@@ -2335,13 +2578,14 @@ fn all_curves_ui(
     histograms: &[[u32; 256]],
     colorize: bool,
     show_histogram: bool,
+    palette: Option<&ChannelPalette>,
 ) -> bool {
     let mut changed = false;
     let template_index = channel_names
         .iter()
         .position(|name| name == template_name)
         .unwrap_or(0);
-    let broadcast_accent = colorize.then(|| channel_color(template_name, template_index));
+    let broadcast_accent = colorize.then(|| channel_color(palette, template_name, template_index));
     let broadcast_histogram = show_histogram
         .then(|| histograms.get(template_index))
         .flatten();
@@ -2367,11 +2611,12 @@ fn all_curves_ui(
     ui.strong("Per-channel Curves");
     ui.small("Open any channel to refine it after using Broadcast.");
     for (index, name) in channel_names.iter().enumerate() {
-        let accent = colorize.then(|| channel_color(name, index));
+        let accent = colorize.then(|| channel_color(palette, name, index));
         let title = if let Some(color) = accent {
-            egui::RichText::new(format!("●  {name}")).color(color)
+            egui::RichText::new(format!("●  {}", channel_display_name(palette, name, index)))
+                .color(color)
         } else {
-            egui::RichText::new(name)
+            egui::RichText::new(channel_display_name(palette, name, index))
         };
         egui::CollapsingHeader::new(title)
             .id_salt(format!("all-channel-curve-{index}-{name}"))
@@ -2394,13 +2639,15 @@ fn all_mixers_ui(
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
     channel_names: &[String],
     colorize: bool,
+    palette: Option<&ChannelPalette>,
 ) -> bool {
     let mut changed = false;
     for (index, output_name) in channel_names.iter().enumerate() {
-        ui.collapsing(format!("Output — {output_name}"), |ui| {
+        let display = channel_display_name(palette, output_name, index);
+        ui.collapsing(format!("Output — {display}"), |ui| {
             let adjustment = adjustments.entry(output_name.clone()).or_default();
-            let accent = colorize.then(|| channel_color(output_name, index));
-            changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent);
+            let accent = colorize.then(|| channel_color(palette, output_name, index));
+            changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);
         });
     }
     changed
@@ -2458,32 +2705,29 @@ mod channel_interaction_tests {
     }
 }
 
-fn channel_color(name: &str, index: usize) -> egui::Color32 {
-    let lower = name.to_ascii_lowercase();
-    if lower == "cyan" || lower == "c" {
-        return egui::Color32::from_rgb(0, 190, 220);
-    }
-    if lower == "magenta" || lower == "m" {
-        return egui::Color32::from_rgb(225, 45, 150);
-    }
-    if lower == "yellow" || lower == "y" {
-        return egui::Color32::from_rgb(225, 190, 20);
-    }
-    if lower == "black" || lower == "k" {
-        return egui::Color32::from_rgb(155, 155, 155);
-    }
-    const SPOTS: [(u8, u8, u8); 8] = [
-        (130, 95, 220),
-        (60, 180, 95),
-        (235, 105, 55),
-        (65, 135, 230),
-        (220, 80, 95),
-        (40, 180, 175),
-        (190, 110, 45),
-        (180, 80, 190),
-    ];
-    let (r, g, b) = SPOTS[index % SPOTS.len()];
+fn channel_display_name<'a>(
+    palette: Option<&'a ChannelPalette>,
+    actual_name: &'a str,
+    index: usize,
+) -> &'a str {
+    palette
+        .map(|palette| palette.display_name(actual_name, index))
+        .unwrap_or(actual_name)
+}
+
+fn channel_color(palette: Option<&ChannelPalette>, name: &str, index: usize) -> egui::Color32 {
+    let [r, g, b] = palette
+        .map(|palette| palette.color(name, index))
+        .unwrap_or_else(|| palette::fallback_channel_color(name, index));
     egui::Color32::from_rgb(r, g, b)
+}
+
+fn palette_entry_readonly(ui: &mut egui::Ui, entry: &palette::ChannelPaletteEntry) {
+    let [r, g, b] = entry.color;
+    ui.horizontal(|ui| {
+        ui.colored_label(egui::Color32::from_rgb(r, g, b), "■");
+        ui.label(&entry.name);
+    });
 }
 
 fn clickable_row(
