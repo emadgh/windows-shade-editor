@@ -35,12 +35,10 @@ jobs:
               raise SystemExit('accent script patch target not found')
           s = s.replace(old, new, 1)
 
-          old = '''            changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent);",
-              "all mixers palette",'''
-          new = '''            changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);",
-              "all mixers palette",'''
+          old = 'changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent);",'
+          new = 'changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);",'
           if old not in s:
-              raise SystemExit('all mixers script patch target not found')
+              raise SystemExit('all mixers script call target not found')
           s = s.replace(old, new, 1)
 
           p.write_text(s, encoding='utf-8')
