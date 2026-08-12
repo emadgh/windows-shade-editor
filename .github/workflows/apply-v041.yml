@@ -1,0 +1,34 @@
+name: Apply Shade Editor v0.4.1 source patch
+
+on:
+  push:
+    branches:
+      - feat/snapshot-groups-channel-accent
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[v041-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Apply patch
+        run: python tools/apply_v041.py
+      - name: Format Rust
+        run: cargo fmt --all
+      - name: Commit generated source changes
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No source changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock RELEASE_NOTES.md src/app_main.rs src/model_v4.rs
+          git commit -m "Apply snapshot grouping and channel accent UX [v041-applied]"
+          git push origin HEAD:feat/snapshot-groups-channel-accent
