@@ -1,3 +1,14 @@
+# Shade Editor 0.7.1
+
+Compact Adjustment layout controls.
+
+- Adds an optional Compact Curve editor setting that hides the selected-point label, Input / Output numeric fields, and helper text while keeping all three graph points directly draggable.
+- In Stacked mode, Levels, Curve, and Channel Mixer Reset actions now live on the same row as their foldout headers instead of at the bottom of each tool.
+- Reset all is moved to the right side of the Editing channel header.
+- Tabs mode keeps a contextual Reset action beside the tool tabs.
+- All-channels Stacked mode uses the same header-level Reset behavior for Levels, Curve, and Mixer.
+- No `.shade` schema change; the compact Curve choice is an application setting.
+
 # Shade Editor 0.7.0
 
 Direct three-point Curve editing.
