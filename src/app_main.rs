@@ -1709,9 +1709,21 @@ impl ShadeApp {
                 if let Some(color) = panel_accent {
                     ui.visuals_mut().widgets.noninteractive.bg_stroke.color =
                         color.gamma_multiply(0.52);
-                    ui.colored_label(color, format!("Editing: {output_display}"));
                 }
-                if ui.button("Reset all adjustments").clicked() {
+                let reset_all = ui
+                    .horizontal(|ui| {
+                        if let Some(color) = panel_accent {
+                            ui.colored_label(color, format!("Editing: {output_display}"));
+                        } else {
+                            ui.strong("Editing: All channels");
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.small_button("Reset all").clicked()
+                        })
+                        .inner
+                    })
+                    .inner;
+                if reset_all {
                     self.project.reset_adjustments(&channel_names);
                     self.mark_all_previews_dirty();
                     self.report_info("All adjustments reset to defaults");
@@ -1750,6 +1762,7 @@ impl ShadeApp {
         palette: Option<&ChannelPalette>,
     ) -> bool {
         let mut changed = false;
+        let compact_curve_controls = self.settings.compact_curve_controls;
         let adjustment = self
             .project
             .adjustments
@@ -1763,11 +1776,23 @@ impl ShadeApp {
             .changed();
         ui.add_enabled_ui(adjustment.enabled, |ui| {
             if self.settings.adjustment_tabs {
+                let mut reset_tool = false;
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
                     ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
                     ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        reset_tool = ui.small_button("Reset").clicked();
+                    });
                 });
+                if reset_tool {
+                    match self.tool {
+                        ToolPanel::Levels => adjustment.levels = model::Levels::default(),
+                        ToolPanel::Curves => adjustment.curve = model::Curve::default(),
+                        ToolPanel::Mixer => reset_mixer_row(adjustment, output_name, channel_names),
+                    }
+                    changed = true;
+                }
                 changed |= match self.tool {
                     ToolPanel::Levels => levels_ui(ui, adjustment, accent),
                     ToolPanel::Curves => curves_ui(
@@ -1775,38 +1800,61 @@ impl ShadeApp {
                         adjustment,
                         histogram.filter(|_| self.settings.show_curve_histogram),
                         accent,
+                        compact_curve_controls,
                     ),
                     ToolPanel::Mixer => {
                         mixer_ui(ui, adjustment, output_name, channel_names, accent, palette)
                     }
                 };
             } else {
-                egui::CollapsingHeader::new("Levels")
-                    .id_salt(format!("selected-levels-{output_name}"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        changed |= levels_ui(ui, adjustment, accent);
-                    });
+                let (body_changed, reset) = adjustment_foldout(
+                    ui,
+                    format!("selected-levels-{output_name}"),
+                    "Levels",
+                    true,
+                    |ui| levels_ui(ui, adjustment, accent),
+                );
+                changed |= body_changed.unwrap_or(false);
+                if reset {
+                    adjustment.levels = model::Levels::default();
+                    changed = true;
+                }
+
                 ui.add_space(4.0);
-                egui::CollapsingHeader::new("Curve")
-                    .id_salt(format!("selected-curve-{output_name}"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        changed |= curves_ui(
+                let (body_changed, reset) = adjustment_foldout(
+                    ui,
+                    format!("selected-curve-{output_name}"),
+                    "Curve",
+                    true,
+                    |ui| {
+                        curves_ui(
                             ui,
                             adjustment,
                             histogram.filter(|_| self.settings.show_curve_histogram),
                             accent,
-                        );
-                    });
+                            compact_curve_controls,
+                        )
+                    },
+                );
+                changed |= body_changed.unwrap_or(false);
+                if reset {
+                    adjustment.curve = model::Curve::default();
+                    changed = true;
+                }
+
                 ui.add_space(4.0);
-                egui::CollapsingHeader::new("Channel Mixer")
-                    .id_salt(format!("selected-mixer-{output_name}"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        changed |=
-                            mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);
-                    });
+                let (body_changed, reset) = adjustment_foldout(
+                    ui,
+                    format!("selected-mixer-{output_name}"),
+                    "Channel Mixer",
+                    true,
+                    |ui| mixer_ui(ui, adjustment, output_name, channel_names, accent, palette),
+                );
+                changed |= body_changed.unwrap_or(false);
+                if reset {
+                    reset_mixer_row(adjustment, output_name, channel_names);
+                    changed = true;
+                }
             }
         });
         changed
@@ -1822,6 +1870,7 @@ impl ShadeApp {
         palette: Option<&ChannelPalette>,
     ) -> bool {
         let mut changed = false;
+        let compact_curve_controls = self.settings.compact_curve_controls;
         let enabled_count = channel_names
             .iter()
             .filter(|name| {
@@ -1851,11 +1900,29 @@ impl ShadeApp {
         );
 
         if self.settings.adjustment_tabs {
+            let mut reset_tool = false;
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
                 ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
                 ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    reset_tool = ui.small_button("Reset").clicked();
+                });
             });
+            if reset_tool {
+                match self.tool {
+                    ToolPanel::Levels => {
+                        reset_all_levels(&mut self.project.adjustments, channel_names)
+                    }
+                    ToolPanel::Curves => {
+                        reset_all_curves(&mut self.project.adjustments, channel_names)
+                    }
+                    ToolPanel::Mixer => {
+                        reset_all_mixers(&mut self.project.adjustments, channel_names)
+                    }
+                }
+                changed = true;
+            }
             changed |= match self.tool {
                 ToolPanel::Levels => broadcast_levels_ui(
                     ui,
@@ -1872,6 +1939,7 @@ impl ShadeApp {
                     histograms,
                     self.settings.colorize_adjustments,
                     self.settings.show_curve_histogram,
+                    compact_curve_controls,
                     palette,
                 ),
                 ToolPanel::Mixer => all_mixers_ui(
@@ -1883,24 +1951,35 @@ impl ShadeApp {
                 ),
             };
         } else {
-            egui::CollapsingHeader::new("Levels — all channels")
-                .id_salt("all-levels-section")
-                .default_open(true)
-                .show(ui, |ui| {
-                    changed |= broadcast_levels_ui(
+            let (body_changed, reset) = adjustment_foldout(
+                ui,
+                "all-levels-section",
+                "Levels — all channels",
+                true,
+                |ui| {
+                    broadcast_levels_ui(
                         ui,
                         &mut self.project.adjustments,
                         template_name,
                         channel_names,
                         accent,
-                    );
-                });
+                    )
+                },
+            );
+            changed |= body_changed.unwrap_or(false);
+            if reset {
+                reset_all_levels(&mut self.project.adjustments, channel_names);
+                changed = true;
+            }
+
             ui.add_space(4.0);
-            egui::CollapsingHeader::new("Curve — broadcast + per channel")
-                .id_salt("all-curves-section")
-                .default_open(true)
-                .show(ui, |ui| {
-                    changed |= all_curves_ui(
+            let (body_changed, reset) = adjustment_foldout(
+                ui,
+                "all-curves-section",
+                "Curve — broadcast + per channel",
+                true,
+                |ui| {
+                    all_curves_ui(
                         ui,
                         &mut self.project.adjustments,
                         template_name,
@@ -1908,22 +1987,38 @@ impl ShadeApp {
                         histograms,
                         self.settings.colorize_adjustments,
                         self.settings.show_curve_histogram,
+                        compact_curve_controls,
                         palette,
-                    );
-                });
+                    )
+                },
+            );
+            changed |= body_changed.unwrap_or(false);
+            if reset {
+                reset_all_curves(&mut self.project.adjustments, channel_names);
+                changed = true;
+            }
+
             ui.add_space(4.0);
-            egui::CollapsingHeader::new("Channel Mixer — all output rows")
-                .id_salt("all-mixers-section")
-                .default_open(true)
-                .show(ui, |ui| {
-                    changed |= all_mixers_ui(
+            let (body_changed, reset) = adjustment_foldout(
+                ui,
+                "all-mixers-section",
+                "Channel Mixer — all output rows",
+                true,
+                |ui| {
+                    all_mixers_ui(
                         ui,
                         &mut self.project.adjustments,
                         channel_names,
                         self.settings.colorize_adjustments,
                         palette,
-                    );
-                });
+                    )
+                },
+            );
+            changed |= body_changed.unwrap_or(false);
+            if reset {
+                reset_all_mixers(&mut self.project.adjustments, channel_names);
+                changed = true;
+            }
         }
         changed
     }
@@ -2142,6 +2237,13 @@ impl ShadeApp {
                         "Use tabs for Levels / Curve / Mixer",
                     )
                     .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.compact_curve_controls,
+                        "Compact Curve editor (hide Input / Output fields)",
+                    )
+                    .changed();
+                ui.small("When enabled, Curve keeps only the draggable graph and hides the selected-point label, Input / Output fields, and helper text.");
                 ui.separator();
                 ui.heading("Color guides");
                 changed |= ui
@@ -2380,6 +2482,78 @@ impl eframe::App for ShadeApp {
     }
 }
 
+fn adjustment_foldout<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    title: impl Into<egui::WidgetText>,
+    default_open: bool,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> (Option<R>, bool) {
+    let id = ui.make_persistent_id(id_salt);
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    let title = title.into();
+    let mut reset = false;
+    let header = ui.horizontal(|ui| {
+        state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+        let title_response = ui.add(egui::Label::new(title).sense(egui::Sense::click()));
+        if title_response.clicked() {
+            state.toggle(ui);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            reset = ui.small_button("Reset").clicked();
+        });
+    });
+    let body = state.show_body_indented(&header.response, ui, body);
+    (body.map(|response| response.inner), reset)
+}
+
+fn reset_mixer_row(
+    adjustment: &mut ChannelAdjustment,
+    output_name: &str,
+    channel_names: &[String],
+) {
+    adjustment.mixer.coefficients.clear();
+    for name in channel_names {
+        adjustment
+            .mixer
+            .coefficients
+            .insert(name.clone(), if name == output_name { 1.0 } else { 0.0 });
+    }
+    adjustment.mixer.constant = 0.0;
+}
+
+fn reset_all_levels(
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    channel_names: &[String],
+) {
+    for name in channel_names {
+        adjustments.entry(name.clone()).or_default().levels = model::Levels::default();
+    }
+}
+
+fn reset_all_curves(
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    channel_names: &[String],
+) {
+    for name in channel_names {
+        adjustments.entry(name.clone()).or_default().curve = model::Curve::default();
+    }
+}
+
+fn reset_all_mixers(
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    channel_names: &[String],
+) {
+    for output_name in channel_names {
+        let adjustment = adjustments.entry(output_name.clone()).or_default();
+        reset_mixer_row(adjustment, output_name, channel_names);
+    }
+}
+
 fn levels_ui(
     ui: &mut egui::Ui,
     adjustment: &mut ChannelAdjustment,
@@ -2415,10 +2589,6 @@ fn levels_ui(
             "Gamma midpoint output: {:.3}",
             model::levels_gamma_mid_output(*levels)
         ));
-        if ui.small_button("Reset Levels").clicked() {
-            adjustment.levels = model::Levels::default();
-            changed = true;
-        }
         changed
     })
 }
@@ -2627,18 +2797,17 @@ fn curves_ui(
     adjustment: &mut ChannelAdjustment,
     histogram: Option<&[u32; 256]>,
     accent: Option<egui::Color32>,
+    compact_controls: bool,
 ) -> bool {
     with_accent(ui, accent, |ui| {
         let (graph_changed, selected) =
             curve_editor_graph(ui, &mut adjustment.curve, histogram, accent);
         let mut changed = graph_changed;
-        ui.add_space(6.0);
-        changed |= curve_point_fields(ui, &mut adjustment.curve, selected);
-        ui.add_space(4.0);
-        ui.small("Drag any of the three points directly. Input / Output use Photoshop-style 0-255 values.");
-        if ui.small_button("Reset Curve").clicked() {
-            adjustment.curve = model::Curve::default();
-            changed = true;
+        if !compact_controls {
+            ui.add_space(6.0);
+            changed |= curve_point_fields(ui, &mut adjustment.curve, selected);
+            ui.add_space(4.0);
+            ui.small("Drag any of the three points directly. Input / Output use Photoshop-style 0-255 values.");
         }
         changed
     })
@@ -2692,17 +2861,6 @@ fn mixer_ui(
             constant_slider = constant_slider.text_color(color);
         }
         changed |= ui.add(constant_slider).changed();
-        if ui.small_button("Reset Mixer").clicked() {
-            adjustment.mixer.coefficients.clear();
-            for name in channel_names {
-                adjustment
-                    .mixer
-                    .coefficients
-                    .insert(name.clone(), if name == output_name { 1.0 } else { 0.0 });
-            }
-            adjustment.mixer.constant = 0.0;
-            changed = true;
-        }
         changed
     })
 }
@@ -2730,9 +2888,10 @@ fn broadcast_curves_ui(
     channel_names: &[String],
     histogram: Option<&[u32; 256]>,
     accent: Option<egui::Color32>,
+    compact_controls: bool,
 ) -> bool {
     let mut draft = adjustments.get(template_name).cloned().unwrap_or_default();
-    if !curves_ui(ui, &mut draft, histogram, accent) {
+    if !curves_ui(ui, &mut draft, histogram, accent, compact_controls) {
         return false;
     }
     for name in channel_names {
@@ -2749,6 +2908,7 @@ fn all_curves_ui(
     histograms: &[[u32; 256]],
     colorize: bool,
     show_histogram: bool,
+    compact_controls: bool,
     palette: Option<&ChannelPalette>,
 ) -> bool {
     let mut changed = false;
@@ -2775,6 +2935,7 @@ fn all_curves_ui(
                 channel_names,
                 broadcast_histogram,
                 broadcast_accent,
+                compact_controls,
             );
         });
 
@@ -2799,7 +2960,7 @@ fn all_curves_ui(
                     None
                 };
                 let adjustment = adjustments.entry(name.clone()).or_default();
-                changed |= curves_ui(ui, adjustment, histogram, accent);
+                changed |= curves_ui(ui, adjustment, histogram, accent, compact_controls);
             });
     }
     changed
