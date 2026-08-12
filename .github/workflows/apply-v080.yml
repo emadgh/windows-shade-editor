@@ -19,6 +19,18 @@ jobs:
         shell: bash
         run: |
           if grep -q 'version = "0.7.1"' Cargo.toml; then
+            python - <<'PY'
+            from pathlib import Path
+            path = Path('scripts/apply_v080.py')
+            text = path.read_text(encoding='utf-8')
+            needle = "app = app.replace('Histogram — ', 'Histogram - ')"
+            replacement = needle + "\napp = app.replace('—', '-')"
+            if "app = app.replace('—', '-')" not in text:
+                if needle not in text:
+                    raise SystemExit('Unicode cleanup anchor not found')
+                text = text.replace(needle, replacement, 1)
+                path.write_text(text, encoding='utf-8')
+            PY
             python scripts/apply_v080.py
             cargo fmt --all
             git config user.name "github-actions[bot]"
