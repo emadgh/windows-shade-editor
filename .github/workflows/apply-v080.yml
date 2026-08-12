@@ -1,0 +1,31 @@
+name: Apply Shade Editor v0.8.0 source migration
+
+on:
+  push:
+    branches: [feat/optional-midpoint-project-metadata]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/optional-midpoint-project-metadata
+          fetch-depth: 0
+      - name: Apply v0.8.0 patch once
+        shell: bash
+        run: |
+          if grep -q 'version = "0.7.1"' Cargo.toml; then
+            python scripts/apply_v080.py
+            cargo fmt --all
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml RELEASE_NOTES.md src/app_main.rs src/model_v6.rs src/thumbnail.rs
+            git commit -m "Implement optional Curve midpoint and project metadata"
+            git push origin HEAD:feat/optional-midpoint-project-metadata
+          else
+            echo "v0.8.0 patch already applied"
+          fi
