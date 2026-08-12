@@ -1,22 +1,19 @@
-# Shade Editor 0.1.0
+# Shade Editor 0.2.1
 
-Initial native Windows version focused on ceramic-print shade matching.
+Engineering fix based on a real Photoshop CMYK TIFF containing two spot channels.
 
-## Included
+## Fixed
 
-- Multi-Face TIFF projects with `.shade` recipe files.
-- CMYK plus additional/spot channel discovery.
-- Composite and isolated-channel preview.
-- Original/adjusted per-channel histogram.
-- Levels, compact Curve, and dynamic N×N Channel Mixer for every channel.
-- Optional export test code on a selected separation.
-- Current-Face and all-Faces TIFF export.
-- ICC Profile and Photoshop Image Resources preservation when present.
-- Application Settings with automatic updates enabled by default and an option to disable them.
-- About window with version, repository link, and manual update check.
-- GitHub Release based self-updater modeled after GahYar's update flow.
-- Windows x64 GitHub Actions build/release pipeline.
+- Decode RGB/CMYK TIFF `ExtraSamples` instead of silently receiving only the base RGB/CMYK samples from image-tiff.
+- Preserve Photoshop spot-channel pixel data for files where `SamplesPerPixel` is larger than the base color-channel count.
+- Keep the source TIFF immutable: the decoder workaround is a read-only in-memory metadata overlay and never changes the source file.
+- Added regression coverage that writes a synthetic CMYK + 2 ExtraSamples TIFF and verifies that all six samples decode byte-for-byte.
+- Retains the v0.2 fixes for Photoshop channel names, ICC/ImageResources metadata, RGB vs CMYK export, channel-specific histograms and stacked adjustment panels.
+
+## Verified production sample
+
+The supplied validation TIFF is 720×1280, 8-bit CMYK, LZW + horizontal predictor, with `SamplesPerPixel = 6`, two unspecified ExtraSamples, and Photoshop channel names `purpol` and `bgreen`. The previous decoder returned exactly four samples per pixel; this build explicitly routes RGB/CMYK + extras through full multiband decoding.
 
 ## Compatibility note
 
-This is an engineering preview. Validate exported files with representative production Photoshop/RIP TIFFs before using version 0.1.0 in a production print workflow. The next TIFF milestone should add round-trip fixtures, fuller metadata preservation, and strip/tile streaming for very large artwork.
+This remains an engineering preview. Photoshop/RIP round-trip should be checked after export before using the build in production. Strip/tile streaming is still planned for very large artwork to reduce peak RAM usage.
