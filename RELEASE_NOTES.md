@@ -1,16 +1,22 @@
-# Shade Editor 0.4.2
+# Shade Editor 0.5.0
 
-Channel selection / solo-preview interaction refinement.
+Snapshot export workflow and expanded Curve controls.
 
-## Changed
+## Snapshot export
 
-- Clicking a different channel now selects it for editing while keeping the composite preview.
-- Clicking the already-selected channel toggles that channel's monochrome Solo Preview on/off.
-- Channel rows show an outline square (`□`) normally and a filled square (`■`) when that channel is soloed.
-- Selecting a different channel while another channel is soloed automatically returns the viewport to Composite before editing the new channel.
-- Channel Mixer `Constant` is visually separated from the source-channel coefficients with additional spacing and a divider.
+- Compact export actions are available for every Snapshot, every day group, and the whole Snapshots panel.
+- Snapshot export always targets the active Face and reuses the exact same TIFF/Test Code backend as Export face.
+- A single Snapshot uses a Save dialog; day/all exports use a destination folder and export every selected Snapshot there.
+- Successful exports are marked with a check. Clicking the check opens the latest export folder.
+- Export history is stored per Snapshot + Face in `.shade` schema v5, but never locks or disables re-export.
 
-## Retained
+## Curve
 
-- Full-row Face / Channel / Snapshot selection, dated Snapshot groups, unique Snapshot names and per-channel adjustment color cues from 0.4.1.
-- Multi-channel RGB/CMYK + Photoshop Spot TIFF support, background rendering, progress, updater, logs, DPI-aware test code and Fit viewport.
+- Curve now has Input black and Input white endpoints in addition to output endpoints and relative midpoint.
+- In All channels, Broadcast remains available and copies its Curve to every channel.
+- Each channel also has its own collapsed full Curve panel for independent refinement after Broadcast.
+- With four channels the Curve section therefore shows one Broadcast Curve plus four channel foldouts.
+
+## Adjustment layout
+
+- In Stacked mode, Levels, Curve and Channel Mixer can each be collapsed/expanded independently.
