@@ -18,12 +18,13 @@ jobs:
         with:
           ref: feat/default-dpi-channel-palettes
           fetch-depth: 0
-      - name: Fix migration script ambiguity
+      - name: Fix migration script ambiguities
         run: |
           python - <<'PY'
           from pathlib import Path
           p = Path('tools/apply_v060.py')
           s = p.read_text(encoding='utf-8')
+
           old = '''app = replace_once(app, ".then(|| channel_color(&output_name, self.selected_channel));", ".then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));", "adjustment control palette")
           app = replace_once(app, ".then(|| channel_color(&output_name, self.selected_channel));", ".then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));", "adjustment panel palette")'''
           new = '''needle = ".then(|| channel_color(&output_name, self.selected_channel));"
@@ -31,8 +32,18 @@ jobs:
               raise SystemExit(f"adjustment palette accents: expected 2 matches, found {app.count(needle)}")
           app = app.replace(needle, ".then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));", 2)'''
           if old not in s:
-              raise SystemExit('script patch target not found')
-          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+              raise SystemExit('accent script patch target not found')
+          s = s.replace(old, new, 1)
+
+          old = '''            changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent);",
+              "all mixers palette",'''
+          new = '''            changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);",
+              "all mixers palette",'''
+          if old not in s:
+              raise SystemExit('all mixers script patch target not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
           PY
       - name: Apply patch
         run: python tools/apply_v060.py
