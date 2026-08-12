@@ -1,6 +1,6 @@
 [package]
 name = "windows-shade-editor"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Native multi-channel TIFF shade editor for digital ceramic printing"
 license = "MIT"

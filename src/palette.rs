@@ -142,6 +142,9 @@ mod tests {
     fn palette_falls_back_after_defined_slots() {
         let palette = builtin_cmyk();
         assert_eq!(palette.display_name("purpol", 4), "purpol");
-        assert_eq!(palette.color("purpol", 4), fallback_channel_color("purpol", 4));
+        assert_eq!(
+            palette.color("purpol", 4),
+            fallback_channel_color("purpol", 4)
+        );
     }
 }
