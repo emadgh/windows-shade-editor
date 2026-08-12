@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use tiff::ColorType;
@@ -31,7 +31,7 @@ pub struct TiffMetadata {
     pub height: u32,
     pub bit_depth: u8,
     /// Actual TIFF SamplesPerPixel. Do not infer this from ColorType: Photoshop
-    /// may store additional alpha/spot separations as extra samples.
+    /// stores spot/alpha separations as ExtraSamples in otherwise RGB/CMYK TIFFs.
     pub samples_per_pixel: usize,
     pub base_channel_count: usize,
     pub color_model: ColorModel,
@@ -59,6 +59,108 @@ pub struct PreviewFace {
     pub histograms: Vec<[u32; 256]>,
 }
 
+/// image-tiff 0.11.x intentionally presents RGB/CMYK + ExtraSamples through
+/// RGB/CMYK ColorType and therefore drops unspecified extra samples from its
+/// decoded output. Photoshop uses exactly those unspecified ExtraSamples for
+/// spot channels. For raw shade editing we need every TIFF sample, not only the
+/// photometric samples.
+///
+/// The decoder already supports arbitrary Multiband samples. To reach that
+/// path without forking image-tiff, a read-only overlay changes only the
+/// PhotometricInterpretation value seen by the decoder from RGB/CMYK to
+/// BlackIsZero. Pixel bytes, compression, predictor, channel count and the
+/// source file itself remain untouched. The real photometric value is read
+/// separately from the original file and retained in TiffMetadata.
+#[derive(Clone, Copy, Debug)]
+struct PhotometricPatch {
+    offset: u64,
+    bytes: [u8; 2],
+}
+
+struct PatchedReader<R> {
+    inner: R,
+    position: u64,
+    patch: PhotometricPatch,
+}
+
+impl<R> PatchedReader<R> {
+    fn new(inner: R, patch: PhotometricPatch) -> Self {
+        Self {
+            inner,
+            position: 0,
+            patch,
+        }
+    }
+}
+
+impl<R: Read> Read for PatchedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let start = self.position;
+        let read = self.inner.read(buffer)?;
+        let end = start.saturating_add(read as u64);
+        let patch_start = self.patch.offset;
+        let patch_end = patch_start.saturating_add(2);
+
+        if start < patch_end && end > patch_start {
+            for (index, byte) in buffer[..read].iter_mut().enumerate() {
+                let absolute = start + index as u64;
+                if absolute == patch_start {
+                    *byte = self.patch.bytes[0];
+                } else if absolute == patch_start + 1 {
+                    *byte = self.patch.bytes[1];
+                }
+            }
+        }
+
+        self.position = end;
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for PatchedReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let absolute = self.inner.seek(position)?;
+        self.position = absolute;
+        Ok(absolute)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TiffEndian {
+    Little,
+    Big,
+}
+
+impl TiffEndian {
+    fn u16(self, bytes: [u8; 2]) -> u16 {
+        match self {
+            Self::Little => u16::from_le_bytes(bytes),
+            Self::Big => u16::from_be_bytes(bytes),
+        }
+    }
+
+    fn u32(self, bytes: [u8; 4]) -> u32 {
+        match self {
+            Self::Little => u32::from_le_bytes(bytes),
+            Self::Big => u32::from_be_bytes(bytes),
+        }
+    }
+
+    fn u64(self, bytes: [u8; 8]) -> u64 {
+        match self {
+            Self::Little => u64::from_le_bytes(bytes),
+            Self::Big => u64::from_be_bytes(bytes),
+        }
+    }
+
+    fn short_bytes(self, value: u16) -> [u8; 2] {
+        match self {
+            Self::Little => value.to_le_bytes(),
+            Self::Big => value.to_be_bytes(),
+        }
+    }
+}
+
 fn open_decoder(path: &Path) -> Result<Decoder<BufReader<File>>, String> {
     let file = File::open(path).map_err(|err| format!("Cannot open TIFF: {err}"))?;
     let reader = BufReader::new(file);
@@ -68,15 +170,64 @@ fn open_decoder(path: &Path) -> Result<Decoder<BufReader<File>>, String> {
     Ok(decoder)
 }
 
-pub fn decode_full(path: &Path) -> Result<DecodedImage, String> {
-    let mut decoder = open_decoder(path)?;
-    let (metadata, planar_configuration) = read_metadata(&mut decoder)?;
+fn open_multiband_decoder(
+    path: &Path,
+) -> Result<Decoder<PatchedReader<BufReader<File>>>, String> {
+    let patch = locate_photometric_patch(path)?;
+    let file = File::open(path).map_err(|err| format!("Cannot reopen TIFF: {err}"))?;
+    let reader = PatchedReader::new(BufReader::new(file), patch);
+    Decoder::new(reader)
+        .map_err(|err| format!("Cannot initialize full-channel TIFF decoder: {err}"))
+        .map(|decoder| decoder.with_limits(Limits::unlimited()))
+}
 
-    let pixel_count = (metadata.width as usize)
-        .checked_mul(metadata.height as usize)
+pub fn decode_full(path: &Path) -> Result<DecodedImage, String> {
+    let mut metadata_decoder = open_decoder(path)?;
+    let (metadata, planar_configuration) = read_metadata(&mut metadata_decoder)?;
+
+    let needs_multiband_workaround = metadata.samples_per_pixel > metadata.base_channel_count
+        && matches!(metadata.color_model, ColorModel::Rgb | ColorModel::Cmyk);
+
+    let samples = if needs_multiband_workaround {
+        // Do not let image-tiff's RGB/CMYK readout discard Photoshop spot
+        // ExtraSamples. Reopen through the metadata-only photometric overlay.
+        drop(metadata_decoder);
+        let decoder = open_multiband_decoder(path)?;
+        decode_samples(
+            decoder,
+            metadata.bit_depth,
+            metadata.width,
+            metadata.height,
+            metadata.samples_per_pixel,
+            planar_configuration,
+        )?
+    } else {
+        decode_samples(
+            metadata_decoder,
+            metadata.bit_depth,
+            metadata.width,
+            metadata.height,
+            metadata.samples_per_pixel,
+            planar_configuration,
+        )?
+    };
+
+    Ok(DecodedImage { metadata, samples })
+}
+
+fn decode_samples<R: Read + Seek>(
+    mut decoder: Decoder<R>,
+    bit_depth: u8,
+    width: u32,
+    height: u32,
+    samples_per_pixel: usize,
+    planar_configuration: u16,
+) -> Result<Vec<u16>, String> {
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
         .ok_or_else(|| "TIFF dimensions are too large.".to_owned())?;
     let expected = pixel_count
-        .checked_mul(metadata.samples_per_pixel)
+        .checked_mul(samples_per_pixel)
         .ok_or_else(|| "TIFF sample count is too large.".to_owned())?;
     if expected > 32_000_000_000usize {
         return Err("TIFF declares an unreasonable number of samples.".to_owned());
@@ -87,11 +238,12 @@ pub fn decode_full(path: &Path) -> Result<DecodedImage, String> {
         .read_image_to_buffer(&mut decoded)
         .map_err(|err| format!("Cannot decode TIFF pixels: {err}"))?;
 
-    let mut samples = decoding_result_to_u16(decoded, metadata.bit_depth)?;
+    let mut samples = decoding_result_to_u16(decoded, bit_depth)?;
     if samples.len() < expected {
         return Err(format!(
-            "Decoded TIFF data is incomplete ({} of {} samples).",
-            samples.len(), expected
+            "Decoded TIFF data is incomplete ({} of {} samples). The decoder returned fewer samples than TIFF SamplesPerPixel declares.",
+            samples.len(),
+            expected
         ));
     }
     if samples.len() > expected {
@@ -99,10 +251,10 @@ pub fn decode_full(path: &Path) -> Result<DecodedImage, String> {
     }
 
     if planar_configuration == 2 || layout.planes > 1 {
-        samples = planar_to_interleaved(&samples, pixel_count, metadata.samples_per_pixel);
+        samples = planar_to_interleaved(&samples, pixel_count, samples_per_pixel);
     }
 
-    Ok(DecodedImage { metadata, samples })
+    Ok(samples)
 }
 
 pub fn load_preview(path: &Path, max_dimension: u32) -> Result<PreviewFace, String> {
@@ -146,7 +298,7 @@ pub fn load_preview(path: &Path, max_dimension: u32) -> Result<PreviewFace, Stri
     })
 }
 
-fn read_metadata<R: std::io::Read + std::io::Seek>(
+fn read_metadata<R: Read + Seek>(
     decoder: &mut Decoder<R>,
 ) -> Result<(TiffMetadata, u16), String> {
     let (width, height) = decoder
@@ -232,6 +384,133 @@ fn infer_color_model(color_type: &ColorType, photometric: Option<u16>) -> (Color
         ColorType::Gray(_) | ColorType::GrayA(_) => (ColorModel::Gray, 1),
         _ => (ColorModel::Other, usize::from(color_type.num_samples()).max(1)),
     }
+}
+
+fn locate_photometric_patch(path: &Path) -> Result<PhotometricPatch, String> {
+    let file = File::open(path).map_err(|err| format!("Cannot inspect TIFF IFD: {err}"))?;
+    let mut reader = BufReader::new(file);
+    locate_photometric_patch_in(&mut reader)
+}
+
+fn locate_photometric_patch_in<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<PhotometricPatch, String> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|err| format!("Cannot seek TIFF header: {err}"))?;
+
+    let mut signature = [0u8; 4];
+    reader
+        .read_exact(&mut signature)
+        .map_err(|err| format!("Cannot read TIFF header: {err}"))?;
+    let endian = match &signature[..2] {
+        b"II" => TiffEndian::Little,
+        b"MM" => TiffEndian::Big,
+        _ => return Err("Cannot patch TIFF: invalid byte-order signature.".to_owned()),
+    };
+    let magic = endian.u16([signature[2], signature[3]]);
+
+    let (first_ifd, big_tiff) = match magic {
+        42 => {
+            let mut bytes = [0u8; 4];
+            reader
+                .read_exact(&mut bytes)
+                .map_err(|err| format!("Cannot read TIFF first IFD offset: {err}"))?;
+            (u64::from(endian.u32(bytes)), false)
+        }
+        43 => {
+            let mut rest = [0u8; 12];
+            reader
+                .read_exact(&mut rest)
+                .map_err(|err| format!("Cannot read BigTIFF header: {err}"))?;
+            let offset_size = endian.u16([rest[0], rest[1]]);
+            let reserved = endian.u16([rest[2], rest[3]]);
+            if offset_size != 8 || reserved != 0 {
+                return Err("Unsupported BigTIFF header layout.".to_owned());
+            }
+            let mut ifd_bytes = [0u8; 8];
+            ifd_bytes.copy_from_slice(&rest[4..12]);
+            (endian.u64(ifd_bytes), true)
+        }
+        _ => return Err(format!("Cannot patch TIFF: unexpected magic value {magic}.")),
+    };
+
+    reader
+        .seek(SeekFrom::Start(first_ifd))
+        .map_err(|err| format!("Cannot seek TIFF first IFD: {err}"))?;
+
+    if big_tiff {
+        let mut count_bytes = [0u8; 8];
+        reader
+            .read_exact(&mut count_bytes)
+            .map_err(|err| format!("Cannot read BigTIFF IFD entry count: {err}"))?;
+        let count = endian.u64(count_bytes);
+        if count > 65_535 {
+            return Err("BigTIFF IFD contains an unreasonable number of entries.".to_owned());
+        }
+
+        for _ in 0..count {
+            let entry_start = reader
+                .stream_position()
+                .map_err(|err| format!("Cannot inspect BigTIFF IFD position: {err}"))?;
+            let mut entry = [0u8; 20];
+            reader
+                .read_exact(&mut entry)
+                .map_err(|err| format!("Cannot read BigTIFF IFD entry: {err}"))?;
+            let tag = endian.u16([entry[0], entry[1]]);
+            if tag != 262 {
+                continue;
+            }
+            let field_type = endian.u16([entry[2], entry[3]]);
+            let mut item_count_bytes = [0u8; 8];
+            item_count_bytes.copy_from_slice(&entry[4..12]);
+            let item_count = endian.u64(item_count_bytes);
+            if field_type != 3 || item_count != 1 {
+                return Err(
+                    "Unsupported BigTIFF PhotometricInterpretation tag representation.".to_owned(),
+                );
+            }
+            return Ok(PhotometricPatch {
+                offset: entry_start + 12,
+                bytes: endian.short_bytes(1),
+            });
+        }
+    } else {
+        let mut count_bytes = [0u8; 2];
+        reader
+            .read_exact(&mut count_bytes)
+            .map_err(|err| format!("Cannot read TIFF IFD entry count: {err}"))?;
+        let count = endian.u16(count_bytes);
+
+        for _ in 0..count {
+            let entry_start = reader
+                .stream_position()
+                .map_err(|err| format!("Cannot inspect TIFF IFD position: {err}"))?;
+            let mut entry = [0u8; 12];
+            reader
+                .read_exact(&mut entry)
+                .map_err(|err| format!("Cannot read TIFF IFD entry: {err}"))?;
+            let tag = endian.u16([entry[0], entry[1]]);
+            if tag != 262 {
+                continue;
+            }
+            let field_type = endian.u16([entry[2], entry[3]]);
+            let item_count =
+                endian.u32([entry[4], entry[5], entry[6], entry[7]]);
+            if field_type != 3 || item_count != 1 {
+                return Err(
+                    "Unsupported TIFF PhotometricInterpretation tag representation.".to_owned(),
+                );
+            }
+            return Ok(PhotometricPatch {
+                offset: entry_start + 8,
+                bytes: endian.short_bytes(1),
+            });
+        }
+    }
+
+    Err("Cannot decode Photoshop extra channels: TIFF PhotometricInterpretation tag was not found."
+        .to_owned())
 }
 
 fn decoding_result_to_u16(decoded: DecodingResult, bit_depth: u8) -> Result<Vec<u16>, String> {
@@ -403,6 +682,10 @@ fn parse_unicode_names(data: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    use tiff::encoder::{TiffEncoder, colortype};
+    use tiff::tags::ExtraSamples;
 
     #[test]
     fn interleaves_planar_data() {
@@ -424,5 +707,59 @@ mod tests {
         let fake = ColorType::Multiband { bit_depth: 8, num_samples: 6 };
         assert_eq!(infer_color_model(&fake, Some(2)), (ColorModel::Rgb, 3));
         assert_eq!(infer_color_model(&fake, Some(5)), (ColorModel::Cmyk, 4));
+    }
+
+    #[test]
+    fn patched_reader_exposes_all_cmyk_extra_samples() {
+        let pixels = vec![
+            1u8, 2, 3, 4, 5, 6,
+            10, 20, 30, 40, 50, 60,
+        ];
+
+        let mut encoded = Cursor::new(Vec::new());
+        {
+            let mut tiff = TiffEncoder::new(&mut encoded).unwrap();
+            let mut image = tiff.new_image::<colortype::CMYK8>(2, 1).unwrap();
+            image
+                .extra_samples(&[ExtraSamples::Unspecified, ExtraSamples::Unspecified])
+                .unwrap();
+            image.write_data(&pixels).unwrap();
+        }
+
+        let bytes = encoded.into_inner();
+        let mut inspector = Cursor::new(bytes.clone());
+        let patch = locate_photometric_patch_in(&mut inspector).unwrap();
+
+        let reader = PatchedReader::new(Cursor::new(bytes), patch);
+        let mut decoder = Decoder::new(reader)
+            .unwrap()
+            .with_limits(Limits::unlimited());
+        assert!(matches!(
+            decoder.colortype().unwrap(),
+            ColorType::Multiband {
+                bit_depth: 8,
+                num_samples: 6
+            }
+        ));
+
+        let mut decoded = DecodingResult::U8(Vec::new());
+        decoder.read_image_to_buffer(&mut decoded).unwrap();
+        let DecodingResult::U8(values) = decoded else {
+            panic!("Expected 8-bit decoded values");
+        };
+        assert_eq!(values, pixels);
+    }
+
+    #[test]
+    fn patch_reader_only_changes_photometric_value_bytes() {
+        let original = vec![10u8, 11, 12, 13, 14, 15];
+        let patch = PhotometricPatch {
+            offset: 2,
+            bytes: [1, 0],
+        };
+        let mut reader = PatchedReader::new(Cursor::new(original), patch);
+        let mut result = Vec::new();
+        reader.read_to_end(&mut result).unwrap();
+        assert_eq!(result, vec![10, 11, 1, 0, 14, 15]);
     }
 }
