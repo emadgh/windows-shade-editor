@@ -24,10 +24,8 @@ jobs:
           from pathlib import Path
           p = Path('src/app_main.rs')
           s = p.read_text(encoding='utf-8')
-          old = '''                &output_display,
-            );'''
-          new = '''                output_display,
-            );'''
+          old = '                &output_display,\n'
+          new = '                output_display,\n'
           if s.count(old) != 1:
               raise SystemExit(f'expected 1 target, got {s.count(old)}')
           p.write_text(s.replace(old, new, 1), encoding='utf-8')
