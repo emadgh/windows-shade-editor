@@ -4,6 +4,7 @@ version = "0.4.0"
 edition = "2024"
 description = "Native multi-channel TIFF shade editor for digital ceramic printing"
 license = "MIT"
+autobins = false
 
 [[bin]]
 name = "ShadeEditor"
