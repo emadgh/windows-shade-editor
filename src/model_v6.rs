@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::palette::ChannelPalette;
 
-pub const SHADE_SCHEMA_VERSION: u32 = 6;
+pub const SHADE_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShadeProject {
@@ -104,16 +104,17 @@ impl Default for Levels {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Curve {
-    /// Input position that maps to the black output endpoint.
+    /// Input coordinate of the black endpoint.
     pub input_black: f32,
-    /// Input position that maps to the white output endpoint.
+    /// Input coordinate of the draggable middle point.
+    pub midpoint_input: f32,
+    /// Input coordinate of the white endpoint.
     pub input_white: f32,
-    /// Output at the black input endpoint.
+    /// Output coordinate of the black endpoint.
     pub black: f32,
-    /// Relative midpoint position inside the current [black, white] output range.
-    /// 0.5 is always a straight line between the two endpoints.
+    /// Output coordinate of the draggable middle point.
     pub midpoint: f32,
-    /// Output at the white input endpoint.
+    /// Output coordinate of the white endpoint.
     pub white: f32,
 }
 
@@ -121,6 +122,7 @@ impl Default for Curve {
     fn default() -> Self {
         Self {
             input_black: 0.0,
+            midpoint_input: 0.5,
             input_white: 1.0,
             black: 0.0,
             midpoint: 0.5,
@@ -215,6 +217,13 @@ impl ShadeProject {
             migrate_absolute_curve_midpoints(&mut project.adjustments);
             for snapshot in &mut project.snapshots {
                 migrate_absolute_curve_midpoints(&mut snapshot.adjustments);
+            }
+        }
+
+        if source_schema < 7 {
+            migrate_relative_curves_to_three_points(&mut project.adjustments);
+            for snapshot in &mut project.snapshots {
+                migrate_relative_curves_to_three_points(&mut snapshot.adjustments);
             }
         }
 
@@ -422,6 +431,15 @@ impl ShadeProject {
     }
 }
 
+fn migrate_relative_curves_to_three_points(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
+    for adjustment in adjustments.values_mut() {
+        let curve = &mut adjustment.curve;
+        curve.midpoint_input = ((curve.input_black + curve.input_white) * 0.5)
+            .clamp(curve.input_black, curve.input_white);
+        curve.midpoint = lerp(curve.black, curve.white, curve.midpoint);
+    }
+}
+
 fn migrate_absolute_curve_midpoints(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
     for adjustment in adjustments.values_mut() {
         let black = adjustment.curve.black;
@@ -492,20 +510,32 @@ pub fn levels_gamma_mid_output(levels: Levels) -> f32 {
 }
 
 pub fn curve_mid_output(curve: Curve) -> f32 {
-    lerp(curve.black, curve.white, curve.midpoint)
+    curve.midpoint.clamp(0.0, 1.0)
 }
 
 pub fn apply_curve(value: f32, curve: Curve) -> f32 {
-    let input_black = curve.input_black.clamp(0.0, 0.9999);
-    let input_white = curve.input_white.clamp(input_black + 0.0001, 1.0);
-    let x = ((value - input_black) / (input_white - input_black)).clamp(0.0, 1.0);
-    let midpoint_output = curve_mid_output(curve);
-    let y = if x <= 0.5 {
-        lerp(curve.black, midpoint_output, x * 2.0)
+    let epsilon = 1.0 / 65_535.0;
+    let x0 = curve.input_black.clamp(0.0, 1.0 - epsilon * 2.0);
+    let x2 = curve.input_white.clamp(x0 + epsilon * 2.0, 1.0);
+    let x1 = curve.midpoint_input.clamp(x0 + epsilon, x2 - epsilon);
+    let y0 = curve.black.clamp(0.0, 1.0);
+    let y1 = curve.midpoint.clamp(0.0, 1.0);
+    let y2 = curve.white.clamp(0.0, 1.0);
+    let x = value.clamp(0.0, 1.0);
+
+    if x <= x0 {
+        return y0;
+    }
+    if x >= x2 {
+        return y2;
+    }
+    if x <= x1 {
+        let t = (x - x0) / (x1 - x0).max(epsilon);
+        lerp(y0, y1, t).clamp(0.0, 1.0)
     } else {
-        lerp(midpoint_output, curve.white, (x - 0.5) * 2.0)
-    };
-    y.clamp(0.0, 1.0)
+        let t = (x - x1) / (x2 - x1).max(epsilon);
+        lerp(y1, y2, t).clamp(0.0, 1.0)
+    }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -533,24 +563,28 @@ mod tests {
     }
 
     #[test]
-    fn curve_midpoint_is_relative_to_endpoints() {
+    fn curve_middle_point_moves_in_both_input_and_output_axes() {
         let curve = Curve {
-            black: 0.2,
-            midpoint: 0.5,
-            white: 0.8,
+            midpoint_input: 0.25,
+            midpoint: 0.70,
             ..Curve::default()
         };
-        assert!((apply_curve(0.0, curve) - 0.2).abs() < 0.0001);
-        assert!((apply_curve(0.5, curve) - 0.5).abs() < 0.0001);
-        assert!((apply_curve(1.0, curve) - 0.8).abs() < 0.0001);
+        assert!((apply_curve(0.0, curve) - 0.0).abs() < 0.0001);
+        assert!((apply_curve(0.25, curve) - 0.70).abs() < 0.0001);
+        assert!((apply_curve(1.0, curve) - 1.0).abs() < 0.0001);
+        assert!((apply_curve(0.125, curve) - 0.35).abs() < 0.0001);
+    }
 
-        let lowered_white = Curve {
-            white: 0.6,
-            ..curve
+    #[test]
+    fn three_collinear_points_preserve_a_straight_curve() {
+        let curve = Curve {
+            midpoint_input: 0.30,
+            midpoint: 0.30,
+            ..Curve::default()
         };
-        assert!((apply_curve(0.5, lowered_white) - 0.4).abs() < 0.0001);
-        assert!((apply_curve(0.25, lowered_white) - 0.3).abs() < 0.0001);
-        assert!((apply_curve(0.75, lowered_white) - 0.5).abs() < 0.0001);
+        for value in [0.0, 0.1, 0.3, 0.6, 1.0] {
+            assert!((apply_curve(value, curve) - value).abs() < 0.0001);
+        }
     }
 
     #[test]

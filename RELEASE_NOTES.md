@@ -1,3 +1,15 @@
+# Shade Editor 0.7.0
+
+Direct three-point Curve editing.
+
+- Curve is edited directly on the graph using exactly three draggable points: Black, Midpoint and White.
+- Midpoint can move horizontally (Input) and vertically (Output).
+- Black and White endpoints are draggable in both axes as well, while point order is constrained.
+- Curve sliders were removed. The selected point exposes compact Photoshop-style Input / Output numeric fields in two columns.
+- Input / Output fields use a 0-255 display scale while processing remains normalized internally.
+- Broadcast and every per-channel Curve foldout use the same direct editor.
+- Existing `.shade` files migrate to schema v7: old relative midpoint output becomes an absolute middle control point and midpoint input starts centered between the prior input endpoints.
+
 # Shade Editor 0.6.1
 
 Font-independent icon compatibility fix.

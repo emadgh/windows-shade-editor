@@ -2423,6 +2423,205 @@ fn levels_ui(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CurvePointKind {
+    Black,
+    Midpoint,
+    White,
+}
+
+impl CurvePointKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Black => "Black point",
+            Self::Midpoint => "Midpoint",
+            Self::White => "White point",
+        }
+    }
+}
+
+fn curve_point_xy(curve: model::Curve, point: CurvePointKind) -> (f32, f32) {
+    match point {
+        CurvePointKind::Black => (curve.input_black, curve.black),
+        CurvePointKind::Midpoint => (curve.midpoint_input, curve.midpoint),
+        CurvePointKind::White => (curve.input_white, curve.white),
+    }
+}
+
+fn set_curve_point(curve: &mut model::Curve, point: CurvePointKind, input: f32, output: f32) {
+    let gap = 1.0 / 255.0;
+    let output = output.clamp(0.0, 1.0);
+    match point {
+        CurvePointKind::Black => {
+            curve.input_black = input.clamp(0.0, (curve.midpoint_input - gap).max(0.0));
+            curve.black = output;
+        }
+        CurvePointKind::Midpoint => {
+            curve.midpoint_input = input.clamp(
+                (curve.input_black + gap).min(1.0),
+                (curve.input_white - gap).max(0.0),
+            );
+            curve.midpoint = output;
+        }
+        CurvePointKind::White => {
+            curve.input_white = input.clamp((curve.midpoint_input + gap).min(1.0), 1.0);
+            curve.white = output;
+        }
+    }
+}
+
+fn curve_point_screen(rect: egui::Rect, input: f32, output: f32) -> egui::Pos2 {
+    egui::pos2(
+        egui::lerp(rect.x_range(), input.clamp(0.0, 1.0)),
+        egui::lerp(rect.bottom()..=rect.top(), output.clamp(0.0, 1.0)),
+    )
+}
+
+fn curve_editor_graph(
+    ui: &mut egui::Ui,
+    curve: &mut model::Curve,
+    histogram: Option<&[u32; 256]>,
+    accent: Option<egui::Color32>,
+) -> (bool, CurvePointKind) {
+    let desired = egui::vec2(ui.available_width().min(340.0).max(150.0), 210.0);
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let graph_id = ui.make_persistent_id("three-point-curve-editor");
+    let selection_id = graph_id.with("selected-point");
+    let mut selected = ui
+        .data(|data| data.get_temp::<CurvePointKind>(selection_id))
+        .unwrap_or(CurvePointKind::Midpoint);
+    let mut changed = false;
+    let points = [
+        CurvePointKind::Black,
+        CurvePointKind::Midpoint,
+        CurvePointKind::White,
+    ];
+
+    for point in points {
+        let (input, output) = curve_point_xy(*curve, point);
+        let center = curve_point_screen(rect, input, output);
+        let hit_rect = egui::Rect::from_center_size(center, egui::vec2(22.0, 22.0));
+        let response = ui.interact(
+            hit_rect,
+            graph_id.with(point),
+            egui::Sense::click_and_drag(),
+        );
+        if response.clicked() || response.drag_started() {
+            selected = point;
+            ui.data_mut(|data| data.insert_temp(selection_id, point));
+        }
+        if response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let output = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
+                set_curve_point(curve, point, input, output);
+                selected = point;
+                ui.data_mut(|data| data.insert_temp(selection_id, point));
+                changed = true;
+            }
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect_stroke(
+        rect,
+        2.0,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    if let Some(bins) = histogram {
+        let max_value = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
+        let hist_color = accent
+            .unwrap_or(ui.visuals().weak_text_color())
+            .gamma_multiply(0.30);
+        for (index, value) in bins.iter().enumerate() {
+            let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
+            let h = *value as f32 / max_value * rect.height();
+            painter.line_segment(
+                [
+                    egui::pos2(x, rect.bottom()),
+                    egui::pos2(x, rect.bottom() - h),
+                ],
+                egui::Stroke::new(1.0, hist_color),
+            );
+        }
+    }
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), rect.bottom()),
+            egui::pos2(rect.right(), rect.top()),
+        ],
+        egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+    );
+    let curve_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
+    let mut last = None;
+    for step in 0..=128 {
+        let x = step as f32 / 128.0;
+        let y = model::apply_curve(x, *curve);
+        let point = curve_point_screen(rect, x, y);
+        if let Some(previous) = last {
+            painter.line_segment([previous, point], egui::Stroke::new(2.0, curve_color));
+        }
+        last = Some(point);
+    }
+    for point in points {
+        let (input, output) = curve_point_xy(*curve, point);
+        let center = curve_point_screen(rect, input, output);
+        let is_selected = point == selected;
+        let radius = if is_selected { 6.5 } else { 5.0 };
+        let fill = if is_selected {
+            curve_color
+        } else {
+            ui.visuals().extreme_bg_color
+        };
+        painter.circle_filled(center, radius, fill);
+        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, curve_color));
+    }
+    (changed, selected)
+}
+
+fn curve_point_fields(
+    ui: &mut egui::Ui,
+    curve: &mut model::Curve,
+    selected: CurvePointKind,
+) -> bool {
+    let (input, output) = curve_point_xy(*curve, selected);
+    let mut input_value = (input * 255.0).round() as i32;
+    let mut output_value = (output * 255.0).round() as i32;
+    ui.small(selected.label());
+    let mut input_changed = false;
+    let mut output_changed = false;
+    ui.columns(2, |columns| {
+        columns[0].label("Input");
+        input_changed = columns[0]
+            .add(
+                egui::DragValue::new(&mut input_value)
+                    .range(0..=255)
+                    .speed(1),
+            )
+            .changed();
+        columns[1].label("Output");
+        output_changed = columns[1]
+            .add(
+                egui::DragValue::new(&mut output_value)
+                    .range(0..=255)
+                    .speed(1),
+            )
+            .changed();
+    });
+    if input_changed || output_changed {
+        set_curve_point(
+            curve,
+            selected,
+            input_value as f32 / 255.0,
+            output_value as f32 / 255.0,
+        );
+        true
+    } else {
+        false
+    }
+}
+
 fn curves_ui(
     ui: &mut egui::Ui,
     adjustment: &mut ChannelAdjustment,
@@ -2430,41 +2629,13 @@ fn curves_ui(
     accent: Option<egui::Color32>,
 ) -> bool {
     with_accent(ui, accent, |ui| {
-        draw_curve(ui, adjustment.curve, histogram, accent);
-        let mut changed = false;
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut adjustment.curve.input_black, 0.0..=0.98)
-                    .text("Input black"),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut adjustment.curve.input_white, 0.02..=1.0)
-                    .text("Input white"),
-            )
-            .changed();
-        if adjustment.curve.input_white <= adjustment.curve.input_black {
-            adjustment.curve.input_white = (adjustment.curve.input_black + 0.01).min(1.0);
-            changed = true;
-        }
-        ui.add_space(3.0);
-        changed |= ui
-            .add(egui::Slider::new(&mut adjustment.curve.black, 0.0..=1.0).text("Black output"))
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut adjustment.curve.midpoint, 0.0..=1.0)
-                    .text("Midpoint (relative)"),
-            )
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut adjustment.curve.white, 0.0..=1.0).text("White output"))
-            .changed();
-        ui.small(format!(
-            "Calculated midpoint output: {:.3}",
-            model::curve_mid_output(adjustment.curve)
-        ));
+        let (graph_changed, selected) =
+            curve_editor_graph(ui, &mut adjustment.curve, histogram, accent);
+        let mut changed = graph_changed;
+        ui.add_space(6.0);
+        changed |= curve_point_fields(ui, &mut adjustment.curve, selected);
+        ui.add_space(4.0);
+        ui.small("Drag any of the three points directly. Input / Output use Photoshop-style 0-255 values.");
         if ui.small_button("Reset Curve").clicked() {
             adjustment.curve = model::Curve::default();
             changed = true;
@@ -3061,63 +3232,6 @@ fn draw_histogram(
                 egui::Stroke::new(1.0, adjusted_color),
             );
         }
-    }
-}
-
-fn draw_curve(
-    ui: &mut egui::Ui,
-    curve: model::Curve,
-    histogram: Option<&[u32; 256]>,
-    accent: Option<egui::Color32>,
-) {
-    let desired = egui::vec2(ui.available_width().min(320.0).max(120.0), 170.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_stroke(
-        rect,
-        2.0,
-        ui.visuals().widgets.noninteractive.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-
-    if let Some(bins) = histogram {
-        let max_value = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
-        let hist_color = accent
-            .unwrap_or(ui.visuals().weak_text_color())
-            .gamma_multiply(0.35);
-        for (index, value) in bins.iter().enumerate() {
-            let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
-            let h = *value as f32 / max_value * rect.height();
-            painter.line_segment(
-                [
-                    egui::pos2(x, rect.bottom()),
-                    egui::pos2(x, rect.bottom() - h),
-                ],
-                egui::Stroke::new(1.0, hist_color),
-            );
-        }
-    }
-
-    painter.line_segment(
-        [
-            egui::pos2(rect.left(), rect.bottom()),
-            egui::pos2(rect.right(), rect.top()),
-        ],
-        egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
-    );
-    let curve_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
-    let mut last = None;
-    for step in 0..=96 {
-        let x = step as f32 / 96.0;
-        let y = model::apply_curve(x, curve);
-        let point = egui::pos2(
-            egui::lerp(rect.x_range(), x),
-            egui::lerp(rect.bottom()..=rect.top(), y),
-        );
-        if let Some(previous) = last {
-            painter.line_segment([previous, point], egui::Stroke::new(2.0, curve_color));
-        }
-        last = Some(point);
     }
 }
 
