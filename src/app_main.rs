@@ -159,6 +159,10 @@ struct ShadeApp {
     project_dirty: bool,
     snapshot_rename_id: Option<u64>,
     snapshot_rename_buffer: String,
+    pending_snapshot_load: Option<u64>,
+    show_close_confirmation: bool,
+    close_after_save: bool,
+    allow_close_once: bool,
     job: Option<JobHandle>,
     render_tx: mpsc::Sender<RenderResult>,
     render_rx: mpsc::Receiver<RenderResult>,
@@ -206,6 +210,10 @@ impl ShadeApp {
             project_dirty: false,
             snapshot_rename_id: None,
             snapshot_rename_buffer: String::new(),
+            pending_snapshot_load: None,
+            show_close_confirmation: false,
+            close_after_save: false,
+            allow_close_once: false,
             job: None,
             render_tx,
             render_rx,
@@ -246,6 +254,9 @@ impl ShadeApp {
         self.project_dirty = false;
         self.snapshot_rename_id = None;
         self.snapshot_rename_buffer.clear();
+        self.pending_snapshot_load = None;
+        self.show_close_confirmation = false;
+        self.close_after_save = false;
         self.report_info("New shade project");
     }
 
@@ -393,9 +404,9 @@ impl ShadeApp {
         });
     }
 
-    fn save_project(&mut self, save_as: bool) {
+    fn save_project(&mut self, save_as: bool) -> bool {
         if self.job.is_some() || self.faces.is_empty() {
-            return;
+            return false;
         }
         let target = if !save_as {
             self.project_path.clone()
@@ -415,7 +426,7 @@ impl ShadeApp {
             }
         };
         let Some(path) = target else {
-            return;
+            return false;
         };
         let mut project = self.project.clone();
         project.file_metadata = Some(build_project_file_metadata(
@@ -458,6 +469,7 @@ impl ShadeApp {
                 result,
             }
         });
+        true
     }
 
     fn export_current_dialog(&mut self) {
@@ -803,7 +815,10 @@ impl ShadeApp {
                     self.project_dirty = false;
                     self.report_info(format!("Saved {}", path.display()));
                 }
-                Err(err) => self.report_error(err),
+                Err(err) => {
+                    self.close_after_save = false;
+                    self.report_error(err);
+                }
             },
             JobResult::Export(payload) => {
                 if !payload.marks.is_empty() {
@@ -1140,11 +1155,137 @@ impl ShadeApp {
         }
     }
 
+    fn apply_snapshot_now(&mut self, id: u64) {
+        if self.project.apply_snapshot(id) {
+            if let Some(snapshot) = self
+                .project
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == id)
+            {
+                self.snapshot_rename_id = Some(id);
+                self.snapshot_rename_buffer = snapshot.name.clone();
+            }
+            self.mark_all_previews_dirty();
+            self.report_info("Snapshot loaded");
+        }
+    }
+
+    fn request_snapshot_load(&mut self, id: u64) {
+        if self.project.active_snapshot_id == Some(id) {
+            return;
+        }
+        let active_snapshot_dirty =
+            self.project.active_snapshot_id.is_some() && !self.project.active_snapshot_matches();
+        if active_snapshot_dirty {
+            self.pending_snapshot_load = Some(id);
+        } else {
+            self.apply_snapshot_now(id);
+        }
+    }
+
+    fn ui_snapshot_discard_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(target_id) = self.pending_snapshot_load else {
+            return;
+        };
+        let current_name = self
+            .project
+            .active_snapshot_name()
+            .unwrap_or("Current snapshot")
+            .to_owned();
+        let target_name = self
+            .project
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == target_id)
+            .map(|snapshot| snapshot.name.clone())
+            .unwrap_or_else(|| "selected snapshot".to_owned());
+        let mut stay = false;
+        let mut discard = false;
+        egui::Window::new("Snapshot changes not updated")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{current_name} has adjustment changes that have not been written back with Update."
+                ));
+                ui.label(format!("Switch to {target_name}?"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    stay = ui.button("Stay editing").clicked();
+                    discard = ui.button("Discard changes and switch").clicked();
+                });
+            });
+        if stay {
+            self.pending_snapshot_load = None;
+        } else if discard {
+            self.pending_snapshot_load = None;
+            self.apply_snapshot_now(target_id);
+        }
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.allow_close_once {
+            self.allow_close_once = false;
+            return;
+        }
+        if self.project_dirty {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_close_confirmation = true;
+        }
+    }
+
+    fn ui_close_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.show_close_confirmation {
+            return;
+        }
+        let mut save_and_exit = false;
+        let mut discard_and_exit = false;
+        let mut stay = false;
+        egui::Window::new("Unsaved project changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("This .shade project has changes that have not been saved.");
+                if self.job.is_some() {
+                    ui.small("Wait for the current operation to finish before saving.");
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    save_and_exit = ui
+                        .add_enabled(
+                            self.job.is_none() && !self.faces.is_empty(),
+                            egui::Button::new("Save and exit"),
+                        )
+                        .clicked();
+                    discard_and_exit = ui.button("Discard and exit").clicked();
+                    stay = ui.button("Stay").clicked();
+                });
+            });
+
+        if stay {
+            self.show_close_confirmation = false;
+        } else if discard_and_exit {
+            self.show_close_confirmation = false;
+            self.allow_close_once = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if save_and_exit && self.save_project(false) {
+            self.show_close_confirmation = false;
+            self.close_after_save = true;
+        }
+    }
+
     fn ui_faces(&mut self, ui: &mut egui::Ui) {
         ui.heading("Faces");
         if self.faces.is_empty() {
             ui.label("Add TIFF files to create a shade project.");
         } else {
+            let duplicate_counts = duplicate_face_counts(&self.faces);
             let mut requested_face = None;
             for (index, face) in self.faces.iter().enumerate() {
                 let label = self
@@ -1158,7 +1299,31 @@ impl ShadeApp {
                             .and_then(|name| name.to_str())
                             .unwrap_or("Face")
                     });
-                if clickable_row(ui, self.current_face == index, label, None, None, 32.0).clicked()
+                let duplicate_count = duplicate_counts
+                    .get(&face_identity_key(&face.path))
+                    .copied()
+                    .unwrap_or(1);
+                let display_label = if duplicate_count > 1 {
+                    format!("{label}  [duplicate x{duplicate_count}]")
+                } else {
+                    label.to_owned()
+                };
+                let duplicate_accent =
+                    (duplicate_count > 1).then_some(egui::Color32::from_rgb(235, 155, 70));
+                if clickable_row(
+                    ui,
+                    self.current_face == index,
+                    &display_label,
+                    None,
+                    duplicate_accent,
+                    32.0,
+                )
+                .on_hover_text(if duplicate_count > 1 {
+                    "This TIFF is referenced more than once in the Faces list."
+                } else {
+                    "Face"
+                })
+                .clicked()
                 {
                     requested_face = Some(index);
                 }
@@ -1336,19 +1501,7 @@ impl ShadeApp {
         }
 
         if let Some(id) = requested_load {
-            if self.project.apply_snapshot(id) {
-                if let Some(snapshot) = self
-                    .project
-                    .snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.id == id)
-                {
-                    self.snapshot_rename_id = Some(id);
-                    self.snapshot_rename_buffer = snapshot.name.clone();
-                }
-                self.mark_all_previews_dirty();
-                self.report_info("Snapshot loaded");
-            }
+            self.request_snapshot_load(id);
         }
         if let Some(id) = requested_export {
             self.export_snapshot_dialog(id);
@@ -2085,19 +2238,24 @@ impl ShadeApp {
             return;
         };
 
-        let title = self
-            .project
-            .faces
-            .get(self.current_face)
-            .map(|item| item.label.clone())
+        let file_name = face
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| face.path.display().to_string());
         let meta = face.preview.metadata.clone();
         let dpi_info = face.dpi;
         let texture = face.texture.clone();
+        let (width_cm, height_cm) = physical_dimensions_cm(meta.width, meta.height, dpi_info);
         ui.horizontal_wrapped(|ui| {
-            ui.strong(title);
+            ui.strong(file_name);
             ui.separator();
             ui.label(format!("{}-bit", meta.bit_depth));
+            ui.label(format!(
+                "{} x {} cm",
+                format_cm_value(width_cm),
+                format_cm_value(height_cm)
+            ));
             ui.label(format!("{} x {} px", meta.width, meta.height));
             if dpi_info.has_physical_resolution {
                 ui.label(format!("{:.0} x {:.0} DPI", dpi_info.dpi_x, dpi_info.dpi_y));
@@ -2465,6 +2623,12 @@ impl eframe::App for ShadeApp {
         self.poll_job();
         self.poll_render(ui.ctx());
         self.sync_update_state();
+        self.handle_close_request(ui.ctx());
+        if self.close_after_save && self.job.is_none() && !self.project_dirty {
+            self.close_after_save = false;
+            self.allow_close_once = true;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         egui::Panel::top("toolbar").show(ui, |ui| self.ui_toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.ui_status(ui));
@@ -2493,6 +2657,8 @@ impl eframe::App for ShadeApp {
         self.ui_settings_window(ui.ctx());
         self.ui_about_window(ui.ctx());
         self.ui_logs_window(ui.ctx());
+        self.ui_snapshot_discard_confirmation(ui.ctx());
+        self.ui_close_confirmation(ui.ctx());
 
         self.start_render_if_needed(ui.ctx());
     }
@@ -3513,6 +3679,38 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     } else {
         ctx.set_visuals(egui::Visuals::light());
     }
+}
+
+fn physical_dimensions_cm(width_px: u32, height_px: u32, dpi: dpi::DpiInfo) -> (f64, f64) {
+    let dpi_x = dpi.dpi_x.max(1.0);
+    let dpi_y = dpi.dpi_y.max(1.0);
+    (
+        width_px as f64 / dpi_x * 2.54,
+        height_px as f64 / dpi_y * 2.54,
+    )
+}
+
+fn format_cm_value(value: f64) -> String {
+    let rounded = value.round();
+    if (value - rounded).abs() < 0.05 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn face_identity_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn duplicate_face_counts(faces: &[RuntimeFace]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for face in faces {
+        *counts.entry(face_identity_key(&face.path)).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn build_project_file_metadata(

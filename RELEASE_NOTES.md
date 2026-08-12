@@ -1,3 +1,13 @@
+# Shade Editor 0.8.1
+
+Physical Face dimensions and safeguards against accidental state loss.
+
+- File information now shows physical dimensions in centimeters between bit depth and pixel dimensions, calculated from the TIFF pixel size and effective DPI.
+- Duplicate TIFF references remain allowed but every duplicated Face row is highlighted and marked with its duplicate count.
+- Closing the application with unsaved project changes now offers Save and exit, Discard and exit, or Stay. Save and exit waits for the existing background Save job to complete successfully before closing.
+- Switching away from an active Snapshot with edits that have not been written back using Update now asks whether to Stay editing or Discard changes and switch.
+- `.shade` schema remains v8.
+
 # Shade Editor 0.8.0
 
 Optional midpoint Curve editing, deterministic Snapshot naming, and richer self-contained project files.
