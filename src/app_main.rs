@@ -1908,6 +1908,7 @@ impl ShadeApp {
                         histograms,
                         self.settings.colorize_adjustments,
                         self.settings.show_curve_histogram,
+                        palette,
                     );
                 });
             ui.add_space(4.0);
@@ -1920,6 +1921,7 @@ impl ShadeApp {
                         &mut self.project.adjustments,
                         channel_names,
                         self.settings.colorize_adjustments,
+                        palette,
                     );
                 });
         }
