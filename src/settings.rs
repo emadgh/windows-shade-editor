@@ -13,6 +13,8 @@ pub struct AppSettings {
     pub adjustment_tabs: bool,
     /// false = selected channel histogram; true = one histogram per channel.
     pub show_all_histograms: bool,
+    /// false = one tools column; true = channels/histogram beside adjustments/test code.
+    pub sidebar_two_columns: bool,
 }
 
 impl Default for AppSettings {
@@ -23,6 +25,7 @@ impl Default for AppSettings {
             max_preview_dimension: 1800,
             adjustment_tabs: false,
             show_all_histograms: false,
+            sidebar_two_columns: false,
         }
     }
 }
