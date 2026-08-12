@@ -4,7 +4,7 @@ mod app_log;
 mod dpi;
 #[path = "export_v4.rs"]
 mod export;
-#[path = "model_v4.rs"]
+#[path = "model_v5.rs"]
 mod model;
 mod render;
 #[path = "settings_v4.rs"]
@@ -104,7 +104,19 @@ enum JobResult {
         path: PathBuf,
         result: Result<(), String>,
     },
-    Export(Result<String, String>),
+    Export(SnapshotExportBatchResult),
+}
+
+struct SnapshotExportMark {
+    snapshot_id: u64,
+    face_key: String,
+    folder: PathBuf,
+    exported_at_unix_ms: i64,
+}
+
+struct SnapshotExportBatchResult {
+    result: Result<String, String>,
+    marks: Vec<SnapshotExportMark>,
 }
 
 struct RenderResult {
@@ -451,7 +463,10 @@ impl ShadeApp {
                 },
             )
             .map(|_| format!("Exported {}", destination.display()));
-            JobResult::Export(result)
+            JobResult::Export(SnapshotExportBatchResult {
+                result,
+                marks: Vec::new(),
+            })
         });
     }
 
@@ -489,8 +504,157 @@ impl ShadeApp {
                 }
                 Ok(format!("Exported {total} face(s) to {}", folder.display()))
             })();
-            JobResult::Export(result)
+            JobResult::Export(SnapshotExportBatchResult {
+                result,
+                marks: Vec::new(),
+            })
         });
+    }
+
+    fn export_snapshot_dialog(&mut self, snapshot_id: u64) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(face) = self.faces.get(self.current_face) else {
+            return;
+        };
+        let Some(snapshot) = self
+            .project
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == snapshot_id)
+            .cloned()
+        else {
+            return;
+        };
+        let stem = face
+            .path
+            .file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "face".to_owned());
+        let suggested = format!(
+            "{}-{}.tif",
+            sanitize_filename(&stem),
+            sanitize_filename(&snapshot.name)
+        );
+        let Some(destination) = rfd::FileDialog::new()
+            .add_filter("TIFF image", &["tif", "tiff"])
+            .set_file_name(suggested)
+            .save_file()
+        else {
+            return;
+        };
+        let source = face.path.clone();
+        let face_key = source.to_string_lossy().into_owned();
+        let folder = destination
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let mut project = self.project.clone();
+        project.adjustments = snapshot.adjustments.clone();
+        project.active_snapshot_id = Some(snapshot.id);
+        self.launch_job("Exporting snapshot", move |progress| {
+            let result = export::export_face_with_progress(
+                &source,
+                &destination,
+                &project,
+                |fraction, detail| {
+                    Self::set_progress(&progress, Some(fraction), "Exporting snapshot", detail);
+                },
+            )
+            .map(|_| format!("Exported {}", destination.display()));
+            let marks = if result.is_ok() {
+                vec![SnapshotExportMark {
+                    snapshot_id,
+                    face_key,
+                    folder,
+                    exported_at_unix_ms: unix_ms_now(),
+                }]
+            } else {
+                Vec::new()
+            };
+            JobResult::Export(SnapshotExportBatchResult { result, marks })
+        });
+    }
+
+    fn export_snapshot_group_dialog(&mut self, snapshot_ids: Vec<u64>, label: String) {
+        if self.job.is_some() || snapshot_ids.is_empty() {
+            return;
+        }
+        let Some(face) = self.faces.get(self.current_face) else {
+            return;
+        };
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let source = face.path.clone();
+        let face_key = source.to_string_lossy().into_owned();
+        let stem = source
+            .file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "face".to_owned());
+        let base_project = self.project.clone();
+        let snapshots = snapshot_ids
+            .into_iter()
+            .filter_map(|id| {
+                self.project
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.id == id)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        if snapshots.is_empty() {
+            return;
+        }
+        self.launch_job("Exporting snapshots", move |progress| {
+            let total = snapshots.len().max(1);
+            let mut marks = Vec::new();
+            let result = (|| -> Result<String, String> {
+                for (index, snapshot) in snapshots.iter().enumerate() {
+                    let destination = folder.join(format!(
+                        "{}-{}.tif",
+                        sanitize_filename(&stem),
+                        sanitize_filename(&snapshot.name)
+                    ));
+                    let mut project = base_project.clone();
+                    project.adjustments = snapshot.adjustments.clone();
+                    project.active_snapshot_id = Some(snapshot.id);
+                    export::export_face_with_progress(
+                        &source,
+                        &destination,
+                        &project,
+                        |inner, detail| {
+                            let overall = (index as f32 + inner) / total as f32;
+                            Self::set_progress(
+                                &progress,
+                                Some(overall),
+                                "Exporting snapshots",
+                                &format!("{} · {detail}", snapshot.name),
+                            );
+                        },
+                    )?;
+                    marks.push(SnapshotExportMark {
+                        snapshot_id: snapshot.id,
+                        face_key: face_key.clone(),
+                        folder: folder.clone(),
+                        exported_at_unix_ms: unix_ms_now(),
+                    });
+                }
+                Ok(format!(
+                    "Exported {} snapshot(s) ({label}) to {}",
+                    snapshots.len(),
+                    folder.display()
+                ))
+            })();
+            JobResult::Export(SnapshotExportBatchResult { result, marks })
+        });
+    }
+
+    fn open_export_folder(&mut self, folder: &str) {
+        if let Err(err) = open_folder(Path::new(folder)) {
+            self.report_error(err);
+        }
     }
 
     fn poll_job(&mut self) {
@@ -568,10 +732,23 @@ impl ShadeApp {
                 }
                 Err(err) => self.report_error(err),
             },
-            JobResult::Export(result) => match result {
-                Ok(message) => self.report_info(message),
-                Err(err) => self.report_error(format!("Export failed: {err}")),
-            },
+            JobResult::Export(payload) => {
+                if !payload.marks.is_empty() {
+                    for mark in payload.marks {
+                        self.project.record_snapshot_export(
+                            mark.snapshot_id,
+                            mark.face_key,
+                            mark.folder.to_string_lossy().into_owned(),
+                            mark.exported_at_unix_ms,
+                        );
+                    }
+                    self.project_dirty = true;
+                }
+                match payload.result {
+                    Ok(message) => self.report_info(message),
+                    Err(err) => self.report_error(format!("Export failed: {err}")),
+                }
+            }
         }
     }
 
@@ -933,59 +1110,156 @@ impl ShadeApp {
         self.ui_test_code(ui);
     }
     fn ui_snapshots(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Snapshots");
-            if ui.small_button("+ New").clicked() {
-                let id = self.project.create_snapshot();
-                if let Some(snapshot) = self
-                    .project
-                    .snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.id == id)
-                {
-                    self.snapshot_rename_id = Some(id);
-                    self.snapshot_rename_buffer = snapshot.name.clone();
-                }
-                self.project_dirty = true;
-            }
-        });
-        ui.small("Saved adjustment test states.");
-        ui.add_space(4.0);
-
-        let active_id = self.project.active_snapshot_id;
-        let active_dirty = active_id.is_some() && !self.project.active_snapshot_matches();
+        let face_key = self
+            .faces
+            .get(self.current_face)
+            .map(|face| face.path.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let rows = self
             .project
             .snapshots
             .iter()
             .map(|snapshot| {
+                let export = self
+                    .project
+                    .snapshot_export_for_face(snapshot.id, &face_key)
+                    .map(|record| (record.folder.clone(), record.exported_at_unix_ms));
                 (
                     snapshot.id,
                     snapshot.name.clone(),
                     snapshot.created_at_unix_ms,
+                    export,
                 )
             })
             .collect::<Vec<_>>();
+
+        let all_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        let all_latest_folder = rows
+            .iter()
+            .filter_map(|row| row.3.as_ref())
+            .max_by_key(|(_, exported_at)| *exported_at)
+            .map(|(folder, _)| folder.clone());
+        let all_exported = !rows.is_empty() && rows.iter().all(|row| row.3.is_some());
+
+        let mut new_snapshot = false;
+        let mut export_all = false;
+        let mut open_all_folder = false;
+        ui.horizontal(|ui| {
+            ui.heading("Snapshots");
+            new_snapshot = ui.small_button("+ New").clicked();
+            export_all = ui
+                .add_enabled(
+                    self.job.is_none() && !all_ids.is_empty() && !self.faces.is_empty(),
+                    egui::Button::new("⇧").min_size(egui::vec2(20.0, 20.0)),
+                )
+                .on_hover_text("Export all snapshots for the active Face")
+                .clicked();
+            if all_exported {
+                open_all_folder = ui
+                    .small_button("✓")
+                    .on_hover_text("Open the latest export folder for these snapshots")
+                    .clicked();
+            }
+        });
+        ui.small(
+            "Saved adjustment test states. Export always remains available after a successful run.",
+        );
+        ui.add_space(4.0);
+
+        if new_snapshot {
+            let id = self.project.create_snapshot();
+            if let Some(snapshot) = self
+                .project
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == id)
+            {
+                self.snapshot_rename_id = Some(id);
+                self.snapshot_rename_buffer = snapshot.name.clone();
+            }
+            self.project_dirty = true;
+        }
+        if export_all {
+            self.export_snapshot_group_dialog(all_ids.clone(), "all snapshots".to_owned());
+        }
+        if open_all_folder {
+            if let Some(folder) = all_latest_folder.as_deref() {
+                self.open_export_folder(folder);
+            }
+        }
+
+        let active_id = self.project.active_snapshot_id;
+        let active_dirty = active_id.is_some() && !self.project.active_snapshot_matches();
+        let mut groups: Vec<(String, Vec<(u64, String, i64, Option<(String, i64)>)>)> = Vec::new();
+        for row in rows {
+            let day = snapshot_day_time(row.2).0;
+            if groups.last().map(|group| group.0.as_str()) != Some(day.as_str()) {
+                groups.push((day, Vec::new()));
+            }
+            groups.last_mut().unwrap().1.push(row);
+        }
+
         let mut requested_load = None;
-        let mut current_day = String::new();
-        for (id, name, created_at) in rows {
-            let (day, time) = snapshot_day_time(created_at);
-            if day != current_day {
-                if !current_day.is_empty() {
-                    ui.add_space(5.0);
+        let mut requested_export = None;
+        let mut requested_group_export: Option<(Vec<u64>, String)> = None;
+        let mut requested_folder: Option<String> = None;
+
+        for (day, day_rows) in groups {
+            ui.add_space(2.0);
+            let day_ids = day_rows.iter().map(|row| row.0).collect::<Vec<_>>();
+            let day_exported = !day_rows.is_empty() && day_rows.iter().all(|row| row.3.is_some());
+            let day_latest_folder = day_rows
+                .iter()
+                .filter_map(|row| row.3.as_ref())
+                .max_by_key(|(_, exported_at)| *exported_at)
+                .map(|(folder, _)| folder.clone());
+            ui.horizontal(|ui| {
+                ui.strong(&day);
+                if ui
+                    .add_enabled(
+                        self.job.is_none() && !day_ids.is_empty() && !self.faces.is_empty(),
+                        egui::Button::new("⇧").min_size(egui::vec2(20.0, 20.0)),
+                    )
+                    .on_hover_text("Export all snapshots from this day for the active Face")
+                    .clicked()
+                {
+                    requested_group_export = Some((day_ids.clone(), day.clone()));
                 }
-                ui.strong(day.clone());
-                current_day = day;
+                if day_exported
+                    && ui
+                        .small_button("✓")
+                        .on_hover_text("Open the latest export folder for this day")
+                        .clicked()
+                {
+                    requested_folder = day_latest_folder.clone();
+                }
+            });
+
+            for (id, name, created_at, export_record) in day_rows {
+                let (_, time) = snapshot_day_time(created_at);
+                let selected = active_id == Some(id);
+                let display_name = if selected && active_dirty {
+                    format!("{name}  *")
+                } else {
+                    name
+                };
+                let (row_response, export_clicked, folder_clicked) = snapshot_row_with_actions(
+                    ui,
+                    selected,
+                    &display_name,
+                    &time,
+                    export_record.is_some(),
+                    self.job.is_none() && !self.faces.is_empty(),
+                );
+                if export_clicked {
+                    requested_export = Some(id);
+                } else if folder_clicked {
+                    requested_folder = export_record.as_ref().map(|record| record.0.clone());
+                } else if row_response.clicked() {
+                    requested_load = Some(id);
+                }
             }
-            let selected = active_id == Some(id);
-            let display_name = if selected && active_dirty {
-                format!("{name}  *")
-            } else {
-                name
-            };
-            if clickable_row(ui, selected, &display_name, Some(&time), None, 36.0).clicked() {
-                requested_load = Some(id);
-            }
+            ui.add_space(4.0);
         }
 
         if let Some(id) = requested_load {
@@ -1002,6 +1276,15 @@ impl ShadeApp {
                 self.mark_all_previews_dirty();
                 self.report_info("Snapshot loaded");
             }
+        }
+        if let Some(id) = requested_export {
+            self.export_snapshot_dialog(id);
+        }
+        if let Some((ids, label)) = requested_group_export {
+            self.export_snapshot_group_dialog(ids, label);
+        }
+        if let Some(folder) = requested_folder {
+            self.open_export_folder(&folder);
         }
 
         let Some(active_id) = self.project.active_snapshot_id else {
@@ -1278,10 +1561,12 @@ impl ShadeApp {
         }
         self.selected_channel = self.selected_channel.min(channel_names.len() - 1);
         let output_name = channel_names[self.selected_channel].clone();
-        let active_histogram = face
+        let all_adjusted_histograms = face
             .adjusted
-            .get(self.selected_channel)
-            .map(|values| render::histogram(values));
+            .iter()
+            .map(|values| render::histogram(values))
+            .collect::<Vec<_>>();
+        let active_histogram = all_adjusted_histograms.get(self.selected_channel).copied();
         let control_accent = self
             .settings
             .colorize_adjustments
@@ -1342,7 +1627,7 @@ impl ShadeApp {
                         ui,
                         &output_name,
                         &channel_names,
-                        active_histogram.as_ref(),
+                        &all_adjusted_histograms,
                         control_accent,
                     ),
                 }
@@ -1392,25 +1677,31 @@ impl ShadeApp {
                     }
                 };
             } else {
-                ui.group(|ui| {
-                    ui.strong("Levels");
-                    changed |= levels_ui(ui, adjustment, accent);
-                });
-                ui.add_space(6.0);
-                ui.group(|ui| {
-                    ui.strong("Curve");
-                    changed |= curves_ui(
-                        ui,
-                        adjustment,
-                        histogram.filter(|_| self.settings.show_curve_histogram),
-                        accent,
-                    );
-                });
-                ui.add_space(6.0);
-                ui.group(|ui| {
-                    ui.strong("Channel Mixer");
-                    changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent);
-                });
+                egui::CollapsingHeader::new("Levels")
+                    .id_salt(format!("selected-levels-{output_name}"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= levels_ui(ui, adjustment, accent);
+                    });
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("Curve")
+                    .id_salt(format!("selected-curve-{output_name}"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= curves_ui(
+                            ui,
+                            adjustment,
+                            histogram.filter(|_| self.settings.show_curve_histogram),
+                            accent,
+                        );
+                    });
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("Channel Mixer")
+                    .id_salt(format!("selected-mixer-{output_name}"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent);
+                    });
             }
         });
         changed
@@ -1421,7 +1712,7 @@ impl ShadeApp {
         ui: &mut egui::Ui,
         template_name: &str,
         channel_names: &[String],
-        histogram: Option<&[u32; 256]>,
+        histograms: &[[u32; 256]],
         accent: Option<egui::Color32>,
     ) -> bool {
         let mut changed = false;
@@ -1450,7 +1741,7 @@ impl ShadeApp {
             changed = true;
         }
         ui.small(
-            "Levels and Curve broadcast to every channel. Mixer output rows remain independent.",
+            "Levels broadcasts to every channel. Curve keeps one Broadcast control plus independent per-channel foldouts. Mixer output rows remain independent.",
         );
 
         if self.settings.adjustment_tabs {
@@ -1467,13 +1758,14 @@ impl ShadeApp {
                     channel_names,
                     accent,
                 ),
-                ToolPanel::Curves => broadcast_curves_ui(
+                ToolPanel::Curves => all_curves_ui(
                     ui,
                     &mut self.project.adjustments,
                     template_name,
                     channel_names,
-                    histogram.filter(|_| self.settings.show_curve_histogram),
-                    accent,
+                    histograms,
+                    self.settings.colorize_adjustments,
+                    self.settings.show_curve_histogram,
                 ),
                 ToolPanel::Mixer => all_mixers_ui(
                     ui,
@@ -1483,38 +1775,45 @@ impl ShadeApp {
                 ),
             };
         } else {
-            ui.group(|ui| {
-                ui.strong("Levels — all channels");
-                changed |= broadcast_levels_ui(
-                    ui,
-                    &mut self.project.adjustments,
-                    template_name,
-                    channel_names,
-                    accent,
-                );
-            });
-            ui.add_space(6.0);
-            ui.group(|ui| {
-                ui.strong("Curve — all channels");
-                changed |= broadcast_curves_ui(
-                    ui,
-                    &mut self.project.adjustments,
-                    template_name,
-                    channel_names,
-                    histogram.filter(|_| self.settings.show_curve_histogram),
-                    accent,
-                );
-            });
-            ui.add_space(6.0);
-            ui.group(|ui| {
-                ui.strong("Channel Mixer — all output rows");
-                changed |= all_mixers_ui(
-                    ui,
-                    &mut self.project.adjustments,
-                    channel_names,
-                    self.settings.colorize_adjustments,
-                );
-            });
+            egui::CollapsingHeader::new("Levels — all channels")
+                .id_salt("all-levels-section")
+                .default_open(true)
+                .show(ui, |ui| {
+                    changed |= broadcast_levels_ui(
+                        ui,
+                        &mut self.project.adjustments,
+                        template_name,
+                        channel_names,
+                        accent,
+                    );
+                });
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new("Curve — broadcast + per channel")
+                .id_salt("all-curves-section")
+                .default_open(true)
+                .show(ui, |ui| {
+                    changed |= all_curves_ui(
+                        ui,
+                        &mut self.project.adjustments,
+                        template_name,
+                        channel_names,
+                        histograms,
+                        self.settings.colorize_adjustments,
+                        self.settings.show_curve_histogram,
+                    );
+                });
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new("Channel Mixer — all output rows")
+                .id_salt("all-mixers-section")
+                .default_open(true)
+                .show(ui, |ui| {
+                    changed |= all_mixers_ui(
+                        ui,
+                        &mut self.project.adjustments,
+                        channel_names,
+                        self.settings.colorize_adjustments,
+                    );
+                });
         }
         changed
     }
@@ -1897,6 +2196,23 @@ fn curves_ui(
         draw_curve(ui, adjustment.curve, histogram, accent);
         let mut changed = false;
         changed |= ui
+            .add(
+                egui::Slider::new(&mut adjustment.curve.input_black, 0.0..=0.98)
+                    .text("Input black"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut adjustment.curve.input_white, 0.02..=1.0)
+                    .text("Input white"),
+            )
+            .changed();
+        if adjustment.curve.input_white <= adjustment.curve.input_black {
+            adjustment.curve.input_white = (adjustment.curve.input_black + 0.01).min(1.0);
+            changed = true;
+        }
+        ui.add_space(3.0);
+        changed |= ui
             .add(egui::Slider::new(&mut adjustment.curve.black, 0.0..=1.0).text("Black output"))
             .changed();
         changed |= ui
@@ -2009,6 +2325,68 @@ fn broadcast_curves_ui(
         adjustments.entry(name.clone()).or_default().curve = draft.curve;
     }
     true
+}
+
+fn all_curves_ui(
+    ui: &mut egui::Ui,
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    template_name: &str,
+    channel_names: &[String],
+    histograms: &[[u32; 256]],
+    colorize: bool,
+    show_histogram: bool,
+) -> bool {
+    let mut changed = false;
+    let template_index = channel_names
+        .iter()
+        .position(|name| name == template_name)
+        .unwrap_or(0);
+    let broadcast_accent = colorize.then(|| channel_color(template_name, template_index));
+    let broadcast_histogram = show_histogram
+        .then(|| histograms.get(template_index))
+        .flatten();
+
+    egui::Frame::new()
+        .inner_margin(6)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(5)
+        .show(ui, |ui| {
+            ui.strong("Broadcast to all");
+            ui.small("Changes here are copied to every channel Curve.");
+            changed |= broadcast_curves_ui(
+                ui,
+                adjustments,
+                template_name,
+                channel_names,
+                broadcast_histogram,
+                broadcast_accent,
+            );
+        });
+
+    ui.add_space(7.0);
+    ui.strong("Per-channel Curves");
+    ui.small("Open any channel to refine it after using Broadcast.");
+    for (index, name) in channel_names.iter().enumerate() {
+        let accent = colorize.then(|| channel_color(name, index));
+        let title = if let Some(color) = accent {
+            egui::RichText::new(format!("●  {name}")).color(color)
+        } else {
+            egui::RichText::new(name)
+        };
+        egui::CollapsingHeader::new(title)
+            .id_salt(format!("all-channel-curve-{index}-{name}"))
+            .default_open(false)
+            .show(ui, |ui| {
+                let histogram = if show_histogram {
+                    histograms.get(index)
+                } else {
+                    None
+                };
+                let adjustment = adjustments.entry(name.clone()).or_default();
+                changed |= curves_ui(ui, adjustment, histogram, accent);
+            });
+    }
+    changed
 }
 
 fn all_mixers_ui(
@@ -2155,6 +2533,97 @@ fn clickable_row(
     response
 }
 
+fn snapshot_row_with_actions(
+    ui: &mut egui::Ui,
+    selected: bool,
+    left: &str,
+    time: &str,
+    exported: bool,
+    export_enabled: bool,
+) -> (egui::Response, bool, bool) {
+    let width = ui.available_width().max(1.0);
+    let height = 38.0;
+    let (rect, row_response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill.gamma_multiply(0.72)
+    } else if row_response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+
+    let action_width = 26.0;
+    let action_gap = 2.0;
+    let right_padding = 4.0;
+    let export_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.right() - right_padding - action_width * 0.5,
+            rect.center().y,
+        ),
+        egui::vec2(action_width, 24.0),
+    );
+    let check_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            export_rect.left() - action_gap - action_width * 0.5,
+            rect.center().y,
+        ),
+        egui::vec2(action_width, 24.0),
+    );
+    let time_right = if exported {
+        check_rect.left() - 7.0
+    } else {
+        export_rect.left() - 7.0
+    };
+
+    ui.painter().text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        left,
+        egui::FontId::proportional(14.0),
+        if selected {
+            visuals.selection.stroke.color
+        } else {
+            visuals.text_color()
+        },
+    );
+    ui.painter().text(
+        egui::pos2(time_right, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        time,
+        egui::FontId::proportional(12.0),
+        visuals.weak_text_color(),
+    );
+
+    let export_clicked = ui
+        .put(
+            export_rect,
+            egui::Button::new("⇧")
+                .frame(false)
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_text("Export this snapshot for the active Face")
+        .clicked()
+        && export_enabled;
+    let folder_clicked = if exported {
+        ui.put(
+            check_rect,
+            egui::Button::new("✓")
+                .frame(false)
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_text("Open export folder")
+        .clicked()
+    } else {
+        false
+    };
+    (row_response, export_clicked, folder_clicked)
+}
+
 fn snapshot_day_time(created_at_unix_ms: i64) -> (String, String) {
     if created_at_unix_ms <= 0 {
         return ("Earlier snapshots".to_owned(), "—".to_owned());
@@ -2280,6 +2749,29 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
         ctx.set_visuals(egui::Visuals::dark());
     } else {
         ctx.set_visuals(egui::Visuals::light());
+    }
+}
+
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn open_folder(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("Cannot open export folder {}: {err}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err("Opening export folders is only available in the Windows build.".to_owned())
     }
 }
 
