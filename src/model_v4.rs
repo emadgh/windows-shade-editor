@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const SHADE_SCHEMA_VERSION: u32 = 3;
+pub const SHADE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShadeProject {
@@ -37,7 +37,16 @@ impl Default for ShadeProject {
     }
 }
 
-fn default_next_snapshot_id() -> u64 { 1 }
+fn default_next_snapshot_id() -> u64 {
+    1
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FaceRef {
@@ -116,6 +125,10 @@ pub struct MixerRow {
 pub struct AdjustmentSnapshot {
     pub id: u64,
     pub name: String,
+    /// Snapshot creation time as Unix milliseconds. Older schema versions do
+    /// not have this field and deserialize it as zero.
+    #[serde(default)]
+    pub created_at_unix_ms: i64,
     pub adjustments: BTreeMap<String, ChannelAdjustment>,
 }
 
@@ -128,7 +141,9 @@ pub enum TestCodePosition {
 }
 
 impl Default for TestCodePosition {
-    fn default() -> Self { Self::TopLeft }
+    fn default() -> Self {
+        Self::TopLeft
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,10 +174,10 @@ impl Default for TestCodeConfig {
 
 impl ShadeProject {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = fs::read_to_string(path)
-            .map_err(|err| format!("Cannot read .shade file: {err}"))?;
-        let mut project: Self = serde_json::from_str(&text)
-            .map_err(|err| format!("Invalid .shade file: {err}"))?;
+        let text =
+            fs::read_to_string(path).map_err(|err| format!("Cannot read .shade file: {err}"))?;
+        let mut project: Self =
+            serde_json::from_str(&text).map_err(|err| format!("Invalid .shade file: {err}"))?;
         if project.schema_version > SHADE_SCHEMA_VERSION {
             return Err(format!(
                 "This project uses .shade schema {}, but this app supports up to {}.",
@@ -179,7 +194,13 @@ impl ShadeProject {
         }
 
         project.schema_version = SHADE_SCHEMA_VERSION;
-        let minimum_next_id = project.snapshots.iter().map(|snapshot| snapshot.id).max().unwrap_or(0) + 1;
+        let minimum_next_id = project
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
         project.next_snapshot_id = project.next_snapshot_id.max(minimum_next_id).max(1);
         Ok(project)
     }
@@ -202,7 +223,11 @@ impl ShadeProject {
             .iter()
             .map(|face| {
                 let path = PathBuf::from(&face.path);
-                if path.is_absolute() { path } else { base.join(path) }
+                if path.is_absolute() {
+                    path
+                } else {
+                    base.join(path)
+                }
             })
             .collect()
     }
@@ -213,7 +238,11 @@ impl ShadeProject {
             ensure_adjustment_channels(&mut snapshot.adjustments, names);
         }
         if !names.iter().any(|name| name == &self.test_code.channel) {
-            self.test_code.channel = names.get(3).or_else(|| names.first()).cloned().unwrap_or_default();
+            self.test_code.channel = names
+                .get(3)
+                .or_else(|| names.first())
+                .cloned()
+                .unwrap_or_default();
         }
     }
 
@@ -222,19 +251,57 @@ impl ShadeProject {
         ensure_adjustment_channels(&mut self.adjustments, names);
     }
 
+    fn next_snapshot_name(&self) -> String {
+        let mut number = 1usize;
+        loop {
+            let candidate = format!("Test {number}");
+            if self.snapshot_name_available(&candidate, None) {
+                return candidate;
+            }
+            number += 1;
+        }
+    }
+
+    pub fn snapshot_name_available(&self, candidate: &str, except_id: Option<u64>) -> bool {
+        let candidate = candidate.trim();
+        !candidate.is_empty()
+            && self.snapshots.iter().all(|snapshot| {
+                except_id == Some(snapshot.id)
+                    || !snapshot.name.trim().eq_ignore_ascii_case(candidate)
+            })
+    }
+
     pub fn create_snapshot(&mut self) -> u64 {
         let id = self.next_snapshot_id.max(1);
         self.next_snapshot_id = id.saturating_add(1);
-        let number = self.snapshots.len() + 1;
+        let name = self.next_snapshot_name();
         self.snapshots.push(AdjustmentSnapshot {
             id,
-            name: format!("Test {number}"),
+            name,
+            created_at_unix_ms: now_unix_ms(),
             adjustments: self.adjustments.clone(),
         });
         self.active_snapshot_id = Some(id);
         id
     }
 
+    pub fn rename_snapshot(&mut self, id: u64, candidate: &str) -> Result<bool, String> {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            return Err("Snapshot name cannot be empty.".to_owned());
+        }
+        if !self.snapshot_name_available(candidate, Some(id)) {
+            return Err(format!("A snapshot named ‘{candidate}’ already exists."));
+        }
+        let Some(snapshot) = self.snapshots.iter_mut().find(|snapshot| snapshot.id == id) else {
+            return Err("Snapshot no longer exists.".to_owned());
+        };
+        if snapshot.name == candidate {
+            return Ok(false);
+        }
+        snapshot.name = candidate.to_owned();
+        Ok(true)
+    }
     pub fn apply_snapshot(&mut self, id: u64) -> bool {
         let Some(snapshot) = self.snapshots.iter().find(|snapshot| snapshot.id == id) else {
             return false;
@@ -263,7 +330,9 @@ impl ShadeProject {
     }
 
     pub fn active_snapshot_matches(&self) -> bool {
-        let Some(id) = self.active_snapshot_id else { return false; };
+        let Some(id) = self.active_snapshot_id else {
+            return false;
+        };
         self.snapshots
             .iter()
             .find(|snapshot| snapshot.id == id)
@@ -273,7 +342,10 @@ impl ShadeProject {
 
     pub fn active_snapshot_name(&self) -> Option<&str> {
         let id = self.active_snapshot_id?;
-        self.snapshots.iter().find(|snapshot| snapshot.id == id).map(|snapshot| snapshot.name.as_str())
+        self.snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == id)
+            .map(|snapshot| snapshot.name.as_str())
     }
 
     pub fn effective_test_code_text(&self) -> String {
@@ -313,11 +385,14 @@ fn ensure_adjustment_channels(
         let row = &mut adjustments.entry(output.clone()).or_default().mixer;
         if row.coefficients.is_empty() {
             for input in names {
-                row.coefficients.insert(input.clone(), if input == output { 1.0 } else { 0.0 });
+                row.coefficients
+                    .insert(input.clone(), if input == output { 1.0 } else { 0.0 });
             }
         } else {
             for input in names {
-                row.coefficients.entry(input.clone()).or_insert(if input == output { 1.0 } else { 0.0 });
+                row.coefficients
+                    .entry(input.clone())
+                    .or_insert(if input == output { 1.0 } else { 0.0 });
             }
         }
     }
@@ -325,7 +400,11 @@ fn ensure_adjustment_channels(
 
 fn make_portable_path(source: &Path, project_dir: &Path) -> String {
     if source.parent() == Some(project_dir) {
-        return source.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        return source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
     }
     if let Ok(relative) = source.strip_prefix(project_dir) {
         return relative.to_string_lossy().into_owned();
@@ -392,12 +471,19 @@ mod tests {
 
     #[test]
     fn curve_midpoint_is_relative_to_endpoints() {
-        let curve = Curve { black: 0.2, midpoint: 0.5, white: 0.8 };
+        let curve = Curve {
+            black: 0.2,
+            midpoint: 0.5,
+            white: 0.8,
+        };
         assert!((apply_curve(0.0, curve) - 0.2).abs() < 0.0001);
         assert!((apply_curve(0.5, curve) - 0.5).abs() < 0.0001);
         assert!((apply_curve(1.0, curve) - 0.8).abs() < 0.0001);
 
-        let lowered_white = Curve { white: 0.6, ..curve };
+        let lowered_white = Curve {
+            white: 0.6,
+            ..curve
+        };
         assert!((apply_curve(0.5, lowered_white) - 0.4).abs() < 0.0001);
         assert!((apply_curve(0.25, lowered_white) - 0.3).abs() < 0.0001);
         assert!((apply_curve(0.75, lowered_white) - 0.5).abs() < 0.0001);
@@ -405,11 +491,18 @@ mod tests {
 
     #[test]
     fn levels_gamma_is_relative_to_output_range() {
-        let levels = Levels { output_black: 0.2, output_white: 0.8, ..Levels::default() };
+        let levels = Levels {
+            output_black: 0.2,
+            output_white: 0.8,
+            ..Levels::default()
+        };
         assert!((apply_levels(0.5, levels) - 0.5).abs() < 0.0001);
         assert!((levels_gamma_mid_output(levels) - 0.5).abs() < 0.0001);
 
-        let lowered_white = Levels { output_white: 0.6, ..levels };
+        let lowered_white = Levels {
+            output_white: 0.6,
+            ..levels
+        };
         assert!((apply_levels(0.5, lowered_white) - 0.4).abs() < 0.0001);
         assert!((levels_gamma_mid_output(lowered_white) - 0.4).abs() < 0.0001);
     }
@@ -430,7 +523,10 @@ mod tests {
             assert_eq!(adjustment.mixer.constant, 0.0);
             for input in &names {
                 let expected = if input == output { 1.0 } else { 0.0 };
-                assert_eq!(adjustment.mixer.coefficients.get(input).copied(), Some(expected));
+                assert_eq!(
+                    adjustment.mixer.coefficients.get(input).copied(),
+                    Some(expected)
+                );
             }
         }
     }
@@ -462,5 +558,38 @@ mod tests {
         assert_eq!(project.effective_test_code_text(), "Moonstone T-07");
         project.test_code.text = "Manual".to_owned();
         assert_eq!(project.effective_test_code_text(), "Manual");
+    }
+    #[test]
+    fn snapshot_names_are_unique_and_rename_rejects_duplicates() {
+        let mut project = ShadeProject::default();
+        let first = project.create_snapshot();
+        let second = project.create_snapshot();
+        assert_eq!(
+            project
+                .snapshots
+                .iter()
+                .find(|item| item.id == first)
+                .unwrap()
+                .name,
+            "Test 1"
+        );
+        assert_eq!(
+            project
+                .snapshots
+                .iter()
+                .find(|item| item.id == second)
+                .unwrap()
+                .name,
+            "Test 2"
+        );
+        assert!(project.rename_snapshot(second, " test 1 ").is_err());
+        assert!(project.rename_snapshot(second, "Reference").unwrap());
+        assert!(project.snapshot_name_available("Test 2", None));
+        assert!(
+            project
+                .snapshots
+                .iter()
+                .all(|item| item.created_at_unix_ms > 0)
+        );
     }
 }
