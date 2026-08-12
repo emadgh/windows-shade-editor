@@ -1150,7 +1150,7 @@ impl ShadeApp {
             export_all = ui
                 .add_enabled(
                     self.job.is_none() && !all_ids.is_empty() && !self.faces.is_empty(),
-                    egui::Button::new("⇧").small(),
+                    egui::Button::new("⇧").min_size(egui::vec2(20.0, 20.0)),
                 )
                 .on_hover_text("Export all snapshots for the active Face")
                 .clicked();
@@ -1205,9 +1205,7 @@ impl ShadeApp {
         let mut requested_folder: Option<String> = None;
 
         for (day, day_rows) in groups {
-            if !ui.available_rect_before_wrap().is_negative() {
-                ui.add_space(2.0);
-            }
+            ui.add_space(2.0);
             let day_ids = day_rows.iter().map(|row| row.0).collect::<Vec<_>>();
             let day_exported = !day_rows.is_empty() && day_rows.iter().all(|row| row.3.is_some());
             let day_latest_folder = day_rows
@@ -1220,7 +1218,7 @@ impl ShadeApp {
                 if ui
                     .add_enabled(
                         self.job.is_none() && !day_ids.is_empty() && !self.faces.is_empty(),
-                        egui::Button::new("⇧").small(),
+                        egui::Button::new("⇧").min_size(egui::vec2(20.0, 20.0)),
                     )
                     .on_hover_text("Export all snapshots from this day for the active Face")
                     .clicked()
@@ -1622,14 +1620,14 @@ impl ShadeApp {
                         ui,
                         &output_name,
                         &channel_names,
-                        &all_adjusted_histograms,
+                        active_histogram.as_ref(),
                         control_accent,
                     ),
                     AdjustmentScope::All => self.ui_all_adjustments(
                         ui,
                         &output_name,
                         &channel_names,
-                        active_histogram.as_ref(),
+                        &all_adjusted_histograms,
                         control_accent,
                     ),
                 }
