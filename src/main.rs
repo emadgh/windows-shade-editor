@@ -7,6 +7,7 @@ mod settings;
 mod tiff_io;
 mod update;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -40,6 +41,12 @@ enum ToolPanel {
     Mixer,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdjustmentScope {
+    Selected,
+    All,
+}
+
 struct RuntimeFace {
     path: PathBuf,
     preview: PreviewFace,
@@ -56,6 +63,7 @@ struct ShadeApp {
     selected_channel: usize,
     solo_channel: Option<usize>,
     tool: ToolPanel,
+    adjustment_scope: AdjustmentScope,
     zoom: f32,
     settings: AppSettings,
     updater: UpdateManager,
@@ -81,6 +89,7 @@ impl ShadeApp {
             selected_channel: 0,
             solo_channel: None,
             tool: ToolPanel::Levels,
+            adjustment_scope: AdjustmentScope::Selected,
             zoom: 1.0,
             settings,
             updater,
@@ -98,6 +107,7 @@ impl ShadeApp {
         self.current_face = 0;
         self.selected_channel = 0;
         self.solo_channel = None;
+        self.adjustment_scope = AdjustmentScope::Selected;
         self.status_message = "New shade project".to_owned();
         self.project_dirty = false;
     }
@@ -188,6 +198,7 @@ impl ShadeApp {
         self.current_face = 0;
         self.selected_channel = 0;
         self.solo_channel = None;
+        self.adjustment_scope = AdjustmentScope::Selected;
         self.project_dirty = false;
         self.status_message = if errors.is_empty() {
             format!("Opened {}", path.display())
@@ -386,6 +397,74 @@ impl ShadeApp {
         }
         ui.separator();
         if ui.button("Remove active face").clicked() { self.remove_current_face(); }
+        ui.separator();
+        self.ui_snapshots(ui);
+    }
+
+    fn ui_snapshots(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Snapshots");
+            if ui.small_button("+ New").clicked() {
+                let id = self.project.create_snapshot();
+                self.project_dirty = true;
+                self.status_message = format!("Created snapshot #{id}");
+            }
+        });
+        ui.small("Snapshots store adjustment settings only.");
+
+        if self.project.snapshots.is_empty() {
+            ui.label("No saved tests yet.");
+            return;
+        }
+
+        let active_id = self.project.active_snapshot_id;
+        let mut requested_load = None;
+        for snapshot in &self.project.snapshots {
+            let selected = active_id == Some(snapshot.id);
+            let label = if selected && !self.project.active_snapshot_matches() {
+                format!("{}  *", snapshot.name)
+            } else {
+                snapshot.name.clone()
+            };
+            if ui.selectable_label(selected, label).clicked() {
+                requested_load = Some(snapshot.id);
+            }
+        }
+
+        if let Some(id) = requested_load {
+            if self.project.apply_snapshot(id) {
+                self.mark_all_previews_dirty();
+                self.status_message = "Snapshot loaded".to_owned();
+            }
+        }
+
+        let Some(active_id) = self.project.active_snapshot_id else { return; };
+        ui.separator();
+        ui.label("Snapshot name");
+        let mut renamed = false;
+        if let Some(snapshot) = self.project.snapshots.iter_mut().find(|snapshot| snapshot.id == active_id) {
+            renamed = ui.text_edit_singleline(&mut snapshot.name).changed();
+        }
+        if renamed { self.project_dirty = true; }
+
+        if !self.project.active_snapshot_matches() {
+            ui.small("Current adjustments differ from this snapshot.");
+        }
+
+        let mut update = false;
+        let mut delete = false;
+        ui.horizontal_wrapped(|ui| {
+            update = ui.button("Update").clicked();
+            delete = ui.button("Delete").clicked();
+        });
+        if update && self.project.update_snapshot(active_id) {
+            self.project_dirty = true;
+            self.status_message = "Snapshot updated from current adjustments".to_owned();
+        }
+        if delete && self.project.delete_snapshot(active_id) {
+            self.project_dirty = true;
+            self.status_message = "Snapshot deleted".to_owned();
+        }
     }
 
     fn ui_channels_and_tools(&mut self, ui: &mut egui::Ui) {
@@ -439,8 +518,10 @@ impl ShadeApp {
 
         ui.separator();
         let output_name = channel_names[self.selected_channel].clone();
-        ui.horizontal(|ui| {
-            ui.strong(format!("Adjustments — {output_name}"));
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Adjustments");
+            ui.selectable_value(&mut self.adjustment_scope, AdjustmentScope::Selected, &output_name);
+            ui.selectable_value(&mut self.adjustment_scope, AdjustmentScope::All, "All channels");
             let layout_label = if self.settings.adjustment_tabs { "Tabs" } else { "Stacked" };
             if ui.small_button(layout_label).clicked() {
                 self.settings.adjustment_tabs = !self.settings.adjustment_tabs;
@@ -448,40 +529,17 @@ impl ShadeApp {
             }
         });
 
-        let mut changed = false;
-        {
-            let adjustment = self.project.adjustments.entry(output_name.clone()).or_default();
-            changed |= ui.checkbox(&mut adjustment.enabled, "Enable adjustment for this channel").changed();
-            ui.add_enabled_ui(adjustment.enabled, |ui| {
-                if self.settings.adjustment_tabs {
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
-                        ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
-                        ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
-                    });
-                    changed |= match self.tool {
-                        ToolPanel::Levels => levels_ui(ui, adjustment),
-                        ToolPanel::Curves => curves_ui(ui, adjustment),
-                        ToolPanel::Mixer => mixer_ui(ui, adjustment, &output_name, &channel_names),
-                    };
-                } else {
-                    ui.group(|ui| {
-                        ui.strong("Levels");
-                        changed |= levels_ui(ui, adjustment);
-                    });
-                    ui.add_space(6.0);
-                    ui.group(|ui| {
-                        ui.strong("Curve");
-                        changed |= curves_ui(ui, adjustment);
-                    });
-                    ui.add_space(6.0);
-                    ui.group(|ui| {
-                        ui.strong("Channel Mixer");
-                        changed |= mixer_ui(ui, adjustment, &output_name, &channel_names);
-                    });
-                }
-            });
+        let reset_all = ui.button("Reset all adjustments").clicked();
+        if reset_all {
+            self.project.reset_adjustments(&channel_names);
+            self.mark_all_previews_dirty();
+            self.status_message = "All adjustments reset to defaults".to_owned();
         }
+
+        let changed = match self.adjustment_scope {
+            AdjustmentScope::Selected => self.ui_selected_adjustment(ui, &output_name, &channel_names),
+            AdjustmentScope::All => self.ui_all_adjustments(ui, &output_name, &channel_names),
+        };
         if changed { self.mark_all_previews_dirty(); }
 
         ui.separator();
@@ -499,6 +557,97 @@ impl ShadeApp {
             test_changed |= ui.add(egui::Slider::new(&mut self.project.test_code.margin_px, 0..=500).text("Margin px")).changed();
             if test_changed { self.project_dirty = true; }
         });
+    }
+
+    fn ui_selected_adjustment(
+        &mut self,
+        ui: &mut egui::Ui,
+        output_name: &str,
+        channel_names: &[String],
+    ) -> bool {
+        let mut changed = false;
+        let adjustment = self.project.adjustments.entry(output_name.to_owned()).or_default();
+        changed |= ui.checkbox(&mut adjustment.enabled, "Enable adjustment for this channel").changed();
+        ui.add_enabled_ui(adjustment.enabled, |ui| {
+            if self.settings.adjustment_tabs {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
+                    ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
+                    ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
+                });
+                changed |= match self.tool {
+                    ToolPanel::Levels => levels_ui(ui, adjustment),
+                    ToolPanel::Curves => curves_ui(ui, adjustment),
+                    ToolPanel::Mixer => mixer_ui(ui, adjustment, output_name, channel_names),
+                };
+            } else {
+                ui.group(|ui| {
+                    ui.strong("Levels");
+                    changed |= levels_ui(ui, adjustment);
+                });
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.strong("Curve");
+                    changed |= curves_ui(ui, adjustment);
+                });
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.strong("Channel Mixer");
+                    changed |= mixer_ui(ui, adjustment, output_name, channel_names);
+                });
+            }
+        });
+        changed
+    }
+
+    fn ui_all_adjustments(
+        &mut self,
+        ui: &mut egui::Ui,
+        template_name: &str,
+        channel_names: &[String],
+    ) -> bool {
+        let mut changed = false;
+        let enabled_count = channel_names.iter()
+            .filter(|name| self.project.adjustments.get(*name).map(|adjustment| adjustment.enabled).unwrap_or(true))
+            .count();
+        let mut all_enabled = enabled_count == channel_names.len();
+        if ui.checkbox(&mut all_enabled, "Enable adjustments on all channels").changed() {
+            for name in channel_names {
+                self.project.adjustments.entry(name.clone()).or_default().enabled = all_enabled;
+            }
+            changed = true;
+        }
+        ui.small(format!("{enabled_count}/{} channels currently enabled", channel_names.len()));
+        ui.small("Levels and Curve changes are broadcast to every channel. Mixer rows remain independent per output.");
+
+        if self.settings.adjustment_tabs {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
+                ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
+                ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
+            });
+            changed |= match self.tool {
+                ToolPanel::Levels => broadcast_levels_ui(ui, &mut self.project.adjustments, template_name, channel_names),
+                ToolPanel::Curves => broadcast_curves_ui(ui, &mut self.project.adjustments, template_name, channel_names),
+                ToolPanel::Mixer => all_mixers_ui(ui, &mut self.project.adjustments, channel_names),
+            };
+        } else {
+            ui.group(|ui| {
+                ui.strong("Levels — all channels");
+                changed |= broadcast_levels_ui(ui, &mut self.project.adjustments, template_name, channel_names);
+            });
+            ui.add_space(6.0);
+            ui.group(|ui| {
+                ui.strong("Curve — all channels");
+                changed |= broadcast_curves_ui(ui, &mut self.project.adjustments, template_name, channel_names);
+            });
+            ui.add_space(6.0);
+            ui.group(|ui| {
+                ui.strong("Channel Mixer — all output rows");
+                changed |= all_mixers_ui(ui, &mut self.project.adjustments, channel_names);
+            });
+        }
+        changed
     }
 
     fn ui_viewport(&mut self, ui: &mut egui::Ui) {
@@ -521,7 +670,7 @@ impl ShadeApp {
             ui.separator();
             ui.label(format!("{} × {} px", meta.width, meta.height));
             ui.label(format!("{}-bit", meta.bit_depth));
-            ui.label(format!("{}", meta.color_model.title()));
+            ui.label(meta.color_model.title());
             ui.label(format!("{} channels", meta.samples_per_pixel));
             if meta.samples_per_pixel > meta.base_channel_count {
                 ui.label(format!("{} extra/spot", meta.samples_per_pixel - meta.base_channel_count));
@@ -621,11 +770,11 @@ impl eframe::App for ShadeApp {
         });
         egui::Panel::bottom("status").show(ui, |ui| self.ui_status(ui));
         egui::Panel::left("faces")
-            .default_size(200.0)
+            .default_size(240.0)
             .resizable(true)
             .show(ui, |ui| self.ui_faces(ui));
         egui::Panel::right("tools")
-            .default_size(360.0)
+            .default_size(380.0)
             .resizable(true)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.ui_channels_and_tools(ui));
@@ -694,6 +843,49 @@ fn mixer_ui(
         }
         adjustment.mixer.constant = 0.0;
         changed = true;
+    }
+    changed
+}
+
+fn broadcast_levels_ui(
+    ui: &mut egui::Ui,
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    template_name: &str,
+    channel_names: &[String],
+) -> bool {
+    let mut draft = adjustments.get(template_name).cloned().unwrap_or_default();
+    if !levels_ui(ui, &mut draft) { return false; }
+    for name in channel_names {
+        adjustments.entry(name.clone()).or_default().levels = draft.levels;
+    }
+    true
+}
+
+fn broadcast_curves_ui(
+    ui: &mut egui::Ui,
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    template_name: &str,
+    channel_names: &[String],
+) -> bool {
+    let mut draft = adjustments.get(template_name).cloned().unwrap_or_default();
+    if !curves_ui(ui, &mut draft) { return false; }
+    for name in channel_names {
+        adjustments.entry(name.clone()).or_default().curve = draft.curve;
+    }
+    true
+}
+
+fn all_mixers_ui(
+    ui: &mut egui::Ui,
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    channel_names: &[String],
+) -> bool {
+    let mut changed = false;
+    for output_name in channel_names {
+        ui.collapsing(format!("Output — {output_name}"), |ui| {
+            let adjustment = adjustments.entry(output_name.clone()).or_default();
+            changed |= mixer_ui(ui, adjustment, output_name, channel_names);
+        });
     }
     changed
 }
