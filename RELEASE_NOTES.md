@@ -1,28 +1,24 @@
-# Shade Editor 0.3.0
+# Shade Editor 0.3.1
 
-Adds test-oriented adjustment workflow features while retaining the Photoshop TIFF/Spot fixes from 0.2.1.
+Layout and viewport refinement release on top of the 0.3.0 adjustment/snapshot workflow.
 
 ## Added
 
-- Adjustment scope switch: edit the selected channel or all channels.
-- In `All channels` scope, Levels and Curve changes are broadcast to every channel.
-- In `All channels` scope, Channel Mixer exposes every output row independently so the N×N separation matrix is not accidentally collapsed by copying one row to all outputs.
-- `Reset all adjustments` restores Levels, Curve, enabled state, and an identity Channel Mixer for every channel.
-- Snapshot panel for storing named adjustment test states inside the `.shade` project.
-- Create, load/switch, inline rename, update, and delete Snapshots.
-- Snapshot dirty indicator when current adjustments differ from the selected saved Snapshot.
-- `.shade` schema v2 with backward-compatible loading of existing schema v1 projects.
+- Tools sidebar can switch between one-column and two-column layouts.
+- Two-column layout keeps Channels + Histogram in the first column and Adjustments + Test Code in the second column.
+- Sidebar layout preference is persisted in application settings and can also be toggled directly from the tools panel.
+- The two-column tools panel uses a wider minimum width while remaining resizable.
+- Image viewport now centers the active face on a larger virtual canvas.
+- Horizontal and vertical scrolling remain available around the centered image.
+- 180 px of overscroll margin is provided beyond the image/canvas edges so the user can pan slightly past the artwork boundaries.
+- Viewport recenters when opening/changing a face and when zoom changes.
 
-## Snapshot behavior
+## Retained 0.3 workflow
 
-Snapshots contain adjustment settings only. Creating a Snapshot captures the current adjustment map. Loading a Snapshot replaces the working adjustments with its stored values. Subsequent edits do not silently overwrite the Snapshot; use `Update` to save the new working state back into the selected Snapshot.
-
-## Retained TIFF fixes
-
-- Full RGB/CMYK + Photoshop ExtraSample/Spot decoding.
-- Photoshop channel names and relevant image resources retained.
-- ICC metadata preservation and RGB vs CMYK aware export.
-- Large TIFF decoder-limit workaround and multi-channel histogram support.
+- Selected-channel and All-channels adjustment scopes.
+- Reset all adjustments to identity/defaults.
+- Named adjustment Snapshots stored inside `.shade` projects.
+- Full RGB/CMYK + Photoshop ExtraSample/Spot decoding and multi-channel histogram support.
 
 ## Compatibility note
 
