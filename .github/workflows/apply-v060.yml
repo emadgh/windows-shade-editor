@@ -1,0 +1,37 @@
+name: Apply Shade Editor v0.6.0 source patch
+
+on:
+  push:
+    branches:
+      - feat/default-dpi-channel-palettes
+    paths:
+      - tools/apply_v060.py
+      - .github/workflows/apply-v060.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[v060-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/default-dpi-channel-palettes
+          fetch-depth: 0
+      - name: Apply patch
+        run: python tools/apply_v060.py
+      - name: Format Rust
+        run: cargo fmt
+      - name: Commit generated source changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml src/app_main.rs src/model_v6.rs src/export_v6.rs src/dpi.rs src/palette.rs src/settings_v6.rs
+          if git diff --cached --quiet; then
+            echo "No generated changes"
+          else
+            git commit -m "Apply default DPI and channel palette workflow [v060-applied]"
+            git push origin HEAD:feat/default-dpi-channel-palettes
+          fi
