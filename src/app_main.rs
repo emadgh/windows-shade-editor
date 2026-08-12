@@ -648,10 +648,17 @@ impl ShadeApp {
     }
 
     fn select_channel(&mut self, channel: usize, isolate: bool) {
-        self.selected_channel = channel;
-        let next_solo = if isolate { Some(channel) } else { None };
-        if self.solo_channel != next_solo {
-            self.solo_channel = next_solo;
+        let previous_solo = self.solo_channel;
+        if isolate {
+            let (selected, solo) =
+                channel_click_state(self.selected_channel, self.solo_channel, channel);
+            self.selected_channel = selected;
+            self.solo_channel = solo;
+        } else {
+            self.selected_channel = channel;
+            self.solo_channel = None;
+        }
+        if self.solo_channel != previous_solo {
             self.mark_current_preview_dirty();
         }
     }
@@ -1197,8 +1204,10 @@ impl ShadeApp {
                 ""
             };
             let accent = channel_color(name, index);
-            let label = format!("●  {name}{suffix}");
-            if clickable_row(
+            let is_solo = self.solo_channel == Some(index);
+            let indicator = if is_solo { "■" } else { "□" };
+            let label = format!("{indicator}  {name}{suffix}");
+            let response = clickable_row(
                 ui,
                 self.selected_channel == index,
                 &label,
@@ -1206,8 +1215,8 @@ impl ShadeApp {
                 Some(accent),
                 32.0,
             )
-            .clicked()
-            {
+            .on_hover_text("Click to select for editing. Click the active channel again to toggle solo preview.");
+            if response.clicked() {
                 self.select_channel(index, true);
             }
         }
@@ -1943,6 +1952,9 @@ fn mixer_ui(
                 ui.add(slider).changed()
             });
         }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
         let mut constant_slider = egui::Slider::new(&mut adjustment.mixer.constant, -1.0..=1.0)
             .text("Constant")
             .trailing_fill(true);
@@ -2032,6 +2044,40 @@ fn with_accent<R>(
         add(ui)
     })
     .inner
+}
+
+fn channel_click_state(
+    selected_channel: usize,
+    solo_channel: Option<usize>,
+    clicked_channel: usize,
+) -> (usize, Option<usize>) {
+    if selected_channel != clicked_channel {
+        // First click on another channel selects it for editing and returns to composite.
+        (clicked_channel, None)
+    } else if solo_channel == Some(clicked_channel) {
+        // Second click while solo is active returns to the composite preview.
+        (selected_channel, None)
+    } else {
+        // Clicking the already-selected channel toggles its monochrome solo preview on.
+        (selected_channel, Some(clicked_channel))
+    }
+}
+
+#[cfg(test)]
+mod channel_interaction_tests {
+    use super::channel_click_state;
+
+    #[test]
+    fn first_click_selects_without_solo_then_active_click_toggles_solo() {
+        assert_eq!(channel_click_state(0, None, 2), (2, None));
+        assert_eq!(channel_click_state(2, None, 2), (2, Some(2)));
+        assert_eq!(channel_click_state(2, Some(2), 2), (2, None));
+    }
+
+    #[test]
+    fn selecting_another_channel_exits_previous_solo() {
+        assert_eq!(channel_click_state(2, Some(2), 4), (4, None));
+    }
 }
 
 fn channel_color(name: &str, index: usize) -> egui::Color32 {
