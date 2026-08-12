@@ -520,10 +520,11 @@ fn snapshot_sequence_seed(name: &str) -> (String, u64) {
 
 fn snapshot_sequence_number(name: &str, prefix: &str) -> Option<u64> {
     let trimmed = name.trim();
-    if trimmed.len() < prefix.len() || !trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    let head = trimmed.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
         return None;
     }
-    trimmed[prefix.len()..].parse::<u64>().ok()
+    trimmed.get(prefix.len()..)?.parse::<u64>().ok()
 }
 
 fn enable_legacy_curve_midpoints(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {

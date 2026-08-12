@@ -2639,7 +2639,12 @@ fn set_curve_point(curve: &mut model::Curve, point: CurvePointKind, input: f32, 
     let output = output.clamp(0.0, 1.0);
     match point {
         CurvePointKind::Black => {
-            curve.input_black = input.clamp(0.0, (curve.midpoint_input - gap).max(0.0));
+            let max_input = if curve.midpoint_enabled {
+                (curve.midpoint_input - gap).max(0.0)
+            } else {
+                (curve.input_white - gap).max(0.0)
+            };
+            curve.input_black = input.clamp(0.0, max_input);
             curve.black = output;
         }
         CurvePointKind::Midpoint => {
@@ -2650,7 +2655,12 @@ fn set_curve_point(curve: &mut model::Curve, point: CurvePointKind, input: f32, 
             curve.midpoint = output;
         }
         CurvePointKind::White => {
-            curve.input_white = input.clamp((curve.midpoint_input + gap).min(1.0), 1.0);
+            let min_input = if curve.midpoint_enabled {
+                (curve.midpoint_input + gap).min(1.0)
+            } else {
+                (curve.input_black + gap).min(1.0)
+            };
+            curve.input_white = input.clamp(min_input, 1.0);
             curve.white = output;
         }
     }
@@ -2680,6 +2690,7 @@ fn curve_editor_graph(
         selected = CurvePointKind::Black;
     }
     let mut changed = false;
+    let mut midpoint_removed_this_frame = false;
     let points = [
         CurvePointKind::Black,
         CurvePointKind::Midpoint,
@@ -2700,6 +2711,7 @@ fn curve_editor_graph(
         );
         if point == CurvePointKind::Midpoint && response.double_clicked() {
             curve.midpoint_enabled = false;
+            midpoint_removed_this_frame = true;
             selected = CurvePointKind::Black;
             ui.data_mut(|data| data.insert_temp(selection_id, selected));
             changed = true;
@@ -2721,7 +2733,7 @@ fn curve_editor_graph(
         }
     }
 
-    if !curve.midpoint_enabled && graph_response.double_clicked() {
+    if !curve.midpoint_enabled && !midpoint_removed_this_frame && graph_response.double_clicked() {
         if let Some(pointer) = graph_response.interact_pointer_pos() {
             let input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
             let gap = 1.0 / 255.0;
