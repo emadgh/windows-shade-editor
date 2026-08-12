@@ -1680,7 +1680,7 @@ impl ShadeApp {
             ui.selectable_value(
                 &mut self.adjustment_scope,
                 AdjustmentScope::Selected,
-                &output_display,
+                output_display,
             );
             ui.selectable_value(
                 &mut self.adjustment_scope,
