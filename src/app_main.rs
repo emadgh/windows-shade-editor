@@ -1067,7 +1067,7 @@ impl ShadeApp {
             }
             UpdateStatus::UpToDate => {
                 if ui
-                    .small_button("Update ✓")
+                    .small_button("Update OK")
                     .on_hover_text("Check again")
                     .clicked()
                 {
@@ -1202,7 +1202,7 @@ impl ShadeApp {
             export_all = ui
                 .add_enabled(
                     self.job.is_none() && !all_ids.is_empty() && !self.faces.is_empty(),
-                    egui::Button::new("⇧").min_size(egui::vec2(20.0, 20.0)),
+                    VectorIconButton::export().min_size(egui::vec2(20.0, 20.0)),
                 )
                 .on_hover_text("Export all snapshots for the active Face")
                 .clicked();
@@ -1270,7 +1270,7 @@ impl ShadeApp {
                 if ui
                     .add_enabled(
                         self.job.is_none() && !day_ids.is_empty() && !self.faces.is_empty(),
-                        egui::Button::new("⇧").min_size(egui::vec2(20.0, 20.0)),
+                        VectorIconButton::export().min_size(egui::vec2(20.0, 20.0)),
                     )
                     .on_hover_text("Export all snapshots from this day for the active Face")
                     .clicked()
@@ -2730,6 +2730,139 @@ fn palette_entry_readonly(ui: &mut egui::Ui, entry: &palette::ChannelPaletteEntr
     });
 }
 
+#[derive(Clone, Copy)]
+enum VectorIconKind {
+    Export,
+    Check,
+}
+
+struct VectorIconButton {
+    icon: VectorIconKind,
+    min_size: egui::Vec2,
+    frame: bool,
+    sense: egui::Sense,
+}
+
+impl VectorIconButton {
+    fn export() -> Self {
+        Self {
+            icon: VectorIconKind::Export,
+            min_size: egui::vec2(20.0, 20.0),
+            frame: true,
+            sense: egui::Sense::click(),
+        }
+    }
+
+    fn check() -> Self {
+        Self {
+            icon: VectorIconKind::Check,
+            min_size: egui::vec2(20.0, 20.0),
+            frame: true,
+            sense: egui::Sense::click(),
+        }
+    }
+
+    fn min_size(mut self, size: egui::Vec2) -> Self {
+        self.min_size = size;
+        self
+    }
+
+    fn frame(mut self, frame: bool) -> Self {
+        self.frame = frame;
+        self
+    }
+
+    fn sense(mut self, sense: egui::Sense) -> Self {
+        self.sense = sense;
+        self
+    }
+}
+
+impl egui::Widget for VectorIconButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(self.min_size, self.sense);
+        let enabled = ui.is_enabled();
+        let visuals = ui.style().interact(&response);
+
+        if self.frame {
+            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+            ui.painter()
+                .rect_stroke(rect, 4.0, visuals.bg_stroke, egui::StrokeKind::Inside);
+        } else if enabled && response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+        }
+
+        let color = if enabled {
+            visuals.fg_stroke.color
+        } else {
+            ui.visuals().weak_text_color().gamma_multiply(0.45)
+        };
+        paint_vector_icon(ui.painter(), rect, self.icon, color);
+        response
+    }
+}
+
+fn paint_vector_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: VectorIconKind,
+    color: egui::Color32,
+) {
+    let icon_rect = rect.shrink(5.0);
+    match icon {
+        VectorIconKind::Export => {
+            let stroke = egui::Stroke::new(1.8, color);
+            let x = icon_rect.center().x;
+            let top = icon_rect.top() + 0.5;
+            let shaft_bottom = icon_rect.center().y + 1.5;
+            painter.line_segment([egui::pos2(x, shaft_bottom), egui::pos2(x, top)], stroke);
+            painter.line_segment([egui::pos2(x, top), egui::pos2(x - 3.2, top + 3.2)], stroke);
+            painter.line_segment([egui::pos2(x, top), egui::pos2(x + 3.2, top + 3.2)], stroke);
+            let bottom = icon_rect.bottom() - 0.5;
+            let side_top = bottom - 4.0;
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.left() + 0.5, side_top),
+                    egui::pos2(icon_rect.left() + 0.5, bottom),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.left() + 0.5, bottom),
+                    egui::pos2(icon_rect.right() - 0.5, bottom),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.right() - 0.5, bottom),
+                    egui::pos2(icon_rect.right() - 0.5, side_top),
+                ],
+                stroke,
+            );
+        }
+        VectorIconKind::Check => {
+            let stroke = egui::Stroke::new(2.0, color);
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.left() + 1.0, icon_rect.center().y),
+                    egui::pos2(icon_rect.center().x - 1.0, icon_rect.bottom() - 1.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.center().x - 1.0, icon_rect.bottom() - 1.5),
+                    egui::pos2(icon_rect.right() - 0.5, icon_rect.top() + 1.0),
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
 fn clickable_row(
     ui: &mut egui::Ui,
     selected: bool,
@@ -2846,7 +2979,7 @@ fn snapshot_row_with_actions(
     let export_clicked = ui
         .put(
             export_rect,
-            egui::Button::new("⇧")
+            VectorIconButton::export()
                 .frame(false)
                 .sense(egui::Sense::click()),
         )
@@ -2856,7 +2989,7 @@ fn snapshot_row_with_actions(
     let folder_clicked = if exported {
         ui.put(
             check_rect,
-            egui::Button::new("✓")
+            VectorIconButton::check()
                 .frame(false)
                 .sense(egui::Sense::click()),
         )
