@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const SHADE_SCHEMA_VERSION: u32 = 1;
+pub const SHADE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShadeProject {
@@ -12,6 +12,12 @@ pub struct ShadeProject {
     pub name: String,
     pub faces: Vec<FaceRef>,
     pub adjustments: BTreeMap<String, ChannelAdjustment>,
+    #[serde(default)]
+    pub snapshots: Vec<AdjustmentSnapshot>,
+    #[serde(default)]
+    pub active_snapshot_id: Option<u64>,
+    #[serde(default = "default_next_snapshot_id")]
+    pub next_snapshot_id: u64,
     pub test_code: TestCodeConfig,
 }
 
@@ -22,10 +28,15 @@ impl Default for ShadeProject {
             name: "Untitled Shade".to_owned(),
             faces: Vec::new(),
             adjustments: BTreeMap::new(),
+            snapshots: Vec::new(),
+            active_snapshot_id: None,
+            next_snapshot_id: default_next_snapshot_id(),
             test_code: TestCodeConfig::default(),
         }
     }
 }
+
+fn default_next_snapshot_id() -> u64 { 1 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FaceRef {
@@ -33,7 +44,7 @@ pub struct FaceRef {
     pub label: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChannelAdjustment {
     pub enabled: bool,
     pub levels: Levels,
@@ -52,7 +63,7 @@ impl Default for ChannelAdjustment {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Levels {
     pub input_black: f32,
     pub gamma: f32,
@@ -73,7 +84,7 @@ impl Default for Levels {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Curve {
     /// Output at input 0.0.
     pub black: f32,
@@ -93,12 +104,19 @@ impl Default for Curve {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct MixerRow {
     /// Source channel name -> coefficient. Missing entries are zero, except the
     /// output channel itself which is treated as 1.0 when the map is empty.
     pub coefficients: BTreeMap<String, f32>,
     pub constant: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdjustmentSnapshot {
+    pub id: u64,
+    pub name: String,
+    pub adjustments: BTreeMap<String, ChannelAdjustment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,7 +144,7 @@ impl ShadeProject {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = fs::read_to_string(path)
             .map_err(|err| format!("Cannot read .shade file: {err}"))?;
-        let project: Self = serde_json::from_str(&text)
+        let mut project: Self = serde_json::from_str(&text)
             .map_err(|err| format!("Invalid .shade file: {err}"))?;
         if project.schema_version > SHADE_SCHEMA_VERSION {
             return Err(format!(
@@ -134,11 +152,15 @@ impl ShadeProject {
                 project.schema_version, SHADE_SCHEMA_VERSION
             ));
         }
+        project.schema_version = SHADE_SCHEMA_VERSION;
+        let minimum_next_id = project.snapshots.iter().map(|snapshot| snapshot.id).max().unwrap_or(0) + 1;
+        project.next_snapshot_id = project.next_snapshot_id.max(minimum_next_id).max(1);
         Ok(project)
     }
 
     pub fn save(&self, path: &Path, resolved_face_paths: &[PathBuf]) -> Result<(), String> {
         let mut portable = self.clone();
+        portable.schema_version = SHADE_SCHEMA_VERSION;
         let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
         for (face, source) in portable.faces.iter_mut().zip(resolved_face_paths.iter()) {
             face.path = make_portable_path(source, project_dir);
@@ -160,23 +182,87 @@ impl ShadeProject {
     }
 
     pub fn ensure_channels(&mut self, names: &[String]) {
-        for name in names {
-            self.adjustments.entry(name.clone()).or_default();
-        }
-        for output in names {
-            let row = &mut self.adjustments.entry(output.clone()).or_default().mixer;
-            if row.coefficients.is_empty() {
-                for input in names {
-                    row.coefficients.insert(input.clone(), if input == output { 1.0 } else { 0.0 });
-                }
-            } else {
-                for input in names {
-                    row.coefficients.entry(input.clone()).or_insert(if input == output { 1.0 } else { 0.0 });
-                }
-            }
+        ensure_adjustment_channels(&mut self.adjustments, names);
+        for snapshot in &mut self.snapshots {
+            ensure_adjustment_channels(&mut snapshot.adjustments, names);
         }
         if !names.iter().any(|name| name == &self.test_code.channel) {
             self.test_code.channel = names.get(3).or_else(|| names.first()).cloned().unwrap_or_default();
+        }
+    }
+
+    pub fn reset_adjustments(&mut self, names: &[String]) {
+        self.adjustments.clear();
+        ensure_adjustment_channels(&mut self.adjustments, names);
+    }
+
+    pub fn create_snapshot(&mut self) -> u64 {
+        let id = self.next_snapshot_id.max(1);
+        self.next_snapshot_id = id.saturating_add(1);
+        let number = self.snapshots.len() + 1;
+        self.snapshots.push(AdjustmentSnapshot {
+            id,
+            name: format!("Test {number}"),
+            adjustments: self.adjustments.clone(),
+        });
+        self.active_snapshot_id = Some(id);
+        id
+    }
+
+    pub fn apply_snapshot(&mut self, id: u64) -> bool {
+        let Some(snapshot) = self.snapshots.iter().find(|snapshot| snapshot.id == id) else {
+            return false;
+        };
+        self.adjustments = snapshot.adjustments.clone();
+        self.active_snapshot_id = Some(id);
+        true
+    }
+
+    pub fn update_snapshot(&mut self, id: u64) -> bool {
+        let Some(snapshot) = self.snapshots.iter_mut().find(|snapshot| snapshot.id == id) else {
+            return false;
+        };
+        snapshot.adjustments = self.adjustments.clone();
+        self.active_snapshot_id = Some(id);
+        true
+    }
+
+    pub fn delete_snapshot(&mut self, id: u64) -> bool {
+        let original_len = self.snapshots.len();
+        self.snapshots.retain(|snapshot| snapshot.id != id);
+        if self.active_snapshot_id == Some(id) {
+            self.active_snapshot_id = None;
+        }
+        self.snapshots.len() != original_len
+    }
+
+    pub fn active_snapshot_matches(&self) -> bool {
+        let Some(id) = self.active_snapshot_id else { return false; };
+        self.snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == id)
+            .map(|snapshot| snapshot.adjustments == self.adjustments)
+            .unwrap_or(false)
+    }
+}
+
+fn ensure_adjustment_channels(
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    names: &[String],
+) {
+    for name in names {
+        adjustments.entry(name.clone()).or_default();
+    }
+    for output in names {
+        let row = &mut adjustments.entry(output.clone()).or_default().mixer;
+        if row.coefficients.is_empty() {
+            for input in names {
+                row.coefficients.insert(input.clone(), if input == output { 1.0 } else { 0.0 });
+            }
+        } else {
+            for input in names {
+                row.coefficients.entry(input.clone()).or_insert(if input == output { 1.0 } else { 0.0 });
+            }
         }
     }
 }
@@ -203,12 +289,6 @@ pub fn apply_levels(value: f32, levels: Levels) -> f32 {
 }
 
 pub fn apply_curve(value: f32, curve: Curve) -> f32 {
-    // Version 1 stores three fixed-x control points: (0, black),
-    // (0.5, midpoint), and (1, white). Piecewise linear interpolation makes
-    // the default 0/0.5/1 curve mathematically identical to the input while
-    // remaining deterministic for 8-bit and 16-bit export. A future schema can
-    // migrate this representation to arbitrary control points without changing
-    // the render/export boundary.
     let x = value.clamp(0.0, 1.0);
     let y = if x <= 0.5 {
         lerp(curve.black, curve.midpoint, x * 2.0)
@@ -226,6 +306,13 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 mod tests {
     use super::*;
 
+    fn channels() -> Vec<String> {
+        ["Cyan", "Magenta", "Yellow", "Black", "purpol", "bgreen"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[test]
     fn identity_adjustments_are_identity() {
         for value in [0.0, 0.1, 0.5, 0.9, 1.0] {
@@ -241,5 +328,54 @@ mod tests {
         assert!((apply_curve(0.0, curve) - 0.1).abs() < 0.0001);
         assert!((apply_curve(0.5, curve) - 0.7).abs() < 0.0001);
         assert!((apply_curve(1.0, curve) - 0.9).abs() < 0.0001);
+    }
+
+    #[test]
+    fn reset_restores_identity_for_every_channel() {
+        let names = channels();
+        let mut project = ShadeProject::default();
+        project.ensure_channels(&names);
+        project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.8;
+        project.adjustments.get_mut("Cyan").unwrap().mixer.constant = 0.2;
+        project.reset_adjustments(&names);
+
+        for output in &names {
+            let adjustment = project.adjustments.get(output).unwrap();
+            assert_eq!(adjustment.levels, Levels::default());
+            assert_eq!(adjustment.curve, Curve::default());
+            assert_eq!(adjustment.mixer.constant, 0.0);
+            for input in &names {
+                let expected = if input == output { 1.0 } else { 0.0 };
+                assert_eq!(adjustment.mixer.coefficients.get(input).copied(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn snapshots_capture_switch_update_and_delete_adjustments() {
+        let names = channels();
+        let mut project = ShadeProject::default();
+        project.ensure_channels(&names);
+
+        project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.4;
+        let first = project.create_snapshot();
+        assert!(project.active_snapshot_matches());
+
+        project.adjustments.get_mut("purpol").unwrap().levels.gamma = 2.0;
+        assert!(!project.active_snapshot_matches());
+        let second = project.create_snapshot();
+        assert!(project.active_snapshot_matches());
+
+        assert!(project.apply_snapshot(first));
+        assert_eq!(project.adjustments.get("purpol").unwrap().levels.gamma, 1.4);
+        project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.6;
+        assert!(project.update_snapshot(first));
+        assert!(project.apply_snapshot(second));
+        assert_eq!(project.adjustments.get("purpol").unwrap().levels.gamma, 2.0);
+        assert!(project.apply_snapshot(first));
+        assert_eq!(project.adjustments.get("purpol").unwrap().levels.gamma, 1.6);
+
+        assert!(project.delete_snapshot(second));
+        assert!(project.snapshots.iter().all(|snapshot| snapshot.id != second));
     }
 }

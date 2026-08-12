@@ -1,19 +1,29 @@
-# Shade Editor 0.2.1
+# Shade Editor 0.3.0
 
-Engineering fix based on a real Photoshop CMYK TIFF containing two spot channels.
+Adds test-oriented adjustment workflow features while retaining the Photoshop TIFF/Spot fixes from 0.2.1.
 
-## Fixed
+## Added
 
-- Decode RGB/CMYK TIFF `ExtraSamples` instead of silently receiving only the base RGB/CMYK samples from image-tiff.
-- Preserve Photoshop spot-channel pixel data for files where `SamplesPerPixel` is larger than the base color-channel count.
-- Keep the source TIFF immutable: the decoder workaround is a read-only in-memory metadata overlay and never changes the source file.
-- Added regression coverage that writes a synthetic CMYK + 2 ExtraSamples TIFF and verifies that all six samples decode byte-for-byte.
-- Retains the v0.2 fixes for Photoshop channel names, ICC/ImageResources metadata, RGB vs CMYK export, channel-specific histograms and stacked adjustment panels.
+- Adjustment scope switch: edit the selected channel or all channels.
+- In `All channels` scope, Levels and Curve changes are broadcast to every channel.
+- In `All channels` scope, Channel Mixer exposes every output row independently so the N×N separation matrix is not accidentally collapsed by copying one row to all outputs.
+- `Reset all adjustments` restores Levels, Curve, enabled state, and an identity Channel Mixer for every channel.
+- Snapshot panel for storing named adjustment test states inside the `.shade` project.
+- Create, load/switch, inline rename, update, and delete Snapshots.
+- Snapshot dirty indicator when current adjustments differ from the selected saved Snapshot.
+- `.shade` schema v2 with backward-compatible loading of existing schema v1 projects.
 
-## Verified production sample
+## Snapshot behavior
 
-The supplied validation TIFF is 720×1280, 8-bit CMYK, LZW + horizontal predictor, with `SamplesPerPixel = 6`, two unspecified ExtraSamples, and Photoshop channel names `purpol` and `bgreen`. The previous decoder returned exactly four samples per pixel; this build explicitly routes RGB/CMYK + extras through full multiband decoding.
+Snapshots contain adjustment settings only. Creating a Snapshot captures the current adjustment map. Loading a Snapshot replaces the working adjustments with its stored values. Subsequent edits do not silently overwrite the Snapshot; use `Update` to save the new working state back into the selected Snapshot.
+
+## Retained TIFF fixes
+
+- Full RGB/CMYK + Photoshop ExtraSample/Spot decoding.
+- Photoshop channel names and relevant image resources retained.
+- ICC metadata preservation and RGB vs CMYK aware export.
+- Large TIFF decoder-limit workaround and multi-channel histogram support.
 
 ## Compatibility note
 
-This remains an engineering preview. Photoshop/RIP round-trip should be checked after export before using the build in production. Strip/tile streaming is still planned for very large artwork to reduce peak RAM usage.
+This remains an engineering preview. Photoshop/RIP round-trip should be checked after export before production use. Strip/tile streaming is still planned for very large artwork to reduce peak RAM usage.
