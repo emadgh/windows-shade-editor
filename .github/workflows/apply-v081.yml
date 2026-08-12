@@ -19,6 +19,7 @@ jobs:
         shell: bash
         run: |
           if grep -q 'version = "0.8.0"' Cargo.toml; then
+            python scripts/fix_apply_v081.py
             python scripts/apply_v081.py
             cargo fmt --all
             git config user.name "github-actions[bot]"
