@@ -1,0 +1,442 @@
+name: Apply Shade Editor v0.7.0 direct Curve editor
+
+on:
+  push:
+    branches:
+      - feat/direct-three-point-curve
+    paths:
+      - .github/workflows/apply-direct-curve-v070.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/direct-three-point-curve
+          fetch-depth: 0
+      - name: Apply direct Curve editor patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          model_path = Path('src/model_v6.rs')
+          model = model_path.read_text(encoding='utf-8')
+          model = model.replace('pub const SHADE_SCHEMA_VERSION: u32 = 6;', 'pub const SHADE_SCHEMA_VERSION: u32 = 7;', 1)
+
+          curve_block = r'''#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+          #[serde(default)]
+          pub struct Curve {
+              /// Input coordinate of the black endpoint.
+              pub input_black: f32,
+              /// Input coordinate of the draggable middle point.
+              pub midpoint_input: f32,
+              /// Input coordinate of the white endpoint.
+              pub input_white: f32,
+              /// Output coordinate of the black endpoint.
+              pub black: f32,
+              /// Output coordinate of the draggable middle point.
+              pub midpoint: f32,
+              /// Output coordinate of the white endpoint.
+              pub white: f32,
+          }
+
+          impl Default for Curve {
+              fn default() -> Self {
+                  Self {
+                      input_black: 0.0,
+                      midpoint_input: 0.5,
+                      input_white: 1.0,
+                      black: 0.0,
+                      midpoint: 0.5,
+                      white: 1.0,
+                  }
+              }
+          }
+          '''
+          model, n = re.subn(
+              r'#\[derive\(Clone, Copy, Debug, Serialize, Deserialize, PartialEq\)\]\n#\[serde\(default\)\]\npub struct Curve \{.*?\n\}\n\nimpl Default for Curve \{.*?\n\}\n',
+              curve_block,
+              model,
+              count=1,
+              flags=re.S,
+          )
+          if n != 1:
+              raise SystemExit(f'Curve struct replacement failed: {n}')
+
+          old_migration = '''        if source_schema < 3 {
+              migrate_absolute_curve_midpoints(&mut project.adjustments);
+              for snapshot in &mut project.snapshots {
+                  migrate_absolute_curve_midpoints(&mut snapshot.adjustments);
+              }
+          }
+
+          project.schema_version = SHADE_SCHEMA_VERSION;'''
+          new_migration = '''        if source_schema < 3 {
+              migrate_absolute_curve_midpoints(&mut project.adjustments);
+              for snapshot in &mut project.snapshots {
+                  migrate_absolute_curve_midpoints(&mut snapshot.adjustments);
+              }
+          }
+          if source_schema < 7 {
+              migrate_relative_curves_to_three_points(&mut project.adjustments);
+              for snapshot in &mut project.snapshots {
+                  migrate_relative_curves_to_three_points(&mut snapshot.adjustments);
+              }
+          }
+
+          project.schema_version = SHADE_SCHEMA_VERSION;'''
+          if old_migration not in model:
+              raise SystemExit('load migration anchor not found')
+          model = model.replace(old_migration, new_migration, 1)
+
+          migration_helper = '''fn migrate_relative_curves_to_three_points(
+              adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+          ) {
+              for adjustment in adjustments.values_mut() {
+                  let curve = &mut adjustment.curve;
+                  curve.midpoint_input = ((curve.input_black + curve.input_white) * 0.5)
+                      .clamp(curve.input_black, curve.input_white);
+                  curve.midpoint = lerp(curve.black, curve.white, curve.midpoint);
+              }
+          }
+
+          '''
+          anchor = 'fn migrate_absolute_curve_midpoints(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {'
+          if anchor not in model:
+              raise SystemExit('curve migration helper anchor not found')
+          model = model.replace(anchor, migration_helper + anchor, 1)
+
+          apply_block = r'''pub fn curve_mid_output(curve: Curve) -> f32 {
+              curve.midpoint.clamp(0.0, 1.0)
+          }
+
+          pub fn apply_curve(value: f32, curve: Curve) -> f32 {
+              let epsilon = 1.0 / 65_535.0;
+              let x0 = curve.input_black.clamp(0.0, 1.0 - epsilon * 2.0);
+              let x2 = curve.input_white.clamp(x0 + epsilon * 2.0, 1.0);
+              let x1 = curve.midpoint_input.clamp(x0 + epsilon, x2 - epsilon);
+              let y0 = curve.black.clamp(0.0, 1.0);
+              let y1 = curve.midpoint.clamp(0.0, 1.0);
+              let y2 = curve.white.clamp(0.0, 1.0);
+              let x = value.clamp(0.0, 1.0);
+
+              if x <= x0 {
+                  return y0;
+              }
+              if x >= x2 {
+                  return y2;
+              }
+              if x <= x1 {
+                  let t = (x - x0) / (x1 - x0).max(epsilon);
+                  lerp(y0, y1, t).clamp(0.0, 1.0)
+              } else {
+                  let t = (x - x1) / (x2 - x1).max(epsilon);
+                  lerp(y1, y2, t).clamp(0.0, 1.0)
+              }
+          }
+          '''
+          model, n = re.subn(
+              r'pub fn curve_mid_output\(curve: Curve\) -> f32 \{.*?\n\}\n\npub fn apply_curve\(value: f32, curve: Curve\) -> f32 \{.*?\n\}\n',
+              apply_block,
+              model,
+              count=1,
+              flags=re.S,
+          )
+          if n != 1:
+              raise SystemExit(f'apply_curve replacement failed: {n}')
+
+          replacement_test = r'''    #[test]
+              fn curve_middle_point_moves_in_both_input_and_output_axes() {
+                  let curve = Curve {
+                      midpoint_input: 0.25,
+                      midpoint: 0.70,
+                      ..Curve::default()
+                  };
+                  assert!((apply_curve(0.0, curve) - 0.0).abs() < 0.0001);
+                  assert!((apply_curve(0.25, curve) - 0.70).abs() < 0.0001);
+                  assert!((apply_curve(1.0, curve) - 1.0).abs() < 0.0001);
+                  assert!((apply_curve(0.125, curve) - 0.35).abs() < 0.0001);
+              }
+
+              #[test]
+              fn three_collinear_points_preserve_a_straight_curve() {
+                  let curve = Curve {
+                      midpoint_input: 0.30,
+                      midpoint: 0.30,
+                      ..Curve::default()
+                  };
+                  for value in [0.0, 0.1, 0.3, 0.6, 1.0] {
+                      assert!((apply_curve(value, curve) - value).abs() < 0.0001);
+                  }
+              }
+          '''
+          model, n = re.subn(
+              r'    #\[test\]\n    fn curve_midpoint_is_relative_to_endpoints\(\) \{.*?\n    \}\n\n    #\[test\]',
+              replacement_test + '\n    #[test]',
+              model,
+              count=1,
+              flags=re.S,
+          )
+          if n != 1:
+              raise SystemExit(f'curve test replacement failed: {n}')
+
+          model_path.write_text(model, encoding='utf-8')
+
+          app_path = Path('src/app_main.rs')
+          app = app_path.read_text(encoding='utf-8')
+
+          new_curves_ui = r'''#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+          enum CurvePointKind {
+              Black,
+              Midpoint,
+              White,
+          }
+
+          impl CurvePointKind {
+              fn label(self) -> &'static str {
+                  match self {
+                      Self::Black => "Black point",
+                      Self::Midpoint => "Midpoint",
+                      Self::White => "White point",
+                  }
+              }
+          }
+
+          fn curve_point_xy(curve: model::Curve, point: CurvePointKind) -> (f32, f32) {
+              match point {
+                  CurvePointKind::Black => (curve.input_black, curve.black),
+                  CurvePointKind::Midpoint => (curve.midpoint_input, curve.midpoint),
+                  CurvePointKind::White => (curve.input_white, curve.white),
+              }
+          }
+
+          fn set_curve_point(
+              curve: &mut model::Curve,
+              point: CurvePointKind,
+              input: f32,
+              output: f32,
+          ) {
+              let gap = 1.0 / 255.0;
+              let output = output.clamp(0.0, 1.0);
+              match point {
+                  CurvePointKind::Black => {
+                      curve.input_black = input.clamp(0.0, (curve.midpoint_input - gap).max(0.0));
+                      curve.black = output;
+                  }
+                  CurvePointKind::Midpoint => {
+                      curve.midpoint_input = input.clamp(
+                          (curve.input_black + gap).min(1.0),
+                          (curve.input_white - gap).max(0.0),
+                      );
+                      curve.midpoint = output;
+                  }
+                  CurvePointKind::White => {
+                      curve.input_white = input.clamp((curve.midpoint_input + gap).min(1.0), 1.0);
+                      curve.white = output;
+                  }
+              }
+          }
+
+          fn curve_point_screen(rect: egui::Rect, input: f32, output: f32) -> egui::Pos2 {
+              egui::pos2(
+                  egui::lerp(rect.x_range(), input.clamp(0.0, 1.0)),
+                  egui::lerp(rect.bottom()..=rect.top(), output.clamp(0.0, 1.0)),
+              )
+          }
+
+          fn curve_editor_graph(
+              ui: &mut egui::Ui,
+              curve: &mut model::Curve,
+              histogram: Option<&[u32; 256]>,
+              accent: Option<egui::Color32>,
+          ) -> (bool, CurvePointKind) {
+              let desired = egui::vec2(ui.available_width().min(340.0).max(150.0), 210.0);
+              let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+              let graph_id = ui.make_persistent_id("three-point-curve-editor");
+              let selection_id = graph_id.with("selected-point");
+              let mut selected = ui
+                  .data(|data| data.get_temp::<CurvePointKind>(selection_id))
+                  .unwrap_or(CurvePointKind::Midpoint);
+              let mut changed = false;
+
+              let points = [CurvePointKind::Black, CurvePointKind::Midpoint, CurvePointKind::White];
+              for point in points {
+                  let (input, output) = curve_point_xy(*curve, point);
+                  let center = curve_point_screen(rect, input, output);
+                  let hit_rect = egui::Rect::from_center_size(center, egui::vec2(22.0, 22.0));
+                  let response = ui.interact(hit_rect, graph_id.with(point), egui::Sense::click_and_drag());
+                  if response.clicked() || response.drag_started() {
+                      selected = point;
+                      ui.data_mut(|data| data.insert_temp(selection_id, point));
+                  }
+                  if response.dragged() {
+                      if let Some(pointer) = response.interact_pointer_pos() {
+                          let input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                          let output = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
+                          set_curve_point(curve, point, input, output);
+                          selected = point;
+                          ui.data_mut(|data| data.insert_temp(selection_id, point));
+                          changed = true;
+                      }
+                  }
+              }
+
+              let painter = ui.painter_at(rect);
+              painter.rect_stroke(
+                  rect,
+                  2.0,
+                  ui.visuals().widgets.noninteractive.bg_stroke,
+                  egui::StrokeKind::Inside,
+              );
+              if let Some(bins) = histogram {
+                  let max_value = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
+                  let hist_color = accent
+                      .unwrap_or(ui.visuals().weak_text_color())
+                      .gamma_multiply(0.30);
+                  for (index, value) in bins.iter().enumerate() {
+                      let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
+                      let h = *value as f32 / max_value * rect.height();
+                      painter.line_segment(
+                          [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
+                          egui::Stroke::new(1.0, hist_color),
+                      );
+                  }
+              }
+              painter.line_segment(
+                  [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.top())],
+                  egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+              );
+
+              let curve_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
+              let mut last = None;
+              for step in 0..=128 {
+                  let x = step as f32 / 128.0;
+                  let y = model::apply_curve(x, *curve);
+                  let point = curve_point_screen(rect, x, y);
+                  if let Some(previous) = last {
+                      painter.line_segment([previous, point], egui::Stroke::new(2.0, curve_color));
+                  }
+                  last = Some(point);
+              }
+
+              for point in points {
+                  let (input, output) = curve_point_xy(*curve, point);
+                  let center = curve_point_screen(rect, input, output);
+                  let is_selected = point == selected;
+                  let radius = if is_selected { 6.5 } else { 5.0 };
+                  let fill = if is_selected {
+                      curve_color
+                  } else {
+                      ui.visuals().extreme_bg_color
+                  };
+                  painter.circle_filled(center, radius, fill);
+                  painter.circle_stroke(center, radius, egui::Stroke::new(2.0, curve_color));
+              }
+
+              (changed, selected)
+          }
+
+          fn curve_point_fields(
+              ui: &mut egui::Ui,
+              curve: &mut model::Curve,
+              selected: CurvePointKind,
+          ) -> bool {
+              let (input, output) = curve_point_xy(*curve, selected);
+              let mut input_value = (input * 255.0).round() as i32;
+              let mut output_value = (output * 255.0).round() as i32;
+              ui.small(selected.label());
+              let mut input_changed = false;
+              let mut output_changed = false;
+              ui.columns(2, |columns| {
+                  columns[0].label("Input");
+                  input_changed = columns[0]
+                      .add(egui::DragValue::new(&mut input_value).range(0..=255).speed(1))
+                      .changed();
+                  columns[1].label("Output");
+                  output_changed = columns[1]
+                      .add(egui::DragValue::new(&mut output_value).range(0..=255).speed(1))
+                      .changed();
+              });
+              if input_changed || output_changed {
+                  set_curve_point(
+                      curve,
+                      selected,
+                      input_value as f32 / 255.0,
+                      output_value as f32 / 255.0,
+                  );
+                  true
+              } else {
+                  false
+              }
+          }
+
+          fn curves_ui(
+              ui: &mut egui::Ui,
+              adjustment: &mut ChannelAdjustment,
+              histogram: Option<&[u32; 256]>,
+              accent: Option<egui::Color32>,
+          ) -> bool {
+              with_accent(ui, accent, |ui| {
+                  let (graph_changed, selected) =
+                      curve_editor_graph(ui, &mut adjustment.curve, histogram, accent);
+                  let mut changed = graph_changed;
+                  ui.add_space(6.0);
+                  changed |= curve_point_fields(ui, &mut adjustment.curve, selected);
+                  ui.add_space(4.0);
+                  ui.small("Drag any of the three points directly. Input / Output use Photoshop-style 0–255 values.");
+                  if ui.small_button("Reset Curve").clicked() {
+                      adjustment.curve = model::Curve::default();
+                      changed = true;
+                  }
+                  changed
+              })
+          }
+
+          fn mixer_ui('''
+          app, n = re.subn(
+              r'fn curves_ui\(.*?\n\}\n\nfn mixer_ui\(',
+              new_curves_ui,
+              app,
+              count=1,
+              flags=re.S,
+          )
+          if n != 1:
+              raise SystemExit(f'curves_ui replacement failed: {n}')
+
+          app, n = re.subn(
+              r'fn draw_curve\(.*?\n\}\n\nfn apply_theme',
+              'fn apply_theme',
+              app,
+              count=1,
+              flags=re.S,
+          )
+          if n != 1:
+              raise SystemExit(f'draw_curve removal failed: {n}')
+
+          app_path.write_text(app, encoding='utf-8')
+
+          cargo_path = Path('Cargo.toml')
+          cargo = cargo_path.read_text(encoding='utf-8')
+          if cargo.count('version = "0.6.1"') != 1:
+              raise SystemExit('Cargo version 0.6.1 not found exactly once')
+          cargo_path.write_text(cargo.replace('version = "0.6.1"', 'version = "0.7.0"', 1), encoding='utf-8')
+
+          notes = Path('RELEASE_NOTES.md')
+          previous = notes.read_text(encoding='utf-8')
+          prefix = '''# Shade Editor 0.7.0\n\nDirect three-point Curve editing.\n\n- Curve is edited directly on the graph using exactly three draggable points: Black, Midpoint and White.\n- Midpoint can now move horizontally (Input) and vertically (Output).\n- Black and White endpoints are draggable in both axes as well, while point order is constrained.\n- Curve sliders were removed. The selected point exposes compact Photoshop-style Input / Output numeric fields in two columns.\n- Input / Output fields use a 0–255 display scale while processing remains normalized internally.\n- Broadcast and every per-channel Curve foldout use the same direct editor.\n- Existing `.shade` files migrate to schema v7: old relative midpoint output becomes an absolute middle control point and midpoint input starts centered between the prior input endpoints.\n\n'''
+          notes.write_text(prefix + previous, encoding='utf-8')
+          PY
+      - name: Format Rust
+        run: cargo fmt
+      - name: Commit generated source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app_main.rs src/model_v6.rs Cargo.toml RELEASE_NOTES.md
+          git commit -m "Add direct three-point Curve editor"
+          git push origin HEAD:feat/direct-three-point-curve
