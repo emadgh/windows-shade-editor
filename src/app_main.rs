@@ -2484,7 +2484,7 @@ impl eframe::App for ShadeApp {
 
 fn adjustment_foldout<R>(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
     title: impl Into<egui::WidgetText>,
     default_open: bool,
     body: impl FnOnce(&mut egui::Ui) -> R,
