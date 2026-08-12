@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::palette::ChannelPalette;
 
-pub const SHADE_SCHEMA_VERSION: u32 = 7;
+pub const SHADE_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShadeProject {
@@ -26,6 +26,14 @@ pub struct ShadeProject {
     /// names and separation order are never changed by this palette.
     #[serde(default)]
     pub channel_palette: Option<ChannelPalette>,
+    /// Embedded project thumbnail. This is a normal PNG encoded as base64 so
+    /// the .shade JSON remains self-contained and portable.
+    #[serde(default)]
+    pub thumbnail: Option<ProjectThumbnail>,
+    /// Cached source/project properties captured on save for fast inspection
+    /// without reopening every TIFF.
+    #[serde(default)]
+    pub file_metadata: Option<ProjectFileMetadata>,
 }
 
 impl Default for ShadeProject {
@@ -40,6 +48,8 @@ impl Default for ShadeProject {
             next_snapshot_id: default_next_snapshot_id(),
             test_code: TestCodeConfig::default(),
             channel_palette: None,
+            thumbnail: None,
+            file_metadata: None,
         }
     }
 }
@@ -59,6 +69,42 @@ fn now_unix_ms() -> i64 {
 pub struct FaceRef {
     pub path: String,
     pub label: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectThumbnail {
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub data_base64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ProjectFileMetadata {
+    pub saved_at_unix_ms: i64,
+    pub face_count: usize,
+    pub active_face_index: usize,
+    pub total_source_bytes: u64,
+    pub faces: Vec<FaceFileMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct FaceFileMetadata {
+    pub label: String,
+    pub source_file_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth: u8,
+    pub color_model: String,
+    pub channel_count: usize,
+    pub base_channel_count: usize,
+    pub channel_names: Vec<String>,
+    pub dpi_x: f64,
+    pub dpi_y: f64,
+    pub dpi_from_source: bool,
+    pub resolution_unit: u16,
+    pub file_size_bytes: u64,
+    pub modified_at_unix_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -106,7 +152,9 @@ impl Default for Levels {
 pub struct Curve {
     /// Input coordinate of the black endpoint.
     pub input_black: f32,
-    /// Input coordinate of the draggable middle point.
+    /// Whether the optional middle point participates in the Curve.
+    pub midpoint_enabled: bool,
+    /// Input coordinate of the optional draggable middle point.
     pub midpoint_input: f32,
     /// Input coordinate of the white endpoint.
     pub input_white: f32,
@@ -122,6 +170,7 @@ impl Default for Curve {
     fn default() -> Self {
         Self {
             input_black: 0.0,
+            midpoint_enabled: false,
             midpoint_input: 0.5,
             input_white: 1.0,
             black: 0.0,
@@ -227,6 +276,16 @@ impl ShadeProject {
             }
         }
 
+        // Schema <= 7 always had a midpoint. Keep it enabled when migrating so
+        // existing projects retain the exact same rendering. New v8 Curves
+        // start with only Black/White endpoints until the user adds a midpoint.
+        if source_schema < 8 {
+            enable_legacy_curve_midpoints(&mut project.adjustments);
+            for snapshot in &mut project.snapshots {
+                enable_legacy_curve_midpoints(&mut snapshot.adjustments);
+            }
+        }
+
         project.schema_version = SHADE_SCHEMA_VERSION;
         let minimum_next_id = project
             .snapshots
@@ -286,13 +345,24 @@ impl ShadeProject {
     }
 
     fn next_snapshot_name(&self) -> String {
-        let mut number = 1usize;
+        let Some(first) = self.snapshots.first() else {
+            return "Test 1".to_owned();
+        };
+
+        let (prefix, first_number) = snapshot_sequence_seed(&first.name);
+        let mut next_number = first_number.saturating_add(1).max(1);
+        for snapshot in &self.snapshots {
+            if let Some(number) = snapshot_sequence_number(&snapshot.name, &prefix) {
+                next_number = next_number.max(number.saturating_add(1));
+            }
+        }
+
         loop {
-            let candidate = format!("Test {number}");
+            let candidate = format!("{prefix}{next_number}");
             if self.snapshot_name_available(&candidate, None) {
                 return candidate;
             }
-            number += 1;
+            next_number = next_number.saturating_add(1);
         }
     }
 
@@ -326,7 +396,7 @@ impl ShadeProject {
             return Err("Snapshot name cannot be empty.".to_owned());
         }
         if !self.snapshot_name_available(candidate, Some(id)) {
-            return Err(format!("A snapshot named ‘{candidate}’ already exists."));
+            return Err(format!("A snapshot named '{candidate}' already exists."));
         }
         let Some(snapshot) = self.snapshots.iter_mut().find(|snapshot| snapshot.id == id) else {
             return Err("Snapshot no longer exists.".to_owned());
@@ -431,6 +501,37 @@ impl ShadeProject {
     }
 }
 
+fn snapshot_sequence_seed(name: &str) -> (String, u64) {
+    let trimmed = name.trim();
+    let split = trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let (prefix, digits) = trimmed.split_at(split);
+    if !digits.is_empty() {
+        if let Ok(number) = digits.parse::<u64>() {
+            return (prefix.to_owned(), number);
+        }
+    }
+    (format!("{}-", trimmed.trim_end_matches('-')), 1)
+}
+
+fn snapshot_sequence_number(name: &str, prefix: &str) -> Option<u64> {
+    let trimmed = name.trim();
+    if trimmed.len() < prefix.len() || !trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    trimmed[prefix.len()..].parse::<u64>().ok()
+}
+
+fn enable_legacy_curve_midpoints(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
+    for adjustment in adjustments.values_mut() {
+        adjustment.curve.midpoint_enabled = true;
+    }
+}
+
 fn migrate_relative_curves_to_three_points(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
     for adjustment in adjustments.values_mut() {
         let curve = &mut adjustment.curve;
@@ -513,7 +614,28 @@ pub fn curve_mid_output(curve: Curve) -> f32 {
     curve.midpoint.clamp(0.0, 1.0)
 }
 
+pub fn curve_linear_output(value: f32, curve: Curve) -> f32 {
+    let epsilon = 1.0 / 65_535.0;
+    let x0 = curve.input_black.clamp(0.0, 1.0 - epsilon);
+    let x2 = curve.input_white.clamp(x0 + epsilon, 1.0);
+    let y0 = curve.black.clamp(0.0, 1.0);
+    let y2 = curve.white.clamp(0.0, 1.0);
+    let x = value.clamp(0.0, 1.0);
+    if x <= x0 {
+        return y0;
+    }
+    if x >= x2 {
+        return y2;
+    }
+    let t = (x - x0) / (x2 - x0).max(epsilon);
+    lerp(y0, y2, t).clamp(0.0, 1.0)
+}
+
 pub fn apply_curve(value: f32, curve: Curve) -> f32 {
+    if !curve.midpoint_enabled {
+        return curve_linear_output(value, curve);
+    }
+
     let epsilon = 1.0 / 65_535.0;
     let x0 = curve.input_black.clamp(0.0, 1.0 - epsilon * 2.0);
     let x2 = curve.input_white.clamp(x0 + epsilon * 2.0, 1.0);
@@ -565,6 +687,7 @@ mod tests {
     #[test]
     fn curve_middle_point_moves_in_both_input_and_output_axes() {
         let curve = Curve {
+            midpoint_enabled: true,
             midpoint_input: 0.25,
             midpoint: 0.70,
             ..Curve::default()
@@ -578,6 +701,7 @@ mod tests {
     #[test]
     fn three_collinear_points_preserve_a_straight_curve() {
         let curve = Curve {
+            midpoint_enabled: true,
             midpoint_input: 0.30,
             midpoint: 0.30,
             ..Curve::default()
@@ -599,6 +723,70 @@ mod tests {
         assert!((apply_curve(0.8, curve) - 1.0).abs() < 0.0001);
         assert!((apply_curve(0.0, curve) - 0.0).abs() < 0.0001);
         assert!((apply_curve(1.0, curve) - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn midpoint_is_disabled_by_default_and_two_points_are_linear() {
+        let curve = Curve::default();
+        assert!(!curve.midpoint_enabled);
+        for value in [0.0, 0.1, 0.5, 0.9, 1.0] {
+            assert!((apply_curve(value, curve) - value).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn enabled_midpoint_changes_the_piecewise_curve() {
+        let curve = Curve {
+            midpoint_enabled: true,
+            midpoint_input: 0.5,
+            midpoint: 0.8,
+            ..Curve::default()
+        };
+        assert!((apply_curve(0.5, curve) - 0.8).abs() < 0.0001);
+    }
+
+    #[test]
+    fn snapshot_names_follow_first_snapshot_trailing_number() {
+        let mut project = ShadeProject::default();
+        let first = project.create_snapshot();
+        project.rename_snapshot(first, "XN-A1-1").unwrap();
+        let second = project.create_snapshot();
+        let third = project.create_snapshot();
+        assert_eq!(
+            project
+                .snapshots
+                .iter()
+                .find(|s| s.id == second)
+                .unwrap()
+                .name,
+            "XN-A1-2"
+        );
+        assert_eq!(
+            project
+                .snapshots
+                .iter()
+                .find(|s| s.id == third)
+                .unwrap()
+                .name,
+            "XN-A1-3"
+        );
+    }
+
+    #[test]
+    fn snapshot_names_append_sequence_when_seed_has_no_number() {
+        let mut project = ShadeProject::default();
+        let first = project.create_snapshot();
+        project.rename_snapshot(first, "Kiln-Test").unwrap();
+        let second = project.create_snapshot();
+        assert_eq!(
+            project
+                .snapshots
+                .iter()
+                .find(|s| s.id == second)
+                .unwrap()
+                .name,
+            "Kiln-Test-2"
+        );
     }
 
     #[test]

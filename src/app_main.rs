@@ -10,6 +10,7 @@ mod palette;
 mod render;
 #[path = "settings_v6.rs"]
 mod settings;
+mod thumbnail;
 #[path = "tiff_io.rs"]
 mod tiff_io;
 #[path = "update_v4.rs"]
@@ -416,7 +417,16 @@ impl ShadeApp {
         let Some(path) = target else {
             return;
         };
-        let project = self.project.clone();
+        let mut project = self.project.clone();
+        project.file_metadata = Some(build_project_file_metadata(
+            &self.project,
+            &self.faces,
+            self.current_face,
+        ));
+        let thumbnail_face = self
+            .faces
+            .get(self.current_face)
+            .map(|face| Arc::clone(&face.preview));
         let face_paths = self
             .faces
             .iter()
@@ -426,11 +436,22 @@ impl ShadeApp {
         self.launch_job("Saving project", move |progress| {
             Self::set_progress(
                 &progress,
-                Some(0.25),
+                Some(0.15),
                 "Saving project",
-                "Serializing settings",
+                "Building project thumbnail",
             );
-            let result = project.save(&path, &face_paths);
+            let result = (|| -> Result<(), String> {
+                if let Some(face) = thumbnail_face.as_deref() {
+                    project.thumbnail = Some(thumbnail::build_project_thumbnail(face, &project)?);
+                }
+                Self::set_progress(
+                    &progress,
+                    Some(0.55),
+                    "Saving project",
+                    "Serializing project and metadata",
+                );
+                project.save(&path, &face_paths)
+            })();
             Self::set_progress(&progress, Some(1.0), "Saving project", "Complete");
             JobResult::Save {
                 path: result_path,
@@ -1101,7 +1122,7 @@ impl ShadeApp {
             }
             UpdateStatus::Ready(info, _) => {
                 if ui
-                    .small_button(format!("Restart → {}", info.version))
+                    .small_button(format!("Restart {}", info.version))
                     .clicked()
                 {
                     match self.updater.apply_ready() {
@@ -1208,7 +1229,7 @@ impl ShadeApp {
                 .clicked();
             if all_exported {
                 open_all_folder = ui
-                    .small_button("✓")
+                    .add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))
                     .on_hover_text("Open the latest export folder for these snapshots")
                     .clicked();
             }
@@ -1279,7 +1300,7 @@ impl ShadeApp {
                 }
                 if day_exported
                     && ui
-                        .small_button("✓")
+                        .add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))
                         .on_hover_text("Open the latest export folder for this day")
                         .clicked()
                 {
@@ -1416,7 +1437,7 @@ impl ShadeApp {
             changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut self.project.test_code.text)
-                        .hint_text(format!("Empty → {fallback}")),
+                        .hint_text(format!("Empty uses {fallback}")),
                 )
                 .changed();
             if !channel_names.is_empty() {
@@ -1575,22 +1596,17 @@ impl ShadeApp {
         ));
         ui.add_space(3.0);
         for (index, name) in channel_names.iter().enumerate() {
-            let suffix = if index >= base_count {
-                "  • spot"
-            } else {
-                ""
-            };
+            let suffix = if index >= base_count { "  spot" } else { "" };
             let accent = channel_color(active_palette.as_ref(), name, index);
             let is_solo = self.solo_channel == Some(index);
-            let indicator = if is_solo { "■" } else { "□" };
             let display_name = channel_display_name(active_palette.as_ref(), name, index);
-            let label = format!("{indicator}  {display_name}{suffix}");
-            let response = clickable_row(
+            let label = format!("{display_name}{suffix}");
+            let response = clickable_channel_row(
                 ui,
                 self.selected_channel == index,
+                is_solo,
                 &label,
-                None,
-                Some(accent),
+                accent,
                 32.0,
             )
             .on_hover_text("Click to select for editing. Click the active channel again to toggle solo preview.");
@@ -1638,7 +1654,7 @@ impl ShadeApp {
                 .then(|| channel_color(active_palette.as_ref(), &channel_names[index], index));
             let display =
                 channel_display_name(active_palette.as_ref(), &channel_names[index], index);
-            ui.strong(format!("Histogram — {display}"));
+            ui.strong(format!("Histogram - {display}"));
             draw_histogram(
                 ui,
                 original_histograms.get(index),
@@ -1954,7 +1970,7 @@ impl ShadeApp {
             let (body_changed, reset) = adjustment_foldout(
                 ui,
                 "all-levels-section",
-                "Levels — all channels",
+                "Levels - all channels",
                 true,
                 |ui| {
                     broadcast_levels_ui(
@@ -1976,7 +1992,7 @@ impl ShadeApp {
             let (body_changed, reset) = adjustment_foldout(
                 ui,
                 "all-curves-section",
-                "Curve — broadcast + per channel",
+                "Curve - broadcast + per channel",
                 true,
                 |ui| {
                     all_curves_ui(
@@ -2002,7 +2018,7 @@ impl ShadeApp {
             let (body_changed, reset) = adjustment_foldout(
                 ui,
                 "all-mixers-section",
-                "Channel Mixer — all output rows",
+                "Channel Mixer - all output rows",
                 true,
                 |ui| {
                     all_mixers_ui(
@@ -2081,18 +2097,18 @@ impl ShadeApp {
         ui.horizontal_wrapped(|ui| {
             ui.strong(title);
             ui.separator();
-            ui.label(format!("{} × {} px", meta.width, meta.height));
             ui.label(format!("{}-bit", meta.bit_depth));
-            ui.label(meta.color_model.title());
-            ui.label(format!("{} channels", meta.samples_per_pixel));
+            ui.label(format!("{} x {} px", meta.width, meta.height));
             if dpi_info.has_physical_resolution {
-                ui.label(format!("{:.0} × {:.0} DPI", dpi_info.dpi_x, dpi_info.dpi_y));
+                ui.label(format!("{:.0} x {:.0} DPI", dpi_info.dpi_x, dpi_info.dpi_y));
             } else {
                 ui.label(format!(
-                    "{:.0} × {:.0} DPI (default)",
+                    "{:.0} x {:.0} DPI (default)",
                     dpi_info.dpi_x, dpi_info.dpi_y
                 ));
             }
+            ui.label(meta.color_model.title());
+            ui.label(format!("{} channels", meta.samples_per_pixel));
         });
         ui.separator();
 
@@ -2147,7 +2163,7 @@ impl ShadeApp {
     fn ui_status(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let dirty = if self.project_dirty {
-                " • modified"
+                " * modified"
             } else {
                 ""
             };
@@ -2269,13 +2285,13 @@ impl ShadeApp {
                 ui.small("Palettes change only UI channel names/colors. TIFF channel names and separation order stay untouched. The active project palette is saved inside the .shade file.");
                 let palette_library = self.settings.palette_library();
                 let default_palette_name = if self.settings.default_palette_id == palette::AUTO_PALETTE_ID {
-                    "Automatic — CMYK/RGB from first Face".to_owned()
+                    "Automatic - CMYK/RGB from first Face".to_owned()
                 } else {
                     palette_library
                         .iter()
                         .find(|palette| palette.id == self.settings.default_palette_id)
                         .map(|palette| palette.name.clone())
-                        .unwrap_or_else(|| "Automatic — CMYK/RGB from first Face".to_owned())
+                        .unwrap_or_else(|| "Automatic - CMYK/RGB from first Face".to_owned())
                 };
                 egui::ComboBox::from_label("Default palette for new projects")
                     .selected_text(default_palette_name)
@@ -2284,7 +2300,7 @@ impl ShadeApp {
                             .selectable_value(
                                 &mut self.settings.default_palette_id,
                                 palette::AUTO_PALETTE_ID.to_owned(),
-                                "Automatic — CMYK/RGB from first Face",
+                                "Automatic - CMYK/RGB from first Face",
                             )
                             .changed();
                         for palette in &palette_library {
@@ -2314,7 +2330,7 @@ impl ShadeApp {
                 let mut remove_channel = None;
                 for custom in &mut self.settings.custom_palettes {
                     let custom_id = custom.id.clone();
-                    egui::CollapsingHeader::new(format!("Custom — {}", custom.name))
+                    egui::CollapsingHeader::new(format!("Custom - {}", custom.name))
                         .id_salt(format!("custom-palette-{custom_id}"))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -2332,7 +2348,7 @@ impl ShadeApp {
                                         .add(egui::TextEdit::singleline(&mut entry.name).desired_width(130.0))
                                         .changed();
                                     changed |= ui.color_edit_button_srgb(&mut entry.color).changed();
-                                    if ui.small_button("−").on_hover_text("Remove channel slot").clicked() {
+                                    if ui.small_button("-").on_hover_text("Remove channel slot").clicked() {
                                         remove_channel = Some((custom_id.clone(), index));
                                     }
                                 });
@@ -2394,7 +2410,7 @@ impl ShadeApp {
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.label("Native multi-channel TIFF shade editor for digital ceramic printing.");
                 ui.separator();
-                ui.label("Copyright © 2026 Emad Ghasemi");
+                ui.label("Copyright (c) 2026 Emad Ghasemi");
                 ui.label("MIT License");
                 ui.hyperlink_to(
                     "GitHub repository",
@@ -2654,12 +2670,15 @@ fn curve_editor_graph(
     accent: Option<egui::Color32>,
 ) -> (bool, CurvePointKind) {
     let desired = egui::vec2(ui.available_width().min(340.0).max(150.0), 210.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let (rect, graph_response) = ui.allocate_exact_size(desired, egui::Sense::click());
     let graph_id = ui.make_persistent_id("three-point-curve-editor");
     let selection_id = graph_id.with("selected-point");
     let mut selected = ui
         .data(|data| data.get_temp::<CurvePointKind>(selection_id))
-        .unwrap_or(CurvePointKind::Midpoint);
+        .unwrap_or(CurvePointKind::Black);
+    if !curve.midpoint_enabled && selected == CurvePointKind::Midpoint {
+        selected = CurvePointKind::Black;
+    }
     let mut changed = false;
     let points = [
         CurvePointKind::Black,
@@ -2668,6 +2687,9 @@ fn curve_editor_graph(
     ];
 
     for point in points {
+        if point == CurvePointKind::Midpoint && !curve.midpoint_enabled {
+            continue;
+        }
         let (input, output) = curve_point_xy(*curve, point);
         let center = curve_point_screen(rect, input, output);
         let hit_rect = egui::Rect::from_center_size(center, egui::vec2(22.0, 22.0));
@@ -2676,6 +2698,13 @@ fn curve_editor_graph(
             graph_id.with(point),
             egui::Sense::click_and_drag(),
         );
+        if point == CurvePointKind::Midpoint && response.double_clicked() {
+            curve.midpoint_enabled = false;
+            selected = CurvePointKind::Black;
+            ui.data_mut(|data| data.insert_temp(selection_id, selected));
+            changed = true;
+            continue;
+        }
         if response.clicked() || response.drag_started() {
             selected = point;
             ui.data_mut(|data| data.insert_temp(selection_id, point));
@@ -2688,6 +2717,25 @@ fn curve_editor_graph(
                 selected = point;
                 ui.data_mut(|data| data.insert_temp(selection_id, point));
                 changed = true;
+            }
+        }
+    }
+
+    if !curve.midpoint_enabled && graph_response.double_clicked() {
+        if let Some(pointer) = graph_response.interact_pointer_pos() {
+            let input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let gap = 1.0 / 255.0;
+            if input > curve.input_black + gap && input < curve.input_white - gap {
+                let output = model::curve_linear_output(input, *curve);
+                let line_point = curve_point_screen(rect, input, output);
+                if pointer.distance(line_point) <= 16.0 {
+                    curve.midpoint_enabled = true;
+                    curve.midpoint_input = input;
+                    curve.midpoint = output;
+                    selected = CurvePointKind::Midpoint;
+                    ui.data_mut(|data| data.insert_temp(selection_id, selected));
+                    changed = true;
+                }
             }
         }
     }
@@ -2735,6 +2783,9 @@ fn curve_editor_graph(
         last = Some(point);
     }
     for point in points {
+        if point == CurvePointKind::Midpoint && !curve.midpoint_enabled {
+            continue;
+        }
         let (input, output) = curve_point_xy(*curve, point);
         let center = curve_point_screen(rect, input, output);
         let is_selected = point == selected;
@@ -2807,7 +2858,7 @@ fn curves_ui(
             ui.add_space(6.0);
             changed |= curve_point_fields(ui, &mut adjustment.curve, selected);
             ui.add_space(4.0);
-            ui.small("Drag any of the three points directly. Input / Output use Photoshop-style 0-255 values.");
+            ui.small("Double-click the Curve line to add the midpoint; double-click the midpoint to remove it. Drag active points directly. Input / Output use Photoshop-style 0-255 values.");
         }
         changed
     })
@@ -2976,7 +3027,7 @@ fn all_mixers_ui(
     let mut changed = false;
     for (index, output_name) in channel_names.iter().enumerate() {
         let display = channel_display_name(palette, output_name, index);
-        ui.collapsing(format!("Output — {display}"), |ui| {
+        ui.collapsing(format!("Output - {display}"), |ui| {
             let adjustment = adjustments.entry(output_name.clone()).or_default();
             let accent = colorize.then(|| channel_color(palette, output_name, index));
             changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);
@@ -3057,7 +3108,9 @@ fn channel_color(palette: Option<&ChannelPalette>, name: &str, index: usize) -> 
 fn palette_entry_readonly(ui: &mut egui::Ui, entry: &palette::ChannelPaletteEntry) {
     let [r, g, b] = entry.color;
     ui.horizontal(|ui| {
-        ui.colored_label(egui::Color32::from_rgb(r, g, b), "■");
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
         ui.label(&entry.name);
     });
 }
@@ -3242,6 +3295,52 @@ fn clickable_row(
     response
 }
 
+fn clickable_channel_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    solo: bool,
+    label: &str,
+    accent: egui::Color32,
+    height: f32,
+) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill.gamma_multiply(0.72)
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+
+    let indicator = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 14.0, rect.center().y),
+        egui::vec2(11.0, 11.0),
+    );
+    if solo {
+        ui.painter().rect_filled(indicator, 1.5, accent);
+    } else {
+        ui.painter().rect_stroke(
+            indicator,
+            1.5,
+            egui::Stroke::new(1.5, accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 28.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        accent,
+    );
+    response
+}
+
 fn snapshot_row_with_actions(
     ui: &mut egui::Ui,
     selected: bool,
@@ -3335,14 +3434,14 @@ fn snapshot_row_with_actions(
 
 fn snapshot_day_time(created_at_unix_ms: i64) -> (String, String) {
     if created_at_unix_ms <= 0 {
-        return ("Earlier snapshots".to_owned(), "—".to_owned());
+        return ("Earlier snapshots".to_owned(), "-".to_owned());
     }
     match Local.timestamp_millis_opt(created_at_unix_ms).single() {
         Some(value) => (
             value.format("%Y-%m-%d").to_string(),
             value.format("%H:%M").to_string(),
         ),
-        None => ("Earlier snapshots".to_owned(), "—".to_owned()),
+        None => ("Earlier snapshots".to_owned(), "-".to_owned()),
     }
 }
 
@@ -3402,6 +3501,70 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     } else {
         ctx.set_visuals(egui::Visuals::light());
     }
+}
+
+fn build_project_file_metadata(
+    project: &ShadeProject,
+    faces: &[RuntimeFace],
+    active_face_index: usize,
+) -> model::ProjectFileMetadata {
+    let mut total_source_bytes = 0u64;
+    let mut entries = Vec::with_capacity(faces.len());
+    for (index, face) in faces.iter().enumerate() {
+        let fs_metadata = std::fs::metadata(&face.path).ok();
+        let file_size_bytes = fs_metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
+        total_source_bytes = total_source_bytes.saturating_add(file_size_bytes);
+        let modified_at_unix_ms = fs_metadata
+            .as_ref()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(system_time_unix_ms);
+        let tiff = &face.preview.metadata;
+        let label = project
+            .faces
+            .get(index)
+            .map(|face| face.label.clone())
+            .unwrap_or_else(|| {
+                face.path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("Face {}", index + 1))
+            });
+        entries.push(model::FaceFileMetadata {
+            label,
+            source_file_name: face
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            width: tiff.width,
+            height: tiff.height,
+            bit_depth: tiff.bit_depth,
+            color_model: tiff.color_model.title().to_owned(),
+            channel_count: tiff.samples_per_pixel,
+            base_channel_count: tiff.base_channel_count,
+            channel_names: tiff.channel_names.clone(),
+            dpi_x: face.dpi.dpi_x,
+            dpi_y: face.dpi.dpi_y,
+            dpi_from_source: face.dpi.has_physical_resolution,
+            resolution_unit: face.dpi.unit,
+            file_size_bytes,
+            modified_at_unix_ms,
+        });
+    }
+    model::ProjectFileMetadata {
+        saved_at_unix_ms: unix_ms_now(),
+        face_count: entries.len(),
+        active_face_index: active_face_index.min(entries.len().saturating_sub(1)),
+        total_source_bytes,
+        faces: entries,
+    }
+}
+
+fn system_time_unix_ms(value: std::time::SystemTime) -> Option<i64> {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
 }
 
 fn unix_ms_now() -> i64 {

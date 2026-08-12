@@ -13,12 +13,8 @@ pub fn build_project_thumbnail(
 ) -> Result<ProjectThumbnail, String> {
     let planes = render::adjusted_planes(face, project);
     let rgba = render::rgba_from_planes(face, &planes, None);
-    let (width, height, resized) = resize_rgba(
-        face.width,
-        face.height,
-        &rgba,
-        THUMBNAIL_MAX_DIMENSION,
-    )?;
+    let (width, height, resized) =
+        resize_rgba(face.width, face.height, &rgba, THUMBNAIL_MAX_DIMENSION)?;
     let png = encode_png(width as u32, height as u32, &resized)?;
     Ok(ProjectThumbnail {
         mime_type: "image/png".to_owned(),

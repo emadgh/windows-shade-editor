@@ -1,3 +1,15 @@
+# Shade Editor 0.8.0
+
+Optional midpoint Curve editing, deterministic Snapshot naming, and richer self-contained project files.
+
+- Curve starts with Black/White endpoints only. Double-click near the rendered line to add the midpoint at the calculated on-line position; double-click the midpoint to remove it.
+- Existing schema v7 projects migrate with their midpoint enabled so their rendering is unchanged.
+- Remaining UI icon glyphs are replaced by vector painter geometry or plain ASCII text, including Snapshot checks, Channel Solo indicators, and palette swatches.
+- Face information is ordered as filename, bit depth, pixel dimensions, DPI, color model, and channel count.
+- Snapshot names follow the first Snapshot's trailing numeric sequence (for example XN-A1-1, XN-A1-2, XN-A1-3).
+- .shade schema v8 embeds a PNG project thumbnail (max 256 px) and cached file/project metadata: face count, active face, source dimensions, bit depth, color model, channels, DPI, file size, and source modified time.
+- Thumbnail generation runs in the existing background Save job.
+
 # Shade Editor 0.7.1
 
 Compact Adjustment layout controls.
