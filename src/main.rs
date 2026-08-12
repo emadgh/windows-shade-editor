@@ -17,6 +17,8 @@ use settings::AppSettings;
 use tiff_io::PreviewFace;
 use update::{UpdateManager, UpdateStatus};
 
+const VIEWPORT_OVERSCROLL: f32 = 180.0;
+
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
@@ -65,6 +67,7 @@ struct ShadeApp {
     tool: ToolPanel,
     adjustment_scope: AdjustmentScope,
     zoom: f32,
+    viewport_recenter: bool,
     settings: AppSettings,
     updater: UpdateManager,
     show_settings: bool,
@@ -91,6 +94,7 @@ impl ShadeApp {
             tool: ToolPanel::Levels,
             adjustment_scope: AdjustmentScope::Selected,
             zoom: 1.0,
+            viewport_recenter: true,
             settings,
             updater,
             show_settings: false,
@@ -108,6 +112,7 @@ impl ShadeApp {
         self.selected_channel = 0;
         self.solo_channel = None;
         self.adjustment_scope = AdjustmentScope::Selected;
+        self.viewport_recenter = true;
         self.status_message = "New shade project".to_owned();
         self.project_dirty = false;
     }
@@ -148,6 +153,7 @@ impl ShadeApp {
             self.current_face = self.faces.len().saturating_sub(added);
             self.selected_channel = 0;
             self.solo_channel = None;
+            self.viewport_recenter = true;
             self.project_dirty = true;
             self.status_message = format!("Added {added} face(s)");
         }
@@ -199,6 +205,7 @@ impl ShadeApp {
         self.selected_channel = 0;
         self.solo_channel = None;
         self.adjustment_scope = AdjustmentScope::Selected;
+        self.viewport_recenter = true;
         self.project_dirty = false;
         self.status_message = if errors.is_empty() {
             format!("Opened {}", path.display())
@@ -278,6 +285,7 @@ impl ShadeApp {
         self.current_face = self.current_face.min(self.faces.len().saturating_sub(1));
         self.selected_channel = 0;
         self.solo_channel = None;
+        self.viewport_recenter = true;
         self.project_dirty = true;
         self.status_message = "Face removed from project (source TIFF was not deleted)".to_owned();
     }
@@ -393,6 +401,7 @@ impl ShadeApp {
             self.current_face = index;
             self.selected_channel = 0;
             self.solo_channel = None;
+            self.viewport_recenter = true;
             if let Some(face) = self.faces.get_mut(index) { face.dirty = true; }
         }
         ui.separator();
@@ -481,6 +490,52 @@ impl ShadeApp {
         if channel_names.is_empty() { return; }
         self.selected_channel = self.selected_channel.min(channel_names.len() - 1);
 
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Tools sidebar");
+            let label = if self.settings.sidebar_two_columns { "1 column" } else { "2 columns" };
+            if ui.small_button(label).clicked() {
+                self.settings.sidebar_two_columns = !self.settings.sidebar_two_columns;
+                self.save_settings_quietly();
+            }
+        });
+        ui.separator();
+
+        if self.settings.sidebar_two_columns {
+            ui.columns(2, |columns| {
+                self.ui_channels_histogram_column(
+                    &mut columns[0],
+                    &channel_names,
+                    &original_histograms,
+                    &adjusted_histograms,
+                    base_count,
+                    color_model,
+                );
+                columns[1].separator();
+                self.ui_adjustments_test_column(&mut columns[1], &channel_names);
+            });
+        } else {
+            self.ui_channels_histogram_column(
+                ui,
+                &channel_names,
+                &original_histograms,
+                &adjusted_histograms,
+                base_count,
+                color_model,
+            );
+            ui.separator();
+            self.ui_adjustments_test_column(ui, &channel_names);
+        }
+    }
+
+    fn ui_channels_histogram_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        channel_names: &[String],
+        original_histograms: &[[u32; 256]],
+        adjusted_histograms: &[[u32; 256]],
+        base_count: usize,
+        color_model: tiff_io::ColorModel,
+    ) {
         ui.heading("Channels");
         ui.horizontal(|ui| {
             if ui.selectable_label(self.solo_channel.is_none(), "Composite").clicked() { self.show_composite(); }
@@ -511,13 +566,17 @@ impl ShadeApp {
                 draw_histogram(ui, original_histograms.get(index), adjusted_histograms.get(index));
             }
         } else {
-            let index = self.selected_channel;
+            let index = self.selected_channel.min(channel_names.len().saturating_sub(1));
             ui.strong(format!("Histogram — {}", channel_names[index]));
             draw_histogram(ui, original_histograms.get(index), adjusted_histograms.get(index));
         }
+    }
 
-        ui.separator();
+    fn ui_adjustments_test_column(&mut self, ui: &mut egui::Ui, channel_names: &[String]) {
+        if channel_names.is_empty() { return; }
+        self.selected_channel = self.selected_channel.min(channel_names.len() - 1);
         let output_name = channel_names[self.selected_channel].clone();
+
         ui.horizontal_wrapped(|ui| {
             ui.strong("Adjustments");
             ui.selectable_value(&mut self.adjustment_scope, AdjustmentScope::Selected, &output_name);
@@ -529,27 +588,30 @@ impl ShadeApp {
             }
         });
 
-        let reset_all = ui.button("Reset all adjustments").clicked();
-        if reset_all {
-            self.project.reset_adjustments(&channel_names);
+        if ui.button("Reset all adjustments").clicked() {
+            self.project.reset_adjustments(channel_names);
             self.mark_all_previews_dirty();
             self.status_message = "All adjustments reset to defaults".to_owned();
         }
 
         let changed = match self.adjustment_scope {
-            AdjustmentScope::Selected => self.ui_selected_adjustment(ui, &output_name, &channel_names),
-            AdjustmentScope::All => self.ui_all_adjustments(ui, &output_name, &channel_names),
+            AdjustmentScope::Selected => self.ui_selected_adjustment(ui, &output_name, channel_names),
+            AdjustmentScope::All => self.ui_all_adjustments(ui, &output_name, channel_names),
         };
         if changed { self.mark_all_previews_dirty(); }
 
         ui.separator();
+        self.ui_test_code(ui, channel_names);
+    }
+
+    fn ui_test_code(&mut self, ui: &mut egui::Ui, channel_names: &[String]) {
         ui.collapsing("Test code", |ui| {
             let mut test_changed = ui.checkbox(&mut self.project.test_code.enabled, "Write test code on export").changed();
             test_changed |= ui.text_edit_singleline(&mut self.project.test_code.text).changed();
             egui::ComboBox::from_label("Channel")
                 .selected_text(&self.project.test_code.channel)
                 .show_ui(ui, |ui| {
-                    for name in &channel_names {
+                    for name in channel_names {
                         test_changed |= ui.selectable_value(&mut self.project.test_code.channel, name.clone(), name).changed();
                     }
                 });
@@ -677,12 +739,36 @@ impl ShadeApp {
             }
         });
         ui.separator();
-        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-            if let Some(texture) = self.faces.get(self.current_face).and_then(|face| face.texture.as_ref()) {
-                let size = texture.size_vec2() * self.zoom;
-                ui.add(egui::Image::from_texture(texture).fit_to_exact_size(size));
-            }
-        });
+
+        let texture = self.faces.get(self.current_face).and_then(|face| face.texture.clone());
+        let zoom = self.zoom;
+        let recenter = self.viewport_recenter;
+        egui::ScrollArea::both()
+            .id_salt("image-viewport-scroll")
+            .auto_shrink([false, false])
+            .show_viewport(ui, |ui, viewport| {
+                let Some(texture) = texture.as_ref() else { return; };
+                let image_size = texture.size_vec2() * zoom;
+                let viewport_size = viewport.size();
+                let canvas_size = egui::vec2(
+                    (image_size.x + VIEWPORT_OVERSCROLL * 2.0)
+                        .max(viewport_size.x + VIEWPORT_OVERSCROLL * 2.0),
+                    (image_size.y + VIEWPORT_OVERSCROLL * 2.0)
+                        .max(viewport_size.y + VIEWPORT_OVERSCROLL * 2.0),
+                );
+                let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
+                let image_rect = egui::Rect::from_center_size(canvas_rect.center(), image_size);
+                ui.put(
+                    image_rect,
+                    egui::Image::from_texture(texture).fit_to_exact_size(image_size),
+                );
+                if recenter {
+                    ui.scroll_to_rect(image_rect, Some(egui::Align::Center));
+                }
+            });
+        if recenter {
+            self.viewport_recenter = false;
+        }
     }
 
     fn ui_status(&mut self, ui: &mut egui::Ui) {
@@ -690,7 +776,9 @@ impl ShadeApp {
             let dirty = if self.project_dirty { " • modified" } else { "" };
             ui.label(format!("{}{}", self.status_message, dirty));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::Slider::new(&mut self.zoom, 0.1..=4.0).logarithmic(true).text("Zoom"));
+                if ui.add(egui::Slider::new(&mut self.zoom, 0.1..=4.0).logarithmic(true).text("Zoom")).changed() {
+                    self.viewport_recenter = true;
+                }
                 if let Some(path) = &self.project_path { ui.label(path.display().to_string()); }
             });
         });
@@ -716,6 +804,7 @@ impl ShadeApp {
                 ui.heading("Editor layout");
                 changed |= ui.checkbox(&mut self.settings.show_all_histograms, "Show a histogram for every channel").changed();
                 changed |= ui.checkbox(&mut self.settings.adjustment_tabs, "Use tabs for Levels / Curve / Mixer").changed();
+                changed |= ui.checkbox(&mut self.settings.sidebar_two_columns, "Use two-column tools sidebar").changed();
                 if dark_changed { apply_theme(ctx, self.settings.dark_mode); }
                 if changed {
                     if let Err(err) = self.settings.save() { self.status_message = err; }
@@ -773,8 +862,12 @@ impl eframe::App for ShadeApp {
             .default_size(240.0)
             .resizable(true)
             .show(ui, |ui| self.ui_faces(ui));
+
+        let tools_default_size = if self.settings.sidebar_two_columns { 720.0 } else { 380.0 };
+        let tools_min_size = if self.settings.sidebar_two_columns { 600.0 } else { 300.0 };
         egui::Panel::right("tools")
-            .default_size(380.0)
+            .default_size(tools_default_size)
+            .min_size(tools_min_size)
             .resizable(true)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.ui_channels_and_tools(ui));
