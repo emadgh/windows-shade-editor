@@ -1,18 +1,16 @@
-# Shade Editor 0.4.1
+# Shade Editor 0.4.2
 
-Snapshot organization and channel-color UX refinement.
+Channel selection / solo-preview interaction refinement.
 
-## Added / changed
+## Changed
 
-- Snapshots now store creation timestamps in `.shade` schema v4.
-- Snapshot list is grouped by local calendar day; each row shows its creation time.
-- Snapshot, Face and Channel rows are full-width click targets with larger row heights.
-- New snapshots automatically receive a unique `Test N` name. Rename validation rejects empty or duplicate names case-insensitively.
-- Legacy snapshots created before schema v4 remain compatible and appear under `Earlier snapshots` because their original creation time was never stored.
-- Channel Mixer source rows use each source channel's own accent for slider controls and labels when adjustment colorization is enabled.
-- The selected-channel Adjustment panel gets a subtle border and internal group-border tint matching the active channel, making the current separation visually explicit.
+- Clicking a different channel now selects it for editing while keeping the composite preview.
+- Clicking the already-selected channel toggles that channel's monochrome Solo Preview on/off.
+- Channel rows show an outline square (`□`) normally and a filled square (`■`) when that channel is soloed.
+- Selecting a different channel while another channel is soloed automatically returns the viewport to Composite before editing the new channel.
+- Channel Mixer `Constant` is visually separated from the source-channel coefficients with additional spacing and a divider.
 
 ## Retained
 
-- Multi-channel CMYK/RGB + Photoshop Spot support.
-- Snapshots, all-channel adjustments, DPI-aware Tahoma test code, Fit viewport, background preview rendering, operation progress, updater progress and application logs from 0.4.0.
+- Full-row Face / Channel / Snapshot selection, dated Snapshot groups, unique Snapshot names and per-channel adjustment color cues from 0.4.1.
+- Multi-channel RGB/CMYK + Photoshop Spot TIFF support, background rendering, progress, updater, logs, DPI-aware test code and Fit viewport.
