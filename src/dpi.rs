@@ -69,24 +69,16 @@ pub fn read_dpi(path: &Path, default_dpi: f64) -> DpiInfo {
     };
     decoder = decoder.with_limits(Limits::unlimited());
 
-    let raw_x = decoder
-        .get_tag_f64(Tag::XResolution)
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0);
-    let raw_y = decoder
-        .get_tag_f64(Tag::YResolution)
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0);
+    // TIFF XResolution/YResolution are RATIONAL values, not DOUBLE values.
+    // image-tiff's get_tag_f64() only accepts Value::Double, while its integer
+    // vector conversion exposes Value::Rational as [numerator, denominator].
+    let raw_x = read_resolution_rational(&mut decoder, Tag::XResolution);
+    let raw_y = read_resolution_rational(&mut decoder, Tag::YResolution);
+
     // TIFF 6.0 defines ResolutionUnit's default as 2 (inch).
     let unit = decoder
         .get_tag_unsigned::<u16>(Tag::ResolutionUnit)
         .unwrap_or(2);
-
-    #[cfg(test)]
-    eprintln!(
-        "SHADE_DPI_DIAG path={} raw_x={raw_x:?} raw_y={raw_y:?} unit={unit}",
-        path.display()
-    );
 
     let convert = |value: Option<f64>| -> Option<f64> {
         let value = value?;
@@ -111,6 +103,18 @@ pub fn read_dpi(path: &Path, default_dpi: f64) -> DpiInfo {
         has_physical_resolution: has,
         used_default: !has,
     }
+}
+
+fn read_resolution_rational<R: std::io::Read + std::io::Seek>(
+    decoder: &mut Decoder<R>,
+    tag: Tag,
+) -> Option<f64> {
+    let values = decoder.get_tag_u64_vec(tag).ok()?;
+    if values.len() < 2 || values[1] == 0 {
+        return None;
+    }
+    let value = values[0] as f64 / values[1] as f64;
+    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 fn normalize_default_dpi(value: f64) -> f64 {
