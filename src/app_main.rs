@@ -1550,8 +1550,9 @@ impl ShadeApp {
         let default_dpi = self.settings.default_dpi;
         self.launch_job("Recovering project", move |progress| {
             let result = (|| -> Result<RecoveryPayload, String> {
-                let mut project = candidate.project;
                 let paths = candidate.resolved_face_paths();
+                let origin_path = candidate.origin_path();
+                let mut project = candidate.project;
                 let total = paths.len().max(1);
                 let mut faces = Vec::new();
                 let mut errors = Vec::new();
@@ -1578,7 +1579,7 @@ impl ShadeApp {
                     }
                 }
                 Ok(RecoveryPayload {
-                    origin_path: candidate.origin_path(),
+                    origin_path,
                     project,
                     faces,
                     errors,
