@@ -7,7 +7,6 @@ def replace_exact(path: Path, old: str, new: str, expected: int = 1) -> None:
     text = path.read_text(encoding="utf-8")
     count = text.count(old)
     if count == 0:
-        # Idempotent reruns after the materialized source commit.
         if new in text:
             return
         raise RuntimeError(f"pattern not found in {path}: {old[:120]!r}")
@@ -20,14 +19,13 @@ app = ROOT / "src" / "app_main.rs"
 render = ROOT / "src" / "render.rs"
 export = ROOT / "src" / "export_v6.rs"
 
-# Keep the enum itself aligned with the user-facing processing order.
 replace_exact(
     app,
     "enum ToolPanel {\n    Levels,\n    Curves,\n    Mixer,\n}",
     "enum ToolPanel {\n    Levels,\n    Mixer,\n    Curves,\n}",
 )
 
-# Tab order in both Selected and All adjustment modes.
+# Selected-channel tab row.
 replace_exact(
     app,
     '                    ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");\n'
@@ -36,10 +34,19 @@ replace_exact(
     '                    ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");\n'
     '                    ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");\n'
     '                    ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");',
-    expected=2,
 )
 
-# Stacked Selected-channel order: Levels -> Mixer -> Curve.
+# All-channels tab row has one less indentation level.
+replace_exact(
+    app,
+    '                ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");\n'
+    '                ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");\n'
+    '                ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");',
+    '                ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");\n'
+    '                ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");\n'
+    '                ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");',
+)
+
 selected_old = '''                ui.add_space(4.0);
                 let (body_changed, reset) = adjustment_foldout(
                     ui,
@@ -112,7 +119,6 @@ selected_new = '''                ui.add_space(4.0);
                 }'''
 replace_exact(app, selected_old, selected_new)
 
-# Stacked All-channel order: Levels -> Mixer -> Curve.
 all_old = '''            ui.add_space(4.0);
             let (body_changed, reset) = adjustment_foldout(
                 ui,
@@ -217,7 +223,7 @@ replace_exact(
     "Levels broadcasts to every channel. Mixer output rows remain independent. Curve keeps one Broadcast control plus independent per-channel foldouts.",
 )
 
-# Preview pipeline: first Levels for each input, then Mixer for each output, then that output's Curve.
+# Preview pipeline: Levels on source channels, then output-row Mixer, then output Curve.
 replace_exact(
     render,
     "                    apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)",
@@ -229,7 +235,7 @@ replace_exact(
     "                    apply_curve(mixed, adjustment.curve)\n                }\n            } else {\n                prepared[out_channel][pixel]\n            };",
 )
 
-# Production export pipeline, both full-decode and strip-streamed paths.
+# Production export, full-decode and streaming paths.
 replace_exact(
     export,
     "                        apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)",
@@ -243,7 +249,7 @@ replace_exact(
     expected=2,
 )
 
-# Regression test makes the ordering contract explicit and catches a future reversion.
+# Regression test makes the ordering contract explicit.
 test_anchor = '''mod streaming_tests {
     use super::*;
     use tiff::encoder::{Compression, TiffEncoder, colortype};
@@ -271,7 +277,7 @@ test_block = '''mod streaming_tests {
             adjustment.curve.midpoint = 0.1;
         }
 
-        let input = [13_107u16, 52_428u16]; // approximately 0.2, 0.8
+        let input = [13_107u16, 52_428u16];
         let output = adjusted_strip(&input, 2, &names, &project);
 
         let raw_a = input[0] as f32 / 65_535.0;
@@ -285,8 +291,6 @@ test_block = '''mod streaming_tests {
         let actual = output[0] as f32 / 65_535.0;
         assert!((actual - expected).abs() <= 2.0 / 65_535.0);
 
-        // The previous Levels -> Curve -> Mixer order produces a substantially
-        // different value for this deliberately nonlinear fixture.
         let legacy = apply_curve(leveled_a, a.curve) * 0.5 + leveled_b * 0.5;
         assert!((actual - legacy).abs() > 0.20);
     }
