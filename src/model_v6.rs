@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::palette::ChannelPalette;
 
-pub const SHADE_SCHEMA_VERSION: u32 = 8;
+pub const SHADE_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShadeProject {
@@ -197,8 +197,7 @@ pub struct SnapshotExportRecord {
 pub struct AdjustmentSnapshot {
     pub id: u64,
     pub name: String,
-    /// Snapshot creation time as Unix milliseconds. Older schema versions do
-    /// not have this field and deserialize it as zero.
+    /// Snapshot creation time as Unix milliseconds.
     #[serde(default)]
     pub created_at_unix_ms: i64,
     pub adjustments: BTreeMap<String, ChannelAdjustment>,
@@ -252,49 +251,14 @@ impl ShadeProject {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text =
             fs::read_to_string(path).map_err(|err| format!("Cannot read .shade file: {err}"))?;
-        let mut project: Self =
+        let project: Self =
             serde_json::from_str(&text).map_err(|err| format!("Invalid .shade file: {err}"))?;
-        if project.schema_version > SHADE_SCHEMA_VERSION {
+        if project.schema_version != SHADE_SCHEMA_VERSION {
             return Err(format!(
-                "This project uses .shade schema {}, but this app supports up to {}.",
+                "Unsupported .shade schema {}. Shade Editor 0.9 accepts schema {} only; pre-production migration code has been removed.",
                 project.schema_version, SHADE_SCHEMA_VERSION
             ));
         }
-
-        let source_schema = project.schema_version;
-        if source_schema < 3 {
-            migrate_absolute_curve_midpoints(&mut project.adjustments);
-            for snapshot in &mut project.snapshots {
-                migrate_absolute_curve_midpoints(&mut snapshot.adjustments);
-            }
-        }
-
-        if source_schema < 7 {
-            migrate_relative_curves_to_three_points(&mut project.adjustments);
-            for snapshot in &mut project.snapshots {
-                migrate_relative_curves_to_three_points(&mut snapshot.adjustments);
-            }
-        }
-
-        // Schema <= 7 always had a midpoint. Keep it enabled when migrating so
-        // existing projects retain the exact same rendering. New v8 Curves
-        // start with only Black/White endpoints until the user adds a midpoint.
-        if source_schema < 8 {
-            enable_legacy_curve_midpoints(&mut project.adjustments);
-            for snapshot in &mut project.snapshots {
-                enable_legacy_curve_midpoints(&mut snapshot.adjustments);
-            }
-        }
-
-        project.schema_version = SHADE_SCHEMA_VERSION;
-        let minimum_next_id = project
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        project.next_snapshot_id = project.next_snapshot_id.max(minimum_next_id).max(1);
         Ok(project)
     }
 
@@ -525,34 +489,6 @@ fn snapshot_sequence_number(name: &str, prefix: &str) -> Option<u64> {
         return None;
     }
     trimmed.get(prefix.len()..)?.parse::<u64>().ok()
-}
-
-fn enable_legacy_curve_midpoints(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
-    for adjustment in adjustments.values_mut() {
-        adjustment.curve.midpoint_enabled = true;
-    }
-}
-
-fn migrate_relative_curves_to_three_points(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
-    for adjustment in adjustments.values_mut() {
-        let curve = &mut adjustment.curve;
-        curve.midpoint_input = ((curve.input_black + curve.input_white) * 0.5)
-            .clamp(curve.input_black, curve.input_white);
-        curve.midpoint = lerp(curve.black, curve.white, curve.midpoint);
-    }
-}
-
-fn migrate_absolute_curve_midpoints(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
-    for adjustment in adjustments.values_mut() {
-        let black = adjustment.curve.black;
-        let white = adjustment.curve.white;
-        let absolute = adjustment.curve.midpoint;
-        adjustment.curve.midpoint = if (white - black).abs() < 0.000_001 {
-            0.5
-        } else {
-            ((absolute - black) / (white - black)).clamp(0.0, 1.0)
-        };
-    }
 }
 
 fn ensure_adjustment_channels(
@@ -921,5 +857,19 @@ mod tests {
                 .iter()
                 .all(|item| item.created_at_unix_ms > 0)
         );
+    }
+    #[test]
+    fn loader_rejects_old_schema_without_migration() {
+        let mut project = ShadeProject::default();
+        project.schema_version = 8;
+        let path = std::env::temp_dir().join(format!(
+            "shade-editor-old-schema-{}-{}.shade",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        fs::write(&path, serde_json::to_string(&project).unwrap()).unwrap();
+        let error = ShadeProject::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+        assert!(error.contains("accepts schema 9 only"));
     }
 }

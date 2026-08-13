@@ -128,7 +128,13 @@ mod tests {
             vec![PathBuf::from(r"C:\tiles\face-1.tif")],
             Some(PathBuf::from(r"C:\tiles\test.shade")),
         );
-        assert_eq!(recovery.resolved_face_paths()[0], PathBuf::from(r"C:\tiles\face-1.tif"));
-        assert_eq!(recovery.origin_path(), Some(PathBuf::from(r"C:\tiles\test.shade")));
+        assert_eq!(
+            recovery.resolved_face_paths()[0],
+            PathBuf::from(r"C:\tiles\face-1.tif")
+        );
+        assert_eq!(
+            recovery.origin_path(),
+            Some(PathBuf::from(r"C:\tiles\test.shade"))
+        );
     }
 }

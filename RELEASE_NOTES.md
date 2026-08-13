@@ -1,3 +1,16 @@
+# Shade Editor 0.9.0
+
+Production-workflow foundation: adjustment History, crash recovery, Before/After comparison, and a clean .shade v9 schema.
+
+- Photoshop-style adjustment Undo/Redo shortcuts: Ctrl+Alt+Z and Ctrl+Shift+Z, plus a clickable History panel. Only adjustment edits participate; Face operations, Snapshot operations, and Palette changes are intentionally excluded.
+- Adjustment drag/keyboard edits are coalesced into useful history states instead of recording every render frame.
+- Dirty active Snapshots retain the existing marker but now get a stronger selected background, border, and visual emphasis.
+- Hold the right mouse button over the image viewport to temporarily show the unadjusted Before view. Space remains available for viewport panning.
+- Recovery autosaves dirty projects every two minutes to LOCALAPPDATA without marking the project saved. On restart the app offers Recover or Discard recovery.
+- Successful manual Save clears the recovery copy; Save and exit still waits for the background save to complete.
+- .shade schema v9 is intentionally a clean break. All v1-v8 migration code was removed and the loader accepts schema v9 only.
+- TIFF preview/export streaming improvements are part of the same v0.9 release backend work.
+
 # Shade Editor 0.8.1
 
 Physical Face dimensions and safeguards against accidental state loss.

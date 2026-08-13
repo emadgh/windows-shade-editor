@@ -17,7 +17,11 @@ pub struct AdjustmentHistory {
 }
 
 impl AdjustmentHistory {
-    pub fn reset(&mut self, adjustments: &BTreeMap<String, ChannelAdjustment>, label: impl Into<String>) {
+    pub fn reset(
+        &mut self,
+        adjustments: &BTreeMap<String, ChannelAdjustment>,
+        label: impl Into<String>,
+    ) {
         self.entries.clear();
         self.entries.push(HistoryEntry {
             label: label.into(),
@@ -26,7 +30,11 @@ impl AdjustmentHistory {
         self.cursor = 0;
     }
 
-    pub fn record(&mut self, adjustments: &BTreeMap<String, ChannelAdjustment>, label: impl Into<String>) -> bool {
+    pub fn record(
+        &mut self,
+        adjustments: &BTreeMap<String, ChannelAdjustment>,
+        label: impl Into<String>,
+    ) -> bool {
         if self.entries.is_empty() {
             self.reset(adjustments, label);
             return true;
