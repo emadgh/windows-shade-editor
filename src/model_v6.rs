@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::palette::ChannelPalette;
 
 pub const SHADE_SCHEMA_VERSION: u32 = 9;
+pub const TEST_CODE_ALL_CHANNELS: &str = "__all_channels__";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShadeProject {
@@ -238,7 +239,7 @@ impl Default for TestCodeConfig {
         Self {
             enabled: false,
             text: String::new(),
-            channel: "Black".to_owned(),
+            channel: TEST_CODE_ALL_CHANNELS.to_owned(),
             font_family: "Tahoma".to_owned(),
             font_size_pt: 12.0,
             margin_cm: 1.0,
@@ -255,7 +256,7 @@ impl ShadeProject {
             serde_json::from_str(&text).map_err(|err| format!("Invalid .shade file: {err}"))?;
         if project.schema_version != SHADE_SCHEMA_VERSION {
             return Err(format!(
-                "Unsupported .shade schema {}. Shade Editor 0.9 accepts schema {} only; pre-production migration code has been removed.",
+                "Unsupported .shade schema {}. This build accepts schema {} only; pre-production migration code has been removed.",
                 project.schema_version, SHADE_SCHEMA_VERSION
             ));
         }
@@ -294,7 +295,9 @@ impl ShadeProject {
         for snapshot in &mut self.snapshots {
             ensure_adjustment_channels(&mut snapshot.adjustments, names);
         }
-        if !names.iter().any(|name| name == &self.test_code.channel) {
+        if self.test_code.channel != TEST_CODE_ALL_CHANNELS
+            && !names.iter().any(|name| name == &self.test_code.channel)
+        {
             self.test_code.channel = names
                 .get(3)
                 .or_else(|| names.first())

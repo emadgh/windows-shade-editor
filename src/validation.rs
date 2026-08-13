@@ -166,18 +166,35 @@ where
             exported_decoded.metadata.compression
         ),
     );
-    let expected_predictor = if source_decoded.metadata.predictor == Some(2) {
+    let expected_predictor = if source_decoded.metadata.predictor == Some(2)
+        && source_decoded.metadata.samples_per_pixel == source_decoded.metadata.base_channel_count
+    {
         Some(2)
     } else {
-        exported_decoded.metadata.predictor
+        // Horizontal Predictor is a compression transform, not image semantics.
+        // The image-tiff encoder's predictor stride excludes appended
+        // ExtraSamples, so production exports intentionally normalize it off
+        // for Spot/extra-channel TIFFs to guarantee pixel integrity. TIFF
+        // Predictor value 1 explicitly means no prediction.
+        Some(1)
     };
     push_check(
         &mut checks,
         "Horizontal predictor",
         exported_decoded.metadata.predictor == expected_predictor,
         format!(
-            "source={:?}, export={:?}",
-            source_decoded.metadata.predictor, exported_decoded.metadata.predictor
+            "source={:?}, expected export={:?}, actual export={:?}{}",
+            source_decoded.metadata.predictor,
+            expected_predictor,
+            exported_decoded.metadata.predictor,
+            if source_decoded.metadata.predictor == Some(2)
+                && source_decoded.metadata.samples_per_pixel
+                    > source_decoded.metadata.base_channel_count
+            {
+                " (Predictor intentionally omitted for extra-channel TIFF pixel safety)"
+            } else {
+                ""
+            }
         ),
     );
     push_check(
