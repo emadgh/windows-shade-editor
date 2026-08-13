@@ -23,6 +23,7 @@ pub struct AppSettings {
     pub colorize_adjustments: bool,
     pub show_curve_histogram: bool,
     pub compact_curve_controls: bool,
+    pub validate_after_export: bool,
     pub default_dpi: f64,
     pub default_palette_id: String,
     pub custom_palettes: Vec<ChannelPalette>,
@@ -41,6 +42,7 @@ impl Default for AppSettings {
             colorize_adjustments: true,
             show_curve_histogram: true,
             compact_curve_controls: false,
+            validate_after_export: false,
             default_dpi: DEFAULT_DPI,
             default_palette_id: AUTO_PALETTE_ID.to_owned(),
             custom_palettes: Vec::new(),
@@ -191,6 +193,11 @@ mod tests {
     #[test]
     fn compact_curve_controls_default_off() {
         assert!(!AppSettings::default().compact_curve_controls);
+    }
+
+    #[test]
+    fn post_export_validation_defaults_off() {
+        assert!(!AppSettings::default().validate_after_export);
     }
 
     #[test]

@@ -6,12 +6,8 @@ This file tracks only work that is still intentionally in scope. Snapshot expans
 
 - Run a real no-adjustment `Validate face` round trip on production CMYK + Spot TIFFs in Photoshop and the production RIP.
 - Confirm Spot type/order/name, Photoshop display color/Solidity, ICC, Photoshop resources, DPI, predictor/compression, and press/RIP interpretation.
-
-## Next production workflow
-
-- Relink missing Faces: Locate file, Locate folder, batch resolution of missing sources, and replacement verification against `.shade` cached metadata.
-- Complete keyboard workflow: Ctrl+S, Ctrl+Shift+S, F Fit, 1-9 channel selection, S Solo, Ctrl+Enter Update Snapshot, Curve point arrow-key nudging and Shift+Arrow larger steps. Existing Ctrl+Alt+Z / Ctrl+Shift+Z history shortcuts stay unchanged.
-- Optional automatic post-export validation summary for normal Export face / Export all, reusing the existing validator and showing a compact verified/failed status.
+- Production-test the v0.10.3 missing-Face relink workflow against moved project folders and changed storage roots.
+- Production-test automatic post-export validation on large CMYK + Spot artwork before considering default-on behavior.
 
 ## Backend follow-up
 
