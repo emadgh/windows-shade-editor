@@ -1,3 +1,14 @@
+# Shade Editor v0.12.0
+
+- Adds a native x64 Windows Shell extension for `.shade` files without loading the editor UI runtime inside Explorer.
+- Explorer thumbnails use the PNG already embedded in schema-v9 `.shade` projects through `IThumbnailProvider` and WIC.
+- A read-only `IPropertyStore` exposes Face count, active Face, physical/pixel dimensions, DPI, bit depth, color model, channel counts, source TIFF name, total source bytes, and save time.
+- Ships a custom Windows Property System `.propdesc` schema for Explorer Details/columns/search metadata.
+- Adds an elevated installer for COM/property-handler registration and per-user `.shade` file association.
+- Shade Editor accepts a `.shade` path as its first command-line argument so Explorer double-click can open the selected project.
+- Native parser and COM/WIC regression tests validate schema-v9 metadata and the embedded PNG thumbnail.
+- `.shade` schema remains v9.
+
 # Shade Editor v0.11.0
 
 - Extended bounded-memory TIFF decoding to tiled and planar 8/16-bit RGB/CMYK layouts.

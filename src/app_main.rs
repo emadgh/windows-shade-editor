@@ -58,6 +58,14 @@ const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
 const HISTORY_COMMIT_DELAY: Duration = Duration::from_millis(300);
 
 fn main() -> eframe::Result {
+    let startup_project = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("shade"))
+        });
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
@@ -66,11 +74,16 @@ fn main() -> eframe::Result {
             .with_min_inner_size([1100.0, 700.0]),
         ..Default::default()
     };
-
     eframe::run_native(
         "Shade Editor",
         native_options,
-        Box::new(|cc| Ok(Box::new(ShadeApp::new(cc)))),
+        Box::new(move |cc| {
+            let mut app = ShadeApp::new(cc);
+            if let Some(path) = startup_project.clone() {
+                app.open_project_path(path);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -442,6 +455,14 @@ impl ShadeApp {
         else {
             return;
         };
+        self.open_project_path(path);
+    }
+
+    fn open_project_path(&mut self, path: PathBuf) {
+        if self.job.is_some() {
+            return;
+        }
+        self.recovery_candidate = None;
         let max_dimension = self.settings.max_preview_dimension;
         let default_dpi = self.settings.default_dpi;
         self.launch_job("Opening project", move |progress| {
