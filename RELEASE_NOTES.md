@@ -1,3 +1,15 @@
+# Shade Editor 0.10.2
+
+Production export correctness and preview/Test Code workflow fixes.
+
+- Fixes corrupt LZW/Deflate/PackBits files produced by the strip-streaming exporter. image-tiff 0.11.x activates compression in `write_data()` but not direct `write_strip()` calls; Shade Editor now streams adjustments to a bounded disk-backed spool and memory-maps it into the library's correct compressed writer path.
+- Adds a regression test starting from a valid six-channel CMYK + 2 ExtraSamples LZW source with horizontal Predictor and fully decodes the exported TIFF byte-for-byte. Horizontal Predictor is intentionally omitted on export when ExtraSamples exist because image-tiff's built-in encoder predictor stride covers only the base RGB/CMYK samples; LZW compression itself is preserved.
+- Before/After right-click now uses the actual image interaction rectangle and egui clipping instead of comparing screen pointer coordinates with the ScrollArea's content-relative viewport, so it works correctly while zoomed/scrolled.
+- Settings now has **Rebuild previews** next to Preview max dimension to reload all open Faces at the newly selected preview size.
+- Test Code can target **All channels** (the new default) or one selected channel. All-channel mode writes the same rasterized code to every separation using each channel's correct ink polarity.
+- Adds a maintained roadmap document for the remaining production work.
+- `.shade` schema remains v9.
+
 # Shade Editor 0.10.1
 
 Production round-trip validator.

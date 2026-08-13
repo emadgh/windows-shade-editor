@@ -1,9 +1,10 @@
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use fontdue::{Font, FontSettings};
+use memmap2::MmapOptions;
 use tiff::encoder::{Compression, Predictor, TiffEncoder, colortype};
 use tiff::tags::{ExtraSamples, Tag};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -11,7 +12,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::dpi::{self, DpiInfo};
-use crate::model::{ShadeProject, TestCodePosition, apply_curve, apply_levels};
+use crate::model::{
+    ShadeProject, TEST_CODE_ALL_CHANNELS, TestCodePosition, apply_curve, apply_levels,
+};
 use crate::tiff_io::{
     ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_strip, stream_info,
 };
@@ -158,37 +161,11 @@ where
         }
     }
 
-    if project.test_code.enabled {
-        let text = project.effective_test_code_text();
-        if !text.trim().is_empty() {
-            if let Some(channel) = names
-                .iter()
-                .position(|name| name == &project.test_code.channel)
-            {
-                progress(0.82, "Rendering test code");
-                let target_value = if channel >= base_channels {
-                    0
-                } else {
-                    match decoded.metadata.color_model {
-                        ColorModel::Cmyk => u16::MAX,
-                        _ => 0,
-                    }
-                };
-                draw_test_code(
-                    &mut output,
-                    width,
-                    height,
-                    channels,
-                    channel,
-                    target_value,
-                    &text,
-                    project.test_code.font_size_pt,
-                    project.test_code.margin_cm,
-                    project.test_code.position,
-                    dpi_info,
-                )?;
-            }
-        }
+    if let Some(overlay) =
+        build_project_test_code_overlay(width, height, &decoded.metadata, project, dpi_info)?
+    {
+        progress(0.82, "Rendering test code");
+        apply_text_overlay_to_rows(&mut output, 0, height, width, channels, &overlay);
     }
 
     progress(0.88, "Writing TIFF");
@@ -276,6 +253,13 @@ where
     if channels == 0 || channels < base_channels {
         return Err("Invalid TIFF channel layout.".to_owned());
     }
+    if !matches!(metadata.bit_depth, 8 | 16) {
+        return Err(format!(
+            "Unsupported export bit depth/color model: {}-bit.",
+            metadata.bit_depth
+        ));
+    }
+
     let dpi_info = dpi::read_dpi(source, default_dpi);
     let overlay = build_project_test_code_overlay(
         metadata.width as usize,
@@ -284,102 +268,141 @@ where
         project,
         dpi_info,
     )?;
+    let spool_path = temporary_spool_path(destination)?;
 
-    progress(0.05, "Preparing streaming TIFF");
-    let file =
-        File::create(destination).map_err(|err| format!("Cannot create export TIFF: {err}"))?;
-    let writer = BufWriter::new(file);
-    let mut encoder = make_tiff_encoder(writer, metadata)?;
+    let result = (|| -> Result<(), String> {
+        progress(0.05, "Streaming adjustments to disk spool");
+        {
+            let spool_file = File::create(&spool_path)
+                .map_err(|err| format!("Cannot create export spool: {err}"))?;
+            let mut spool = BufWriter::new(spool_file);
+            match metadata.bit_depth {
+                8 => stream_spool_u8(
+                    source,
+                    stream,
+                    project,
+                    overlay.as_ref(),
+                    &mut spool,
+                    progress,
+                )?,
+                16 => stream_spool_u16(
+                    source,
+                    stream,
+                    project,
+                    overlay.as_ref(),
+                    &mut spool,
+                    progress,
+                )?,
+                _ => unreachable!(),
+            }
+            spool
+                .flush()
+                .map_err(|err| format!("Cannot flush export spool: {err}"))?;
+        }
 
-    match (metadata.color_model, metadata.bit_depth) {
-        (ColorModel::Rgb, 8) => {
-            let mut image = encoder
-                .new_image::<colortype::RGB8>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create RGB 8-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 3, metadata, dpi_info)?;
-            image
-                .rows_per_strip(stream.rows_per_strip)
-                .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            stream_write_u8(
-                source,
-                stream,
-                project,
-                overlay.as_ref(),
-                &mut image,
-                progress,
-            )?;
-            image
-                .finish()
-                .map_err(|err| format!("Cannot finalize TIFF: {err}"))?;
-        }
-        (ColorModel::Rgb, 16) => {
-            let mut image = encoder
-                .new_image::<colortype::RGB16>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create RGB 16-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 3, metadata, dpi_info)?;
-            image
-                .rows_per_strip(stream.rows_per_strip)
-                .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            stream_write_u16(
-                source,
-                stream,
-                project,
-                overlay.as_ref(),
-                &mut image,
-                progress,
-            )?;
-            image
-                .finish()
-                .map_err(|err| format!("Cannot finalize TIFF: {err}"))?;
-        }
-        (ColorModel::Cmyk, 8) => {
-            let mut image = encoder
-                .new_image::<colortype::CMYK8>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create CMYK 8-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 4, metadata, dpi_info)?;
-            image
-                .rows_per_strip(stream.rows_per_strip)
-                .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            stream_write_u8(
-                source,
-                stream,
-                project,
-                overlay.as_ref(),
-                &mut image,
-                progress,
-            )?;
-            image
-                .finish()
-                .map_err(|err| format!("Cannot finalize TIFF: {err}"))?;
-        }
-        (ColorModel::Cmyk, 16) => {
-            let mut image = encoder
-                .new_image::<colortype::CMYK16>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create CMYK 16-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 4, metadata, dpi_info)?;
-            image
-                .rows_per_strip(stream.rows_per_strip)
-                .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            stream_write_u16(
-                source,
-                stream,
-                project,
-                overlay.as_ref(),
-                &mut image,
-                progress,
-            )?;
-            image
-                .finish()
-                .map_err(|err| format!("Cannot finalize TIFF: {err}"))?;
-        }
-        (_, depth) => {
+        let bytes_per_sample = u64::from(metadata.bit_depth / 8);
+        let expected_bytes = u64::from(metadata.width)
+            .checked_mul(u64::from(metadata.height))
+            .and_then(|value| value.checked_mul(channels as u64))
+            .and_then(|value| value.checked_mul(bytes_per_sample))
+            .ok_or_else(|| "Export spool size overflow.".to_owned())?;
+        let actual_bytes = fs::metadata(&spool_path)
+            .map_err(|err| format!("Cannot inspect export spool: {err}"))?
+            .len();
+        if actual_bytes != expected_bytes {
             return Err(format!(
-                "Unsupported export bit depth/color model: {depth}-bit."
+                "Export spool size mismatch: wrote {actual_bytes} bytes, expected {expected_bytes}."
             ));
         }
-    }
-    progress(1.0, "Export complete");
-    Ok(())
+
+        // image-tiff 0.11.x only activates LZW/Deflate/PackBits in
+        // ImageEncoder::write_data(). Direct write_strip() calls do not turn
+        // the compressor on even though the Compression TIFF tag is present.
+        // Keep adjustment processing strip-streamed into a disk-backed spool,
+        // then memory-map that spool and let write_data() perform the final
+        // correctly compressed strip encoding without allocating the full
+        // image in RAM.
+        progress(0.72, "Compressing TIFF from disk-backed spool");
+        let spool_file =
+            File::open(&spool_path).map_err(|err| format!("Cannot reopen export spool: {err}"))?;
+        // SAFETY: this mapping is read-only, the spool file is no longer
+        // written after the map is created, and it stays open for the map's
+        // lifetime inside this closure.
+        let mmap = unsafe {
+            MmapOptions::new()
+                .map(&spool_file)
+                .map_err(|err| format!("Cannot map export spool: {err}"))?
+        };
+
+        let file =
+            File::create(destination).map_err(|err| format!("Cannot create export TIFF: {err}"))?;
+        let writer = BufWriter::new(file);
+        let mut encoder = make_tiff_encoder(writer, metadata)?;
+
+        match (metadata.color_model, metadata.bit_depth) {
+            (ColorModel::Rgb, 8) => {
+                let mut image = encoder
+                    .new_image::<colortype::RGB8>(metadata.width, metadata.height)
+                    .map_err(|err| format!("Cannot create RGB 8-bit TIFF image: {err}"))?;
+                configure_extras_and_metadata(&mut image, channels, 3, metadata, dpi_info)?;
+                image
+                    .rows_per_strip(stream.rows_per_strip)
+                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
+                image
+                    .write_data(&mmap[..])
+                    .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
+            }
+            (ColorModel::Rgb, 16) => {
+                let data = mmap_as_u16(&mmap)?;
+                let mut image = encoder
+                    .new_image::<colortype::RGB16>(metadata.width, metadata.height)
+                    .map_err(|err| format!("Cannot create RGB 16-bit TIFF image: {err}"))?;
+                configure_extras_and_metadata(&mut image, channels, 3, metadata, dpi_info)?;
+                image
+                    .rows_per_strip(stream.rows_per_strip)
+                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
+                image
+                    .write_data(data)
+                    .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
+            }
+            (ColorModel::Cmyk, 8) => {
+                let mut image = encoder
+                    .new_image::<colortype::CMYK8>(metadata.width, metadata.height)
+                    .map_err(|err| format!("Cannot create CMYK 8-bit TIFF image: {err}"))?;
+                configure_extras_and_metadata(&mut image, channels, 4, metadata, dpi_info)?;
+                image
+                    .rows_per_strip(stream.rows_per_strip)
+                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
+                image
+                    .write_data(&mmap[..])
+                    .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
+            }
+            (ColorModel::Cmyk, 16) => {
+                let data = mmap_as_u16(&mmap)?;
+                let mut image = encoder
+                    .new_image::<colortype::CMYK16>(metadata.width, metadata.height)
+                    .map_err(|err| format!("Cannot create CMYK 16-bit TIFF image: {err}"))?;
+                configure_extras_and_metadata(&mut image, channels, 4, metadata, dpi_info)?;
+                image
+                    .rows_per_strip(stream.rows_per_strip)
+                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
+                image
+                    .write_data(data)
+                    .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
+            }
+            (_, depth) => {
+                return Err(format!(
+                    "Unsupported export bit depth/color model: {depth}-bit."
+                ));
+            }
+        }
+
+        progress(1.0, "Export complete");
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&spool_path);
+    result
 }
 
 fn adjusted_strip(
@@ -429,22 +452,21 @@ fn adjusted_strip(
     output
 }
 
-fn stream_write_u8<W, C, K, F>(
+fn stream_spool_u8<W, F>(
     source: &Path,
     stream: &StreamInfo,
     project: &ShadeProject,
     overlay: Option<&TextOverlay>,
-    image: &mut tiff::encoder::ImageEncoder<'_, W, C, K>,
+    writer: &mut W,
     progress: &mut F,
 ) -> Result<(), String>
 where
-    W: std::io::Write + std::io::Seek,
-    C: tiff::encoder::colortype::ColorType<Inner = u8>,
-    K: tiff::encoder::TiffKind,
+    W: Write,
     F: FnMut(f32, &str),
 {
     let channels = stream.metadata.samples_per_pixel;
     let names = &stream.metadata.channel_names;
+    let width = stream.metadata.width as usize;
     for_each_decoded_strip(source, stream, |row_start, row_count, input| {
         let mut adjusted = adjusted_strip(input, channels, names, project);
         if let Some(overlay) = overlay {
@@ -452,7 +474,7 @@ where
                 &mut adjusted,
                 row_start as usize,
                 row_count as usize,
-                stream.metadata.width as usize,
+                width,
                 channels,
                 overlay,
             );
@@ -461,39 +483,38 @@ where
             .into_iter()
             .map(|value| (value >> 8) as u8)
             .collect::<Vec<_>>();
-        let expected = image.next_strip_sample_count() as usize;
+        let expected = row_count as usize * width * channels;
         if data.len() != expected {
             return Err(format!(
-                "Output strip sample mismatch: generated {}, encoder expects {expected}.",
+                "Output strip sample mismatch: generated {}, expected {expected}.",
                 data.len()
             ));
         }
-        image
-            .write_strip(&data)
-            .map_err(|err| format!("Cannot write TIFF strip: {err}"))?;
+        writer
+            .write_all(&data)
+            .map_err(|err| format!("Cannot write export spool: {err}"))?;
         let done =
             row_start.saturating_add(row_count) as f32 / stream.metadata.height.max(1) as f32;
-        progress(0.06 + done * 0.90, "Streaming adjustments and TIFF strips");
+        progress(0.06 + done * 0.60, "Streaming adjustments to disk spool");
         Ok(())
     })
 }
 
-fn stream_write_u16<W, C, K, F>(
+fn stream_spool_u16<W, F>(
     source: &Path,
     stream: &StreamInfo,
     project: &ShadeProject,
     overlay: Option<&TextOverlay>,
-    image: &mut tiff::encoder::ImageEncoder<'_, W, C, K>,
+    writer: &mut W,
     progress: &mut F,
 ) -> Result<(), String>
 where
-    W: std::io::Write + std::io::Seek,
-    C: tiff::encoder::colortype::ColorType<Inner = u16>,
-    K: tiff::encoder::TiffKind,
+    W: Write,
     F: FnMut(f32, &str),
 {
     let channels = stream.metadata.samples_per_pixel;
     let names = &stream.metadata.channel_names;
+    let width = stream.metadata.width as usize;
     for_each_decoded_strip(source, stream, |row_start, row_count, input| {
         let mut adjusted = adjusted_strip(input, channels, names, project);
         if let Some(overlay) = overlay {
@@ -501,25 +522,46 @@ where
                 &mut adjusted,
                 row_start as usize,
                 row_count as usize,
-                stream.metadata.width as usize,
+                width,
                 channels,
                 overlay,
             );
         }
-        let expected = image.next_strip_sample_count() as usize;
+        let expected = row_count as usize * width * channels;
         if adjusted.len() != expected {
             return Err(format!(
-                "Output strip sample mismatch: generated {}, encoder expects {expected}.",
+                "Output strip sample mismatch: generated {}, expected {expected}.",
                 adjusted.len()
             ));
         }
-        image
-            .write_strip(&adjusted)
-            .map_err(|err| format!("Cannot write TIFF strip: {err}"))?;
+        let mut bytes = Vec::with_capacity(adjusted.len().saturating_mul(2));
+        for value in adjusted {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        writer
+            .write_all(&bytes)
+            .map_err(|err| format!("Cannot write export spool: {err}"))?;
         let done =
             row_start.saturating_add(row_count) as f32 / stream.metadata.height.max(1) as f32;
-        progress(0.06 + done * 0.90, "Streaming adjustments and TIFF strips");
+        progress(0.06 + done * 0.60, "Streaming adjustments to disk spool");
         Ok(())
+    })
+}
+
+fn mmap_as_u16(mmap: &memmap2::Mmap) -> Result<&[u16], String> {
+    if mmap.len() % std::mem::size_of::<u16>() != 0 {
+        return Err("16-bit export spool has an odd byte length.".to_owned());
+    }
+    if (mmap.as_ptr() as usize) % std::mem::align_of::<u16>() != 0 {
+        return Err("16-bit export spool is not aligned for u16 samples.".to_owned());
+    }
+    // SAFETY: length and alignment are checked above. The read-only mmap stays
+    // alive for the returned slice lifetime and is never mutated concurrently.
+    Ok(unsafe {
+        std::slice::from_raw_parts(
+            mmap.as_ptr().cast::<u16>(),
+            mmap.len() / std::mem::size_of::<u16>(),
+        )
     })
 }
 
@@ -600,10 +642,36 @@ fn make_tiff_encoder(
     let mut encoder = TiffEncoder::new(writer)
         .map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?
         .with_compression(compression);
-    if metadata.predictor == Some(2) {
+    // image-tiff's encoder Predictor stride comes from the compile-time RGB/CMYK
+    // color type and does not include appended ExtraSamples. Preserve horizontal
+    // Predictor only when the TIFF has exactly the base channels; for Spot/extra
+    // channels, omit Predictor while preserving the lossless compression itself.
+    if metadata.predictor == Some(2) && metadata.samples_per_pixel == metadata.base_channel_count {
         encoder = encoder.with_predictor(Predictor::Horizontal);
     }
     Ok(encoder)
+}
+
+fn temporary_spool_path(destination: &Path) -> Result<PathBuf, String> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export.tif");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..32u32 {
+        let candidate = parent.join(format!(
+            ".{file_name}.shade-editor-spool-{}-{stamp}-{attempt}.raw",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("Cannot allocate a temporary export spool beside the destination.".to_owned())
 }
 
 fn temporary_export_path(destination: &Path) -> Result<PathBuf, String> {
@@ -671,9 +739,32 @@ fn find_windows_font(family: &str) -> Result<PathBuf, String> {
 struct TextOverlay {
     x0: usize,
     y0: usize,
-    target_channel: usize,
-    target_value: u16,
+    targets: Vec<(usize, u16)>,
     bitmap: TextBitmap,
+}
+
+fn test_code_target_value(metadata: &TiffMetadata, channel: usize) -> u16 {
+    if channel >= metadata.base_channel_count {
+        0
+    } else if metadata.color_model == ColorModel::Cmyk {
+        u16::MAX
+    } else {
+        0
+    }
+}
+
+fn test_code_targets(metadata: &TiffMetadata, project: &ShadeProject) -> Vec<(usize, u16)> {
+    if project.test_code.channel == TEST_CODE_ALL_CHANNELS {
+        return (0..metadata.samples_per_pixel)
+            .map(|channel| (channel, test_code_target_value(metadata, channel)))
+            .collect();
+    }
+    metadata
+        .channel_names
+        .iter()
+        .position(|name| name == &project.test_code.channel)
+        .map(|channel| vec![(channel, test_code_target_value(metadata, channel))])
+        .unwrap_or_default()
 }
 
 fn build_project_test_code_overlay(
@@ -690,25 +781,14 @@ fn build_project_test_code_overlay(
     if text.trim().is_empty() {
         return Ok(None);
     }
-    let Some(target_channel) = metadata
-        .channel_names
-        .iter()
-        .position(|name| name == &project.test_code.channel)
-    else {
+    let targets = test_code_targets(metadata, project);
+    if targets.is_empty() {
         return Ok(None);
-    };
-    let target_value = if target_channel >= metadata.base_channel_count {
-        0
-    } else if metadata.color_model == ColorModel::Cmyk {
-        u16::MAX
-    } else {
-        0
-    };
+    }
     build_text_overlay(
         width,
         height,
-        target_channel,
-        target_value,
+        targets,
         &text,
         project.test_code.font_size_pt,
         project.test_code.margin_cm,
@@ -721,8 +801,7 @@ fn build_project_test_code_overlay(
 fn build_text_overlay(
     width: usize,
     height: usize,
-    target_channel: usize,
-    target_value: u16,
+    targets: Vec<(usize, u16)>,
     text: &str,
     font_size_pt: f32,
     margin_cm: f32,
@@ -753,8 +832,7 @@ fn build_text_overlay(
     Ok(TextOverlay {
         x0,
         y0,
-        target_channel,
-        target_value,
+        targets,
         bitmap,
     })
 }
@@ -789,43 +867,17 @@ fn apply_text_overlay_to_rows(
             if x >= width {
                 continue;
             }
-            let index = (local_y * width + x) * channels + overlay.target_channel;
-            if index >= samples.len() {
-                continue;
+            for &(target_channel, target_value) in &overlay.targets {
+                let index = (local_y * width + x) * channels + target_channel;
+                if index >= samples.len() {
+                    continue;
+                }
+                let a = f32::from(alpha) / 255.0;
+                let current = samples[index] as f32;
+                samples[index] = (current * (1.0 - a) + target_value as f32 * a).round() as u16;
             }
-            let a = f32::from(alpha) / 255.0;
-            let current = samples[index] as f32;
-            samples[index] = (current * (1.0 - a) + overlay.target_value as f32 * a).round() as u16;
         }
     }
-}
-
-fn draw_test_code(
-    samples: &mut [u16],
-    width: usize,
-    height: usize,
-    channels: usize,
-    target_channel: usize,
-    target_value: u16,
-    text: &str,
-    font_size_pt: f32,
-    margin_cm: f32,
-    position: TestCodePosition,
-    dpi_info: DpiInfo,
-) -> Result<(), String> {
-    let overlay = build_text_overlay(
-        width,
-        height,
-        target_channel,
-        target_value,
-        text,
-        font_size_pt,
-        margin_cm,
-        position,
-        dpi_info,
-    )?;
-    apply_text_overlay_to_rows(samples, 0, height, width, channels, &overlay);
-    Ok(())
 }
 
 struct TextBitmap {
@@ -897,8 +949,23 @@ fn rasterize_text(font: &Font, text: &str, px: f32) -> TextBitmap {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
-    use tiff::encoder::{TiffEncoder, colortype};
+    use tiff::encoder::{Compression, TiffEncoder, colortype};
     use tiff::tags::ExtraSamples;
+
+    fn apply_dynamic_u8_predictor(data: &mut [u8], width: usize, height: usize, channels: usize) {
+        let row_samples = width * channels;
+        assert_eq!(data.len(), row_samples * height);
+        for row in 0..height {
+            let start = row * row_samples;
+            for x in (1..width).rev() {
+                for channel in 0..channels {
+                    let index = start + x * channels + channel;
+                    let previous = start + (x - 1) * channels + channel;
+                    data[index] = data[index].wrapping_sub(data[previous]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn streaming_identity_export_preserves_six_channels() {
@@ -919,18 +986,28 @@ mod streaming_tests {
 
         {
             let file = File::create(&source).unwrap();
-            let mut tiff = TiffEncoder::new(BufWriter::new(file)).unwrap();
+            let mut tiff = TiffEncoder::new(BufWriter::new(file))
+                .unwrap()
+                .with_compression(Compression::Lzw);
             let mut image = tiff.new_image::<colortype::CMYK8>(2, 2).unwrap();
             image
                 .extra_samples(&[ExtraSamples::Unspecified, ExtraSamples::Unspecified])
                 .unwrap();
+            // Build a valid six-channel Predictor=2 source without relying on
+            // image-tiff's base-CMYK predictor stride. The decoder must restore
+            // the original samples using SamplesPerPixel=6.
+            image.encoder().write_tag(Tag::Predictor, 2u16).unwrap();
             image.rows_per_strip(1).unwrap();
-            image.write_data(&pixels).unwrap();
+            let mut predicted = pixels.clone();
+            apply_dynamic_u8_predictor(&mut predicted, 2, 2, 6);
+            image.write_data(&predicted).unwrap();
         }
 
         let info = stream_info(&source).unwrap();
         assert!(info.streamable);
         assert_eq!(info.metadata.samples_per_pixel, 6);
+        assert_eq!(info.metadata.compression, Some(5));
+        assert_eq!(info.metadata.predictor, Some(2));
         let decoded_source = decode_full(&source).unwrap();
         let mut project = ShadeProject::default();
         project.ensure_channels(&decoded_source.metadata.channel_names);
@@ -941,6 +1018,10 @@ mod streaming_tests {
         let decoded_output = decode_full(&destination).unwrap();
         assert_eq!(decoded_output.metadata.samples_per_pixel, 6);
         assert_eq!(decoded_output.metadata.color_model, ColorModel::Cmyk);
+        assert_eq!(decoded_output.metadata.compression, Some(5));
+        // Predictor is intentionally normalized off for extra-channel TIFFs;
+        // decoded pixel/separation data must still be exactly identical.
+        assert_ne!(decoded_output.metadata.predictor, Some(2));
         assert_eq!(decoded_output.samples, decoded_source.samples);
 
         let _ = std::fs::remove_file(source);

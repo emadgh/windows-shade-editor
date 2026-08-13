@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone};
 use eframe::egui;
-use model::{ChannelAdjustment, ShadeProject, TestCodePosition};
+use model::{ChannelAdjustment, ShadeProject, TEST_CODE_ALL_CHANNELS, TestCodePosition};
 use palette::ChannelPalette;
 use settings::AppSettings;
 use tiff_io::PreviewFace;
@@ -115,6 +115,7 @@ enum JobResult {
         faces: Vec<LoadedFace>,
         errors: Vec<String>,
     },
+    RebuildPreviews(Result<Vec<LoadedFace>, String>),
     Open(Result<OpenPayload, String>),
     Recover(Result<RecoveryPayload, String>),
     Save {
@@ -392,6 +393,46 @@ impl ShadeApp {
             }
             Self::set_progress(&progress, Some(1.0), "Opening TIFF", "Complete");
             JobResult::AddFaces { faces, errors }
+        });
+    }
+
+    fn rebuild_previews(&mut self) {
+        if self.job.is_some() || self.faces.is_empty() {
+            return;
+        }
+        let paths = self
+            .faces
+            .iter()
+            .map(|face| face.path.clone())
+            .collect::<Vec<_>>();
+        let max_dimension = self.settings.max_preview_dimension;
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Rebuilding previews", move |progress| {
+            let result = (|| -> Result<Vec<LoadedFace>, String> {
+                let total = paths.len().max(1);
+                let mut faces = Vec::with_capacity(paths.len());
+                for (index, path) in paths.into_iter().enumerate() {
+                    Self::set_progress(
+                        &progress,
+                        Some(index as f32 / total as f32),
+                        "Rebuilding previews",
+                        &path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    );
+                    let preview = tiff_io::load_preview(&path, max_dimension)
+                        .map_err(|err| format!("{}: {err}", path.display()))?;
+                    faces.push(LoadedFace {
+                        dpi: dpi::read_dpi(&path, default_dpi),
+                        path,
+                        preview,
+                    });
+                }
+                Self::set_progress(&progress, Some(1.0), "Rebuilding previews", "Complete");
+                Ok(faces)
+            })();
+            JobResult::RebuildPreviews(result)
         });
     }
 
@@ -869,6 +910,38 @@ impl ShadeApp {
                     ));
                 }
             }
+            JobResult::RebuildPreviews(result) => match result {
+                Ok(items) => {
+                    let old_generations = self
+                        .faces
+                        .iter()
+                        .map(|face| face.generation)
+                        .collect::<Vec<_>>();
+                    self.faces = items.into_iter().map(Self::make_runtime_face).collect();
+                    for (face, old_generation) in
+                        self.faces.iter_mut().zip(old_generations.into_iter())
+                    {
+                        face.generation = old_generation.wrapping_add(1).max(1);
+                    }
+                    self.current_face = self.current_face.min(self.faces.len().saturating_sub(1));
+                    if let Some(face) = self.faces.get(self.current_face) {
+                        let count = face.preview.metadata.channel_names.len();
+                        self.selected_channel = self.selected_channel.min(count.saturating_sub(1));
+                        if self.solo_channel.is_some_and(|channel| channel >= count) {
+                            self.solo_channel = None;
+                        }
+                    }
+                    self.render_busy = None;
+                    self.fit_requested = true;
+                    self.viewport_recenter = true;
+                    self.report_info(format!(
+                        "Rebuilt {} preview(s) at max dimension {}",
+                        self.faces.len(),
+                        self.settings.max_preview_dimension
+                    ));
+                }
+                Err(err) => self.report_error(format!("Preview rebuild failed: {err}")),
+            },
             JobResult::Open(result) => match result {
                 Ok(payload) => {
                     self.project = payload.project;
@@ -1999,18 +2072,31 @@ impl ShadeApp {
                 )
                 .changed();
             if !channel_names.is_empty() {
-                let selected_index = channel_names
-                    .iter()
-                    .position(|name| name == &self.project.test_code.channel)
-                    .unwrap_or(0);
-                let selected_display = channel_display_name(
-                    palette.as_ref(),
-                    &channel_names[selected_index],
-                    selected_index,
-                );
+                let selected_display = if self.project.test_code.channel == TEST_CODE_ALL_CHANNELS {
+                    "All channels".to_owned()
+                } else {
+                    let selected_index = channel_names
+                        .iter()
+                        .position(|name| name == &self.project.test_code.channel)
+                        .unwrap_or(0);
+                    channel_display_name(
+                        palette.as_ref(),
+                        &channel_names[selected_index],
+                        selected_index,
+                    )
+                    .to_owned()
+                };
                 egui::ComboBox::from_label("Ink / channel")
                     .selected_text(selected_display)
                     .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.project.test_code.channel,
+                                TEST_CODE_ALL_CHANNELS.to_owned(),
+                                "All channels",
+                            )
+                            .changed();
+                        ui.separator();
                         for (index, name) in channel_names.iter().enumerate() {
                             let display = channel_display_name(palette.as_ref(), name, index);
                             changed |= ui
@@ -2751,13 +2837,8 @@ impl ShadeApp {
                 );
                 let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
                 let image_rect = egui::Rect::from_center_size(canvas_rect.center(), image_size);
-                let show_before = ui.input(|input| {
-                    input.pointer.secondary_down()
-                        && input
-                            .pointer
-                            .hover_pos()
-                            .is_some_and(|pos| viewport.contains(pos))
-                });
+                let show_before = ui.input(|input| input.pointer.secondary_down())
+                    && ui.rect_contains_pointer(image_rect);
                 let display_texture = if show_before {
                     original_texture.as_ref().unwrap_or(&texture)
                 } else {
@@ -2818,6 +2899,7 @@ impl ShadeApp {
             return;
         }
         let mut open = self.show_settings;
+        let mut rebuild_previews_requested = false;
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(true)
@@ -2836,12 +2918,25 @@ impl ShadeApp {
                     .checkbox(&mut self.settings.dark_mode, "Dark mode")
                     .changed();
                 changed |= dark_changed;
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.settings.max_preview_dimension, 600..=4000)
-                            .text("Preview max dimension"),
-                    )
-                    .changed();
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.settings.max_preview_dimension, 600..=4000)
+                                .text("Preview max dimension"),
+                        )
+                        .changed();
+                    if ui
+                        .add_enabled(
+                            !self.faces.is_empty() && self.job.is_none(),
+                            egui::Button::new("Rebuild previews"),
+                        )
+                        .on_hover_text("Reload all current TIFF Faces using this preview size")
+                        .clicked()
+                    {
+                        rebuild_previews_requested = true;
+                    }
+                });
+                ui.small("The max dimension is used when TIFF previews are loaded. Use Rebuild previews to apply a changed value to Faces already open in this project.");
                 let old_default_dpi = self.settings.default_dpi;
                 changed |= ui
                     .add(
@@ -3021,6 +3116,9 @@ impl ShadeApp {
                 });
             });
         self.show_settings = open;
+        if rebuild_previews_requested {
+            self.rebuild_previews();
+        }
     }
 
     fn ui_about_window(&mut self, ctx: &egui::Context) {
