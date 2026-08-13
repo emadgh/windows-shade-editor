@@ -22,11 +22,11 @@ pub struct PreviousShadeEntry {
 impl Default for PreviousShadeEntry {
     fn default() -> Self {
         Self {
-  path: String::new(),
-  project_name: String::new(),
-  last_opened_unix_ms: 0,
-  saved_at_unix_ms: 0,
-  open_count: 0,
+            path: String::new(),
+            project_name: String::new(),
+            last_opened_unix_ms: 0,
+            saved_at_unix_ms: 0,
+            open_count: 0,
         }
     }
 }
@@ -49,10 +49,10 @@ pub enum PreviousShadesSort {
 impl PreviousShadesSort {
     pub fn label(self) -> &'static str {
         match self {
-  Self::LastOpened => "Last opened",
-  Self::ProjectName => "Project name",
-  Self::SavedAt => "Saved time",
-  Self::Path => "Path",
+            Self::LastOpened => "Last opened",
+            Self::ProjectName => "Project name",
+            Self::SavedAt => "Saved time",
+            Self::Path => "Path",
         }
     }
 }
@@ -85,10 +85,10 @@ impl PreviousShadesStore {
     pub fn load() -> Result<Self, String> {
         let path = history_path();
         let Ok(text) = fs::read_to_string(&path) else {
-  return Ok(Self::default());
+            return Ok(Self::default());
         };
         let mut store: Self = serde_json::from_str(&text)
-  .map_err(|err| format!("Cannot parse Previous Shades history: {err}"))?;
+            .map_err(|err| format!("Cannot parse Previous Shades history: {err}"))?;
         store.sanitize();
         Ok(store)
     }
@@ -96,13 +96,12 @@ impl PreviousShadesStore {
     pub fn save(&self) -> Result<(), String> {
         let path = history_path();
         if let Some(parent) = path.parent() {
-  fs::create_dir_all(parent)
-      .map_err(|err| format!("Cannot create Previous Shades directory: {err}"))?;
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Cannot create Previous Shades directory: {err}"))?;
         }
         let text = serde_json::to_string_pretty(self)
-  .map_err(|err| format!("Cannot serialize Previous Shades history: {err}"))?;
-        fs::write(path, text)
-  .map_err(|err| format!("Cannot save Previous Shades history: {err}"))
+            .map_err(|err| format!("Cannot serialize Previous Shades history: {err}"))?;
+        fs::write(path, text).map_err(|err| format!("Cannot save Previous Shades history: {err}"))
     }
 
     pub fn entries(&self) -> &[PreviousShadeEntry] {
@@ -114,59 +113,63 @@ impl PreviousShadesStore {
         let display = normalized.to_string_lossy().into_owned();
         let now = unix_ms_now();
         let saved_at = ShadeProject::load(path)
-  .ok()
-  .and_then(|project| project.file_metadata.map(|metadata| metadata.saved_at_unix_ms))
-  .unwrap_or_else(|| {
-      fs::metadata(path)
-          .ok()
-          .and_then(|metadata| metadata.modified().ok())
-          .and_then(system_time_to_unix_ms)
-          .unwrap_or(0)
-  });
+            .ok()
+            .and_then(|project| {
+                project
+                    .file_metadata
+                    .map(|metadata| metadata.saved_at_unix_ms)
+            })
+            .unwrap_or_else(|| {
+                fs::metadata(path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(system_time_to_unix_ms)
+                    .unwrap_or(0)
+            });
         if let Some(entry) = self
-  .entries
-  .iter_mut()
-  .find(|entry| same_path(&entry.path, &display))
+            .entries
+            .iter_mut()
+            .find(|entry| same_path(&entry.path, &display))
         {
-  entry.path = display;
-  entry.project_name = project_name.trim().to_owned();
-  entry.last_opened_unix_ms = now;
-  entry.saved_at_unix_ms = saved_at;
-  entry.open_count = entry.open_count.saturating_add(1).max(1);
+            entry.path = display;
+            entry.project_name = project_name.trim().to_owned();
+            entry.last_opened_unix_ms = now;
+            entry.saved_at_unix_ms = saved_at;
+            entry.open_count = entry.open_count.saturating_add(1).max(1);
         } else {
-  self.entries.push(PreviousShadeEntry {
-      path: display,
-      project_name: project_name.trim().to_owned(),
-      last_opened_unix_ms: now,
-      saved_at_unix_ms: saved_at,
-      open_count: 1,
-  });
+            self.entries.push(PreviousShadeEntry {
+                path: display,
+                project_name: project_name.trim().to_owned(),
+                last_opened_unix_ms: now,
+                saved_at_unix_ms: saved_at,
+                open_count: 1,
+            });
         }
     }
 
     fn sanitize(&mut self) {
         let mut sanitized: Vec<PreviousShadeEntry> = Vec::new();
         for mut entry in self.entries.drain(..) {
-  entry.path = entry.path.trim().to_owned();
-  entry.project_name = entry.project_name.trim().to_owned();
-  if entry.path.is_empty() {
-      continue;
-  }
-  if let Some(existing) = sanitized
-      .iter_mut()
-      .find(|existing| same_path(&existing.path, &entry.path))
-  {
-      if entry.last_opened_unix_ms >= existing.last_opened_unix_ms {
-          existing.path = entry.path;
-          existing.project_name = entry.project_name;
-          existing.last_opened_unix_ms = entry.last_opened_unix_ms;
-          existing.saved_at_unix_ms = entry.saved_at_unix_ms;
-      }
-      existing.open_count = existing.open_count.max(entry.open_count).max(1);
-  } else {
-      entry.open_count = entry.open_count.max(1);
-      sanitized.push(entry);
-  }
+            entry.path = entry.path.trim().to_owned();
+            entry.project_name = entry.project_name.trim().to_owned();
+            if entry.path.is_empty() {
+                continue;
+            }
+            if let Some(existing) = sanitized
+                .iter_mut()
+                .find(|existing| same_path(&existing.path, &entry.path))
+            {
+                if entry.last_opened_unix_ms >= existing.last_opened_unix_ms {
+                    existing.path = entry.path;
+                    existing.project_name = entry.project_name;
+                    existing.last_opened_unix_ms = entry.last_opened_unix_ms;
+                    existing.saved_at_unix_ms = entry.saved_at_unix_ms;
+                }
+                existing.open_count = existing.open_count.max(entry.open_count).max(1);
+            } else {
+                entry.open_count = entry.open_count.max(1);
+                sanitized.push(entry);
+            }
         }
         self.entries = sanitized;
     }
@@ -194,15 +197,15 @@ pub fn inspect(path: &Path) -> Result<ShadeInspection, String> {
         .unwrap_or(0);
     let active_face = metadata.as_ref().and_then(|metadata| {
         metadata
-  .faces
-  .get(active_face_index)
-  .or_else(|| metadata.faces.first())
-  .cloned()
+            .faces
+            .get(active_face_index)
+            .or_else(|| metadata.faces.first())
+            .cloned()
     });
     let (thumbnail, thumbnail_error) = match project.thumbnail.as_ref() {
         Some(thumbnail) => match decode_thumbnail(thumbnail) {
-  Ok(decoded) => (Some(decoded), None),
-  Err(err) => (None, Some(err)),
+            Ok(decoded) => (Some(decoded), None),
+            Err(err) => (None, Some(err)),
         },
         None => (None, None),
     };
@@ -231,8 +234,8 @@ pub fn inspect(path: &Path) -> Result<ShadeInspection, String> {
 fn decode_thumbnail(thumbnail: &ProjectThumbnail) -> Result<DecodedThumbnail, String> {
     if !thumbnail.mime_type.eq_ignore_ascii_case("image/png") {
         return Err(format!(
-  "Unsupported project thumbnail type: {}",
-  thumbnail.mime_type
+            "Unsupported project thumbnail type: {}",
+            thumbnail.mime_type
         ));
     }
     let bytes = BASE64_STANDARD
