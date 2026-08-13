@@ -787,3 +787,56 @@ fn rasterize_text(font: &Font, text: &str, px: f32) -> TextBitmap {
         alpha,
     }
 }
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use tiff::encoder::{TiffEncoder, colortype};
+    use tiff::tags::ExtraSamples;
+
+    #[test]
+    fn streaming_identity_export_preserves_six_channels() {
+        let unique = format!(
+            "shade-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source = std::env::temp_dir().join(format!("{unique}-source.tif"));
+        let destination = std::env::temp_dir().join(format!("{unique}-export.tif"));
+        let pixels = vec![
+            1u8, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+            160, 170, 180,
+        ];
+
+        {
+            let file = File::create(&source).unwrap();
+            let mut tiff = TiffEncoder::new(BufWriter::new(file)).unwrap();
+            let mut image = tiff.new_image::<colortype::CMYK8>(2, 2).unwrap();
+            image
+                .extra_samples(&[ExtraSamples::Unspecified, ExtraSamples::Unspecified])
+                .unwrap();
+            image.rows_per_strip(1).unwrap();
+            image.write_data(&pixels).unwrap();
+        }
+
+        let info = stream_info(&source).unwrap();
+        assert!(info.streamable);
+        assert_eq!(info.metadata.samples_per_pixel, 6);
+        let decoded_source = decode_full(&source).unwrap();
+        let mut project = ShadeProject::default();
+        project.ensure_channels(&decoded_source.metadata.channel_names);
+
+        export_face_with_progress(&source, &destination, &project, 220.0, |_, _| {}).unwrap();
+
+        let decoded_output = decode_full(&destination).unwrap();
+        assert_eq!(decoded_output.metadata.samples_per_pixel, 6);
+        assert_eq!(decoded_output.metadata.color_model, ColorModel::Cmyk);
+        assert_eq!(decoded_output.samples, decoded_source.samples);
+
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(destination);
+    }
+}
