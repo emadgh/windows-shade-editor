@@ -1,14 +1,15 @@
 [package]
 name = "windows-shade-editor"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2024"
 description = "Native multi-channel TIFF shade editor for digital ceramic printing"
 license = "MIT"
 autobins = false
+build = "build.rs"
 
 [[bin]]
 name = "ShadeEditor"
-path = "src/app_main.rs"
+path = "src/entry_v0103.rs"
 
 [dependencies]
 eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
