@@ -37,8 +37,24 @@ fn cleanup(source: PathBuf, output: PathBuf) {
 }
 
 fn export_identity(source: &std::path::Path, output: &std::path::Path) {
+    export_identity_with_options(source, output, true);
+}
+
+fn export_identity_with_options(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    force_lzw: bool,
+) {
     let project = identity_project(source);
-    export::export_face_with_progress(source, output, &project, 220.0, |_, _| {}).unwrap();
+    export::export_face_with_progress_options(
+        source,
+        output,
+        &project,
+        220.0,
+        export::ExportOptions { force_lzw },
+        |_, _| {},
+    )
+    .unwrap();
 }
 
 fn write_rgb8_source(path: &std::path::Path, compression: Compression, predictor: bool) -> Vec<u8> {
@@ -57,11 +73,16 @@ fn write_rgb8_source(path: &std::path::Path, compression: Compression, predictor
     pixels
 }
 
-fn assert_rgb8_compression(compression: Compression, expected_tag: u16, label: &str) {
+fn assert_rgb8_compression(
+    compression: Compression,
+    expected_tag: u16,
+    label: &str,
+    force_lzw: bool,
+) {
     let (source, output) = temp_paths(label);
     write_rgb8_source(&source, compression, false);
     let source_decoded = tiff_io::decode_full(&source).unwrap();
-    export_identity(&source, &output);
+    export_identity_with_options(&source, &output, force_lzw);
     let exported = tiff_io::decode_full(&output).unwrap();
     assert_eq!(exported.metadata.color_model, ColorModel::Rgb);
     assert_eq!(exported.metadata.bit_depth, 8);
@@ -71,14 +92,28 @@ fn assert_rgb8_compression(compression: Compression, expected_tag: u16, label: &
 }
 
 #[test]
-fn identity_export_preserves_supported_lossless_compressions() {
-    assert_rgb8_compression(Compression::Uncompressed, 1, "uncompressed");
-    assert_rgb8_compression(Compression::Lzw, 5, "lzw");
-    assert_rgb8_compression(Compression::Packbits, 32773, "packbits");
+fn identity_export_defaults_to_lzw_for_supported_lossless_sources() {
+    assert_rgb8_compression(Compression::Uncompressed, 5, "uncompressed-to-lzw", true);
+    assert_rgb8_compression(Compression::Lzw, 5, "lzw-to-lzw", true);
+    assert_rgb8_compression(Compression::Packbits, 5, "packbits-to-lzw", true);
+    assert_rgb8_compression(
+        Compression::Deflate(tiff::encoder::DeflateLevel::Balanced),
+        5,
+        "deflate-to-lzw",
+        true,
+    );
+}
+
+#[test]
+fn identity_export_can_preserve_supported_lossless_compressions_when_lzw_is_disabled() {
+    assert_rgb8_compression(Compression::Uncompressed, 1, "keep-uncompressed", false);
+    assert_rgb8_compression(Compression::Lzw, 5, "keep-lzw", false);
+    assert_rgb8_compression(Compression::Packbits, 32773, "keep-packbits", false);
     assert_rgb8_compression(
         Compression::Deflate(tiff::encoder::DeflateLevel::Balanced),
         8,
-        "deflate",
+        "keep-deflate",
+        false,
     );
 }
 
