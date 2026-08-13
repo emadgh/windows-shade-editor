@@ -28,6 +28,7 @@ jobs:
         run: |
           python scripts/apply_v0102_fixes.py
           python scripts/fix_v0102_compile.py
+          python scripts/fix_v0102_predictor.py
           cargo fmt --all
           cargo check --target x86_64-pc-windows-msvc
           cargo test --target x86_64-pc-windows-msvc
@@ -36,7 +37,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock src/app_main.rs src/model_v6.rs src/export_v6.rs RELEASE_NOTES.md docs/ROADMAP.md
-          git rm scripts/apply_v0102_fixes.py scripts/fix_v0102_compile.py .github/workflows/apply-v0102-fixes.yml
+          git add Cargo.toml Cargo.lock src/app_main.rs src/model_v6.rs src/export_v6.rs src/validation.rs RELEASE_NOTES.md docs/ROADMAP.md
+          git rm scripts/apply_v0102_fixes.py scripts/fix_v0102_compile.py scripts/fix_v0102_predictor.py .github/workflows/apply-v0102-fixes.yml
           git commit -m "Fix compressed TIFF export and preview workflow"
           git push origin HEAD:fix/v0102-export-preview-testcode
