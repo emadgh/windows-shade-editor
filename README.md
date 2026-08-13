@@ -22,6 +22,7 @@ Shade Editor keeps source TIFF faces unchanged and stores color-adjustment recip
 - Parse Photoshop Spot display color/Solidity for preview and distinguish declared Spot vs Alpha channels.
 - Stream normal chunky strip TIFF preview/export with bounded working buffers.
 - Atomic same-directory TIFF export replacement to avoid partial destination files.
+- One-click current-Face production round-trip validation with pixel and critical TIFF/Photoshop metadata comparison reports.
 - Automatic GitHub Release update checking/downloading with SHA-256 asset verification, enabled by default and disableable in Settings.
 - About window with application version and manual update check.
 

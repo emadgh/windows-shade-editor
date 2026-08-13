@@ -17,6 +17,7 @@ mod thumbnail;
 mod tiff_io;
 #[path = "update_v4.rs"]
 mod update;
+mod validation;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -549,6 +550,49 @@ impl ShadeApp {
                 },
             )
             .map(|_| format!("Exported {}", destination.display()));
+            JobResult::Export(SnapshotExportBatchResult {
+                result,
+                marks: Vec::new(),
+            })
+        });
+    }
+
+    fn validate_current_face_dialog(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(face) = self.faces.get(self.current_face) else {
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(parent) = face.path.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(folder) = dialog.pick_folder() else {
+            return;
+        };
+        let source = face.path.clone();
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Validating TIFF", move |progress| {
+            let result = validation::validate_no_adjustment_roundtrip(
+                &source,
+                &folder,
+                default_dpi,
+                |fraction, detail| {
+                    Self::set_progress(&progress, Some(fraction), "Validating TIFF", detail);
+                },
+            )
+            .map(|artifacts| {
+                let result = if artifacts.report.passed {
+                    "PASS"
+                } else {
+                    "FAIL"
+                };
+                format!(
+                    "TIFF round-trip {result} · report {}",
+                    artifacts.markdown_path.display()
+                )
+            });
             JobResult::Export(SnapshotExportBatchResult {
                 result,
                 marks: Vec::new(),
@@ -1131,6 +1175,16 @@ impl ShadeApp {
                     .clicked()
                 {
                     self.export_all_dialog();
+                }
+                if ui
+                    .add_enabled(
+                        enabled && !self.faces.is_empty(),
+                        egui::Button::new("Validate face"),
+                    )
+                    .on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.")
+                    .clicked()
+                {
+                    self.validate_current_face_dialog();
                 }
                 ui.separator();
                 if ui.button("Settings").clicked() {

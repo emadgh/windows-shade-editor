@@ -43,7 +43,10 @@ where
     F: FnMut(f32, &str),
 {
     if !source.is_file() {
-        return Err(format!("Validation source does not exist: {}", source.display()));
+        return Err(format!(
+            "Validation source does not exist: {}",
+            source.display()
+        ));
     }
     fs::create_dir_all(output_folder)
         .map_err(|err| format!("Cannot create validation folder: {err}"))?;
@@ -142,7 +145,10 @@ where
         "Decompressed samples",
         source_decoded.samples == exported_decoded.samples,
         if source_decoded.samples == exported_decoded.samples {
-            format!("{} samples are byte-for-byte equivalent after decode", source_decoded.samples.len())
+            format!(
+                "{} samples are byte-for-byte equivalent after decode",
+                source_decoded.samples.len()
+            )
         } else {
             sample_difference_detail(&source_decoded.samples, &exported_decoded.samples)
         },
@@ -208,8 +214,14 @@ where
         source_decoded.metadata.photoshop_image_source_data
             == exported_decoded.metadata.photoshop_image_source_data,
         byte_payload_detail(
-            source_decoded.metadata.photoshop_image_source_data.as_deref(),
-            exported_decoded.metadata.photoshop_image_source_data.as_deref(),
+            source_decoded
+                .metadata
+                .photoshop_image_source_data
+                .as_deref(),
+            exported_decoded
+                .metadata
+                .photoshop_image_source_data
+                .as_deref(),
         ),
     );
     push_check(
@@ -217,10 +229,7 @@ where
         "Photoshop Spot display metadata",
         source_decoded.metadata.channel_display_info
             == exported_decoded.metadata.channel_display_info,
-        spot_display_detail(
-            &source_decoded.metadata,
-            &exported_decoded.metadata,
-        ),
+        spot_display_detail(&source_decoded.metadata, &exported_decoded.metadata),
     );
 
     let dpi_matches = dpi_equivalent(source_dpi, exported_dpi);
@@ -256,7 +265,14 @@ where
         .map_err(|err| format!("Cannot write validation JSON report: {err}"))?;
     fs::write(&markdown_path, markdown_report(&report))
         .map_err(|err| format!("Cannot write validation Markdown report: {err}"))?;
-    progress(1.0, if passed { "Validation PASS" } else { "Validation FAIL" });
+    progress(
+        1.0,
+        if passed {
+            "Validation PASS"
+        } else {
+            "Validation FAIL"
+        },
+    );
 
     Ok(ValidationArtifacts {
         report,
@@ -291,7 +307,11 @@ fn dpi_equivalent(source: dpi::DpiInfo, output: dpi::DpiInfo) -> bool {
 
 fn sample_difference_detail(source: &[u16], output: &[u16]) -> String {
     if source.len() != output.len() {
-        return format!("sample count differs: source={}, export={}", source.len(), output.len());
+        return format!(
+            "sample count differs: source={}, export={}",
+            source.len(),
+            output.len()
+        );
     }
     let mut differences = 0usize;
     let mut first = None;
@@ -315,7 +335,11 @@ fn byte_payload_detail(source: Option<&[u8]>, output: Option<&[u8]>) -> String {
     match (source, output) {
         (None, None) => "absent in both source and export".to_owned(),
         (Some(a), Some(b)) if a == b => format!("preserved exactly ({} bytes)", a.len()),
-        (Some(a), Some(b)) => format!("payload differs: source={} bytes, export={} bytes", a.len(), b.len()),
+        (Some(a), Some(b)) => format!(
+            "payload differs: source={} bytes, export={} bytes",
+            a.len(),
+            b.len()
+        ),
         (Some(a), None) => format!("lost on export (source={} bytes)", a.len()),
         (None, Some(b)) => format!("unexpected payload added on export ({} bytes)", b.len()),
     }
@@ -345,7 +369,11 @@ fn spot_display_detail(source: &TiffMetadata, output: &TiffMetadata) -> String {
             .collect::<Vec<_>>()
             .join("; ")
     };
-    format!("source=[{}], export=[{}]", summarize(source), summarize(output))
+    format!(
+        "source=[{}], export=[{}]",
+        summarize(source),
+        summarize(output)
+    )
 }
 
 fn markdown_report(report: &RoundtripValidationReport) -> String {
@@ -401,8 +429,8 @@ mod tests {
         fs::create_dir_all(&folder).unwrap();
         let source = folder.join("source.tif");
         let pixels = vec![
-            1u8, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120,
-            130, 140, 150, 160, 170, 180,
+            1u8, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+            160, 170, 180,
         ];
         {
             let file = File::create(&source).unwrap();
