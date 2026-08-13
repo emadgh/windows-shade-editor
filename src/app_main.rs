@@ -2044,6 +2044,7 @@ impl ShadeApp {
             .collect::<Vec<_>>();
         let base_count = face.preview.metadata.base_channel_count;
         let color_model = face.preview.metadata.color_model;
+        let photoshop_display = face.preview.metadata.channel_display_info.clone();
         if channel_names.is_empty() {
             return;
         }
@@ -2100,11 +2101,33 @@ impl ShadeApp {
         ));
         ui.add_space(3.0);
         for (index, name) in channel_names.iter().enumerate() {
-            let suffix = if index >= base_count { "  spot" } else { "" };
-            let accent = channel_color(active_palette.as_ref(), name, index);
+            let display_info = photoshop_display.get(index).and_then(|value| *value);
+            let suffix = if index >= base_count {
+                match display_info {
+                    Some(info) if info.is_spot() => "  spot",
+                    Some(_) => "  alpha",
+                    None => "  extra",
+                }
+            } else {
+                ""
+            };
+            let accent = channel_color_with_photoshop(
+                active_palette.as_ref(),
+                &photoshop_display,
+                name,
+                index,
+            );
             let is_solo = self.solo_channel == Some(index);
             let display_name = channel_display_name(active_palette.as_ref(), name, index);
             let label = format!("{display_name}{suffix}");
+            let hover = match display_info {
+                Some(info) if info.is_spot() => format!(
+                    "Photoshop Spot Channel · Solidity {:.0}% · click to select; click again to toggle solo preview.",
+                    info.solidity * 100.0
+                ),
+                Some(_) => "Photoshop Alpha/auxiliary channel · click to select; click again to toggle solo preview.".to_owned(),
+                None => "Extra TIFF channel (Spot/Alpha type not declared) · click to select; click again to toggle solo preview.".to_owned(),
+            };
             let response = clickable_channel_row(
                 ui,
                 self.selected_channel == index,
@@ -2113,7 +2136,7 @@ impl ShadeApp {
                 accent,
                 32.0,
             )
-            .on_hover_text("Click to select for editing. Click the active channel again to toggle solo preview.");
+            .on_hover_text(hover);
             if response.clicked() {
                 self.select_channel(index, true);
             }
@@ -2137,10 +2160,14 @@ impl ShadeApp {
         });
         if self.settings.show_all_histograms {
             for (index, name) in channel_names.iter().enumerate() {
-                let accent = self
-                    .settings
-                    .colorize_histograms
-                    .then(|| channel_color(active_palette.as_ref(), name, index));
+                let accent = self.settings.colorize_histograms.then(|| {
+                    channel_color_with_photoshop(
+                        active_palette.as_ref(),
+                        &photoshop_display,
+                        name,
+                        index,
+                    )
+                });
                 let display = channel_display_name(active_palette.as_ref(), name, index);
                 ui.colored_label(accent.unwrap_or(ui.visuals().text_color()), display);
                 draw_histogram(
@@ -2152,10 +2179,14 @@ impl ShadeApp {
             }
         } else {
             let index = self.selected_channel;
-            let accent = self
-                .settings
-                .colorize_histograms
-                .then(|| channel_color(active_palette.as_ref(), &channel_names[index], index));
+            let accent = self.settings.colorize_histograms.then(|| {
+                channel_color_with_photoshop(
+                    active_palette.as_ref(),
+                    &photoshop_display,
+                    &channel_names[index],
+                    index,
+                )
+            });
             let display =
                 channel_display_name(active_palette.as_ref(), &channel_names[index], index);
             ui.strong(format!("Histogram - {display}"));
@@ -3669,6 +3700,35 @@ fn channel_color(palette: Option<&ChannelPalette>, name: &str, index: usize) -> 
         .map(|palette| palette.color(name, index))
         .unwrap_or_else(|| palette::fallback_channel_color(name, index));
     egui::Color32::from_rgb(r, g, b)
+}
+
+fn channel_color_with_photoshop(
+    palette: Option<&ChannelPalette>,
+    photoshop_display: &[Option<tiff_io::PhotoshopChannelDisplay>],
+    name: &str,
+    index: usize,
+) -> egui::Color32 {
+    // Explicit project palette entries always win. For channels beyond the
+    // configured palette, use the TIFF's Photoshop Spot display color before
+    // falling back to the deterministic generic palette.
+    if palette
+        .and_then(|palette| palette.channels.get(index))
+        .is_some()
+    {
+        return channel_color(palette, name, index);
+    }
+    if let Some(info) = photoshop_display.get(index).and_then(|value| *value) {
+        if info.is_spot() {
+            if let Some([r, g, b]) = info.rgb {
+                return egui::Color32::from_rgb(
+                    (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                );
+            }
+        }
+    }
+    channel_color(palette, name, index)
 }
 
 fn palette_entry_readonly(ui: &mut egui::Ui, entry: &palette::ChannelPaletteEntry) {

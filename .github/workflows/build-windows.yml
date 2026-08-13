@@ -34,7 +34,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifact | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/ShadeEditor.exe artifact/ShadeEditor.exe
+          $exe = "target/x86_64-pc-windows-msvc/release/ShadeEditor.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  ShadeEditor.exe" | Set-Content -Encoding ascii -NoNewline "target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256"
+          Copy-Item $exe artifact/ShadeEditor.exe
+          Copy-Item target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256 artifact/ShadeEditor.exe.sha256
           Copy-Item README.md artifact/README.md
           Copy-Item LICENSE artifact/LICENSE
       - uses: actions/upload-artifact@v4
@@ -49,6 +53,7 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" `
             target/x86_64-pc-windows-msvc/release/ShadeEditor.exe `
+            target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256 `
             --title "Shade Editor ${{ github.ref_name }}" `
             --notes-file RELEASE_NOTES.md `
             --latest

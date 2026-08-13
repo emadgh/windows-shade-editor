@@ -8,11 +8,13 @@ use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use windows_sys::Win32::Networking::WinHttp::*;
 
 const REPOSITORY: &str = "emadgh/windows-shade-editor";
 const API_HOST: &str = "api.github.com";
 const ASSET_NAME: &str = "ShadeEditor.exe";
+const CHECKSUM_ASSET_NAME: &str = "ShadeEditor.exe.sha256";
 const MAX_DOWNLOAD_SIZE: usize = 200 * 1024 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -21,6 +23,7 @@ pub struct UpdateInfo {
     pub version: String,
     pub release_url: String,
     pub download_url: String,
+    pub checksum_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -45,7 +48,9 @@ pub struct UpdateManager {
 
 impl Default for UpdateManager {
     fn default() -> Self {
-        Self { state: Arc::new(Mutex::new(UpdateStatus::Idle)) }
+        Self {
+            state: Arc::new(Mutex::new(UpdateStatus::Idle)),
+        }
     }
 }
 
@@ -57,7 +62,10 @@ impl UpdateManager {
     pub fn start_check(&self, auto_download: bool) -> bool {
         {
             let mut state = self.state.lock().unwrap();
-            if matches!(*state, UpdateStatus::Checking | UpdateStatus::Downloading { .. }) {
+            if matches!(
+                *state,
+                UpdateStatus::Checking | UpdateStatus::Downloading { .. }
+            ) {
                 return false;
             }
             *state = UpdateStatus::Checking;
@@ -128,9 +136,12 @@ impl UpdateManager {
             UpdateStatus::Ready(info, source) => (info, source),
             _ => return Ok(false),
         };
-        let current_exe = std::env::current_exe().map_err(|err| format!("Cannot locate current executable: {err}"))?;
-        let script = std::env::temp_dir().join(format!("ShadeEditor-updater-{}.ps1", std::process::id()));
-        fs::write(&script, updater_script()).map_err(|err| format!("Cannot create updater script: {err}"))?;
+        let current_exe = std::env::current_exe()
+            .map_err(|err| format!("Cannot locate current executable: {err}"))?;
+        let script =
+            std::env::temp_dir().join(format!("ShadeEditor-updater-{}.ps1", std::process::id()));
+        fs::write(&script, updater_script())
+            .map_err(|err| format!("Cannot create updater script: {err}"))?;
         launch_updater(&script, &source, &current_exe)?;
         Ok(true)
     }
@@ -154,7 +165,9 @@ struct InternetHandle(*mut c_void);
 impl Drop for InternetHandle {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            unsafe { WinHttpCloseHandle(self.0); }
+            unsafe {
+                WinHttpCloseHandle(self.0);
+            }
         }
     }
 }
@@ -177,13 +190,28 @@ fn check_latest_release() -> Result<Option<UpdateInfo>, String> {
     if !is_newer(&release.tag_name, env!("CARGO_PKG_VERSION")) {
         return Ok(None);
     }
-    let asset = release.assets.into_iter()
-        .find(|asset| asset.name.eq_ignore_ascii_case(ASSET_NAME))
+    let mut executable = None;
+    let mut checksum = None;
+    for asset in release.assets {
+        if asset.name.eq_ignore_ascii_case(ASSET_NAME) {
+            executable = Some(asset.browser_download_url.clone());
+        } else if asset.name.eq_ignore_ascii_case(CHECKSUM_ASSET_NAME) {
+            checksum = Some(asset.browser_download_url.clone());
+        }
+    }
+    let download_url = executable
         .ok_or_else(|| format!("Release {} has no {ASSET_NAME} asset.", release.tag_name))?;
+    let checksum_url = checksum.ok_or_else(|| {
+        format!(
+            "Release {} has no {CHECKSUM_ASSET_NAME} integrity asset.",
+            release.tag_name
+        )
+    })?;
     Ok(Some(UpdateInfo {
         version: release.tag_name.trim_start_matches(['v', 'V']).to_owned(),
         release_url: release.html_url,
-        download_url: asset.browser_download_url,
+        download_url,
+        checksum_url,
     }))
 }
 
@@ -191,6 +219,14 @@ fn download_update<F>(info: &UpdateInfo, progress: F) -> Result<PathBuf, String>
 where
     F: Fn(u64, Option<u64>),
 {
+    let (checksum_host, checksum_path) = split_https_url(&info.checksum_url)
+        .ok_or_else(|| "Update checksum URL is not a valid HTTPS URL.".to_owned())?;
+    let checksum_payload = http_get(checksum_host, checksum_path, None)?;
+    let expected_checksum = match checksum_payload {
+        HttpPayload::Data(bytes) => parse_sha256_checksum(&bytes)?,
+        HttpPayload::NotFound => return Err("Update checksum asset returned HTTP 404.".to_owned()),
+    };
+
     let (host, path) = split_https_url(&info.download_url)
         .ok_or_else(|| "Update URL is not a valid HTTPS URL.".to_owned())?;
     let payload = http_get(host, path, Some(&progress))?;
@@ -201,7 +237,15 @@ where
     if bytes.len() < 100_000 || !bytes.starts_with(b"MZ") {
         return Err("Downloaded update is not a valid Windows executable.".to_owned());
     }
-    let safe_version = info.version.chars()
+    let actual_checksum = sha256_hex(&bytes);
+    if !actual_checksum.eq_ignore_ascii_case(&expected_checksum) {
+        return Err(format!(
+            "Update integrity check failed: expected {expected_checksum}, got {actual_checksum}."
+        ));
+    }
+    let safe_version = info
+        .version
+        .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '.' || *ch == '-')
         .collect::<String>();
     let path = std::env::temp_dir().join(format!(
@@ -212,13 +256,46 @@ where
     Ok(path)
 }
 
+fn parse_sha256_checksum(bytes: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "Update checksum file is not UTF-8/ASCII text.".to_owned())?;
+    let checksum = text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "Update checksum file is empty.".to_owned())?;
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Update checksum file does not contain a valid SHA-256 digest.".to_owned());
+    }
+    Ok(checksum.to_ascii_lowercase())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut text = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut text, "{byte:02x}");
+    }
+    text
+}
+
 fn launch_updater(script: &Path, source: &Path, destination: &Path) -> Result<(), String> {
     Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+        ])
         .arg(script)
-        .arg("-TargetPid").arg(std::process::id().to_string())
-        .arg("-Source").arg(source)
-        .arg("-Destination").arg(destination)
+        .arg("-TargetPid")
+        .arg(std::process::id().to_string())
+        .arg("-Source")
+        .arg(source)
+        .arg("-Destination")
+        .arg(destination)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
@@ -253,7 +330,11 @@ fn version_tuple(value: &str) -> Option<(u32, u32, u32)> {
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().unwrap_or("0").parse().ok()?;
     let patch_text = parts.next().unwrap_or("0");
-    let patch = patch_text.split(|ch: char| !ch.is_ascii_digit()).next()?.parse().ok()?;
+    let patch = patch_text
+        .split(|ch: char| !ch.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
     Some((major, minor, patch))
 }
 
@@ -275,7 +356,9 @@ fn http_get(
             null(),
             0,
         ));
-        if session.0.is_null() { return Err("Cannot initialize WinHTTP.".to_owned()); }
+        if session.0.is_null() {
+            return Err("Cannot initialize WinHTTP.".to_owned());
+        }
 
         let host_wide = wide(host);
         let connection = InternetHandle(WinHttpConnect(
@@ -284,7 +367,9 @@ fn http_get(
             INTERNET_DEFAULT_HTTPS_PORT,
             0,
         ));
-        if connection.0.is_null() { return Err("Cannot connect to update server.".to_owned()); }
+        if connection.0.is_null() {
+            return Err("Cannot connect to update server.".to_owned());
+        }
 
         let verb = wide("GET");
         let path_wide = wide(path);
@@ -297,9 +382,12 @@ fn http_get(
             null(),
             WINHTTP_FLAG_SECURE | WINHTTP_FLAG_REFRESH,
         ));
-        if request.0.is_null() { return Err("Cannot create update request.".to_owned()); }
+        if request.0.is_null() {
+            return Err("Cannot create update request.".to_owned());
+        }
         if WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) == 0
-            || WinHttpReceiveResponse(request.0, null_mut()) == 0 {
+            || WinHttpReceiveResponse(request.0, null_mut()) == 0
+        {
             return Err("Update request failed.".to_owned());
         }
 
@@ -313,7 +401,8 @@ fn http_get(
             &mut status_code as *mut u32 as *mut c_void,
             &mut status_size,
             &mut index,
-        ) == 0 {
+        ) == 0
+        {
             return Err("Cannot read update HTTP status.".to_owned());
         }
         if status_code == 404 {
@@ -333,20 +422,26 @@ fn http_get(
             &mut content_length as *mut u32 as *mut c_void,
             &mut content_length_size,
             &mut content_index,
-        ) != 0 && content_length > 0 {
+        ) != 0
+            && content_length > 0
+        {
             Some(u64::from(content_length))
         } else {
             None
         };
 
         let mut body = Vec::new();
-        if let Some(callback) = progress { callback(0, total); }
+        if let Some(callback) = progress {
+            callback(0, total);
+        }
         loop {
             let mut available = 0u32;
             if WinHttpQueryDataAvailable(request.0, &mut available) == 0 {
                 return Err("Cannot read update response.".to_owned());
             }
-            if available == 0 { break; }
+            if available == 0 {
+                break;
+            }
             if body.len().saturating_add(available as usize) > MAX_DOWNLOAD_SIZE {
                 return Err("Update download is unexpectedly large.".to_owned());
             }
@@ -358,11 +453,14 @@ fn http_get(
                 body[start..].as_mut_ptr() as *mut c_void,
                 available,
                 &mut read,
-            ) == 0 {
+            ) == 0
+            {
                 return Err("Cannot read update data.".to_owned());
             }
             body.truncate(start + read as usize);
-            if let Some(callback) = progress { callback(body.len() as u64, total); }
+            if let Some(callback) = progress {
+                callback(body.len() as u64, total);
+            }
         }
         Ok(HttpPayload::Data(body))
     }
@@ -375,6 +473,16 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_release_checksum() {
+        let parsed = parse_sha256_checksum(
+            b"d0f2fd43d5f2dffb54732717a3f24c75c7779f4d821d6dd2af59786acbd7dbe8  ShadeEditor.exe\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 64);
+        assert!(parse_sha256_checksum(b"not-a-hash").is_err());
+    }
 
     #[test]
     fn compares_release_versions() {
