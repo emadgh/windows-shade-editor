@@ -11,8 +11,8 @@ This file tracks only work that is still intentionally in scope. Snapshot expans
 
 ## Backend follow-up
 
-- Extend bounded streaming to tiled and planar TIFF layouts. Normal chunky strip TIFFs already use the streaming pipeline.
-- Rotate crash recovery through the latest three recovery states instead of keeping only one recovery file.
+- Production-test bounded tiled/planar TIFF streaming against real Photoshop/RIP assets; synthetic planar-strip and tiled-edge fixtures are covered in CI.
+- Production-test the three-state recovery rotation and corrupted-latest fallback on Windows.
 - Continue TIFF conformance regression coverage across compression, predictors, bit depth, ExtraSamples, and Photoshop metadata.
 
 ## Native Windows integration

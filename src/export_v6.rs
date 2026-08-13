@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,8 @@ use crate::model::{
     ShadeProject, TEST_CODE_ALL_CHANNELS, TestCodePosition, apply_curve, apply_levels,
 };
 use crate::tiff_io::{
-    ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_strip, stream_info,
+    ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_region,
+    for_each_decoded_strip, stream_info,
 };
 
 pub fn export_face(
@@ -272,7 +273,7 @@ where
 
     let result = (|| -> Result<(), String> {
         progress(0.05, "Streaming adjustments to disk spool");
-        {
+        if stream.row_streamable {
             let spool_file = File::create(&spool_path)
                 .map_err(|err| format!("Cannot create export spool: {err}"))?;
             let mut spool = BufWriter::new(spool_file);
@@ -298,6 +299,15 @@ where
             spool
                 .flush()
                 .map_err(|err| format!("Cannot flush export spool: {err}"))?;
+        } else {
+            stream_spool_regions(
+                source,
+                stream,
+                project,
+                overlay.as_ref(),
+                &spool_path,
+                progress,
+            )?;
         }
 
         let bytes_per_sample = u64::from(metadata.bit_depth / 8);
@@ -546,6 +556,116 @@ where
         progress(0.06 + done * 0.60, "Streaming adjustments to disk spool");
         Ok(())
     })
+}
+
+fn stream_spool_regions<F>(
+    source: &Path,
+    stream: &StreamInfo,
+    project: &ShadeProject,
+    overlay: Option<&TextOverlay>,
+    spool_path: &Path,
+    progress: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(f32, &str),
+{
+    let metadata = &stream.metadata;
+    let channels = metadata.samples_per_pixel;
+    let names = &metadata.channel_names;
+    let full_width = metadata.width as usize;
+    let bytes_per_sample = usize::from(metadata.bit_depth / 8);
+    let total_samples = (metadata.width as usize)
+        .checked_mul(metadata.height as usize)
+        .and_then(|value| value.checked_mul(channels))
+        .ok_or_else(|| "Export spool sample count overflow.".to_owned())?;
+    let total_bytes = total_samples
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| "Export spool size overflow.".to_owned())?;
+
+    let spool_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(spool_path)
+        .map_err(|err| format!("Cannot create random-access export spool: {err}"))?;
+    spool_file
+        .set_len(total_bytes as u64)
+        .map_err(|err| format!("Cannot size export spool: {err}"))?;
+    let mut mmap = unsafe {
+        MmapOptions::new()
+            .map_mut(&spool_file)
+            .map_err(|err| format!("Cannot map export spool for writing: {err}"))?
+    };
+    let total_pixels = u64::from(metadata.width).saturating_mul(u64::from(metadata.height));
+    let mut processed_pixels = 0u64;
+
+    for_each_decoded_region(source, stream, |x, y, width, height, input| {
+        let region_width = width as usize;
+        let region_height = height as usize;
+        let mut adjusted = adjusted_strip(input, channels, names, project);
+        if let Some(overlay) = overlay {
+            apply_text_overlay_to_region(
+                &mut adjusted,
+                x as usize,
+                y as usize,
+                region_width,
+                region_height,
+                channels,
+                overlay,
+            );
+        }
+        let expected = region_width
+            .checked_mul(region_height)
+            .and_then(|value| value.checked_mul(channels))
+            .ok_or_else(|| "Output region sample count overflow.".to_owned())?;
+        if adjusted.len() != expected {
+            return Err(format!(
+                "Output region sample mismatch: generated {}, expected {expected}.",
+                adjusted.len()
+            ));
+        }
+
+        for local_y in 0..region_height {
+            let source_sample = local_y * region_width * channels;
+            let destination_sample = ((y as usize + local_y) * full_width + x as usize) * channels;
+            let row_samples = region_width * channels;
+            match metadata.bit_depth {
+                8 => {
+                    let destination = destination_sample;
+                    for offset in 0..row_samples {
+                        mmap[destination + offset] = (adjusted[source_sample + offset] >> 8) as u8;
+                    }
+                }
+                16 => {
+                    let destination = destination_sample * 2;
+                    for offset in 0..row_samples {
+                        let bytes = adjusted[source_sample + offset].to_ne_bytes();
+                        let index = destination + offset * 2;
+                        mmap[index] = bytes[0];
+                        mmap[index + 1] = bytes[1];
+                    }
+                }
+                depth => {
+                    return Err(format!(
+                        "Unsupported streaming spool bit depth: {depth}-bit."
+                    ));
+                }
+            }
+        }
+
+        processed_pixels =
+            processed_pixels.saturating_add(u64::from(width).saturating_mul(u64::from(height)));
+        let done = processed_pixels as f32 / total_pixels.max(1) as f32;
+        progress(
+            0.06 + done.min(1.0) * 0.60,
+            "Streaming TIFF regions to disk spool",
+        );
+        Ok(())
+    })?;
+    mmap.flush()
+        .map_err(|err| format!("Cannot flush random-access export spool: {err}"))?;
+    Ok(())
 }
 
 fn mmap_as_u16(mmap: &memmap2::Mmap) -> Result<&[u16], String> {
@@ -835,6 +955,53 @@ fn build_text_overlay(
         targets,
         bitmap,
     })
+}
+
+fn apply_text_overlay_to_region(
+    samples: &mut [u16],
+    region_x: usize,
+    region_y: usize,
+    region_width: usize,
+    region_height: usize,
+    channels: usize,
+    overlay: &TextOverlay,
+) {
+    if overlay.bitmap.width == 0 || overlay.bitmap.height == 0 {
+        return;
+    }
+    let region_x1 = region_x.saturating_add(region_width);
+    let region_y1 = region_y.saturating_add(region_height);
+    let text_x1 = overlay.x0.saturating_add(overlay.bitmap.width);
+    let text_y1 = overlay.y0.saturating_add(overlay.bitmap.height);
+    let x_begin = region_x.max(overlay.x0);
+    let x_end = region_x1.min(text_x1);
+    let y_begin = region_y.max(overlay.y0);
+    let y_end = region_y1.min(text_y1);
+    if x_begin >= x_end || y_begin >= y_end {
+        return;
+    }
+
+    for image_y in y_begin..y_end {
+        let bitmap_y = image_y - overlay.y0;
+        let local_y = image_y - region_y;
+        for image_x in x_begin..x_end {
+            let bitmap_x = image_x - overlay.x0;
+            let alpha = overlay.bitmap.alpha[bitmap_y * overlay.bitmap.width + bitmap_x];
+            if alpha == 0 {
+                continue;
+            }
+            let local_x = image_x - region_x;
+            for &(target_channel, target_value) in &overlay.targets {
+                let index = (local_y * region_width + local_x) * channels + target_channel;
+                if index >= samples.len() {
+                    continue;
+                }
+                let a = f32::from(alpha) / 255.0;
+                let current = samples[index] as f32;
+                samples[index] = (current * (1.0 - a) + target_value as f32 * a).round() as u16;
+            }
+        }
+    }
 }
 
 fn apply_text_overlay_to_rows(
