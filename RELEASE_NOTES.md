@@ -4,6 +4,12 @@
 - Automatically switches to BigTIFF when the uncompressed output layout approaches the 32-bit offset ceiling of classic TIFF.
 - Uses the same Levels / Curve / Channel Mixer / Test Code and Photoshop metadata preservation pipeline for classic TIFF and BigTIFF outputs.
 - Adds regression coverage for a real BigTIFF identity export plus large-layout format selection without allocating a huge test image.
+- Adds optional native x64 Windows Explorer integration for `.shade` projects without loading the Rust/egui editor runtime into Explorer.
+- Explorer thumbnails come from the PNG already embedded in schema-v9 `.shade` files through `IThumbnailProvider` + WIC.
+- A read-only `IPropertyStore` exposes cached Face count, active Face, physical/pixel dimensions, DPI, bit depth, color model, channel counts, source TIFF name, total source bytes, and save time.
+- Adds a Windows Property System `.propdesc` schema plus an elevated installer for COM/property-handler registration and per-user `.shade` association.
+- Shade Editor now accepts a `.shade` path as its first command-line argument so Explorer double-click opens that project.
+- Native parser and COM/WIC tests validate schema-v9 metadata and the embedded PNG thumbnail without source TIFF access.
 - `.shade` schema remains v9.
 
 # Shade Editor v0.11.1
