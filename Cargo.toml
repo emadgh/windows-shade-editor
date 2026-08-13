@@ -5,7 +5,7 @@ edition = "2024"
 description = "Native multi-channel TIFF shade editor for digital ceramic printing"
 license = "MIT"
 autobins = false
-build = "build.rs"
+build = "build_wrapper.rs"
 
 [[bin]]
 name = "ShadeEditor"
