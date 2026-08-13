@@ -4,9 +4,11 @@ mod app_log;
 mod dpi;
 #[path = "export_v6.rs"]
 mod export;
+mod history;
 #[path = "model_v6.rs"]
 mod model;
 mod palette;
+mod recovery;
 mod render;
 #[path = "settings_v6.rs"]
 mod settings;
@@ -31,6 +33,8 @@ use update::{UpdateManager, UpdateStatus};
 
 const VIEWPORT_OVERSCROLL: f32 = 180.0;
 const ERROR_TOAST_LIFETIME: Duration = Duration::from_secs(120);
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
+const HISTORY_COMMIT_DELAY: Duration = Duration::from_millis(300);
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
@@ -68,6 +72,7 @@ struct RuntimeFace {
     dpi: dpi::DpiInfo,
     adjusted: Vec<Vec<u16>>,
     texture: Option<egui::TextureHandle>,
+    original_texture: Option<egui::TextureHandle>,
     generation: u64,
     rendered_generation: u64,
 }
@@ -80,6 +85,13 @@ struct LoadedFace {
 
 struct OpenPayload {
     path: PathBuf,
+    project: ShadeProject,
+    faces: Vec<LoadedFace>,
+    errors: Vec<String>,
+}
+
+struct RecoveryPayload {
+    origin_path: Option<PathBuf>,
     project: ShadeProject,
     faces: Vec<LoadedFace>,
     errors: Vec<String>,
@@ -103,6 +115,7 @@ enum JobResult {
         errors: Vec<String>,
     },
     Open(Result<OpenPayload, String>),
+    Recover(Result<RecoveryPayload, String>),
     Save {
         path: PathBuf,
         result: Result<(), String>,
@@ -127,6 +140,7 @@ struct RenderResult {
     generation: u64,
     adjusted: Vec<Vec<u16>>,
     rgba: Vec<u8>,
+    original_rgba: Vec<u8>,
 }
 
 struct ErrorToast {
@@ -163,6 +177,14 @@ struct ShadeApp {
     show_close_confirmation: bool,
     close_after_save: bool,
     allow_close_once: bool,
+    history: history::AdjustmentHistory,
+    history_pending_label: Option<String>,
+    history_pending_at: Option<Instant>,
+    recovery_candidate: Option<recovery::RecoveryFile>,
+    autosave_tx: mpsc::Sender<Result<PathBuf, String>>,
+    autosave_rx: mpsc::Receiver<Result<PathBuf, String>>,
+    autosave_busy: bool,
+    last_autosave: Instant,
     job: Option<JobHandle>,
     render_tx: mpsc::Sender<RenderResult>,
     render_rx: mpsc::Receiver<RenderResult>,
@@ -178,6 +200,7 @@ impl ShadeApp {
             updater.start_check(true);
         }
         let (render_tx, render_rx) = mpsc::channel();
+        let (autosave_tx, autosave_rx) = mpsc::channel();
         let mut project = ShadeProject::default();
         project.channel_palette = settings.default_project_palette();
         let log = app_log::AppLog::default();
@@ -185,6 +208,15 @@ impl ShadeApp {
             "Shade Editor {} started",
             env!("CARGO_PKG_VERSION")
         ));
+        let recovery_candidate = match recovery::load() {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                log.error(&err);
+                None
+            }
+        };
+        let mut history = history::AdjustmentHistory::default();
+        history.reset(&project.adjustments, "Start");
         Self {
             project,
             project_path: None,
@@ -214,6 +246,14 @@ impl ShadeApp {
             show_close_confirmation: false,
             close_after_save: false,
             allow_close_once: false,
+            history,
+            history_pending_label: None,
+            history_pending_at: None,
+            recovery_candidate,
+            autosave_tx,
+            autosave_rx,
+            autosave_busy: false,
+            last_autosave: Instant::now(),
             job: None,
             render_tx,
             render_rx,
@@ -257,6 +297,9 @@ impl ShadeApp {
         self.pending_snapshot_load = None;
         self.show_close_confirmation = false;
         self.close_after_save = false;
+        self.history.reset(&self.project.adjustments, "New project");
+        self.history_pending_label = None;
+        self.history_pending_at = None;
         self.report_info("New shade project");
     }
 
@@ -267,6 +310,7 @@ impl ShadeApp {
             dpi: item.dpi,
             adjusted: Vec::new(),
             texture: None,
+            original_texture: None,
             generation: 1,
             rendered_generation: 0,
         }
@@ -768,6 +812,10 @@ impl ShadeApp {
                     self.fit_requested = true;
                     self.viewport_recenter = true;
                     self.project_dirty = true;
+                    self.history
+                        .reset(&self.project.adjustments, "Faces changed");
+                    self.history_pending_label = None;
+                    self.history_pending_at = None;
                     self.report_info(format!("Added {added} face(s)"));
                 }
                 if !errors.is_empty() {
@@ -799,6 +847,10 @@ impl ShadeApp {
                     self.fit_requested = true;
                     self.viewport_recenter = true;
                     self.project_dirty = false;
+                    self.history
+                        .reset(&self.project.adjustments, "Open project");
+                    self.history_pending_label = None;
+                    self.history_pending_at = None;
                     self.report_info(format!("Opened {}", payload.path.display()));
                     if !payload.errors.is_empty() {
                         self.report_error(format!(
@@ -809,10 +861,44 @@ impl ShadeApp {
                 }
                 Err(err) => self.report_error(err),
             },
+            JobResult::Recover(result) => match result {
+                Ok(payload) => {
+                    self.project = payload.project;
+                    self.project_path = payload.origin_path;
+                    self.faces = payload
+                        .faces
+                        .into_iter()
+                        .map(Self::make_runtime_face)
+                        .collect();
+                    self.current_face = 0;
+                    self.selected_channel = 0;
+                    self.solo_channel = None;
+                    self.adjustment_scope = AdjustmentScope::Selected;
+                    self.fit_requested = true;
+                    self.viewport_recenter = true;
+                    self.project_dirty = true;
+                    self.history
+                        .reset(&self.project.adjustments, "Recovered project");
+                    self.history_pending_label = None;
+                    self.history_pending_at = None;
+                    self.last_autosave = Instant::now();
+                    self.report_info("Recovered autosaved project state");
+                    if !payload.errors.is_empty() {
+                        self.report_error(format!(
+                            "Recovery opened with TIFF errors: {}",
+                            payload.errors.join(" | ")
+                        ));
+                    }
+                }
+                Err(err) => self.report_error(format!("Recovery failed: {err}")),
+            },
             JobResult::Save { path, result } => match result {
                 Ok(()) => {
                     self.project_path = Some(path.clone());
                     self.project_dirty = false;
+                    if let Err(err) = recovery::clear() {
+                        self.log.error(&err);
+                    }
                     self.report_info(format!("Saved {}", path.display()));
                 }
                 Err(err) => {
@@ -879,6 +965,19 @@ impl ShadeApp {
                     options,
                 ));
             }
+            let original_image = egui::ColorImage::from_rgba_unmultiplied(
+                [face.preview.width, face.preview.height],
+                &result.original_rgba,
+            );
+            if let Some(texture) = &mut face.original_texture {
+                texture.set(original_image, options);
+            } else {
+                face.original_texture = Some(ctx.load_texture(
+                    format!("face-original-preview-{}", result.face_index),
+                    original_image,
+                    options,
+                ));
+            }
             face.rendered_generation = result.generation;
         }
     }
@@ -903,11 +1002,13 @@ impl ShadeApp {
         std::thread::spawn(move || {
             let adjusted = render::adjusted_planes(&preview, &project);
             let rgba = render::rgba_from_planes(&preview, &adjusted, solo_channel);
+            let original_rgba = render::rgba_from_planes(&preview, &preview.channels, solo_channel);
             let _ = tx.send(RenderResult {
                 face_index,
                 generation,
                 adjusted,
                 rgba,
+                original_rgba,
             });
         });
     }
@@ -1167,6 +1268,14 @@ impl ShadeApp {
                 self.snapshot_rename_buffer = snapshot.name.clone();
             }
             self.mark_all_previews_dirty();
+            let history_label = self
+                .project
+                .active_snapshot_name()
+                .map(|name| format!("Snapshot - {name}"))
+                .unwrap_or_else(|| "Snapshot".to_owned());
+            self.history.reset(&self.project.adjustments, history_label);
+            self.history_pending_label = None;
+            self.history_pending_at = None;
             self.report_info("Snapshot loaded");
         }
     }
@@ -1272,11 +1381,252 @@ impl ShadeApp {
             self.show_close_confirmation = false;
         } else if discard_and_exit {
             self.show_close_confirmation = false;
+            if let Err(err) = recovery::clear() {
+                self.log.error(&err);
+            }
             self.allow_close_once = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if save_and_exit && self.save_project(false) {
             self.show_close_confirmation = false;
             self.close_after_save = true;
+        }
+    }
+
+    fn queue_adjustment_history(&mut self, before: &BTreeMap<String, ChannelAdjustment>) {
+        if *before == self.project.adjustments {
+            return;
+        }
+        self.history_pending_label =
+            Some(history::describe_change(before, &self.project.adjustments));
+        self.history_pending_at = Some(Instant::now());
+    }
+
+    fn commit_pending_history(&mut self, ctx: &egui::Context, force: bool) {
+        let Some(label) = self.history_pending_label.clone() else {
+            return;
+        };
+        let ready = force
+            || (self
+                .history_pending_at
+                .is_some_and(|at| at.elapsed() >= HISTORY_COMMIT_DELAY)
+                && !ctx.input(|input| input.pointer.any_down()));
+        if !ready {
+            return;
+        }
+        self.history.record(&self.project.adjustments, label);
+        self.history_pending_label = None;
+        self.history_pending_at = None;
+    }
+
+    fn apply_history_adjustments(
+        &mut self,
+        adjustments: BTreeMap<String, ChannelAdjustment>,
+        message: &str,
+    ) {
+        self.project.adjustments = adjustments;
+        self.history_pending_label = None;
+        self.history_pending_at = None;
+        self.mark_all_previews_dirty();
+        self.report_info(message);
+    }
+
+    fn undo_adjustment(&mut self, ctx: &egui::Context) {
+        self.commit_pending_history(ctx, true);
+        if let Some(adjustments) = self.history.undo() {
+            self.apply_history_adjustments(adjustments, "Undo adjustment");
+        }
+    }
+
+    fn redo_adjustment(&mut self, ctx: &egui::Context) {
+        self.commit_pending_history(ctx, true);
+        if let Some(adjustments) = self.history.redo() {
+            self.apply_history_adjustments(adjustments, "Redo adjustment");
+        }
+    }
+
+    fn handle_history_shortcuts(&mut self, ctx: &egui::Context) {
+        let (undo, redo) = ctx.input(|input| {
+            let z = input.key_pressed(egui::Key::Z);
+            (
+                z && input.modifiers.ctrl && input.modifiers.alt && !input.modifiers.shift,
+                z && input.modifiers.ctrl && input.modifiers.shift && !input.modifiers.alt,
+            )
+        });
+        if undo {
+            self.undo_adjustment(ctx);
+        } else if redo {
+            self.redo_adjustment(ctx);
+        }
+    }
+
+    fn ui_history(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("History");
+            if ui
+                .add_enabled(self.history.can_undo(), egui::Button::new("Undo").small())
+                .on_hover_text("Ctrl+Alt+Z")
+                .clicked()
+            {
+                self.undo_adjustment(ui.ctx());
+            }
+            if ui
+                .add_enabled(self.history.can_redo(), egui::Button::new("Redo").small())
+                .on_hover_text("Ctrl+Shift+Z")
+                .clicked()
+            {
+                self.redo_adjustment(ui.ctx());
+            }
+        });
+        ui.small("Adjustment history only. Faces, Snapshots and Palette changes are intentionally excluded.");
+        let rows = self
+            .history
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, entry.label.clone()))
+            .collect::<Vec<_>>();
+        let cursor = self.history.cursor();
+        let mut requested = None;
+        egui::ScrollArea::vertical()
+            .id_salt("adjustment-history")
+            .max_height(210.0)
+            .show(ui, |ui| {
+                for (index, label) in rows {
+                    if clickable_row(ui, index == cursor, &label, None, None, 28.0).clicked() {
+                        requested = Some(index);
+                    }
+                }
+            });
+        if let Some(index) = requested {
+            self.commit_pending_history(ui.ctx(), true);
+            if let Some(adjustments) = self.history.jump(index) {
+                self.apply_history_adjustments(adjustments, "History state selected");
+            }
+        }
+    }
+
+    fn poll_autosave(&mut self) {
+        while let Ok(result) = self.autosave_rx.try_recv() {
+            self.autosave_busy = false;
+            match result {
+                Ok(path) => self
+                    .log
+                    .info(&format!("Recovery autosaved: {}", path.display())),
+                Err(err) => self.log.error(&format!("Recovery autosave failed: {err}")),
+            }
+        }
+    }
+
+    fn maybe_autosave(&mut self) {
+        if !self.project_dirty
+            || self.autosave_busy
+            || self.job.is_some()
+            || self.faces.is_empty()
+            || self.last_autosave.elapsed() < AUTOSAVE_INTERVAL
+        {
+            return;
+        }
+        let recovery_file = recovery::RecoveryFile::new(
+            self.project.clone(),
+            self.faces.iter().map(|face| face.path.clone()).collect(),
+            self.project_path.clone(),
+        );
+        let tx = self.autosave_tx.clone();
+        self.autosave_busy = true;
+        self.last_autosave = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(recovery::write(&recovery_file));
+        });
+    }
+
+    fn recover_project(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(candidate) = self.recovery_candidate.take() else {
+            return;
+        };
+        let max_dimension = self.settings.max_preview_dimension;
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Recovering project", move |progress| {
+            let result = (|| -> Result<RecoveryPayload, String> {
+                let paths = candidate.resolved_face_paths();
+                let origin_path = candidate.origin_path();
+                let mut project = candidate.project;
+                let total = paths.len().max(1);
+                let mut faces = Vec::new();
+                let mut errors = Vec::new();
+                for (index, source) in paths.into_iter().enumerate() {
+                    Self::set_progress(
+                        &progress,
+                        Some(index as f32 / total as f32),
+                        "Recovering project",
+                        &source
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    );
+                    match tiff_io::load_preview(&source, max_dimension) {
+                        Ok(preview) => {
+                            project.ensure_channels(&preview.metadata.channel_names);
+                            faces.push(LoadedFace {
+                                dpi: dpi::read_dpi(&source, default_dpi),
+                                path: source,
+                                preview,
+                            });
+                        }
+                        Err(err) => errors.push(format!("{}: {err}", source.display())),
+                    }
+                }
+                Ok(RecoveryPayload {
+                    origin_path,
+                    project,
+                    faces,
+                    errors,
+                })
+            })();
+            Self::set_progress(&progress, Some(1.0), "Recovering project", "Complete");
+            JobResult::Recover(result)
+        });
+    }
+
+    fn ui_recovery_window(&mut self, ctx: &egui::Context) {
+        let Some(candidate) = self.recovery_candidate.as_ref() else {
+            return;
+        };
+        let saved = Local
+            .timestamp_millis_opt(candidate.saved_at_unix_ms)
+            .single()
+            .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "unknown time".to_owned());
+        let origin = candidate
+            .origin_project_path
+            .as_deref()
+            .unwrap_or("Unsaved project")
+            .to_owned();
+        let mut recover_now = false;
+        let mut discard = false;
+        egui::Window::new("Recovery available")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.strong("An autosaved Shade Editor recovery state was found.");
+                ui.label(format!("Saved: {saved}"));
+                ui.label(format!("Project: {origin}"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    recover_now = ui.button("Recover").clicked();
+                    discard = ui.button("Discard recovery").clicked();
+                });
+            });
+        if recover_now {
+            self.recover_project();
+        } else if discard {
+            if let Err(err) = recovery::clear() {
+                self.report_error(err);
+            }
+            self.recovery_candidate = None;
         }
     }
 
@@ -1484,6 +1834,7 @@ impl ShadeApp {
                 let (row_response, export_clicked, folder_clicked) = snapshot_row_with_actions(
                     ui,
                     selected,
+                    selected && active_dirty,
                     &display_name,
                     &time,
                     export_record.is_some(),
@@ -1817,6 +2168,7 @@ impl ShadeApp {
         }
     }
     fn ui_adjustments(&mut self, ui: &mut egui::Ui) {
+        let adjustments_before = self.project.adjustments.clone();
         let Some(face) = self.faces.get(self.current_face) else {
             ui.heading("Adjustments");
             ui.label("No active face");
@@ -1919,6 +2271,9 @@ impl ShadeApp {
             .inner;
         if changed {
             self.mark_all_previews_dirty();
+        }
+        if self.project.adjustments != adjustments_before {
+            self.queue_adjustment_history(&adjustments_before);
         }
     }
     fn ui_selected_adjustment(
@@ -2210,7 +2565,11 @@ impl ShadeApp {
             ui.columns(2, |columns| {
                 egui::ScrollArea::vertical()
                     .id_salt("channels-column")
-                    .show(&mut columns[0], |ui| self.ui_channels_histogram(ui));
+                    .show(&mut columns[0], |ui| {
+                        self.ui_channels_histogram(ui);
+                        ui.separator();
+                        self.ui_history(ui);
+                    });
                 egui::ScrollArea::vertical()
                     .id_salt("adjustments-column")
                     .show(&mut columns[1], |ui| self.ui_adjustments(ui));
@@ -2218,6 +2577,8 @@ impl ShadeApp {
         } else {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.ui_channels_histogram(ui);
+                ui.separator();
+                self.ui_history(ui);
                 ui.separator();
                 self.ui_adjustments(ui);
             });
@@ -2246,6 +2607,7 @@ impl ShadeApp {
         let meta = face.preview.metadata.clone();
         let dpi_info = face.dpi;
         let texture = face.texture.clone();
+        let original_texture = face.original_texture.clone();
         let (width_cm, height_cm) = physical_dimensions_cm(meta.width, meta.height, dpi_info);
         ui.horizontal_wrapped(|ui| {
             ui.strong(file_name);
@@ -2304,10 +2666,31 @@ impl ShadeApp {
                 );
                 let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
                 let image_rect = egui::Rect::from_center_size(canvas_rect.center(), image_size);
+                let show_before = ui.input(|input| {
+                    input.pointer.secondary_down()
+                        && input
+                            .pointer
+                            .hover_pos()
+                            .is_some_and(|pos| viewport.contains(pos))
+                });
+                let display_texture = if show_before {
+                    original_texture.as_ref().unwrap_or(&texture)
+                } else {
+                    &texture
+                };
                 ui.put(
                     image_rect,
-                    egui::Image::from_texture(&texture).fit_to_exact_size(image_size),
+                    egui::Image::from_texture(display_texture).fit_to_exact_size(image_size),
                 );
+                if show_before {
+                    ui.painter().text(
+                        image_rect.left_top() + egui::vec2(10.0, 10.0),
+                        egui::Align2::LEFT_TOP,
+                        "BEFORE",
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::WHITE,
+                    );
+                }
                 if recenter {
                     ui.scroll_to_rect(image_rect, Some(egui::Align::Center));
                 }
@@ -2623,6 +3006,9 @@ impl eframe::App for ShadeApp {
         self.poll_job();
         self.poll_render(ui.ctx());
         self.sync_update_state();
+        self.poll_autosave();
+        self.handle_history_shortcuts(ui.ctx());
+        self.maybe_autosave();
         self.handle_close_request(ui.ctx());
         if self.close_after_save && self.job.is_none() && !self.project_dirty {
             self.close_after_save = false;
@@ -2657,8 +3043,10 @@ impl eframe::App for ShadeApp {
         self.ui_settings_window(ui.ctx());
         self.ui_about_window(ui.ctx());
         self.ui_logs_window(ui.ctx());
+        self.ui_recovery_window(ui.ctx());
         self.ui_snapshot_discard_confirmation(ui.ctx());
         self.ui_close_confirmation(ui.ctx());
+        self.commit_pending_history(ui.ctx(), false);
 
         self.start_render_if_needed(ui.ctx());
     }
@@ -3522,6 +3910,7 @@ fn clickable_channel_row(
 fn snapshot_row_with_actions(
     ui: &mut egui::Ui,
     selected: bool,
+    dirty: bool,
     left: &str,
     time: &str,
     exported: bool,
@@ -3532,7 +3921,9 @@ fn snapshot_row_with_actions(
     let (rect, row_response) =
         ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let visuals = ui.visuals();
-    let fill = if selected {
+    let fill = if dirty {
+        visuals.selection.bg_fill.gamma_multiply(1.12)
+    } else if selected {
         visuals.selection.bg_fill.gamma_multiply(0.72)
     } else if row_response.hovered() {
         visuals.widgets.hovered.bg_fill
@@ -3541,6 +3932,19 @@ fn snapshot_row_with_actions(
     };
     if fill != egui::Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    if dirty {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            4.0,
+            egui::Stroke::new(1.5, visuals.selection.stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 3.0, rect.bottom())),
+            2.0,
+            visuals.selection.stroke.color,
+        );
     }
 
     let action_width = 26.0;
@@ -3570,7 +3974,7 @@ fn snapshot_row_with_actions(
         rect.left_center() + egui::vec2(8.0, 0.0),
         egui::Align2::LEFT_CENTER,
         left,
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(if dirty { 15.0 } else { 14.0 }),
         if selected {
             visuals.selection.stroke.color
         } else {

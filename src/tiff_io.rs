@@ -59,6 +59,17 @@ pub struct PreviewFace {
     pub histograms: Vec<[u32; 256]>,
 }
 
+#[derive(Clone, Debug)]
+pub struct StreamInfo {
+    pub metadata: TiffMetadata,
+    pub rows_per_strip: u32,
+    pub strip_count: u32,
+    /// True when the source is chunky/interleaved and strip-based, allowing
+    /// bounded-memory incremental decoding. Planar/tiled files use the proven
+    /// full-image compatibility path.
+    pub streamable: bool,
+}
+
 /// image-tiff 0.11.x intentionally presents RGB/CMYK + ExtraSamples through
 /// RGB/CMYK ColorType and therefore drops unspecified extra samples from its
 /// decoded output. Photoshop uses exactly those unspecified ExtraSamples for
@@ -170,9 +181,7 @@ fn open_decoder(path: &Path) -> Result<Decoder<BufReader<File>>, String> {
     Ok(decoder)
 }
 
-fn open_multiband_decoder(
-    path: &Path,
-) -> Result<Decoder<PatchedReader<BufReader<File>>>, String> {
+fn open_multiband_decoder(path: &Path) -> Result<Decoder<PatchedReader<BufReader<File>>>, String> {
     let patch = locate_photometric_patch(path)?;
     let file = File::open(path).map_err(|err| format!("Cannot reopen TIFF: {err}"))?;
     let reader = PatchedReader::new(BufReader::new(file), patch);
@@ -257,40 +266,166 @@ fn decode_samples<R: Read + Seek>(
     Ok(samples)
 }
 
+pub fn stream_info(path: &Path) -> Result<StreamInfo, String> {
+    let mut decoder = open_decoder(path)?;
+    let (metadata, planar_configuration) = read_metadata(&mut decoder)?;
+    let rows_per_strip = decoder
+        .find_tag_unsigned::<u32>(Tag::RowsPerStrip)
+        .ok()
+        .flatten()
+        .unwrap_or(metadata.height)
+        .max(1)
+        .min(metadata.height.max(1));
+    let strip_count = decoder.strip_count().ok();
+    Ok(StreamInfo {
+        metadata,
+        rows_per_strip,
+        strip_count: strip_count.unwrap_or(1),
+        streamable: planar_configuration == 1 && strip_count.is_some(),
+    })
+}
+
+pub fn for_each_decoded_strip<F>(
+    path: &Path,
+    info: &StreamInfo,
+    mut callback: F,
+) -> Result<(), String>
+where
+    F: FnMut(u32, u32, &[u16]) -> Result<(), String>,
+{
+    if !info.streamable {
+        let decoded = decode_full(path)?;
+        callback(0, decoded.metadata.height, &decoded.samples)?;
+        return Ok(());
+    }
+
+    let needs_multiband_workaround = info.metadata.samples_per_pixel
+        > info.metadata.base_channel_count
+        && matches!(
+            info.metadata.color_model,
+            ColorModel::Rgb | ColorModel::Cmyk
+        );
+    if needs_multiband_workaround {
+        let decoder = open_multiband_decoder(path)?;
+        stream_decoder_strips(decoder, info, &mut callback)
+    } else {
+        let decoder = open_decoder(path)?;
+        stream_decoder_strips(decoder, info, &mut callback)
+    }
+}
+
+fn stream_decoder_strips<R, F>(
+    mut decoder: Decoder<R>,
+    info: &StreamInfo,
+    callback: &mut F,
+) -> Result<(), String>
+where
+    R: Read + Seek,
+    F: FnMut(u32, u32, &[u16]) -> Result<(), String>,
+{
+    let strip_count = decoder
+        .strip_count()
+        .map_err(|err| format!("Cannot read TIFF strip count: {err}"))?;
+    let width = info.metadata.width as usize;
+    let channels = info.metadata.samples_per_pixel;
+    let mut row_start = 0u32;
+
+    for strip_index in 0..strip_count {
+        let (chunk_width, row_count) = decoder.chunk_data_dimensions(strip_index);
+        if chunk_width != info.metadata.width {
+            return Err(format!(
+                "Unexpected TIFF strip width {chunk_width}; expected {}.",
+                info.metadata.width
+            ));
+        }
+        let decoded = decoder
+            .read_chunk(strip_index)
+            .map_err(|err| format!("Cannot decode TIFF strip {strip_index}: {err}"))?;
+        let mut samples = decoding_result_to_u16(decoded, info.metadata.bit_depth)?;
+        let expected = width
+            .checked_mul(row_count as usize)
+            .and_then(|pixels| pixels.checked_mul(channels))
+            .ok_or_else(|| "TIFF strip sample count is too large.".to_owned())?;
+        if samples.len() < expected {
+            return Err(format!(
+                "Decoded TIFF strip {strip_index} is incomplete ({} of {expected} samples).",
+                samples.len()
+            ));
+        }
+        samples.truncate(expected);
+        callback(row_start, row_count, &samples)?;
+        row_start = row_start.saturating_add(row_count);
+    }
+
+    if row_start < info.metadata.height {
+        return Err(format!(
+            "TIFF strip stream ended at row {row_start} of {}.",
+            info.metadata.height
+        ));
+    }
+    Ok(())
+}
+
 pub fn load_preview(path: &Path, max_dimension: u32) -> Result<PreviewFace, String> {
-    let decoded = decode_full(path)?;
-    let source_width = decoded.metadata.width as usize;
-    let source_height = decoded.metadata.height as usize;
+    let info = stream_info(path)?;
+    let source_width = info.metadata.width as usize;
+    let source_height = info.metadata.height as usize;
     let max_source = source_width.max(source_height).max(1);
     let max_dimension = max_dimension.max(256) as usize;
     let scale = (max_source as f64 / max_dimension as f64).max(1.0);
     let width = ((source_width as f64 / scale).round() as usize).max(1);
     let height = ((source_height as f64 / scale).round() as usize).max(1);
-    let channel_count = decoded.metadata.samples_per_pixel;
-
+    let channel_count = info.metadata.samples_per_pixel;
     let preview_pixels = width
         .checked_mul(height)
         .ok_or_else(|| "Preview dimensions are too large.".to_owned())?;
     let mut channels = (0..channel_count)
-        .map(|_| Vec::with_capacity(preview_pixels))
+        .map(|_| vec![0u16; preview_pixels])
         .collect::<Vec<_>>();
 
-    for y in 0..height {
-        let src_y = ((y as f64 * source_height as f64 / height as f64).floor() as usize)
-            .min(source_height - 1);
-        for x in 0..width {
-            let src_x = ((x as f64 * source_width as f64 / width as f64).floor() as usize)
-                .min(source_width - 1);
-            let base = (src_y * source_width + src_x) * channel_count;
-            for channel in 0..channel_count {
-                channels[channel].push(decoded.samples[base + channel]);
-            }
-        }
-    }
+    let source_x = (0..width)
+        .map(|x| {
+            ((x as f64 * source_width as f64 / width as f64).floor() as usize)
+                .min(source_width.saturating_sub(1))
+        })
+        .collect::<Vec<_>>();
+    let source_y = (0..height)
+        .map(|y| {
+            ((y as f64 * source_height as f64 / height as f64).floor() as usize)
+                .min(source_height.saturating_sub(1))
+        })
+        .collect::<Vec<_>>();
+    let mut next_preview_y = 0usize;
 
+    for_each_decoded_strip(path, &info, |row_start, row_count, samples| {
+        let row_end = row_start.saturating_add(row_count) as usize;
+        while next_preview_y < height && source_y[next_preview_y] < row_end {
+            let src_y = source_y[next_preview_y];
+            if src_y < row_start as usize {
+                next_preview_y += 1;
+                continue;
+            }
+            let local_y = src_y - row_start as usize;
+            for (preview_x, &src_x) in source_x.iter().enumerate() {
+                let source_base = (local_y * source_width + src_x) * channel_count;
+                let destination = next_preview_y * width + preview_x;
+                for channel in 0..channel_count {
+                    channels[channel][destination] = samples[source_base + channel];
+                }
+            }
+            next_preview_y += 1;
+        }
+        Ok(())
+    })?;
+
+    if next_preview_y != height {
+        return Err(format!(
+            "Preview stream filled {next_preview_y} of {height} rows."
+        ));
+    }
     let histograms = channels.iter().map(|plane| histogram(plane)).collect();
     Ok(PreviewFace {
-        metadata: decoded.metadata,
+        metadata: info.metadata,
         width,
         height,
         channels,
@@ -298,9 +433,7 @@ pub fn load_preview(path: &Path, max_dimension: u32) -> Result<PreviewFace, Stri
     })
 }
 
-fn read_metadata<R: Read + Seek>(
-    decoder: &mut Decoder<R>,
-) -> Result<(TiffMetadata, u16), String> {
+fn read_metadata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(TiffMetadata, u16), String> {
     let (width, height) = decoder
         .dimensions()
         .map_err(|err| format!("Cannot read TIFF dimensions: {err}"))?;
@@ -320,7 +453,9 @@ fn read_metadata<R: Read + Seek>(
         .map(usize::from)
         .unwrap_or_else(|| usize::from(color_type.num_samples()));
     if samples_per_pixel == 0 || samples_per_pixel > 56 {
-        return Err(format!("Unsupported TIFF channel count: {samples_per_pixel}."));
+        return Err(format!(
+            "Unsupported TIFF channel count: {samples_per_pixel}."
+        ));
     }
 
     let photometric = decoder
@@ -341,7 +476,9 @@ fn read_metadata<R: Read + Seek>(
         .flatten()
         .unwrap_or(1);
     if !matches!(planar_configuration, 1 | 2) {
-        return Err(format!("Unsupported TIFF PlanarConfiguration: {planar_configuration}."));
+        return Err(format!(
+            "Unsupported TIFF PlanarConfiguration: {planar_configuration}."
+        ));
     }
 
     let icc_profile = decoder.get_tag_u8_vec(Tag::IccProfile).ok();
@@ -382,7 +519,10 @@ fn infer_color_model(color_type: &ColorType, photometric: Option<u16>) -> (Color
         ColorType::RGB(_) | ColorType::RGBA(_) => (ColorModel::Rgb, 3),
         ColorType::CMYK(_) | ColorType::CMYKA(_) => (ColorModel::Cmyk, 4),
         ColorType::Gray(_) | ColorType::GrayA(_) => (ColorModel::Gray, 1),
-        _ => (ColorModel::Other, usize::from(color_type.num_samples()).max(1)),
+        _ => (
+            ColorModel::Other,
+            usize::from(color_type.num_samples()).max(1),
+        ),
     }
 }
 
@@ -392,9 +532,7 @@ fn locate_photometric_patch(path: &Path) -> Result<PhotometricPatch, String> {
     locate_photometric_patch_in(&mut reader)
 }
 
-fn locate_photometric_patch_in<R: Read + Seek>(
-    reader: &mut R,
-) -> Result<PhotometricPatch, String> {
+fn locate_photometric_patch_in<R: Read + Seek>(reader: &mut R) -> Result<PhotometricPatch, String> {
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|err| format!("Cannot seek TIFF header: {err}"))?;
@@ -432,7 +570,11 @@ fn locate_photometric_patch_in<R: Read + Seek>(
             ifd_bytes.copy_from_slice(&rest[4..12]);
             (endian.u64(ifd_bytes), true)
         }
-        _ => return Err(format!("Cannot patch TIFF: unexpected magic value {magic}.")),
+        _ => {
+            return Err(format!(
+                "Cannot patch TIFF: unexpected magic value {magic}."
+            ));
+        }
     };
 
     reader
@@ -495,8 +637,7 @@ fn locate_photometric_patch_in<R: Read + Seek>(
                 continue;
             }
             let field_type = endian.u16([entry[2], entry[3]]);
-            let item_count =
-                endian.u32([entry[4], entry[5], entry[6], entry[7]]);
+            let item_count = endian.u32([entry[4], entry[5], entry[6], entry[7]]);
             if field_type != 3 || item_count != 1 {
                 return Err(
                     "Unsupported TIFF PhotometricInterpretation tag representation.".to_owned(),
@@ -509,19 +650,23 @@ fn locate_photometric_patch_in<R: Read + Seek>(
         }
     }
 
-    Err("Cannot decode Photoshop extra channels: TIFF PhotometricInterpretation tag was not found."
-        .to_owned())
+    Err(
+        "Cannot decode Photoshop extra channels: TIFF PhotometricInterpretation tag was not found."
+            .to_owned(),
+    )
 }
 
 fn decoding_result_to_u16(decoded: DecodingResult, bit_depth: u8) -> Result<Vec<u16>, String> {
     match decoded {
-        DecodingResult::U8(values) if bit_depth == 8 => {
-            Ok(values.into_iter().map(|value| u16::from(value) * 257).collect())
-        }
+        DecodingResult::U8(values) if bit_depth == 8 => Ok(values
+            .into_iter()
+            .map(|value| u16::from(value) * 257)
+            .collect()),
         DecodingResult::U16(values) if bit_depth == 16 => Ok(values),
-        DecodingResult::U8(values) => {
-            Ok(values.into_iter().map(|value| u16::from(value) * 257).collect())
-        }
+        DecodingResult::U8(values) => Ok(values
+            .into_iter()
+            .map(|value| u16::from(value) * 257)
+            .collect()),
         DecodingResult::U16(values) => Ok(values),
         _ => Err("This TIFF sample type is not supported by Shade Editor.".to_owned()),
     }
@@ -557,10 +702,18 @@ fn channel_names(
     photoshop: Option<&[u8]>,
 ) -> Vec<String> {
     let mut names: Vec<String> = match model {
-        ColorModel::Rgb => ["Red", "Green", "Blue"].into_iter().map(str::to_owned).collect(),
-        ColorModel::Cmyk => ["Cyan", "Magenta", "Yellow", "Black"].into_iter().map(str::to_owned).collect(),
+        ColorModel::Rgb => ["Red", "Green", "Blue"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ColorModel::Cmyk => ["Cyan", "Magenta", "Yellow", "Black"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         ColorModel::Gray => vec!["Gray".to_owned()],
-        ColorModel::Other => (0..base_count).map(|index| format!("Channel {}", index + 1)).collect(),
+        ColorModel::Other => (0..base_count)
+            .map(|index| format!("Channel {}", index + 1))
+            .collect(),
     };
     names.truncate(base_count);
     while names.len() < base_count {
@@ -568,7 +721,9 @@ fn channel_names(
     }
 
     let extra_count = total_count.saturating_sub(base_count);
-    let photoshop_names = photoshop.map(parse_photoshop_channel_names).unwrap_or_default();
+    let photoshop_names = photoshop
+        .map(parse_photoshop_channel_names)
+        .unwrap_or_default();
     for index in 0..extra_count {
         let name = photoshop_names
             .get(index)
@@ -608,24 +763,37 @@ fn parse_photoshop_channel_names(resources: &[u8]) -> Vec<String> {
             continue;
         }
         offset += 4;
-        if offset + 2 > resources.len() { break; }
+        if offset + 2 > resources.len() {
+            break;
+        }
         let id = u16::from_be_bytes([resources[offset], resources[offset + 1]]);
         offset += 2;
 
-        if offset >= resources.len() { break; }
+        if offset >= resources.len() {
+            break;
+        }
         let name_len = resources[offset] as usize;
         offset += 1;
-        if offset + name_len > resources.len() { break; }
+        if offset + name_len > resources.len() {
+            break;
+        }
         offset += name_len;
         if (1 + name_len) % 2 != 0 {
             offset = offset.saturating_add(1);
         }
-        if offset + 4 > resources.len() { break; }
+        if offset + 4 > resources.len() {
+            break;
+        }
         let size = u32::from_be_bytes([
-            resources[offset], resources[offset + 1], resources[offset + 2], resources[offset + 3],
+            resources[offset],
+            resources[offset + 1],
+            resources[offset + 2],
+            resources[offset + 3],
         ]) as usize;
         offset += 4;
-        if offset + size > resources.len() { break; }
+        if offset + size > resources.len() {
+            break;
+        }
         let data = &resources[offset..offset + size];
 
         match id {
@@ -640,7 +808,11 @@ fn parse_photoshop_channel_names(resources: &[u8]) -> Vec<String> {
         }
     }
 
-    if !unicode_names.is_empty() { unicode_names } else { pascal_names }
+    if !unicode_names.is_empty() {
+        unicode_names
+    } else {
+        pascal_names
+    }
 }
 
 fn parse_pascal_names(data: &[u8]) -> Vec<String> {
@@ -649,7 +821,9 @@ fn parse_pascal_names(data: &[u8]) -> Vec<String> {
     while offset < data.len() {
         let len = data[offset] as usize;
         offset += 1;
-        if offset + len > data.len() { break; }
+        if offset + len > data.len() {
+            break;
+        }
         names.push(String::from_utf8_lossy(&data[offset..offset + len]).into_owned());
         offset += len;
     }
@@ -661,19 +835,28 @@ fn parse_unicode_names(data: &[u8]) -> Vec<String> {
     let mut offset = 0usize;
     while offset + 4 <= data.len() {
         let units = u32::from_be_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]) as usize;
         offset += 4;
         let byte_len = match units.checked_mul(2) {
             Some(value) => value,
             None => break,
         };
-        if offset + byte_len > data.len() { break; }
+        if offset + byte_len > data.len() {
+            break;
+        }
         let mut utf16 = Vec::with_capacity(units);
         for pair in data[offset..offset + byte_len].chunks_exact(2) {
             utf16.push(u16::from_be_bytes([pair[0], pair[1]]));
         }
-        names.push(String::from_utf16_lossy(&utf16).trim_end_matches('\0').to_owned());
+        names.push(
+            String::from_utf16_lossy(&utf16)
+                .trim_end_matches('\0')
+                .to_owned(),
+        );
         offset += byte_len;
     }
     names
@@ -690,7 +873,10 @@ mod tests {
     #[test]
     fn interleaves_planar_data() {
         let planar = vec![1, 2, 3, 10, 20, 30];
-        assert_eq!(planar_to_interleaved(&planar, 3, 2), vec![1, 10, 2, 20, 3, 30]);
+        assert_eq!(
+            planar_to_interleaved(&planar, 3, 2),
+            vec![1, 10, 2, 20, 3, 30]
+        );
     }
 
     #[test]
@@ -704,17 +890,17 @@ mod tests {
 
     #[test]
     fn photometric_overrides_multiband_shape() {
-        let fake = ColorType::Multiband { bit_depth: 8, num_samples: 6 };
+        let fake = ColorType::Multiband {
+            bit_depth: 8,
+            num_samples: 6,
+        };
         assert_eq!(infer_color_model(&fake, Some(2)), (ColorModel::Rgb, 3));
         assert_eq!(infer_color_model(&fake, Some(5)), (ColorModel::Cmyk, 4));
     }
 
     #[test]
     fn patched_reader_exposes_all_cmyk_extra_samples() {
-        let pixels = vec![
-            1u8, 2, 3, 4, 5, 6,
-            10, 20, 30, 40, 50, 60,
-        ];
+        let pixels = vec![1u8, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60];
 
         let mut encoded = Cursor::new(Vec::new());
         {
