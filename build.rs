@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::process::Command;
 
 fn checked(command: &mut Command, label: &str) {
@@ -14,6 +15,13 @@ fn main() {
     println!("cargo:rerun-if-changed=scripts/apply_adjustment_pipeline_order.py");
 
     if env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+        return;
+    }
+
+    let already_applied = fs::read_to_string("src/export_v6.rs")
+        .map(|text| text.contains("fn adjustment_pipeline_is_levels_then_mixer_then_curve()"))
+        .unwrap_or(false);
+    if already_applied {
         return;
     }
 
