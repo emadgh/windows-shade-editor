@@ -20,16 +20,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: shade-editor-windows
       - name: Check
         run: cargo check --target x86_64-pc-windows-msvc
       - name: Test
         run: cargo test --target x86_64-pc-windows-msvc
       - name: Build release
         run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Build and test native Shell extension
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist shell\bin mkdir shell\bin
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeProjectDataTests.exe shell\ShadeProjectDataTests.cpp shell\ShadeProjectData.cpp
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeProjectDataTests.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /LD /Fe:shell\bin\ShadeEditorShell.dll shell\ShadeEditorShell.cpp shell\ShadeProjectData.cpp /link ole32.lib shlwapi.lib windowscodecs.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeShellTests.exe shell\ShadeShellTests.cpp /link ole32.lib shlwapi.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeShellTests.exe shell\bin\ShadeEditorShell.dll
+          if errorlevel 1 exit /b 1
+      - name: Validate Shell property schema XML
+        shell: pwsh
+        run: |
+          [xml](Get-Content -Raw shell/ShadeEditor.propdesc) | Out-Null
       - name: Prepare artifact
         shell: pwsh
         run: |
@@ -41,6 +58,14 @@ jobs:
           Copy-Item target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256 artifact/ShadeEditor.exe.sha256
           Copy-Item README.md artifact/README.md
           Copy-Item LICENSE artifact/LICENSE
+          New-Item -ItemType Directory -Force artifact/Shell | Out-Null
+          Copy-Item shell/bin/ShadeEditorShell.dll artifact/Shell/ShadeEditorShell.dll
+          Copy-Item shell/ShadeEditor.propdesc artifact/Shell/ShadeEditor.propdesc
+          Copy-Item shell/Install-ShadeEditorShell.ps1 artifact/Shell/Install-ShadeEditorShell.ps1
+          Copy-Item shell/Uninstall-ShadeEditorShell.ps1 artifact/Shell/Uninstall-ShadeEditorShell.ps1
+          Copy-Item shell/README.md artifact/Shell/README.md
+          $shellHash = (Get-FileHash -Algorithm SHA256 shell/bin/ShadeEditorShell.dll).Hash.ToLowerInvariant()
+          "$shellHash  ShadeEditorShell.dll" | Set-Content -Encoding ascii -NoNewline artifact/Shell/ShadeEditorShell.dll.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: ShadeEditor-win-x64
@@ -54,6 +79,11 @@ jobs:
           gh release create "${{ github.ref_name }}" `
             target/x86_64-pc-windows-msvc/release/ShadeEditor.exe `
             target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256 `
+            artifact/Shell/ShadeEditorShell.dll `
+            artifact/Shell/ShadeEditorShell.dll.sha256 `
+            artifact/Shell/ShadeEditor.propdesc `
+            artifact/Shell/Install-ShadeEditorShell.ps1 `
+            artifact/Shell/Uninstall-ShadeEditorShell.ps1 `
             --title "Shade Editor ${{ github.ref_name }}" `
             --notes-file RELEASE_NOTES.md `
             --latest
