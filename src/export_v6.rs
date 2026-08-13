@@ -20,6 +20,17 @@ use crate::tiff_io::{
     for_each_decoded_strip, stream_info,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub struct ExportOptions {
+    pub force_lzw: bool,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self { force_lzw: true }
+    }
+}
+
 pub fn export_face(
     source: &Path,
     destination: &Path,
@@ -34,6 +45,27 @@ pub fn export_face_with_progress<F>(
     destination: &Path,
     project: &ShadeProject,
     default_dpi: f64,
+    progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(f32, &str),
+{
+    export_face_with_progress_options(
+        source,
+        destination,
+        project,
+        default_dpi,
+        ExportOptions::default(),
+        progress,
+    )
+}
+
+pub fn export_face_with_progress_options<F>(
+    source: &Path,
+    destination: &Path,
+    project: &ShadeProject,
+    default_dpi: f64,
+    options: ExportOptions,
     mut progress: F,
 ) -> Result<(), String>
 where
@@ -45,6 +77,7 @@ where
         &temporary,
         project,
         default_dpi,
+        options,
         |fraction, detail| progress((fraction * 0.98).clamp(0.0, 0.98), detail),
     );
     if let Err(err) = result {
@@ -65,6 +98,7 @@ fn export_face_direct_with_progress<F>(
     destination: &Path,
     project: &ShadeProject,
     default_dpi: f64,
+    options: ExportOptions,
     mut progress: F,
 ) -> Result<(), String>
 where
@@ -78,6 +112,7 @@ where
             destination,
             project,
             default_dpi,
+            options,
             &stream,
             &mut progress,
         );
@@ -181,6 +216,7 @@ where
                 destination,
                 &decoded.metadata,
                 dpi_info,
+                options,
                 None,
                 OutputPixels::U8(&data),
             )?;
@@ -191,6 +227,7 @@ where
                 destination,
                 &decoded.metadata,
                 dpi_info,
+                options,
                 None,
                 OutputPixels::U16(&output),
             )?;
@@ -211,6 +248,7 @@ fn export_face_streaming<F>(
     destination: &Path,
     project: &ShadeProject,
     default_dpi: f64,
+    options: ExportOptions,
     stream: &StreamInfo,
     progress: &mut F,
 ) -> Result<(), String>
@@ -326,6 +364,7 @@ where
                     destination,
                     metadata,
                     dpi_info,
+                    options,
                     Some(stream.rows_per_strip),
                     OutputPixels::U8(&mmap[..]),
                 )?;
@@ -337,6 +376,7 @@ where
                     destination,
                     metadata,
                     dpi_info,
+                    options,
                     Some(stream.rows_per_strip),
                     OutputPixels::U16(data),
                 )?;
@@ -739,17 +779,22 @@ fn should_write_bigtiff(source: &Path, metadata: &TiffMetadata) -> Result<bool, 
 fn configure_tiff_encoder<W, K>(
     mut encoder: TiffEncoder<W, K>,
     metadata: &TiffMetadata,
+    options: ExportOptions,
 ) -> TiffEncoder<W, K>
 where
     W: std::io::Write + std::io::Seek,
     K: tiff::encoder::TiffKind,
 {
-    let compression = match metadata.compression {
-        Some(1) => Compression::Uncompressed,
-        Some(5) => Compression::Lzw,
-        Some(8 | 32946) => Compression::Deflate(tiff::encoder::DeflateLevel::Balanced),
-        Some(32773) => Compression::Packbits,
-        _ => Compression::Lzw,
+    let compression = if options.force_lzw {
+        Compression::Lzw
+    } else {
+        match metadata.compression {
+            Some(1) => Compression::Uncompressed,
+            Some(5) => Compression::Lzw,
+            Some(8 | 32946) => Compression::Deflate(tiff::encoder::DeflateLevel::Balanced),
+            Some(32773) => Compression::Packbits,
+            _ => Compression::Lzw,
+        }
     };
     encoder = encoder.with_compression(compression);
     if metadata.predictor == Some(2) && metadata.samples_per_pixel == metadata.base_channel_count {
@@ -763,6 +808,7 @@ fn write_tiff_pixels(
     destination: &Path,
     metadata: &TiffMetadata,
     dpi_info: DpiInfo,
+    options: ExportOptions,
     rows_per_strip: Option<u32>,
     pixels: OutputPixels<'_>,
 ) -> Result<(), String> {
@@ -772,12 +818,12 @@ fn write_tiff_pixels(
     if should_write_bigtiff(source, metadata)? {
         let encoder = TiffEncoder::new_big(writer)
             .map_err(|err| format!("Cannot initialize BigTIFF encoder: {err}"))?;
-        let mut encoder = configure_tiff_encoder(encoder, metadata);
+        let mut encoder = configure_tiff_encoder(encoder, metadata, options);
         write_tiff_with_encoder(&mut encoder, metadata, dpi_info, rows_per_strip, pixels)
     } else {
         let encoder = TiffEncoder::new(writer)
             .map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?;
-        let mut encoder = configure_tiff_encoder(encoder, metadata);
+        let mut encoder = configure_tiff_encoder(encoder, metadata, options);
         write_tiff_with_encoder(&mut encoder, metadata, dpi_info, rows_per_strip, pixels)
     }
 }

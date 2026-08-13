@@ -37,6 +37,19 @@ pub fn validate_no_adjustment_roundtrip<F>(
     source: &Path,
     output_folder: &Path,
     default_dpi: f64,
+    progress: F,
+) -> Result<ValidationArtifacts, String>
+where
+    F: FnMut(f32, &str),
+{
+    validate_no_adjustment_roundtrip_with_options(source, output_folder, default_dpi, true, progress)
+}
+
+pub fn validate_no_adjustment_roundtrip_with_options<F>(
+    source: &Path,
+    output_folder: &Path,
+    default_dpi: f64,
+    force_lzw: bool,
     mut progress: F,
 ) -> Result<ValidationArtifacts, String>
 where
@@ -71,11 +84,12 @@ where
     let markdown_path = output_folder.join(format!("{base_name}.validation.md"));
 
     progress(0.12, "Exporting through production TIFF backend");
-    export::export_face_with_progress(
+    export::export_face_with_progress_options(
         source,
         &export_path,
         &identity_project,
         default_dpi,
+        export::ExportOptions { force_lzw },
         |fraction, detail| progress(0.12 + fraction * 0.58, detail),
     )?;
 
@@ -154,7 +168,7 @@ where
         },
     );
 
-    let expected_compression = expected_export_compression(source_decoded.metadata.compression);
+    let expected_compression = expected_export_compression(source_decoded.metadata.compression, force_lzw);
     push_check(
         &mut checks,
         "Compression",
@@ -299,6 +313,14 @@ where
 }
 
 pub fn validate_export_transport(source: &Path, exported: &Path) -> Result<String, String> {
+    validate_export_transport_with_options(source, exported, true)
+}
+
+pub fn validate_export_transport_with_options(
+    source: &Path,
+    exported: &Path,
+    force_lzw: bool,
+) -> Result<String, String> {
     let source_info = tiff_io::stream_info(source)
         .map_err(|err| format!("Cannot inspect source TIFF for post-export validation: {err}"))?;
     let output_info = tiff_io::stream_info(exported)
@@ -336,7 +358,7 @@ pub fn validate_export_transport(source: &Path, exported: &Path) -> Result<Strin
     if source_meta.orientation != output_meta.orientation {
         mismatches.push("orientation changed".to_owned());
     }
-    let expected_compression = expected_export_compression(source_meta.compression);
+    let expected_compression = expected_export_compression(source_meta.compression, force_lzw);
     if output_meta.compression != expected_compression {
         mismatches.push(format!(
             "compression expected {:?}, got {:?}",
@@ -411,7 +433,10 @@ fn push_check(checks: &mut Vec<ValidationCheck>, name: &str, passed: bool, detai
     });
 }
 
-fn expected_export_compression(source: Option<u16>) -> Option<u16> {
+fn expected_export_compression(source: Option<u16>, force_lzw: bool) -> Option<u16> {
+    if force_lzw {
+        return Some(5);
+    }
     match source {
         Some(1 | 5 | 8 | 32946 | 32773) => source,
         _ => Some(5),

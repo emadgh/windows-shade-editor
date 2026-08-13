@@ -1,3 +1,12 @@
+# Shade Editor v0.12.1
+
+- Moved export/storage controls into a dedicated Settings section.
+- Added persistent LZW export compression control; enabled by default.
+- Added Settings buttons for bundled Windows Shell install/uninstall scripts and a clear separate-package message when the shell folder is missing.
+- Reworked About shortcuts into readable groups.
+- Error toolbar messages now auto-expire quickly and can be dismissed.
+- Widened operation/update progress bars and moved long operation details below the progress label.
+
 # Shade Editor v0.12.0
 
 - Preserves BigTIFF container format when exporting a BigTIFF source.

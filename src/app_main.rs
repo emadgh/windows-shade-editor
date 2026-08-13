@@ -53,7 +53,7 @@ use tiff_io::PreviewFace;
 use update::{UpdateManager, UpdateStatus};
 
 const VIEWPORT_OVERSCROLL: f32 = 180.0;
-const ERROR_TOAST_LIFETIME: Duration = Duration::from_secs(120);
+const ERROR_TOAST_LIFETIME: Duration = Duration::from_secs(8);
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
 const HISTORY_COMMIT_DELAY: Duration = Duration::from_millis(300);
 
@@ -309,7 +309,7 @@ impl ShadeApp {
     fn report_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.log.error(&message);
-        self.status_message = message.clone();
+        self.status_message = "Error - see Logs".to_owned();
         self.toast = Some(ErrorToast {
             message,
             created: Instant::now(),
@@ -618,13 +618,15 @@ impl ShadeApp {
         let source = face.path.clone();
         let project = self.project.clone();
         let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
         let validate_after_export = self.settings.validate_after_export;
         self.launch_job("Exporting TIFF", move |progress| {
-            let result = export::export_face_with_progress(
+            let result = export::export_face_with_progress_options(
                 &source,
                 &destination,
                 &project,
                 default_dpi,
+                export::ExportOptions { force_lzw },
                 |fraction, detail| {
                     let fraction = if validate_after_export {
                         fraction * 0.88
@@ -642,7 +644,11 @@ impl ShadeApp {
                         "Validating exported TIFF",
                         "Decoding strips and checking production metadata",
                     );
-                    let verified = validation::validate_export_transport(&source, &destination)?;
+                    let verified = validation::validate_export_transport_with_options(
+                        &source,
+                        &destination,
+                        force_lzw,
+                    )?;
                     Ok(format!("Exported {} · {verified}", destination.display()))
                 } else {
                     Ok(format!("Exported {}", destination.display()))
@@ -677,11 +683,13 @@ impl ShadeApp {
         };
         let source = face.path.clone();
         let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
         self.launch_job("Validating TIFF", move |progress| {
-            let result = validation::validate_no_adjustment_roundtrip(
+            let result = validation::validate_no_adjustment_roundtrip_with_options(
                 &source,
                 &folder,
                 default_dpi,
+                force_lzw,
                 |fraction, detail| {
                     Self::set_progress(&progress, Some(fraction), "Validating TIFF", detail);
                 },
@@ -722,6 +730,7 @@ impl ShadeApp {
             .collect::<Vec<_>>();
         let project = self.project.clone();
         let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
         let validate_after_export = self.settings.validate_after_export;
         self.launch_job("Exporting faces", move |progress| {
             let total = sources.len().max(1);
@@ -732,11 +741,12 @@ impl ShadeApp {
                         .map(|value| value.to_string_lossy())
                         .unwrap_or_default();
                     let destination = folder.join(format!("{stem}-shade.tif"));
-                    export::export_face_with_progress(
+                    export::export_face_with_progress_options(
                         source,
                         &destination,
                         &project,
                         default_dpi,
+                        export::ExportOptions { force_lzw },
                         |inner, detail| {
                             let phase = if validate_after_export {
                                 inner * 0.88
@@ -755,7 +765,11 @@ impl ShadeApp {
                             "Validating exported TIFF",
                             &destination.display().to_string(),
                         );
-                        validation::validate_export_transport(source, &destination)?;
+                        validation::validate_export_transport_with_options(
+                            source,
+                            &destination,
+                            force_lzw,
+                        )?;
                     }
                 }
                 if validate_after_export {
@@ -821,14 +835,16 @@ impl ShadeApp {
             .to_path_buf();
         let mut project = self.project.clone();
         let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
         project.adjustments = snapshot.adjustments.clone();
         project.active_snapshot_id = Some(snapshot.id);
         self.launch_job("Exporting snapshot", move |progress| {
-            let result = export::export_face_with_progress(
+            let result = export::export_face_with_progress_options(
                 &source,
                 &destination,
                 &project,
                 default_dpi,
+                export::ExportOptions { force_lzw },
                 |fraction, detail| {
                     Self::set_progress(&progress, Some(fraction), "Exporting snapshot", detail);
                 },
@@ -872,6 +888,7 @@ impl ShadeApp {
             .unwrap_or_else(|| "face".to_owned());
         let base_project = self.project.clone();
         let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
         let snapshots = snapshot_ids
             .into_iter()
             .filter_map(|id| {
@@ -898,11 +915,12 @@ impl ShadeApp {
                     let mut project = base_project.clone();
                     project.adjustments = snapshot.adjustments.clone();
                     project.active_snapshot_id = Some(snapshot.id);
-                    export::export_face_with_progress(
+                    export::export_face_with_progress_options(
                         &source,
                         &destination,
                         &project,
                         default_dpi,
+                        export::ExportOptions { force_lzw },
                         |inner, detail| {
                             let overall = (index as f32 + inner) / total as f32;
                             Self::set_progress(
@@ -1287,6 +1305,36 @@ impl ShadeApp {
         }
     }
 
+    fn bundled_shell_script(file_name: &str) -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let root = exe.parent()?;
+        for folder in ["shell", "Shell"] {
+            let candidate = root.join(folder).join(file_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn launch_shell_script(&mut self, file_name: &str, action: &str) {
+        let Some(script) = Self::bundled_shell_script(file_name) else {
+            self.report_error("Shell integration package was not found next to ShadeEditor.exe. Install the Shell package separately.");
+            return;
+        };
+        match std::process::Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script)
+            .spawn()
+        {
+            Ok(_) => self.report_info(format!("Shell integration {action} started - approve the Windows administrator prompt.")),
+            Err(err) => self.report_error(format!("Cannot start Shell integration {action}: {err}")),
+        }
+    }
+
     fn sync_update_state(&mut self) {
         match self.updater.status() {
             UpdateStatus::Failed(message) => {
@@ -1303,125 +1351,71 @@ impl ShadeApp {
             .is_some_and(|toast| toast.created.elapsed() > ERROR_TOAST_LIFETIME)
         {
             self.toast = None;
+            if self.status_message == "Error - see Logs" {
+                self.status_message = "Ready".to_owned();
+            }
         }
     }
 
     fn ui_toolbar(&mut self, ui: &mut egui::Ui) {
+        let mut dismiss_error = false;
         ui.horizontal(|ui| {
             ui.horizontal_wrapped(|ui| {
                 let enabled = self.job.is_none();
-                if ui.add_enabled(enabled, egui::Button::new("New")).clicked() {
-                    self.new_project();
-                }
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Open .shade"))
-                    .clicked()
-                {
-                    self.open_project_dialog();
-                }
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Add TIFF faces"))
-                    .clicked()
-                {
-                    self.add_faces_dialog();
-                }
+                if ui.add_enabled(enabled, egui::Button::new("New")).clicked() { self.new_project(); }
+                if ui.add_enabled(enabled, egui::Button::new("Open .shade")).clicked() { self.open_project_dialog(); }
+                if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces")).clicked() { self.add_faces_dialog(); }
                 ui.separator();
-                if ui
-                    .add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save"))
-                    .clicked()
-                {
-                    self.save_project(false);
-                }
-                if ui
-                    .add_enabled(
-                        enabled && !self.faces.is_empty(),
-                        egui::Button::new("Save As"),
-                    )
-                    .clicked()
-                {
-                    self.save_project(true);
-                }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() { self.save_project(false); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save As")).clicked() { self.save_project(true); }
                 ui.separator();
-                if ui
-                    .add_enabled(
-                        enabled && !self.faces.is_empty(),
-                        egui::Button::new("Export face"),
-                    )
-                    .clicked()
-                {
-                    self.export_current_dialog();
-                }
-                if ui
-                    .add_enabled(
-                        enabled && !self.faces.is_empty(),
-                        egui::Button::new("Export all"),
-                    )
-                    .clicked()
-                {
-                    self.export_all_dialog();
-                }
-                if ui
-                    .add_enabled(
-                        enabled && !self.faces.is_empty(),
-                        egui::Button::new("Validate face"),
-                    )
-                    .on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.")
-                    .clicked()
-                {
-                    self.validate_current_face_dialog();
-                }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export face")).clicked() { self.export_current_dialog(); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Validate face")).on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.").clicked() { self.validate_current_face_dialog(); }
                 ui.separator();
-                if ui.button("Settings").clicked() {
-                    self.show_settings = true;
-                }
-                if ui.button("About").clicked() {
-                    self.show_about = true;
-                }
+                if ui.button("Settings").clicked() { self.show_settings = true; }
+                if ui.button("About").clicked() { self.show_about = true; }
             });
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Logs").clicked() {
-                    self.log_cache = self.log.read();
-                    self.show_logs = true;
-                }
+                if ui.small_button("Logs").clicked() { self.log_cache = self.log.read(); self.show_logs = true; }
                 self.ui_update_compact(ui);
                 self.ui_operation_progress(ui);
                 if let Some(toast) = &self.toast {
-                    ui.label(
-                        egui::RichText::new(&toast.message)
-                            .color(egui::Color32::LIGHT_RED)
-                            .small(),
-                    );
+                    ui.horizontal(|ui| {
+                        dismiss_error = ui.small_button("x").on_hover_text("Dismiss error").clicked();
+                        let full = toast.message.clone();
+                        let mut compact = full.chars().take(56).collect::<String>();
+                        if full.chars().count() > 56 { compact.push('…'); }
+                        ui.label(egui::RichText::new(compact).color(egui::Color32::LIGHT_RED).small()).on_hover_text(full);
+                    });
                 }
             });
         });
+        if dismiss_error {
+            self.toast = None;
+            if self.status_message == "Error - see Logs" { self.status_message = "Ready".to_owned(); }
+        }
     }
 
     fn ui_operation_progress(&self, ui: &mut egui::Ui) {
         if let Some(job) = &self.job {
             if let Ok(progress) = job.progress.lock() {
                 let value = progress.fraction.unwrap_or(0.5);
-                let text = if progress.detail.is_empty() {
-                    progress.label.clone()
-                } else {
-                    format!("{} · {}", progress.label, progress.detail)
-                };
-                ui.add(
-                    egui::ProgressBar::new(value)
-                        .desired_width(175.0)
-                        .text(text)
-                        .animate(progress.fraction.is_none()),
-                );
+                let label = progress.label.clone();
+                let detail = progress.detail.clone();
+                ui.vertical(|ui| {
+                    ui.add(egui::ProgressBar::new(value).desired_width(300.0).text(label).animate(progress.fraction.is_none()));
+                    if !detail.is_empty() {
+                        let mut compact = detail.chars().take(48).collect::<String>();
+                        if detail.chars().count() > 48 { compact.push('…'); }
+                        ui.small(compact).on_hover_text(detail);
+                    }
+                });
                 return;
             }
         }
         if self.render_busy.is_some() {
-            ui.add(
-                egui::ProgressBar::new(0.45)
-                    .desired_width(145.0)
-                    .text("Rendering preview")
-                    .animate(true),
-            );
+            ui.add(egui::ProgressBar::new(0.45).desired_width(240.0).text("Rendering preview").animate(true));
         }
     }
 
@@ -1435,7 +1429,7 @@ impl ShadeApp {
             UpdateStatus::Checking => {
                 ui.add(
                     egui::ProgressBar::new(0.5)
-                        .desired_width(125.0)
+                        .desired_width(190.0)
                         .text("Checking update")
                         .animate(true),
                 );
@@ -1469,7 +1463,7 @@ impl ShadeApp {
                     .unwrap_or(0.5);
                 ui.add(
                     egui::ProgressBar::new(fraction)
-                        .desired_width(150.0)
+                        .desired_width(220.0)
                         .text(format!("Updating {}", info.version))
                         .animate(total.is_none()),
                 );
@@ -3011,6 +3005,15 @@ impl ShadeApp {
                     }
                 });
                 ui.small("The max dimension is used when TIFF previews are loaded. Use Rebuild previews to apply a changed value to Faces already open in this project.");
+                ui.separator();
+                ui.heading("Export & storage");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.lzw_compression,
+                        "Use LZW compression for exported TIFF files",
+                    )
+                    .changed();
+                ui.small("LZW is enabled by default. Disable it only when you specifically need to preserve a supported source compression mode.");
                 changed |= ui
                     .checkbox(
                         &mut self.settings.validate_after_export,
@@ -3034,6 +3037,21 @@ impl ShadeApp {
                             face.dpi = dpi::DpiInfo::with_default(self.settings.default_dpi);
                         }
                     }
+                }
+                ui.separator();
+                ui.heading("Windows Explorer integration");
+                let shell_installer = Self::bundled_shell_script("Install-ShadeEditorShell.ps1");
+                let shell_uninstaller = Self::bundled_shell_script("Uninstall-ShadeEditorShell.ps1");
+                if let Some(installer) = shell_installer {
+                    ui.small(format!("Bundled Shell package: {}", installer.parent().unwrap_or_else(|| Path::new(".")).display()));
+                    ui.horizontal(|ui| {
+                        if ui.button("Install Shell integration").clicked() { self.launch_shell_script("Install-ShadeEditorShell.ps1", "installation"); }
+                        if shell_uninstaller.is_some() && ui.button("Uninstall Shell integration").clicked() { self.launch_shell_script("Uninstall-ShadeEditorShell.ps1", "removal"); }
+                    });
+                    ui.small("The installer may request administrator permission because Explorer COM/property handlers are registered machine-wide.");
+                } else {
+                    ui.colored_label(egui::Color32::YELLOW, "Bundled shell folder not found next to ShadeEditor.exe.");
+                    ui.small("Install the Shell package separately, or place the shell folder from the build package next to ShadeEditor.exe.");
                 }
                 ui.separator();
                 ui.heading("Editor layout");
@@ -3209,7 +3227,8 @@ impl ShadeApp {
         let mut open = self.show_about;
         egui::Window::new("About Shade Editor")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
+            .default_width(520.0)
             .show(ctx, |ui| {
                 ui.heading("Shade Editor");
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
@@ -3224,7 +3243,19 @@ impl ShadeApp {
                 ui.separator();
                 ui.label("Update controls are located on the right side of the main toolbar.");
                 ui.separator();
-                ui.label("Shortcuts: Ctrl+S Save · Ctrl+Shift+S Save As · F Fit · 1-9 channel · S Solo · Ctrl+Enter Update Snapshot · Curve arrows nudge; Shift+Arrow uses larger steps.");
+                ui.strong("Shortcuts");
+                egui::Grid::new("about-shortcuts")
+                    .num_columns(2)
+                    .spacing([18.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("File"); ui.label("Ctrl+S  Save   |   Ctrl+Shift+S  Save As"); ui.end_row();
+                        ui.strong("View"); ui.label("F  Fit image"); ui.end_row();
+                        ui.strong("Channels"); ui.label("1-9  Select channel   |   S  Solo channel"); ui.end_row();
+                        ui.strong("Snapshot"); ui.label("Ctrl+Enter  Update active Snapshot"); ui.end_row();
+                        ui.strong("Curve"); ui.label("Arrow keys  Nudge point   |   Shift+Arrow  Larger step"); ui.end_row();
+                        ui.strong("History"); ui.label("Ctrl+Alt+Z  Undo   |   Ctrl+Shift+Z  Redo"); ui.end_row();
+                    });
             });
         self.show_about = open;
     }

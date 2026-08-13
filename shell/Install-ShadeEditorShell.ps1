@@ -27,7 +27,7 @@ if (-not (Test-Path $editorSource)) {
 if (-not (Test-Path $dllSource)) { throw "Missing $dllSource" }
 if (-not (Test-Path $schemaSource)) { throw "Missing $schemaSource" }
 
-$version = '0.12.0'
+$version = '0.12.1'
 $clsid = '{6F49F9D5-0F3A-4BF0-8C74-8A59951A75D2}'
 $thumbHandler = '{E357FCCD-A995-4576-B01F-234630154E96}'
 $progId = 'ShadeEditor.Project'
