@@ -1,0 +1,44 @@
+name: Apply Shade Editor v0.12 BigTIFF export
+
+on:
+  push:
+    branches: [feat/v012-bigtiff-export]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/v012-bigtiff-export
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: shade-editor-windows
+      - name: Apply source patch
+        shell: pwsh
+        run: |
+          python scripts/apply_v012_bigtiff.py
+          cargo fmt --all
+      - name: Check
+        run: cargo check --target x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+      - name: Release build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Commit final source and remove patch machinery
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm scripts/apply_v012_bigtiff.py .github/workflows/apply-v012-bigtiff.yml
+          git add Cargo.toml Cargo.lock src/export_v6.rs RELEASE_NOTES.md docs/ROADMAP.md
+          git commit -m "Add automatic BigTIFF export support"
+          git push origin HEAD:feat/v012-bigtiff-export
