@@ -3,7 +3,9 @@ use crate::tiff_io::{ColorModel, PreviewFace};
 
 pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u16>> {
     let channel_count = face.channels.len();
-    if channel_count == 0 { return Vec::new(); }
+    if channel_count == 0 {
+        return Vec::new();
+    }
     let pixel_count = face.channels[0].len();
     let names = &face.metadata.channel_names;
 
@@ -41,7 +43,9 @@ pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u1
                 } else {
                     let mut mixed = adjustment.mixer.constant;
                     for source in 0..channel_count {
-                        let coefficient = adjustment.mixer.coefficients
+                        let coefficient = adjustment
+                            .mixer
+                            .coefficients
                             .get(&names[source])
                             .copied()
                             .unwrap_or(if source == out_channel { 1.0 } else { 0.0 });
@@ -77,7 +81,11 @@ pub fn rgba_from_planes(
             && channel < face.metadata.base_channel_count;
         for value in &planes[channel] {
             let byte = (*value >> 8) as u8;
-            let gray = if invert { 255u8.saturating_sub(byte) } else { byte };
+            let gray = if invert {
+                255u8.saturating_sub(byte)
+            } else {
+                byte
+            };
             rgba.extend_from_slice(&[gray, gray, gray, 255]);
         }
         return rgba;
@@ -138,13 +146,11 @@ fn composite_extra_channels(
     rgb: &mut [f32; 3],
 ) {
     let first_extra = face.metadata.base_channel_count.min(planes.len());
-    if first_extra >= planes.len() { return; }
+    if first_extra >= planes.len() {
+        return;
+    }
 
-    // Photoshop spot channels are grayscale separations where dark values mean
-    // more visible spot ink. Until DisplayInfo 1077 colors are decoded, use a
-    // deterministic diagnostic tint per extra separation. Crucially, this never
-    // changes sample addressing or the TIFF data itself.
-    const TINTS: [[f32; 3]; 8] = [
+    const DIAGNOSTIC_TINTS: [[f32; 3]; 8] = [
         [0.00, 0.90, 0.45],
         [0.95, 0.15, 0.20],
         [0.15, 0.55, 0.95],
@@ -154,15 +160,51 @@ fn composite_extra_channels(
         [0.55, 0.25, 0.90],
         [0.95, 0.45, 0.05],
     ];
-    for (extra_index, plane) in planes[first_extra..].iter().enumerate() {
-        if pixel >= plane.len() { continue; }
-        let coverage = 1.0 - plane[pixel] as f32 / 65535.0;
-        if coverage <= 0.001 { continue; }
-        let tint = TINTS[extra_index % TINTS.len()];
-        let strength = (coverage * 0.72).clamp(0.0, 0.72);
-        for component in 0..3 {
-            rgb[component] = rgb[component] * (1.0 - strength) + tint[component] * strength;
+
+    for channel_index in first_extra..planes.len() {
+        let plane = &planes[channel_index];
+        if pixel >= plane.len() {
+            continue;
         }
+        let coverage = 1.0 - plane[pixel] as f32 / 65535.0;
+        if coverage <= 0.001 {
+            continue;
+        }
+        let display = face
+            .metadata
+            .channel_display_info
+            .get(channel_index)
+            .and_then(|value| *value);
+        match display {
+            Some(info) if info.is_spot() => {
+                let tint = info.rgb.unwrap_or(
+                    DIAGNOSTIC_TINTS[(channel_index - first_extra) % DIAGNOSTIC_TINTS.len()],
+                );
+                // Photoshop Solidity affects composite/on-screen simulation only,
+                // not the actual separation. Honor the stored value exactly.
+                blend_tint(rgb, tint, (coverage * info.solidity).clamp(0.0, 1.0));
+            }
+            Some(_) => {
+                // Known Alpha/protected display channels are not printing inks;
+                // do not contaminate the composite preview with them.
+            }
+            None => {
+                // Files without DisplayInfo cannot tell us Spot vs Alpha here.
+                // Retain a deterministic engineering tint so extra separations
+                // remain visible during diagnosis.
+                let tint = DIAGNOSTIC_TINTS[(channel_index - first_extra) % DIAGNOSTIC_TINTS.len()];
+                blend_tint(rgb, tint, (coverage * 0.72).clamp(0.0, 0.72));
+            }
+        }
+    }
+}
+
+fn blend_tint(rgb: &mut [f32; 3], tint: [f32; 3], strength: f32) {
+    if strength <= 0.0 {
+        return;
+    }
+    for component in 0..3 {
+        rgb[component] = rgb[component] * (1.0 - strength) + tint[component] * strength;
     }
 }
 

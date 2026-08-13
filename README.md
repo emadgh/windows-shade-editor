@@ -4,7 +4,7 @@ Native Windows shade editor for multi-channel TIFF artwork used in digital ceram
 
 Shade Editor keeps source TIFF faces unchanged and stores color-adjustment recipes in a small `.shade` project beside the artwork. The first version is intentionally focused on shade matching rather than general image editing.
 
-## First-version features
+## Current features
 
 - Native Rust desktop UI; no WebView or Electron runtime.
 - Open multiple TIFF files as project **Faces** and switch between them.
@@ -18,8 +18,11 @@ Shade Editor keeps source TIFF faces unchanged and stores color-adjustment recip
 - Optional test-code raster in the selected output channel.
 - Export current Face or all Faces as TIFF.
 - Preserve source ICC profile and Photoshop Image Resources when available.
-- Preserve extra TIFF samples when exporting CMYK plus additional channels.
-- Automatic GitHub Release update checking/downloading, enabled by default and disableable in Settings.
+- Preserve extra TIFF samples when exporting RGB/CMYK plus additional channels.
+- Parse Photoshop Spot display color/Solidity for preview and distinguish declared Spot vs Alpha channels.
+- Stream normal chunky strip TIFF preview/export with bounded working buffers.
+- Atomic same-directory TIFF export replacement to avoid partial destination files.
+- Automatic GitHub Release update checking/downloading with SHA-256 asset verification, enabled by default and disableable in Settings.
 - About window with application version and manual update check.
 
 ## `.shade` projects
@@ -34,7 +37,7 @@ Moonstone/
 └─ moonstone-test-1.shade
 ```
 
-The format is versioned JSON in schema version 1. Source paths are saved relative to the `.shade` file when possible.
+The format is versioned JSON. Shade Editor 0.10 uses schema version 9; pre-production v1-v8 migration support was intentionally removed in v0.9. Source paths are saved relative to the `.shade` file when possible.
 
 ## Color pipeline
 
@@ -50,7 +53,7 @@ The on-screen composite is an engineering preview and is not yet a press/RIP col
 
 ## TIFF compatibility scope
 
-Version 0.1 targets 8-bit and 16-bit CMYK TIFF with optional additional samples. It reads the embedded ICC profile and Photoshop Image Resources and copies them to exported files. Photoshop/RIP interoperability must still be validated against representative production TIFFs before relying on this version in a production print workflow.
+The current production-oriented path targets 8-bit and 16-bit RGB/CMYK TIFF with optional additional samples/Spot Channels. It reads the embedded ICC profile and Photoshop Image Resources and copies them to exported files. Photoshop/RIP interoperability must still be validated against representative production TIFFs before relying on a new build in a production print workflow. See `docs/PRODUCTION_VALIDATION.md`.
 
 ## Build
 

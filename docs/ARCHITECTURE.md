@@ -26,7 +26,7 @@ Owns the `.shade` project schema and adjustment domain model.
 
 `ShadeProject::ensure_channels` is the central invariant builder. Every discovered channel receives an adjustment and an identity mixer row.
 
-Future `.shade` changes must increment `SHADE_SCHEMA_VERSION` and add explicit migration logic before old files are rewritten.
+Schema v9 is the current clean-break project format. Future schema changes should increment `SHADE_SCHEMA_VERSION`; add migration only when backward compatibility is explicitly required.
 
 ### `tiff_io.rs`
 Owns TIFF decoding and source metadata discovery.
@@ -42,7 +42,7 @@ Current responsibilities:
 - parse Photoshop channel-name resources 1006/1045;
 - build downsampled preview planes and histograms.
 
-The current v0.1 preview decoder reads the full source before downsampling. Replace this with tiled/strip streaming before optimizing for very large production artwork. Keep the public `PreviewFace` boundary so the UI does not care how decoding is implemented.
+Normal chunky strip TIFFs are decoded strip-by-strip for preview. Planar/tiled inputs retain the full-decode compatibility path. Keep the public `PreviewFace` boundary so UI code remains independent from decoding strategy.
 
 ### `render.rs`
 Pure preview processing.
@@ -55,20 +55,25 @@ Pipeline:
 4. N×N mixer;
 5. convert adjusted planes to preview RGBA or isolated-channel grayscale.
 
-The composite conversion is intentionally approximate in v0.1. A future color-managed preview should live behind this module and use ICC/ink display-color information rather than leaking color conversion into UI code.
+The base RGB/CMYK composite conversion remains an engineering approximation, but Photoshop DisplayInfo 1077 Spot colors and Solidity are honored when present. Full ICC color-managed proofing should still live behind this module rather than leaking conversion into UI code.
 
 ### `export.rs`
 Full-resolution destructive renderer for newly-created output files only.
 
 It applies the same adjustment order as `render.rs`, can rasterize test code into a selected separation, and writes CMYK plus TIFF ExtraSamples. ICC and Photoshop resource payloads are copied from the source when present.
 
-Important future work:
+Current hardening:
 
-- stream strips/tiles rather than retaining the full image;
-- preserve resolution, orientation and other approved TIFF metadata;
-- validate Photoshop spot-channel semantics and ordering against production samples;
-- add atomic output writing and collision policy;
-- add regression fixtures for Photoshop/RIP round trips.
+- chunky strip inputs stream through preview and export;
+- output preserves approved resolution/orientation/ICC/Photoshop metadata and source lossless compression/predictor intent;
+- output is committed with same-directory atomic replacement;
+- Photoshop DisplayInfo 1077 is parsed for Spot display semantics.
+
+Remaining production validation:
+
+- reopen representative no-adjustment exports in Photoshop and the actual RIP to confirm Spot semantics/order;
+- maintain regression fixtures or metadata baselines for each production TIFF family;
+- treat the preview as engineering simulation, not a press proof.
 
 ### `settings.rs`
 Persists app-level preferences under `%LOCALAPPDATA%\ShadeEditor\settings.json`.
@@ -87,7 +92,7 @@ Self-update subsystem modeled after GahYar but isolated from the UI.
 
 The updater must never replace the running executable while a project is still open. Auto-update downloads in the background, but install is an explicit **Restart and update** action.
 
-Future hardening should add release-asset hashing/signature verification.
+Tagged Releases publish `ShadeEditor.exe.sha256`; the updater requires and verifies that SHA-256 digest before staging the executable. A future code-signing step can add publisher/authenticode verification on top.
 
 ### `main.rs`
 Application orchestration and egui UI.

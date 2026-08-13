@@ -1,10 +1,14 @@
 use std::fs::{self, File};
 use std::io::BufWriter;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use fontdue::{Font, FontSettings};
-use tiff::encoder::{TiffEncoder, colortype};
+use tiff::encoder::{Compression, Predictor, TiffEncoder, colortype};
 use tiff::tags::{ExtraSamples, Tag};
+use windows_sys::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
 
 use crate::dpi::{self, DpiInfo};
 use crate::model::{ShadeProject, TestCodePosition, apply_curve, apply_levels};
@@ -22,6 +26,37 @@ pub fn export_face(
 }
 
 pub fn export_face_with_progress<F>(
+    source: &Path,
+    destination: &Path,
+    project: &ShadeProject,
+    default_dpi: f64,
+    mut progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(f32, &str),
+{
+    let temporary = temporary_export_path(destination)?;
+    let result = export_face_direct_with_progress(
+        source,
+        &temporary,
+        project,
+        default_dpi,
+        |fraction, detail| progress((fraction * 0.98).clamp(0.0, 0.98), detail),
+    );
+    if let Err(err) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(err);
+    }
+    progress(0.99, "Committing TIFF atomically");
+    if let Err(err) = atomic_replace(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(err);
+    }
+    progress(1.0, "Export complete");
+    Ok(())
+}
+
+fn export_face_direct_with_progress<F>(
     source: &Path,
     destination: &Path,
     project: &ShadeProject,
@@ -160,8 +195,7 @@ where
     let file =
         File::create(destination).map_err(|err| format!("Cannot create export TIFF: {err}"))?;
     let writer = BufWriter::new(file);
-    let mut encoder =
-        TiffEncoder::new(writer).map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?;
+    let mut encoder = make_tiff_encoder(writer, &decoded.metadata)?;
 
     match (decoded.metadata.color_model, decoded.metadata.bit_depth) {
         (ColorModel::Rgb, 8) => {
@@ -255,8 +289,7 @@ where
     let file =
         File::create(destination).map_err(|err| format!("Cannot create export TIFF: {err}"))?;
     let writer = BufWriter::new(file);
-    let mut encoder =
-        TiffEncoder::new(writer).map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?;
+    let mut encoder = make_tiff_encoder(writer, metadata)?;
 
     match (metadata.color_model, metadata.bit_depth) {
         (ColorModel::Rgb, 8) => {
@@ -520,6 +553,13 @@ where
         .write_tag(Tag::ResolutionUnit, resolution_unit)
         .map_err(|err| format!("Cannot preserve/write TIFF resolution unit: {err}"))?;
 
+    if let Some(orientation) = metadata.orientation {
+        image
+            .encoder()
+            .write_tag(Tag::Orientation, orientation)
+            .map_err(|err| format!("Cannot preserve TIFF orientation: {err}"))?;
+    }
+
     if let Some(profile) = &metadata.icc_profile {
         image
             .encoder()
@@ -542,6 +582,72 @@ where
         .encoder()
         .write_tag(Tag::Software, "Shade Editor")
         .map_err(|err| format!("Cannot write TIFF software tag: {err}"))?;
+    Ok(())
+}
+
+fn make_tiff_encoder(
+    writer: BufWriter<File>,
+    metadata: &TiffMetadata,
+) -> Result<TiffEncoder<BufWriter<File>>, String> {
+    let compression = match metadata.compression {
+        Some(1) => Compression::Uncompressed,
+        Some(5) => Compression::Lzw,
+        Some(8 | 32946) => Compression::Deflate(tiff::encoder::DeflateLevel::Balanced),
+        Some(32773) => Compression::Packbits,
+        // Never fall back to a lossy or unknown encoder for production artwork.
+        _ => Compression::Lzw,
+    };
+    let mut encoder = TiffEncoder::new(writer)
+        .map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?
+        .with_compression(compression);
+    if metadata.predictor == Some(2) {
+        encoder = encoder.with_predictor(Predictor::Horizontal);
+    }
+    Ok(encoder)
+}
+
+fn temporary_export_path(destination: &Path) -> Result<PathBuf, String> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export.tif");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..32u32 {
+        let candidate = parent.join(format!(
+            ".{file_name}.shade-editor-{}-{stamp}-{attempt}.tmp",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("Cannot allocate a temporary export file beside the destination.".to_owned())
+}
+
+fn atomic_replace(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
+    if moved == 0 {
+        return Err(format!(
+            "Cannot atomically replace {}: {}",
+            destination.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
     Ok(())
 }
 
@@ -829,6 +935,7 @@ mod streaming_tests {
         let mut project = ShadeProject::default();
         project.ensure_channels(&decoded_source.metadata.channel_names);
 
+        std::fs::write(&destination, b"stale partial export").unwrap();
         export_face_with_progress(&source, &destination, &project, 220.0, |_, _| {}).unwrap();
 
         let decoded_output = decode_full(&destination).unwrap();

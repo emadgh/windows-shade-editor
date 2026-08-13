@@ -25,6 +25,23 @@ impl ColorModel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhotoshopChannelDisplay {
+    /// Photoshop display color converted to normalized sRGB when the Color
+    /// structure uses a color space we understand.
+    pub rgb: Option<[f32; 3]>,
+    /// Photoshop DisplayInfo opacity/solidity normalized to 0..=1.
+    pub solidity: f32,
+    /// DisplayInfo kind. Photoshop spot channels use kind 2 in production TIFFs.
+    pub kind: u8,
+}
+
+impl PhotoshopChannelDisplay {
+    pub fn is_spot(self) -> bool {
+        self.kind == 2
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TiffMetadata {
     pub width: u32,
@@ -36,6 +53,12 @@ pub struct TiffMetadata {
     pub base_channel_count: usize,
     pub color_model: ColorModel,
     pub channel_names: Vec<String>,
+    /// Per-channel Photoshop display metadata. Base channels normally contain
+    /// None; extra channels may contain Spot/Alpha DisplayInfo resource 1077.
+    pub channel_display_info: Vec<Option<PhotoshopChannelDisplay>>,
+    pub compression: Option<u16>,
+    pub predictor: Option<u16>,
+    pub orientation: Option<u16>,
     pub icc_profile: Option<Vec<u8>>,
     pub photoshop_resources: Option<Vec<u8>>,
     pub photoshop_image_source_data: Option<Vec<u8>>,
@@ -481,6 +504,18 @@ fn read_metadata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(TiffMetada
         ));
     }
 
+    let compression = decoder
+        .find_tag_unsigned::<u16>(Tag::Compression)
+        .ok()
+        .flatten();
+    let predictor = decoder
+        .find_tag_unsigned::<u16>(Tag::Predictor)
+        .ok()
+        .flatten();
+    let orientation = decoder
+        .find_tag_unsigned::<u16>(Tag::Orientation)
+        .ok()
+        .flatten();
     let icc_profile = decoder.get_tag_u8_vec(Tag::IccProfile).ok();
     let photoshop_resources = decoder.get_tag_u8_vec(Tag::Unknown(34377)).ok();
     let photoshop_image_source_data = decoder.get_tag_u8_vec(Tag::Unknown(37724)).ok();
@@ -490,6 +525,12 @@ fn read_metadata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(TiffMetada
         samples_per_pixel,
         photoshop_resources.as_deref(),
     );
+    let channel_display_info = photoshop_resources
+        .as_deref()
+        .map(|resources| {
+            photoshop_channel_display_info(base_channel_count, samples_per_pixel, resources)
+        })
+        .unwrap_or_else(|| vec![None; samples_per_pixel]);
 
     Ok((
         TiffMetadata {
@@ -500,6 +541,10 @@ fn read_metadata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(TiffMetada
             base_channel_count,
             color_model,
             channel_names,
+            channel_display_info,
+            compression,
+            predictor,
+            orientation,
             icc_profile,
             photoshop_resources,
             photoshop_image_source_data,
@@ -739,6 +784,142 @@ fn channel_names(
     names
 }
 
+fn photoshop_channel_display_info(
+    base_count: usize,
+    total_count: usize,
+    resources: &[u8],
+) -> Vec<Option<PhotoshopChannelDisplay>> {
+    let mut result = vec![None; total_count];
+    let Some(payload) = find_photoshop_resource(resources, 1077) else {
+        return result;
+    };
+    let extra_count = total_count.saturating_sub(base_count);
+    for (index, display) in parse_photoshop_display_info(payload)
+        .into_iter()
+        .take(extra_count)
+        .enumerate()
+    {
+        result[base_count + index] = Some(display);
+    }
+    result
+}
+
+fn find_photoshop_resource(resources: &[u8], wanted_id: u16) -> Option<&[u8]> {
+    let mut offset = 0usize;
+    while offset + 12 <= resources.len() {
+        if &resources[offset..offset + 4] != b"8BIM" {
+            offset += 1;
+            continue;
+        }
+        offset += 4;
+        let id = u16::from_be_bytes([resources[offset], resources[offset + 1]]);
+        offset += 2;
+        if offset >= resources.len() {
+            return None;
+        }
+        let name_len = resources[offset] as usize;
+        offset += 1;
+        if offset + name_len > resources.len() {
+            return None;
+        }
+        offset += name_len;
+        if (1 + name_len) % 2 != 0 {
+            offset = offset.saturating_add(1);
+        }
+        if offset + 4 > resources.len() {
+            return None;
+        }
+        let size = u32::from_be_bytes([
+            resources[offset],
+            resources[offset + 1],
+            resources[offset + 2],
+            resources[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if offset + size > resources.len() {
+            return None;
+        }
+        let payload = &resources[offset..offset + size];
+        if id == wanted_id {
+            return Some(payload);
+        }
+        offset += size;
+        if size % 2 != 0 {
+            offset = offset.saturating_add(1);
+        }
+    }
+    None
+}
+
+fn parse_photoshop_display_info(payload: &[u8]) -> Vec<PhotoshopChannelDisplay> {
+    // Resource 1077 starts with a big-endian u32 version followed by 13-byte
+    // DisplayInfo records: Color(10), opacity/solidity u16, kind u8.
+    if payload.len() < 4 || u32::from_be_bytes(payload[0..4].try_into().unwrap()) != 1 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut offset = 4usize;
+    while offset + 13 <= payload.len() {
+        let color_space = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        let mut components = [0u16; 4];
+        for (component, slot) in components.iter_mut().enumerate() {
+            let start = offset + 2 + component * 2;
+            *slot = u16::from_be_bytes([payload[start], payload[start + 1]]);
+        }
+        let solidity_raw = u16::from_be_bytes([payload[offset + 10], payload[offset + 11]]);
+        let kind = payload[offset + 12];
+        result.push(PhotoshopChannelDisplay {
+            rgb: photoshop_color_to_rgb(color_space, components),
+            solidity: (solidity_raw as f32 / 100.0).clamp(0.0, 1.0),
+            kind,
+        });
+        offset += 13;
+    }
+    result
+}
+
+fn photoshop_color_to_rgb(color_space: u16, c: [u16; 4]) -> Option<[f32; 3]> {
+    let unit = |value: u16| value as f32 / 65535.0;
+    match color_space {
+        0 => Some([unit(c[0]), unit(c[1]), unit(c[2])]),
+        1 => Some(hsb_to_rgb(unit(c[0]), unit(c[1]), unit(c[2]))),
+        2 => {
+            // Adobe Color structure CMYK uses 0 = 100% ink and 65535 = 0% ink.
+            let cyan = 1.0 - unit(c[0]);
+            let magenta = 1.0 - unit(c[1]);
+            let yellow = 1.0 - unit(c[2]);
+            let black = 1.0 - unit(c[3]);
+            Some([
+                1.0 - (cyan + black).min(1.0),
+                1.0 - (magenta + black).min(1.0),
+                1.0 - (yellow + black).min(1.0),
+            ])
+        }
+        8 => {
+            let gray = (c[0] as f32 / 10000.0).clamp(0.0, 1.0);
+            Some([gray, gray, gray])
+        }
+        _ => None,
+    }
+}
+
+fn hsb_to_rgb(hue: f32, saturation: f32, brightness: f32) -> [f32; 3] {
+    let h = hue.rem_euclid(1.0) * 6.0;
+    let sector = h.floor() as i32;
+    let f = h - sector as f32;
+    let p = brightness * (1.0 - saturation);
+    let q = brightness * (1.0 - saturation * f);
+    let t = brightness * (1.0 - saturation * (1.0 - f));
+    match sector.rem_euclid(6) {
+        0 => [brightness, t, p],
+        1 => [q, brightness, p],
+        2 => [p, brightness, t],
+        3 => [p, q, brightness],
+        4 => [t, p, brightness],
+        _ => [brightness, p, q],
+    }
+}
+
 fn unique_name(mut name: String, existing: &[String]) -> String {
     if !existing.iter().any(|item| item == &name) {
         return name;
@@ -947,5 +1128,25 @@ mod tests {
         let mut result = Vec::new();
         reader.read_to_end(&mut result).unwrap();
         assert_eq!(result, vec![10, 11, 1, 0, 14, 15]);
+    }
+
+    #[test]
+    fn parses_photoshop_spot_display_info_from_production_resource_shape() {
+        // The two 13-byte records mirror the resource 1077 layout seen in a
+        // production CMYK + 2 Spot TIFF: HSB purple and HSB green, kind = 2.
+        let payload = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0xd4, 0xd4, 0xc7, 0xc7, 0xff, 0xff, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x01, 0x6e, 0x6e, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
+            0x00, 0x02,
+        ];
+        let display = parse_photoshop_display_info(&payload);
+        assert_eq!(display.len(), 2);
+        assert!(display[0].is_spot());
+        assert!(display[1].is_spot());
+        assert_eq!(display[0].solidity, 0.0);
+        let purple = display[0].rgb.unwrap();
+        let green = display[1].rgb.unwrap();
+        assert!(purple[0] > 0.95 && purple[2] > 0.95 && purple[1] < 0.30);
+        assert!(green[1] > 0.95 && green[0] < 0.05 && green[2] > 0.50);
     }
 }

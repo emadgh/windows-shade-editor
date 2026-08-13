@@ -1,3 +1,16 @@
+# Shade Editor 0.10.0
+
+Production interchange hardening and real Photoshop Spot display metadata.
+
+- Parses Photoshop Image Resource 1077 DisplayInfo for extra channels, including Spot-vs-Alpha kind, display color, and Solidity.
+- Composite preview uses the TIFF's Photoshop Spot display color/Solidity when available; known Alpha channels no longer receive a fake ink tint.
+- Channel rows distinguish Spot, Alpha, and undeclared Extra channels; Spot hover information includes Solidity.
+- Export preserves source lossless compression intent (LZW/Deflate/PackBits/uncompressed), horizontal predictor, orientation, DPI, ICC, Photoshop Image Resources, and ImageSourceData. Unknown/lossy source compression falls back to lossless LZW.
+- TIFF exports are written to a same-directory temporary file and atomically replace the destination only after successful completion, preventing half-written production files.
+- GitHub Release updates now require a companion ShadeEditor.exe.sha256 asset; downloaded executables are SHA-256 verified before staging.
+- Windows CI creates the checksum in both build artifacts and tagged GitHub Releases.
+- Adds production Photoshop/RIP validation guidance and regression coverage for the production-shaped DisplayInfo 1077 payload.
+
 # Shade Editor 0.9.0
 
 Production-workflow foundation: adjustment History, crash recovery, Before/After comparison, and a clean .shade v9 schema.
