@@ -1,3 +1,11 @@
+# Shade Editor v0.12.0
+
+- Preserves BigTIFF container format when exporting a BigTIFF source.
+- Automatically switches to BigTIFF when the uncompressed output layout approaches the 32-bit offset ceiling of classic TIFF.
+- Uses the same Levels / Curve / Channel Mixer / Test Code and Photoshop metadata preservation pipeline for classic TIFF and BigTIFF outputs.
+- Adds regression coverage for a real BigTIFF identity export plus large-layout format selection without allocating a huge test image.
+- `.shade` schema remains v9.
+
 # Shade Editor v0.11.1
 
 - Fixes physical TIFF DPI detection: XResolution/YResolution are TIFF RATIONAL values and are now decoded as numerator/denominator instead of incorrectly requesting DOUBLE tags.

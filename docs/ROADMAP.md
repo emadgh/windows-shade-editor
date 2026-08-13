@@ -11,6 +11,7 @@ This file tracks only work that is still intentionally in scope. Snapshot expans
 
 ## Backend follow-up
 
+- Production-test BigTIFF export on >4 GiB ceramic artwork and confirm Photoshop/RIP acceptance.
 - Production-test bounded tiled/planar TIFF streaming against real Photoshop/RIP assets; synthetic planar-strip and tiled-edge fixtures are covered in CI.
 - Production-test the three-state recovery rotation and corrupted-latest fallback on Windows.
 - Continue TIFF conformance regression coverage across compression, predictors, bit depth, ExtraSamples, and Photoshop metadata.
