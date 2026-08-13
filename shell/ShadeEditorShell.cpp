@@ -19,6 +19,9 @@
 
 #include "ShadeProjectData.h"
 
+#pragma comment(linker, "/EXPORT:DllGetClassObject")
+#pragma comment(linker, "/EXPORT:DllCanUnloadNow")
+
 using Microsoft::WRL::ComPtr;
 using shade_shell::ProjectData;
 
