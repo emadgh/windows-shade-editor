@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="utf-8"?>
+<schema xmlns="http://schemas.microsoft.com/windows/2006/propertydescription" schemaVersion="1.0">
+  <propertyDescriptionList publisher="Shade Editor" product="Shade Editor">
+    <propertyDescription name="ShadeEditor.FaceCount" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="2">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Face count" />
+      <typeInfo type="UInt32" />
+      <displayInfo displayType="Number" defaultColumnWidth="10" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.ActiveFace" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="3">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Active Face" />
+      <typeInfo type="String" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.TotalSourceBytes" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="4">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <labelInfo label="Total source bytes" />
+      <typeInfo type="UInt64" />
+      <displayInfo displayType="Number" defaultColumnWidth="16" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.SavedAt" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="5">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Project saved" />
+      <typeInfo type="DateTime" />
+      <displayInfo displayType="DateTime" defaultColumnWidth="20" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.PhysicalWidthCm" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="10">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <labelInfo label="Width (cm)" />
+      <typeInfo type="Double" />
+      <displayInfo displayType="Number" defaultColumnWidth="12" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.PhysicalHeightCm" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="11">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <labelInfo label="Height (cm)" />
+      <typeInfo type="Double" />
+      <displayInfo displayType="Number" defaultColumnWidth="12" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.PixelWidth" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="12">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <labelInfo label="Width (px)" />
+      <typeInfo type="UInt32" />
+      <displayInfo displayType="Number" defaultColumnWidth="12" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.PixelHeight" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="13">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <labelInfo label="Height (px)" />
+      <typeInfo type="UInt32" />
+      <displayInfo displayType="Number" defaultColumnWidth="12" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.DpiX" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="14">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <labelInfo label="Horizontal DPI" />
+      <typeInfo type="Double" />
+      <displayInfo displayType="Number" defaultColumnWidth="12" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.DpiY" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="15">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <labelInfo label="Vertical DPI" />
+      <typeInfo type="Double" />
+      <displayInfo displayType="Number" defaultColumnWidth="12" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.BitDepth" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="16">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Bit depth" />
+      <typeInfo type="UInt32" />
+      <displayInfo displayType="Number" defaultColumnWidth="10" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.ColorModel" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="17">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Color model" />
+      <typeInfo type="String" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.ChannelCount" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="18">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Channel count" />
+      <typeInfo type="UInt32" />
+      <displayInfo displayType="Number" defaultColumnWidth="12" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.BaseChannelCount" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="19">
+      <searchInfo inInvertedIndex="false" isColumn="true" />
+      <labelInfo label="Base channels" />
+      <typeInfo type="UInt32" />
+      <displayInfo displayType="Number" defaultColumnWidth="12" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.SourceFileName" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="20">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Source TIFF" />
+      <typeInfo type="String" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.PhysicalDimensions" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="21">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Physical dimensions" />
+      <typeInfo type="String" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.PixelDimensions" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="22">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Pixel dimensions" />
+      <typeInfo type="String" />
+    </propertyDescription>
+    <propertyDescription name="ShadeEditor.Dpi" formatID="{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}" propID="23">
+      <searchInfo inInvertedIndex="true" isColumn="true" />
+      <labelInfo label="Resolution" />
+      <typeInfo type="String" />
+    </propertyDescription>
+  </propertyDescriptionList>
+</schema>
