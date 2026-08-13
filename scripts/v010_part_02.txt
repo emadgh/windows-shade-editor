@@ -1,0 +1,170 @@
+    }
+}
+
+fn blend_tint(rgb: &mut [f32; 3], tint: [f32; 3], strength: f32) {
+    if strength <= 0.0 {
+        return;
+    }
+    for component in 0..3 {
+        rgb[component] = rgb[component] * (1.0 - strength) + tint[component] * strength;
+    }
+}
+'''
+render = render[:start] + new_composite + render[end:]
+RENDER.write_text(render, encoding='utf-8')
+
+# App: identify Spot vs Alpha and use Photoshop spot swatch when palette has no explicit slot.
+app = APP.read_text(encoding='utf-8')
+app = once(app,
+'''        let base_count = face.preview.metadata.base_channel_count;
+        let color_model = face.preview.metadata.color_model;''',
+'''        let base_count = face.preview.metadata.base_channel_count;
+        let color_model = face.preview.metadata.color_model;
+        let photoshop_display = face.preview.metadata.channel_display_info.clone();''', 'app display metadata')
+app = once(app,
+'''        for (index, name) in channel_names.iter().enumerate() {
+            let suffix = if index >= base_count { "  spot" } else { "" };
+            let accent = channel_color(active_palette.as_ref(), name, index);
+            let is_solo = self.solo_channel == Some(index);
+            let display_name = channel_display_name(active_palette.as_ref(), name, index);
+            let label = format!("{display_name}{suffix}");
+            let response = clickable_channel_row(
+                ui,
+                self.selected_channel == index,
+                is_solo,
+                &label,
+                accent,
+                32.0,
+            )
+            .on_hover_text("Click to select for editing. Click the active channel again to toggle solo preview.");''',
+'''        for (index, name) in channel_names.iter().enumerate() {
+            let display_info = photoshop_display.get(index).and_then(|value| *value);
+            let suffix = if index >= base_count {
+                match display_info {
+                    Some(info) if info.is_spot() => "  spot",
+                    Some(_) => "  alpha",
+                    None => "  extra",
+                }
+            } else {
+                ""
+            };
+            let accent = channel_color_with_photoshop(
+                active_palette.as_ref(),
+                &photoshop_display,
+                name,
+                index,
+            );
+            let is_solo = self.solo_channel == Some(index);
+            let display_name = channel_display_name(active_palette.as_ref(), name, index);
+            let label = format!("{display_name}{suffix}");
+            let hover = match display_info {
+                Some(info) if info.is_spot() => format!(
+                    "Photoshop Spot Channel · Solidity {:.0}% · click to select; click again to toggle solo preview.",
+                    info.solidity * 100.0
+                ),
+                Some(_) => "Photoshop Alpha/auxiliary channel · click to select; click again to toggle solo preview.".to_owned(),
+                None => "Extra TIFF channel (Spot/Alpha type not declared) · click to select; click again to toggle solo preview.".to_owned(),
+            };
+            let response = clickable_channel_row(
+                ui,
+                self.selected_channel == index,
+                is_solo,
+                &label,
+                accent,
+                32.0,
+            )
+            .on_hover_text(hover);''', 'channel rows')
+app = app.replace('.then(|| channel_color(active_palette.as_ref(), name, index));',
+                  '.then(|| channel_color_with_photoshop(active_palette.as_ref(), &photoshop_display, name, index));')
+app = app.replace('.then(|| channel_color(active_palette.as_ref(), &channel_names[index], index));',
+                  '.then(|| channel_color_with_photoshop(active_palette.as_ref(), &photoshop_display, &channel_names[index], index));')
+helper = r'''
+fn channel_color_with_photoshop(
+    palette: Option<&ChannelPalette>,
+    photoshop_display: &[Option<tiff_io::PhotoshopChannelDisplay>],
+    name: &str,
+    index: usize,
+) -> egui::Color32 {
+    // Explicit project palette entries always win. For channels beyond the
+    // configured palette, use the TIFF's Photoshop Spot display color before
+    // falling back to the deterministic generic palette.
+    if palette.and_then(|palette| palette.channels.get(index)).is_some() {
+        return channel_color(palette, name, index);
+    }
+    if let Some(info) = photoshop_display.get(index).and_then(|value| *value) {
+        if info.is_spot() {
+            if let Some([r, g, b]) = info.rgb {
+                return egui::Color32::from_rgb(
+                    (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                );
+            }
+        }
+    }
+    channel_color(palette, name, index)
+}
+
+'''
+app = once(app, '\nfn palette_entry_readonly(', '\n'+helper+'fn palette_entry_readonly(', 'photoshop channel color helper')
+APP.write_text(app, encoding='utf-8')
+
+# Export: atomic same-directory replacement, source compression/predictor/orientation.
+export = EXPORT.read_text(encoding='utf-8')
+export = once(export, 'use std::io::BufWriter;\n', 'use std::io::BufWriter;\nuse std::os::windows::ffi::OsStrExt;\n', 'windows path import')
+export = once(export, 'use tiff::encoder::{TiffEncoder, colortype};',
+              'use tiff::encoder::{Compression, Predictor, TiffEncoder, colortype};', 'tiff compression imports')
+export = once(export, 'use tiff::tags::{ExtraSamples, Tag};\n',
+'''use tiff::tags::{ExtraSamples, Tag};
+use windows_sys::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
+''', 'windows atomic imports')
+export = once(export, 'pub fn export_face_with_progress<F>(', 'fn export_face_direct_with_progress<F>(', 'rename direct exporter')
+wrapper = r'''
+pub fn export_face_with_progress<F>(
+    source: &Path,
+    destination: &Path,
+    project: &ShadeProject,
+    default_dpi: f64,
+    mut progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(f32, &str),
+{
+    let temporary = temporary_export_path(destination)?;
+    let result = export_face_direct_with_progress(
+        source,
+        &temporary,
+        project,
+        default_dpi,
+        |fraction, detail| progress((fraction * 0.98).clamp(0.0, 0.98), detail),
+    );
+    if let Err(err) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(err);
+    }
+    progress(0.99, "Committing TIFF atomically");
+    if let Err(err) = atomic_replace(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(err);
+    }
+    progress(1.0, "Export complete");
+    Ok(())
+}
+
+'''
+export = once(export, '\nfn export_face_direct_with_progress<F>(', '\n'+wrapper+'fn export_face_direct_with_progress<F>(', 'atomic wrapper insert')
+# Replace both encoder constructors with source-aware compressed encoder.
+export = export.replace(
+'''    let mut encoder =
+        TiffEncoder::new(writer).map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?;''',
+'''    let mut encoder = make_tiff_encoder(writer, &decoded.metadata)?;''', 1)
+export = export.replace(
+'''    let mut encoder =
+        TiffEncoder::new(writer).map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?;''',
+'''    let mut encoder = make_tiff_encoder(writer, metadata)?;''', 1)
+
+export_helpers = r'''
+fn make_tiff_encoder(
+    writer: BufWriter<File>,
