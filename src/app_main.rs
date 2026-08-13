@@ -26,7 +26,7 @@ mod palette;
 mod recovery;
 #[path = "render.rs"]
 mod render;
-#[path = "D:/a/windows-shade-editor/windows-shade-editor/target/x86_64-pc-windows-msvc/debug/build/windows-shade-editor-012cff5d06356448/out/settings_v0103.rs"]
+#[path = "settings_v6.rs"]
 mod settings;
 #[path = "thumbnail.rs"]
 mod thumbnail;
@@ -34,7 +34,7 @@ mod thumbnail;
 mod tiff_io;
 #[path = "update_v4.rs"]
 mod update;
-#[path = "D:/a/windows-shade-editor/windows-shade-editor/target/x86_64-pc-windows-msvc/debug/build/windows-shade-editor-012cff5d06356448/out/validation_v0103.rs"]
+#[path = "validation.rs"]
 mod validation;
 #[path = "workflow_v0103.rs"]
 mod workflow_v0103;
