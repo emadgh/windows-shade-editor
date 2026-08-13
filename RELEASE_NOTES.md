@@ -5,6 +5,12 @@
 - Uses the same Levels / Curve / Channel Mixer / Test Code and Photoshop metadata preservation pipeline for classic TIFF and BigTIFF outputs.
 - Adds regression coverage for a real BigTIFF identity export plus large-layout format selection without allocating a huge test image.
 - `.shade` schema remains v9.
+- Adds a native x64 Windows Shell extension for `.shade` files without loading the editor UI runtime inside Explorer.
+- Explorer thumbnails use the PNG embedded in schema-v9 `.shade` files through `IThumbnailProvider` and Windows Imaging Component.
+- A read-only `IPropertyStore` exposes Face count, active Face, physical/pixel dimensions, DPI, bit depth, color model, channel counts, source TIFF name, source bytes, and save time.
+- Ships a custom Windows Property System schema plus an elevated installer for COM/property-handler registration and per-user `.shade` file association.
+- Shade Editor accepts a `.shade` path as its first command-line argument so Explorer double-click opens that project.
+- Native parser and COM/WIC regression tests validate schema-v9 metadata, custom properties, and embedded thumbnail decoding.
 
 # Shade Editor v0.11.1
 
