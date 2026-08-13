@@ -19,7 +19,7 @@ pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u1
             let raw = face.channels[channel][pixel] as f32 / 65535.0;
             prepared[channel][pixel] = if let Some(adjustment) = adjustment {
                 if adjustment.enabled {
-                    apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)
+                    apply_levels(raw, adjustment.levels)
                 } else {
                     raw
                 }
@@ -51,7 +51,7 @@ pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u1
                             .unwrap_or(if source == out_channel { 1.0 } else { 0.0 });
                         mixed += prepared[source][pixel] * coefficient;
                     }
-                    mixed
+                    apply_curve(mixed, adjustment.curve)
                 }
             } else {
                 prepared[out_channel][pixel]
