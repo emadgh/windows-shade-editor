@@ -1,0 +1,317 @@
+name: Apply adjustment order
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]' || github.event.head_commit.message != 'Apply Levels Mixer Curve ordering'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Apply source changes
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          def replace_exact(path, old, new, expected=1):
+              text = path.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count == 0:
+                  if new in text:
+                      return
+                  raise RuntimeError(f'{path}: pattern not found: {old[:100]!r}')
+              if count != expected:
+                  raise RuntimeError(f'{path}: expected {expected} matches, got {count}')
+              path.write_text(text.replace(old, new), encoding='utf-8')
+
+          app = Path('src/app_main.rs')
+          render = Path('src/render.rs')
+          export = Path('src/export_v6.rs')
+          cargo = Path('Cargo.toml')
+
+          replace_exact(app,
+              'enum ToolPanel {\n    Levels,\n    Curves,\n    Mixer,\n}',
+              'enum ToolPanel {\n    Levels,\n    Mixer,\n    Curves,\n}')
+
+          for indent in ('                    ', '                '):
+              replace_exact(app,
+                  indent + 'ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");\n' +
+                  indent + 'ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");\n' +
+                  indent + 'ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");',
+                  indent + 'ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");\n' +
+                  indent + 'ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");\n' +
+                  indent + 'ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");')
+
+          selected_curve = '''                ui.add_space(4.0);
+                          let (body_changed, reset) = adjustment_foldout(
+                              ui,
+                              format!("selected-curve-{output_name}"),
+                              "Curve",
+                              true,
+                              |ui| {
+                                  curves_ui(
+                                      ui,
+                                      adjustment,
+                                      histogram.filter(|_| self.settings.show_curve_histogram),
+                                      accent,
+                                      compact_curve_controls,
+                                  )
+                              },
+                          );
+                          changed |= body_changed.unwrap_or(false);
+                          if reset {
+                              adjustment.curve = model::Curve::default();
+                              changed = true;
+                          }
+
+                          ui.add_space(4.0);
+                          let (body_changed, reset) = adjustment_foldout(
+                              ui,
+                              format!("selected-mixer-{output_name}"),
+                              "Channel Mixer",
+                              true,
+                              |ui| mixer_ui(ui, adjustment, output_name, channel_names, accent, palette),
+                          );
+                          changed |= body_changed.unwrap_or(false);
+                          if reset {
+                              reset_mixer_row(adjustment, output_name, channel_names);
+                              changed = true;
+                          }'''
+          # Preserve exact source indentation from the Rust file.
+          selected_curve = selected_curve.replace('                          ', '                ')
+          selected_mixer = '''                ui.add_space(4.0);
+                          let (body_changed, reset) = adjustment_foldout(
+                              ui,
+                              format!("selected-mixer-{output_name}"),
+                              "Channel Mixer",
+                              true,
+                              |ui| mixer_ui(ui, adjustment, output_name, channel_names, accent, palette),
+                          );
+                          changed |= body_changed.unwrap_or(false);
+                          if reset {
+                              reset_mixer_row(adjustment, output_name, channel_names);
+                              changed = true;
+                          }
+
+                          ui.add_space(4.0);
+                          let (body_changed, reset) = adjustment_foldout(
+                              ui,
+                              format!("selected-curve-{output_name}"),
+                              "Curve",
+                              true,
+                              |ui| {
+                                  curves_ui(
+                                      ui,
+                                      adjustment,
+                                      histogram.filter(|_| self.settings.show_curve_histogram),
+                                      accent,
+                                      compact_curve_controls,
+                                  )
+                              },
+                          );
+                          changed |= body_changed.unwrap_or(false);
+                          if reset {
+                              adjustment.curve = model::Curve::default();
+                              changed = true;
+                          }'''.replace('                          ', '                ')
+          replace_exact(app, selected_curve, selected_mixer)
+
+          all_curve = '''            ui.add_space(4.0);
+                      let (body_changed, reset) = adjustment_foldout(
+                          ui,
+                          "all-curves-section",
+                          "Curve - broadcast + per channel",
+                          true,
+                          |ui| {
+                              all_curves_ui(
+                                  ui,
+                                  &mut self.project.adjustments,
+                                  template_name,
+                                  channel_names,
+                                  histograms,
+                                  self.settings.colorize_adjustments,
+                                  self.settings.show_curve_histogram,
+                                  compact_curve_controls,
+                                  palette,
+                              )
+                          },
+                      );
+                      changed |= body_changed.unwrap_or(false);
+                      if reset {
+                          reset_all_curves(&mut self.project.adjustments, channel_names);
+                          changed = true;
+                      }
+
+                      ui.add_space(4.0);
+                      let (body_changed, reset) = adjustment_foldout(
+                          ui,
+                          "all-mixers-section",
+                          "Channel Mixer - all output rows",
+                          true,
+                          |ui| {
+                              all_mixers_ui(
+                                  ui,
+                                  &mut self.project.adjustments,
+                                  channel_names,
+                                  self.settings.colorize_adjustments,
+                                  palette,
+                              )
+                          },
+                      );
+                      changed |= body_changed.unwrap_or(false);
+                      if reset {
+                          reset_all_mixers(&mut self.project.adjustments, channel_names);
+                          changed = true;
+                      }'''.replace('                      ', '            ')
+          all_mixer = '''            ui.add_space(4.0);
+                      let (body_changed, reset) = adjustment_foldout(
+                          ui,
+                          "all-mixers-section",
+                          "Channel Mixer - all output rows",
+                          true,
+                          |ui| {
+                              all_mixers_ui(
+                                  ui,
+                                  &mut self.project.adjustments,
+                                  channel_names,
+                                  self.settings.colorize_adjustments,
+                                  palette,
+                              )
+                          },
+                      );
+                      changed |= body_changed.unwrap_or(false);
+                      if reset {
+                          reset_all_mixers(&mut self.project.adjustments, channel_names);
+                          changed = true;
+                      }
+
+                      ui.add_space(4.0);
+                      let (body_changed, reset) = adjustment_foldout(
+                          ui,
+                          "all-curves-section",
+                          "Curve - broadcast + per channel",
+                          true,
+                          |ui| {
+                              all_curves_ui(
+                                  ui,
+                                  &mut self.project.adjustments,
+                                  template_name,
+                                  channel_names,
+                                  histograms,
+                                  self.settings.colorize_adjustments,
+                                  self.settings.show_curve_histogram,
+                                  compact_curve_controls,
+                                  palette,
+                              )
+                          },
+                      );
+                      changed |= body_changed.unwrap_or(false);
+                      if reset {
+                          reset_all_curves(&mut self.project.adjustments, channel_names);
+                          changed = true;
+                      }'''.replace('                      ', '            ')
+          replace_exact(app, all_curve, all_mixer)
+
+          replace_exact(app, 'Use tabs for Levels / Curve / Mixer', 'Use tabs for Levels / Mixer / Curve')
+          replace_exact(app, 'Colorize Levels / Curve / Mixer by channel', 'Colorize Levels / Mixer / Curve by channel')
+          replace_exact(app,
+              'Levels broadcasts to every channel. Curve keeps one Broadcast control plus independent per-channel foldouts. Mixer output rows remain independent.',
+              'Levels broadcasts to every channel. Mixer output rows remain independent. Curve keeps one Broadcast control plus independent per-channel foldouts.')
+
+          # Preview may already have been updated directly; keep this idempotent.
+          r = render.read_text(encoding='utf-8')
+          old = 'apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)'
+          if old in r:
+              r = r.replace(old, 'apply_levels(raw, adjustment.levels)', 1)
+          old = '                    mixed\n                }\n            } else {\n                prepared[out_channel][pixel]\n            };'
+          new = '                    apply_curve(mixed, adjustment.curve)\n                }\n            } else {\n                prepared[out_channel][pixel]\n            };'
+          if old in r:
+              r = r.replace(old, new, 1)
+          render.write_text(r, encoding='utf-8')
+
+          # Full decode export: Levels -> Mixer -> Curve.
+          replace_exact(export,
+              '                        apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)',
+              '                        apply_levels(raw, adjustment.levels)')
+          replace_exact(export,
+              '                        mixed\n                    }\n                    _ => prepared[out_channel],',
+              '                        apply_curve(mixed, adjustment.curve)\n                    }\n                    _ => prepared[out_channel],')
+
+          # Streaming export: same exact order.
+          replace_exact(export,
+              '                    apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)',
+              '                    apply_levels(raw, adjustment.levels)')
+          replace_exact(export,
+              '                    mixed\n                }\n                _ => prepared[out_channel],',
+              '                    apply_curve(mixed, adjustment.curve)\n                }\n                _ => prepared[out_channel],')
+
+          text = export.read_text(encoding='utf-8')
+          marker = 'fn adjustment_pipeline_is_levels_then_mixer_then_curve()'
+          if marker not in text:
+              anchor = '''mod streaming_tests {
+              use super::*;
+              use tiff::encoder::{Compression, TiffEncoder, colortype};
+              use tiff::tags::ExtraSamples;
+          '''.replace('              ', '    ')
+              test = anchor + '''
+
+              #[test]
+              fn adjustment_pipeline_is_levels_then_mixer_then_curve() {
+                  let names = vec!["A".to_owned(), "B".to_owned()];
+                  let mut project = ShadeProject::default();
+                  project.ensure_channels(&names);
+                  {
+                      let adjustment = project.adjustments.get_mut("A").unwrap();
+                      adjustment.levels.output_white = 0.5;
+                      adjustment.mixer.constant = 0.0;
+                      adjustment.mixer.coefficients.insert("A".to_owned(), 0.5);
+                      adjustment.mixer.coefficients.insert("B".to_owned(), 0.5);
+                      adjustment.curve.midpoint_enabled = true;
+                      adjustment.curve.midpoint_input = 0.5;
+                      adjustment.curve.midpoint = 0.1;
+                  }
+                  let input = [13_107u16, 52_428u16];
+                  let output = adjusted_strip(&input, 2, &names, &project);
+                  let a = project.adjustments.get("A").unwrap();
+                  let b = project.adjustments.get("B").unwrap();
+                  let leveled_a = apply_levels(input[0] as f32 / 65_535.0, a.levels);
+                  let leveled_b = apply_levels(input[1] as f32 / 65_535.0, b.levels);
+                  let expected = apply_curve(leveled_a * 0.5 + leveled_b * 0.5, a.curve);
+                  let actual = output[0] as f32 / 65_535.0;
+                  assert!((actual - expected).abs() <= 2.0 / 65_535.0);
+                  let legacy = apply_curve(leveled_a, a.curve) * 0.5 + leveled_b * 0.5;
+                  assert!((actual - legacy).abs() > 0.20);
+              }
+          '''.replace('              ', '    ')
+              if anchor not in text:
+                  raise RuntimeError('streaming_tests anchor not found')
+              export.write_text(text.replace(anchor, test, 1), encoding='utf-8')
+
+          c = cargo.read_text(encoding='utf-8')
+          c = c.replace('build = false\n', '')
+          cargo.write_text(c, encoding='utf-8')
+
+          for obsolete in (Path('build.rs'), Path('scripts/apply_adjustment_pipeline_order.py')):
+              if obsolete.exists():
+                  obsolete.unlink()
+          '@ | python -
+
+      - name: Commit source changes
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if (git status --porcelain) {
+            git commit -m "Apply Levels Mixer Curve ordering"
+            git push origin HEAD:main
+          } else {
+            Write-Host "No changes needed."
+          }
