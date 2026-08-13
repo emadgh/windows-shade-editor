@@ -1,3 +1,11 @@
+# Shade Editor v0.11.0
+
+- Extended bounded-memory TIFF decoding to tiled and planar 8/16-bit RGB/CMYK layouts.
+- Preview now samples arbitrary TIFF coding regions instead of requiring full-width strips.
+- Export uses a random-access disk-backed spool for tiled/planar sources while keeping the proven sequential strip path for normal Photoshop TIFFs.
+- Crash recovery now rotates the latest three states and automatically falls back to an older valid state if the newest recovery JSON is damaged.
+- Added planar-strip and edge-tile regression fixtures for the new region decoder.
+
 # Shade Editor 0.10.2
 
 Production export correctness and preview/Test Code workflow fixes.
