@@ -34,12 +34,13 @@ jobs:
           cargo fmt --all
           cargo check --target x86_64-pc-windows-msvc
           cargo test --target x86_64-pc-windows-msvc
-      - name: Commit validated changes
+      - name: Commit validated source changes
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml RELEASE_NOTES.md README.md docs/ARCHITECTURE.md docs/PRODUCTION_VALIDATION.md src/tiff_io.rs src/render.rs src/app_main.rs src/export_v6.rs src/update_v4.rs .github/workflows/build-windows.yml
-          git rm scripts/v010_part_*.txt .github/workflows/apply-v010-hardening.yml
+          git restore .github/workflows/build-windows.yml
+          git add Cargo.toml RELEASE_NOTES.md README.md docs/ARCHITECTURE.md docs/PRODUCTION_VALIDATION.md src/tiff_io.rs src/render.rs src/app_main.rs src/export_v6.rs src/update_v4.rs
+          git rm scripts/v010_part_*.txt
           git commit -m "Harden Photoshop TIFF production interchange"
           git push origin HEAD:feat/v010-production-hardening
