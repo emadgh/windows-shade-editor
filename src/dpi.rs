@@ -54,8 +54,6 @@ impl DpiInfo {
             let y = self.raw_y.or(self.raw_x).unwrap_or(fallback_y);
             (x, y, self.unit)
         } else {
-            // A fallback/default DPI is an inch-based physical resolution when
-            // written to a new TIFF.
             (self.dpi_x, self.dpi_y, 2)
         }
     }
@@ -79,13 +77,16 @@ pub fn read_dpi(path: &Path, default_dpi: f64) -> DpiInfo {
         .get_tag_f64(Tag::YResolution)
         .ok()
         .filter(|v| v.is_finite() && *v > 0.0);
-    // TIFF 6.0 defines ResolutionUnit's default as 2 (inch). A valid TIFF may
-    // therefore omit tag 296 while still providing physical X/Y resolution.
-    // Treating an omitted tag as 1 (no absolute unit) incorrectly discards
-    // that physical resolution and falls back to the application Default DPI.
+    // TIFF 6.0 defines ResolutionUnit's default as 2 (inch).
     let unit = decoder
         .get_tag_unsigned::<u16>(Tag::ResolutionUnit)
         .unwrap_or(2);
+
+    #[cfg(test)]
+    eprintln!(
+        "SHADE_DPI_DIAG path={} raw_x={raw_x:?} raw_y={raw_y:?} unit={unit}",
+        path.display()
+    );
 
     let convert = |value: Option<f64>| -> Option<f64> {
         let value = value?;
