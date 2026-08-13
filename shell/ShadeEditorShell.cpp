@@ -1,4 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <thumbcache.h>
 #include <propsys.h>
@@ -231,7 +232,7 @@ class ShadeShellHandler final : public IInitializeWithStream,
                                 public IPropertyStore {
 public:
     ShadeShellHandler() { ++g_objects; }
-    ~ShadeShellHandler() override { --g_objects; }
+    ~ShadeShellHandler() { --g_objects; }
 
     IFACEMETHODIMP QueryInterface(REFIID riid, void** object) override {
         if (!object) return E_POINTER;
@@ -412,7 +413,7 @@ private:
 class ShadeClassFactory final : public IClassFactory {
 public:
     ShadeClassFactory() { ++g_objects; }
-    ~ShadeClassFactory() override { --g_objects; }
+    ~ShadeClassFactory() { --g_objects; }
 
     IFACEMETHODIMP QueryInterface(REFIID riid, void** object) override {
         if (!object) return E_POINTER;
@@ -466,11 +467,11 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     return TRUE;
 }
 
-extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow() {
+STDAPI DllCanUnloadNow() {
     return g_objects.load() == 0 && g_locks.load() == 0 ? S_OK : S_FALSE;
 }
 
-extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(
+STDAPI DllGetClassObject(
     REFCLSID clsid, REFIID riid, void** object) {
     if (!object) return E_POINTER;
     *object = nullptr;
