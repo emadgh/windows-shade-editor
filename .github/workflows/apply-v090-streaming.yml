@@ -1,0 +1,32 @@
+name: Apply Shade Editor v0.9 TIFF streaming
+
+on:
+  push:
+    branches: [feat/v090-production-workflow]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/v090-production-workflow
+          fetch-depth: 0
+      - name: Apply v0.9 TIFF streaming patch once
+        shell: bash
+        run: |
+          if ! grep -q 'pub struct StreamInfo' src/tiff_io.rs; then
+            python scripts/apply_v090_streaming.py
+            cargo fmt --all
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/tiff_io.rs src/export_v6.rs
+            git commit -m "Stream TIFF preview and export by strips"
+            git push origin HEAD:feat/v090-production-workflow
+          else
+            echo "v0.9 TIFF streaming patch already applied"
+          fi
