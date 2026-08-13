@@ -21,13 +21,15 @@ jobs:
         run: |
           $path = 'shell/ShadeEditorShell.cpp'
           $text = Get-Content -Raw $path
-          if (-not $text.Contains("#define NOMINMAX")) {
-            $text = $text.Replace("#define WIN32_LEAN_AND_MEAN`n", "#define WIN32_LEAN_AND_MEAN`n#define NOMINMAX`n")
+          if (-not $text.Contains('#define NOMINMAX')) {
+            $text = [regex]::Replace($text, '(?m)^#define WIN32_LEAN_AND_MEAN\r?$', "#define WIN32_LEAN_AND_MEAN`n#define NOMINMAX", 1)
           }
           $text = $text.Replace('~ShadeShellHandler() override', '~ShadeShellHandler()')
           $text = $text.Replace('~ShadeClassFactory() override', '~ShadeClassFactory()')
           $text = $text.Replace('extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow()', 'STDAPI DllCanUnloadNow()')
           $text = $text.Replace('extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(', 'STDAPI DllGetClassObject(')
+          if ($text.Contains('~ShadeShellHandler() override') -or $text.Contains('~ShadeClassFactory() override')) { throw 'destructor patch failed' }
+          if ($text.Contains('extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow')) { throw 'COM export patch failed' }
           Set-Content -NoNewline -Encoding utf8 $path $text
       - name: Compile parser, COM DLL and COM tests
         shell: cmd
@@ -36,13 +38,13 @@ jobs:
           if not defined VSINSTALL exit /b 1
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           if not exist shell\bin mkdir shell\bin
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeProjectDataTests.exe shell\ShadeProjectDataTests.cpp shell\ShadeProjectData.cpp
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeProjectDataTests.exe shell\ShadeProjectDataTests.cpp shell\ShadeProjectData.cpp
           if errorlevel 1 exit /b 1
           shell\bin\ShadeProjectDataTests.exe
           if errorlevel 1 exit /b 1
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /DUNICODE /D_UNICODE /LD /Fe:shell\bin\ShadeEditorShell.dll shell\ShadeEditorShell.cpp shell\ShadeProjectData.cpp /link /EXPORT:DllCanUnloadNow /EXPORT:DllGetClassObject ole32.lib shlwapi.lib windowscodecs.lib propsys.lib gdi32.lib
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /LD /Fe:shell\bin\ShadeEditorShell.dll shell\ShadeEditorShell.cpp shell\ShadeProjectData.cpp /link /EXPORT:DllCanUnloadNow /EXPORT:DllGetClassObject ole32.lib shlwapi.lib windowscodecs.lib propsys.lib gdi32.lib
           if errorlevel 1 exit /b 1
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeShellTests.exe shell\ShadeShellTests.cpp /link ole32.lib shlwapi.lib propsys.lib gdi32.lib
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeShellTests.exe shell\ShadeShellTests.cpp /link ole32.lib shlwapi.lib propsys.lib gdi32.lib
           if errorlevel 1 exit /b 1
           shell\bin\ShadeShellTests.exe shell\bin\ShadeEditorShell.dll
           if errorlevel 1 exit /b 1
