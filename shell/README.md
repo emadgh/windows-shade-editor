@@ -4,7 +4,7 @@ This directory contains the native x64 Windows Shell support for `.shade` projec
 
 `ShadeEditorShell.dll` implements one read-only COM class exposing `IInitializeWithStream`, `IThumbnailProvider`, and `IPropertyStore`. The thumbnail provider decodes the PNG already embedded in schema-v9 `.shade` files through Windows Imaging Component (WIC). The property store reads the cached `file_metadata` block and exposes project/active-Face properties without opening source TIFFs.
 
-The custom properties use FMTID `{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}`. The COM class is `{6F49F9D5-0F3A-4BF0-8C74-8A59951A75D2}`.
+The custom properties use FMTID `{E1486A27-9A7B-4E56-BBD1-50D7F01C1778}`. The COM class is `{6F49F9D5-0F3A-4BF0-8C74-8A59951A75D2}`. `DllGetClassObject` and `DllCanUnloadNow` are exported by the DLL source itself, so the production Shell binary does not depend on special export flags in an external build wrapper.
 
 The build runs two native regressions: `ShadeProjectDataTests` checks schema-v9 JSON/base64 parsing; `ShadeShellTests` loads the produced DLL through `DllGetClassObject`, initializes it from an in-memory `.shade` stream, queries custom properties, and asks WIC for the embedded PNG thumbnail.
 
