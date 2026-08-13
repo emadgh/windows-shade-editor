@@ -8,7 +8,10 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <new>
 #include <string>
 #include <vector>
@@ -23,6 +26,8 @@ HMODULE g_module = nullptr;
 std::atomic<long> g_objects{0};
 std::atomic<long> g_locks{0};
 
+// One read-only COM class implements both the thumbnail provider and property
+// store. The Shell creates/querys whichever interface it needs.
 const CLSID CLSID_ShadeEditorShell = {
     0x6f49f9d5, 0x0f3a, 0x4bf0, {0x8c, 0x74, 0x8a, 0x59, 0x95, 0x1a, 0x75, 0xd2}};
 const GUID FMTID_ShadeEditor = {
@@ -43,6 +48,31 @@ const PROPERTYKEY PKEY_Shade_ColorModel = {FMTID_ShadeEditor, 17};
 const PROPERTYKEY PKEY_Shade_ChannelCount = {FMTID_ShadeEditor, 18};
 const PROPERTYKEY PKEY_Shade_BaseChannelCount = {FMTID_ShadeEditor, 19};
 const PROPERTYKEY PKEY_Shade_SourceFileName = {FMTID_ShadeEditor, 20};
+const PROPERTYKEY PKEY_Shade_PhysicalDimensions = {FMTID_ShadeEditor, 21};
+const PROPERTYKEY PKEY_Shade_PixelDimensions = {FMTID_ShadeEditor, 22};
+const PROPERTYKEY PKEY_Shade_Dpi = {FMTID_ShadeEditor, 23};
+
+const PROPERTYKEY kProperties[] = {
+    PKEY_Title,
+    PKEY_Shade_FaceCount,
+    PKEY_Shade_ActiveFace,
+    PKEY_Shade_TotalSourceBytes,
+    PKEY_Shade_SavedAt,
+    PKEY_Shade_PhysicalWidthCm,
+    PKEY_Shade_PhysicalHeightCm,
+    PKEY_Shade_PixelWidth,
+    PKEY_Shade_PixelHeight,
+    PKEY_Shade_DpiX,
+    PKEY_Shade_DpiY,
+    PKEY_Shade_BitDepth,
+    PKEY_Shade_ColorModel,
+    PKEY_Shade_ChannelCount,
+    PKEY_Shade_BaseChannelCount,
+    PKEY_Shade_SourceFileName,
+    PKEY_Shade_PhysicalDimensions,
+    PKEY_Shade_PixelDimensions,
+    PKEY_Shade_Dpi,
+};
 
 bool key_equal(REFPROPERTYKEY a, REFPROPERTYKEY b) {
     return a.pid == b.pid && IsEqualGUID(a.fmtid, b.fmtid);
@@ -50,7 +80,11 @@ bool key_equal(REFPROPERTYKEY a, REFPROPERTYKEY b) {
 
 std::wstring utf8_to_wide(const std::string& text) {
     if (text.empty()) return {};
-    int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                   static_cast<int>(text.size()), nullptr, 0);
+    if (size <= 0) {
+        size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    }
     if (size <= 0) return {};
     std::wstring out(static_cast<size_t>(size), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size);
@@ -82,6 +116,10 @@ HRESULT string_variant(const std::string& value, PROPVARIANT* out) {
     return InitPropVariantFromString(wide.c_str(), out);
 }
 
+HRESULT wide_string_variant(const std::wstring& value, PROPVARIANT* out) {
+    return InitPropVariantFromString(value.c_str(), out);
+}
+
 FILETIME unix_ms_to_filetime(std::int64_t unix_ms) {
     constexpr std::int64_t kEpochOffsetMs = 11644473600000ll;
     ULONGLONG ticks = unix_ms > -kEpochOffsetMs
@@ -90,6 +128,36 @@ FILETIME unix_ms_to_filetime(std::int64_t unix_ms) {
     ft.dwLowDateTime = static_cast<DWORD>(ticks);
     ft.dwHighDateTime = static_cast<DWORD>(ticks >> 32);
     return ft;
+}
+
+std::wstring format_number(double value, int precision = 2) {
+    wchar_t buffer[64]{};
+    swprintf_s(buffer, L"%.*f", precision, value);
+    std::wstring text(buffer);
+    while (text.size() > 1 && text.back() == L'0') text.pop_back();
+    if (!text.empty() && text.back() == L'.') text.pop_back();
+    return text;
+}
+
+std::wstring physical_dimensions(const ProjectData& data) {
+    if (!data.has_active_face || data.active_face.dpi_x <= 0.0 || data.active_face.dpi_y <= 0.0)
+        return {};
+    const double width_cm = static_cast<double>(data.active_face.width) / data.active_face.dpi_x * 2.54;
+    const double height_cm = static_cast<double>(data.active_face.height) / data.active_face.dpi_y * 2.54;
+    return format_number(width_cm) + L" x " + format_number(height_cm) + L" cm";
+}
+
+std::wstring pixel_dimensions(const ProjectData& data) {
+    if (!data.has_active_face) return {};
+    return std::to_wstring(data.active_face.width) + L" x " +
+           std::to_wstring(data.active_face.height) + L" px";
+}
+
+std::wstring dpi_dimensions(const ProjectData& data) {
+    if (!data.has_active_face || data.active_face.dpi_x <= 0.0 || data.active_face.dpi_y <= 0.0)
+        return {};
+    return format_number(data.active_face.dpi_x, 1) + L" x " +
+           format_number(data.active_face.dpi_y, 1) + L" DPI";
 }
 
 HRESULT thumbnail_from_png(const std::vector<std::uint8_t>& png, UINT requested,
@@ -156,4 +224,260 @@ HRESULT thumbnail_from_png(const std::vector<std::uint8_t>& png, UINT requested,
     *bitmap = dib;
     *alpha_type = WTSAT_ARGB;
     return S_OK;
+}
+
+class ShadeShellHandler final : public IInitializeWithStream,
+                                public IThumbnailProvider,
+                                public IPropertyStore {
+public:
+    ShadeShellHandler() { ++g_objects; }
+    ~ShadeShellHandler() override { --g_objects; }
+
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IInitializeWithStream)) {
+            *object = static_cast<IInitializeWithStream*>(this);
+        } else if (IsEqualIID(riid, IID_IThumbnailProvider)) {
+            *object = static_cast<IThumbnailProvider*>(this);
+        } else if (IsEqualIID(riid, IID_IPropertyStore)) {
+            *object = static_cast<IPropertyStore*>(this);
+        } else {
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+
+    IFACEMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&refs_));
+    }
+
+    IFACEMETHODIMP_(ULONG) Release() override {
+        ULONG value = static_cast<ULONG>(InterlockedDecrement(&refs_));
+        if (!value) delete this;
+        return value;
+    }
+
+    IFACEMETHODIMP Initialize(IStream* stream, DWORD) override {
+        if (!stream) return E_POINTER;
+        if (stream_) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+        stream_ = stream;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP GetThumbnail(UINT cx, HBITMAP* bitmap, WTS_ALPHATYPE* alpha_type) override {
+        HRESULT hr = ensure_data();
+        if (FAILED(hr)) return hr;
+        return thumbnail_from_png(data_.thumbnail_png, cx, bitmap, alpha_type);
+    }
+
+    IFACEMETHODIMP GetCount(DWORD* count) override {
+        if (!count) return E_POINTER;
+        *count = static_cast<DWORD>(std::size(kProperties));
+        return S_OK;
+    }
+
+    IFACEMETHODIMP GetAt(DWORD index, PROPERTYKEY* key) override {
+        if (!key) return E_POINTER;
+        if (index >= std::size(kProperties)) return E_INVALIDARG;
+        *key = kProperties[index];
+        return S_OK;
+    }
+
+    IFACEMETHODIMP GetValue(REFPROPERTYKEY key, PROPVARIANT* value) override {
+        if (!value) return E_POINTER;
+        PropVariantInit(value);
+        HRESULT hr = ensure_data();
+        if (FAILED(hr)) return hr;
+
+        if (key_equal(key, PKEY_Title)) return string_variant(data_.name, value);
+        if (key_equal(key, PKEY_Shade_FaceCount)) {
+            value->vt = VT_UI4;
+            value->ulVal = data_.face_count;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_ActiveFace)) {
+            std::string name;
+            if (data_.has_active_face) {
+                name = !data_.active_face.label.empty() ? data_.active_face.label
+                                                       : data_.active_face.source_file_name;
+            }
+            return string_variant(name, value);
+        }
+        if (key_equal(key, PKEY_Shade_TotalSourceBytes)) {
+            value->vt = VT_UI8;
+            value->uhVal.QuadPart = data_.total_source_bytes;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_SavedAt)) {
+            if (data_.saved_at_unix_ms <= 0) return S_OK;
+            value->vt = VT_FILETIME;
+            value->filetime = unix_ms_to_filetime(data_.saved_at_unix_ms);
+            return S_OK;
+        }
+        if (!data_.has_active_face) return S_OK;
+
+        if (key_equal(key, PKEY_Shade_PhysicalWidthCm) ||
+            key_equal(key, PKEY_Shade_PhysicalHeightCm)) {
+            const bool x = key_equal(key, PKEY_Shade_PhysicalWidthCm);
+            const double dpi = x ? data_.active_face.dpi_x : data_.active_face.dpi_y;
+            const std::uint32_t pixels = x ? data_.active_face.width : data_.active_face.height;
+            if (dpi <= 0.0) return S_OK;
+            value->vt = VT_R8;
+            value->dblVal = static_cast<double>(pixels) / dpi * 2.54;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_PixelWidth)) {
+            value->vt = VT_UI4;
+            value->ulVal = data_.active_face.width;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_PixelHeight)) {
+            value->vt = VT_UI4;
+            value->ulVal = data_.active_face.height;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_DpiX)) {
+            value->vt = VT_R8;
+            value->dblVal = data_.active_face.dpi_x;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_DpiY)) {
+            value->vt = VT_R8;
+            value->dblVal = data_.active_face.dpi_y;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_BitDepth)) {
+            value->vt = VT_UI4;
+            value->ulVal = data_.active_face.bit_depth;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_ColorModel))
+            return string_variant(data_.active_face.color_model, value);
+        if (key_equal(key, PKEY_Shade_ChannelCount)) {
+            value->vt = VT_UI4;
+            value->ulVal = data_.active_face.channel_count;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_BaseChannelCount)) {
+            value->vt = VT_UI4;
+            value->ulVal = data_.active_face.base_channel_count;
+            return S_OK;
+        }
+        if (key_equal(key, PKEY_Shade_SourceFileName))
+            return string_variant(data_.active_face.source_file_name, value);
+        if (key_equal(key, PKEY_Shade_PhysicalDimensions))
+            return wide_string_variant(physical_dimensions(data_), value);
+        if (key_equal(key, PKEY_Shade_PixelDimensions))
+            return wide_string_variant(pixel_dimensions(data_), value);
+        if (key_equal(key, PKEY_Shade_Dpi))
+            return wide_string_variant(dpi_dimensions(data_), value);
+        return S_OK;
+    }
+
+    IFACEMETHODIMP SetValue(REFPROPERTYKEY, REFPROPVARIANT) override {
+        return STG_E_ACCESSDENIED;
+    }
+
+    IFACEMETHODIMP Commit() override { return STG_E_ACCESSDENIED; }
+
+private:
+    HRESULT ensure_data() {
+        if (parsed_) return parse_result_;
+        parsed_ = true;
+        if (!stream_) {
+            parse_result_ = E_UNEXPECTED;
+            return parse_result_;
+        }
+        std::string text;
+        parse_result_ = read_stream(stream_.Get(), text);
+        if (FAILED(parse_result_)) return parse_result_;
+        std::string error;
+        if (!shade_shell::ParseShadeProject(text, data_, &error)) {
+            parse_result_ = HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);
+            return parse_result_;
+        }
+        parse_result_ = S_OK;
+        return S_OK;
+    }
+
+    LONG refs_ = 1;
+    ComPtr<IStream> stream_;
+    bool parsed_ = false;
+    HRESULT parse_result_ = E_PENDING;
+    ProjectData data_;
+};
+
+class ShadeClassFactory final : public IClassFactory {
+public:
+    ShadeClassFactory() { ++g_objects; }
+    ~ShadeClassFactory() override { --g_objects; }
+
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IClassFactory)) {
+            *object = static_cast<IClassFactory*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    IFACEMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&refs_));
+    }
+
+    IFACEMETHODIMP_(ULONG) Release() override {
+        ULONG value = static_cast<ULONG>(InterlockedDecrement(&refs_));
+        if (!value) delete this;
+        return value;
+    }
+
+    IFACEMETHODIMP CreateInstance(IUnknown* outer, REFIID riid, void** object) override {
+        if (outer) return CLASS_E_NOAGGREGATION;
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        auto* handler = new (std::nothrow) ShadeShellHandler();
+        if (!handler) return E_OUTOFMEMORY;
+        HRESULT hr = handler->QueryInterface(riid, object);
+        handler->Release();
+        return hr;
+    }
+
+    IFACEMETHODIMP LockServer(BOOL lock) override {
+        if (lock) ++g_locks;
+        else --g_locks;
+        return S_OK;
+    }
+
+private:
+    LONG refs_ = 1;
+};
+
+}  // namespace
+
+extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_module = instance;
+        DisableThreadLibraryCalls(instance);
+    }
+    return TRUE;
+}
+
+extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow() {
+    return g_objects.load() == 0 && g_locks.load() == 0 ? S_OK : S_FALSE;
+}
+
+extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(
+    REFCLSID clsid, REFIID riid, void** object) {
+    if (!object) return E_POINTER;
+    *object = nullptr;
+    if (!IsEqualCLSID(clsid, CLSID_ShadeEditorShell)) return CLASS_E_CLASSNOTAVAILABLE;
+    auto* factory = new (std::nothrow) ShadeClassFactory();
+    if (!factory) return E_OUTOFMEMORY;
+    HRESULT hr = factory->QueryInterface(riid, object);
+    factory->Release();
+    return hr;
 }
