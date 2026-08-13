@@ -1,0 +1,66 @@
+name: Apply adjustment order v2
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  apply:
+    if: github.event.head_commit.message != 'Apply Levels Mixer Curve ordering'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Materialize source ordering
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          path = Path('scripts/apply_adjustment_pipeline_order.py')
+          text = path.read_text(encoding='utf-8').replace('expected=2,', 'expected=1,')
+          path.write_text(text, encoding='utf-8')
+          '@ | python -
+
+          python scripts/apply_adjustment_pipeline_order.py
+
+          @'
+          from pathlib import Path
+
+          export = Path('src/export_v6.rs')
+          text = export.read_text(encoding='utf-8')
+          old = '                    apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)'
+          new = '                    apply_levels(raw, adjustment.levels)'
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise RuntimeError('streaming Levels pipeline pattern not found')
+
+          old = '                    mixed\n                }\n                _ => prepared[out_channel],'
+          new = '                    apply_curve(mixed, adjustment.curve)\n                }\n                _ => prepared[out_channel],'
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise RuntimeError('streaming Curve pipeline pattern not found')
+          export.write_text(text, encoding='utf-8')
+
+          cargo = Path('Cargo.toml')
+          cargo.write_text(cargo.read_text(encoding='utf-8').replace('build = false\n', ''), encoding='utf-8')
+
+          for obsolete in (Path('build.rs'), Path('scripts/apply_adjustment_pipeline_order.py')):
+              if obsolete.exists():
+                  obsolete.unlink()
+          '@ | python -
+
+      - name: Commit source changes
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if (git status --porcelain) {
+            git commit -m "Apply Levels Mixer Curve ordering"
+            git push origin HEAD:main
+          }
