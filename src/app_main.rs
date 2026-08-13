@@ -22,6 +22,8 @@ mod history;
 mod model;
 #[path = "palette.rs"]
 mod palette;
+#[path = "previous_shades.rs"]
+mod previous_shades;
 #[path = "recovery.rs"]
 mod recovery;
 #[path = "render.rs"]
@@ -210,6 +212,16 @@ struct ShadeApp {
     show_settings: bool,
     show_about: bool,
     show_logs: bool,
+    show_previous_shades: bool,
+    previous_shades: previous_shades::PreviousShadesStore,
+    previous_shades_query: String,
+    previous_shades_sort: previous_shades::PreviousShadesSort,
+    previous_shades_selected: Option<String>,
+    previous_shade_preview: Option<previous_shades::ShadeInspection>,
+    previous_shade_preview_error: Option<String>,
+    previous_shade_texture: Option<egui::TextureHandle>,
+    remind_after_export: bool,
+    show_snapshot_save_reminder: bool,
     log: app_log::AppLog,
     log_cache: String,
     last_update_failure: Option<String>,
@@ -253,7 +265,11 @@ impl ShadeApp {
             "Shade Editor {} started",
             env!("CARGO_PKG_VERSION")
         ));
-        let recovery_candidate = match recovery::load() {
+        let previous_shades = previous_shades::PreviousShadesStore::load().unwrap_or_else(|err| {
+        log.error(&err);
+        previous_shades::PreviousShadesStore::default()
+    });
+    let recovery_candidate = match recovery::load() {
             Ok(candidate) => candidate,
             Err(err) => {
                 log.error(&err);
@@ -276,10 +292,20 @@ impl ShadeApp {
             viewport_recenter: true,
             settings,
             updater,
-            show_settings: false,
-            show_about: false,
-            show_logs: false,
-            log,
+  show_settings: false,
+    show_about: false,
+    show_logs: false,
+    show_previous_shades: false,
+    previous_shades,
+    previous_shades_query: String::new(),
+    previous_shades_sort: previous_shades::PreviousShadesSort::LastOpened,
+    previous_shades_selected: None,
+    previous_shade_preview: None,
+    previous_shade_preview_error: None,
+    previous_shade_texture: None,
+    remind_after_export: false,
+    show_snapshot_save_reminder: false,
+    log,
             log_cache: String::new(),
             last_update_failure: None,
             toast: None,
@@ -341,8 +367,10 @@ impl ShadeApp {
         self.snapshot_rename_buffer.clear();
         self.pending_snapshot_load = None;
         self.show_close_confirmation = false;
-        self.close_after_save = false;
-        self.history.reset(&self.project.adjustments, "New project");
+    self.close_after_save = false;
+    self.remind_after_export = false;
+    self.show_snapshot_save_reminder = false;
+    self.history.reset(&self.project.adjustments, "New project");
         self.history_pending_label = None;
         self.history_pending_at = None;
         self.report_info("New shade project");
@@ -397,51 +425,86 @@ impl ShadeApp {
         }
     }
 
-    fn add_faces_dialog(&mut self) {
-        if self.job.is_some() {
-            return;
-        }
-        let Some(paths) = rfd::FileDialog::new()
-            .add_filter("TIFF images", &["tif", "tiff"])
-            .pick_files()
-        else {
-            return;
-        };
-        if paths.is_empty() {
-            return;
-        }
-        let max_dimension = self.settings.max_preview_dimension;
-        let default_dpi = self.settings.default_dpi;
-        self.launch_job("Opening TIFF", move |progress| {
-            let total = paths.len().max(1);
-            let mut faces = Vec::new();
-            let mut errors = Vec::new();
-            for (index, path) in paths.into_iter().enumerate() {
-                Self::set_progress(
-                    &progress,
-                    Some(index as f32 / total as f32),
-                    "Opening TIFF",
-                    &path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                );
-                match tiff_io::load_preview(&path, max_dimension) {
-                    Ok(preview) => faces.push(LoadedFace {
-                        dpi: dpi::read_dpi(&path, default_dpi),
-                        path,
-                        available: true,
-                        preview,
-                    }),
-                    Err(err) => errors.push(format!("{}: {err}", path.display())),
-                }
-            }
-            Self::set_progress(&progress, Some(1.0), "Opening TIFF", "Complete");
-            JobResult::AddFaces { faces, errors }
-        });
-    }
+fn is_tiff_path(path: &Path) -> bool {
+path.extension()
+    .and_then(|ext| ext.to_str())
+    .is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
+}
 
-    fn rebuild_previews(&mut self) {
+fn add_faces_paths(&mut self, paths: Vec<PathBuf>) {
+    if self.job.is_some() {
+        return;
+    }
+    let paths = paths
+        .into_iter()
+        .filter(|path| Self::is_tiff_path(path))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return;
+    }
+    let max_dimension = self.settings.max_preview_dimension;
+    let default_dpi = self.settings.default_dpi;
+    self.launch_job("Opening TIFF", move |progress| {
+        let total = paths.len().max(1);
+        let mut faces = Vec::new();
+        let mut errors = Vec::new();
+        for (index, path) in paths.into_iter().enumerate() {
+            Self::set_progress(
+                &progress,
+                Some(index as f32 / total as f32),
+                "Opening TIFF",
+                &path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            match tiff_io::load_preview(&path, max_dimension) {
+                Ok(preview) => faces.push(LoadedFace {
+                    dpi: dpi::read_dpi(&path, default_dpi),
+                    path,
+                    available: true,
+                    preview,
+                }),
+                Err(err) => errors.push(format!("{}: {err}", path.display())),
+            }
+        }
+        Self::set_progress(&progress, Some(1.0), "Opening TIFF", "Complete");
+        JobResult::AddFaces { faces, errors }
+    });
+}
+
+fn add_faces_dialog(&mut self) {
+    if self.job.is_some() {
+        return;
+    }
+    let Some(paths) = rfd::FileDialog::new()
+        .add_filter("TIFF images", &["tif", "tiff"])
+        .pick_files()
+    else {
+        return;
+    };
+    self.add_faces_paths(paths);
+}
+
+fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+    if self.job.is_some() {
+        return;
+    }
+    let paths = ctx.input(|input| {
+        input
+            .raw
+            .dropped_files
+            .iter()
+            .filter_map(|file| file.path.clone())
+            .filter(|path| Self::is_tiff_path(path))
+            .collect::<Vec<_>>()
+    });
+    if !paths.is_empty() {
+        self.add_faces_paths(paths);
+    }
+}
+
+fn rebuild_previews(&mut self) {
         workflow_v0103::rebuild_previews(self);
     }
 
@@ -520,77 +583,117 @@ impl ShadeApp {
         });
     }
 
-    fn save_project(&mut self, save_as: bool) -> bool {
-        if self.job.is_some() || self.faces.is_empty() {
-            return false;
+fn begin_project_save(&mut self, path: PathBuf) -> bool {
+if self.job.is_some() || self.faces.is_empty() {
+    return false;
+}
+let mut project = self.project.clone();
+project.file_metadata = Some(build_project_file_metadata(
+    &self.project,
+    &self.faces,
+    self.current_face,
+));
+let thumbnail_face = self
+    .faces
+    .get(self.current_face)
+    .filter(|face| face.available)
+    .or_else(|| self.faces.iter().find(|face| face.available))
+    .map(|face| Arc::clone(&face.preview));
+let face_paths = self
+    .faces
+    .iter()
+    .map(|face| face.path.clone())
+    .collect::<Vec<_>>();
+let result_path = path.clone();
+self.launch_job("Saving project", move |progress| {
+    Self::set_progress(
+        &progress,
+        Some(0.15),
+        "Saving project",
+        "Building project thumbnail",
+    );
+    let result = (|| -> Result<(), String> {
+        if let Some(face) = thumbnail_face.as_deref() {
+            project.thumbnail = Some(thumbnail::build_project_thumbnail(face, &project)?);
         }
-        let target = if !save_as {
-            self.project_path.clone()
-        } else {
-            None
-        };
-        let target = match target {
-            Some(path) => Some(path),
-            None => {
-                let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Shade project", &["shade"])
-                    .set_file_name(format!("{}.shade", sanitize_filename(&self.project.name)));
-                if let Some(parent) = self.faces.first().and_then(|face| face.path.parent()) {
-                    dialog = dialog.set_directory(parent);
-                }
-                dialog.save_file()
-            }
-        };
-        let Some(path) = target else {
-            return false;
-        };
-        let mut project = self.project.clone();
-        project.file_metadata = Some(build_project_file_metadata(
-            &self.project,
-            &self.faces,
-            self.current_face,
-        ));
-        let thumbnail_face = self
-            .faces
-            .get(self.current_face)
-            .filter(|face| face.available)
-            .or_else(|| self.faces.iter().find(|face| face.available))
-            .map(|face| Arc::clone(&face.preview));
-        let face_paths = self
-            .faces
-            .iter()
-            .map(|face| face.path.clone())
-            .collect::<Vec<_>>();
-        let result_path = path.clone();
-        self.launch_job("Saving project", move |progress| {
-            Self::set_progress(
-                &progress,
-                Some(0.15),
-                "Saving project",
-                "Building project thumbnail",
-            );
-            let result = (|| -> Result<(), String> {
-                if let Some(face) = thumbnail_face.as_deref() {
-                    project.thumbnail = Some(thumbnail::build_project_thumbnail(face, &project)?);
-                }
-                Self::set_progress(
-                    &progress,
-                    Some(0.55),
-                    "Saving project",
-                    "Serializing project and metadata",
-                );
-                project.save(&path, &face_paths)
-            })();
-            Self::set_progress(&progress, Some(1.0), "Saving project", "Complete");
-            JobResult::Save {
-                path: result_path,
-                result,
-            }
-        });
-        true
+        Self::set_progress(
+            &progress,
+            Some(0.55),
+            "Saving project",
+            "Serializing project and metadata",
+        );
+        project.save(&path, &face_paths)
+    })();
+    Self::set_progress(&progress, Some(1.0), "Saving project", "Complete");
+    JobResult::Save {
+        path: result_path,
+        result,
     }
+});
+true
+}
 
-    fn export_current_dialog(&mut self) {
+fn save_project(&mut self, save_as: bool) -> bool {
+    if self.job.is_some() || self.faces.is_empty() {
+        return false;
+    }
+    let target = if !save_as {
+        self.project_path.clone()
+    } else {
+        None
+    };
+    let target = match target {
+        Some(path) => Some(path),
+        None => {
+            let mut dialog = rfd::FileDialog::new()
+                .add_filter("Shade project", &["shade"])
+                .set_file_name(format!("{}.shade", sanitize_filename(&self.project.name)));
+            if let Some(parent) = self.faces.first().and_then(|face| face.path.parent()) {
+                dialog = dialog.set_directory(parent);
+            }
+            dialog.save_file()
+        }
+    };
+    let Some(path) = target else {
+        return false;
+    };
+    self.begin_project_save(path)
+}
+
+fn quick_save_target(&self) -> Option<PathBuf> {
+    if self.project_path.is_some() || self.faces.is_empty() {
+        return None;
+    }
+    let face = self
+        .faces
+        .get(self.current_face)
+        .or_else(|| self.faces.first())?;
+    let parent = face.path.parent().unwrap_or_else(|| Path::new("."));
+    let mut stem = sanitize_filename(self.project.name.trim());
+    if stem.trim().is_empty() || self.project.name.trim().eq_ignore_ascii_case("Untitled Shade") {
+        stem = face
+            .path
+            .file_stem()
+            .map(|value| sanitize_filename(&value.to_string_lossy()))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Shade Project".to_owned());
+    }
+    Some(unique_shade_path(parent, &stem))
+}
+
+fn quick_save_project(&mut self) -> bool {
+    let Some(path) = self.quick_save_target() else {
+        return false;
+    };
+    self.begin_project_save(path)
+}
+
+fn snapshot_project_needs_save_reminder(&self) -> bool {
+    self.project.active_snapshot_id.is_some()
+        && (self.project_dirty || self.project_path.is_none())
+}
+
+fn export_current_dialog(&mut self) {
         if self.job.is_some() {
             return;
         }
@@ -620,6 +723,7 @@ impl ShadeApp {
         let default_dpi = self.settings.default_dpi;
         let force_lzw = self.settings.lzw_compression;
         let validate_after_export = self.settings.validate_after_export;
+        self.remind_after_export = self.snapshot_project_needs_save_reminder();
         self.launch_job("Exporting TIFF", move |progress| {
             let result = export::export_face_with_progress_options(
                 &source,
@@ -684,6 +788,7 @@ impl ShadeApp {
         let source = face.path.clone();
         let default_dpi = self.settings.default_dpi;
         let force_lzw = self.settings.lzw_compression;
+        self.remind_after_export = false;
         self.launch_job("Validating TIFF", move |progress| {
             let result = validation::validate_no_adjustment_roundtrip_with_options(
                 &source,
@@ -732,6 +837,7 @@ impl ShadeApp {
         let default_dpi = self.settings.default_dpi;
         let force_lzw = self.settings.lzw_compression;
         let validate_after_export = self.settings.validate_after_export;
+        self.remind_after_export = self.snapshot_project_needs_save_reminder();
         self.launch_job("Exporting faces", move |progress| {
             let total = sources.len().max(1);
             let result = (|| -> Result<String, String> {
@@ -838,6 +944,7 @@ impl ShadeApp {
         let force_lzw = self.settings.lzw_compression;
         project.adjustments = snapshot.adjustments.clone();
         project.active_snapshot_id = Some(snapshot.id);
+        self.remind_after_export = self.snapshot_project_needs_save_reminder();
         self.launch_job("Exporting snapshot", move |progress| {
             let result = export::export_face_with_progress_options(
                 &source,
@@ -902,6 +1009,7 @@ impl ShadeApp {
         if snapshots.is_empty() {
             return;
         }
+        self.remind_after_export = self.snapshot_project_needs_save_reminder();
         self.launch_job("Exporting snapshots", move |progress| {
             let total = snapshots.len().max(1);
             let mut marks = Vec::new();
@@ -1089,8 +1197,11 @@ impl ShadeApp {
                     self.adjustment_scope = AdjustmentScope::Selected;
                     self.fit_requested = true;
                     self.viewport_recenter = true;
-                    self.project_dirty = false;
-                    self.history
+self.project_dirty = false;
+        self.remind_after_export = false;
+        self.show_snapshot_save_reminder = false;
+        self.remember_previous_shade(&payload.path);
+        self.history
                         .reset(&self.project.adjustments, "Open project");
                     self.history_pending_label = None;
                     self.history_pending_at = None;
@@ -1137,9 +1248,12 @@ impl ShadeApp {
             },
             JobResult::Save { path, result } => match result {
                 Ok(()) => {
-                    self.project_path = Some(path.clone());
-                    self.project_dirty = false;
-                    if let Err(err) = recovery::clear() {
+self.project_path = Some(path.clone());
+        self.project_dirty = false;
+        self.remind_after_export = false;
+        self.show_snapshot_save_reminder = false;
+        self.remember_previous_shade(&path);
+        if let Err(err) = recovery::clear() {
                         self.log.error(&err);
                     }
                     self.report_info(format!("Saved {}", path.display()));
@@ -1149,23 +1263,28 @@ impl ShadeApp {
                     self.report_error(err);
                 }
             },
-            JobResult::Export(payload) => {
-                if !payload.marks.is_empty() {
-                    for mark in payload.marks {
-                        self.project.record_snapshot_export(
-                            mark.snapshot_id,
-                            mark.face_key,
-                            mark.folder.to_string_lossy().into_owned(),
-                            mark.exported_at_unix_ms,
-                        );
-                    }
-                    self.project_dirty = true;
-                }
-                match payload.result {
-                    Ok(message) => self.report_info(message),
-                    Err(err) => self.report_error(format!("Export failed: {err}")),
-                }
-            }
+  JobResult::Export(payload) => {
+    let export_ok = payload.result.is_ok();
+    if !payload.marks.is_empty() {
+        for mark in payload.marks {
+  self.project.record_snapshot_export(
+      mark.snapshot_id,
+      mark.face_key,
+      mark.folder.to_string_lossy().into_owned(),
+      mark.exported_at_unix_ms,
+  );
+        }
+        self.project_dirty = true;
+    }
+    match payload.result {
+        Ok(message) => self.report_info(message),
+        Err(err) => self.report_error(format!("Export failed: {err}")),
+    }
+    if export_ok && self.remind_after_export {
+        self.show_snapshot_save_reminder = true;
+    }
+    self.remind_after_export = false;
+}
         }
     }
 
@@ -1299,7 +1418,38 @@ impl ShadeApp {
         self.report_info("Face removed from project (source TIFF was not deleted)");
     }
 
-    fn save_settings_quietly(&mut self) {
+fn remember_previous_shade(&mut self, path: &Path) {
+self.previous_shades.record_open(path, &self.project.name);
+if let Err(err) = self.previous_shades.save() {
+    self.log.error(&err);
+}
+}
+
+fn load_previous_shade_preview(&mut self, ctx: &egui::Context, path: &str) {
+    self.previous_shades_selected = Some(path.to_owned());
+    self.previous_shade_texture = None;
+    self.previous_shade_preview = None;
+    self.previous_shade_preview_error = None;
+    match previous_shades::inspect(Path::new(path)) {
+        Ok(mut preview) => {
+            if let Some(thumbnail) = preview.thumbnail.take() {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [thumbnail.width, thumbnail.height],
+                    &thumbnail.rgba,
+                );
+                self.previous_shade_texture = Some(ctx.load_texture(
+                    format!("previous-shade-thumbnail:{path}"),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            self.previous_shade_preview = Some(preview);
+        }
+        Err(err) => self.previous_shade_preview_error = Some(err),
+    }
+}
+
+fn save_settings_quietly(&mut self) {
         if let Err(err) = self.settings.save() {
             self.report_error(err);
         }
@@ -1364,8 +1514,10 @@ impl ShadeApp {
                 let enabled = self.job.is_none();
                 if ui.add_enabled(enabled, egui::Button::new("New")).clicked() { self.new_project(); }
                 if ui.add_enabled(enabled, egui::Button::new("Open .shade")).clicked() { self.open_project_dialog(); }
+                if ui.button("Previous shades").clicked() { self.show_previous_shades = true; }
                 if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces")).clicked() { self.add_faces_dialog(); }
                 ui.separator();
+                if self.project_path.is_none() && ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Quick Save")).on_hover_text("Create the first .shade project beside the source TIFF files without opening a Save dialog").clicked() { self.quick_save_project(); }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() { self.save_project(false); }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save As")).clicked() { self.save_project(true); }
                 ui.separator();
@@ -2962,7 +3114,287 @@ impl ShadeApp {
         });
     }
 
-    fn ui_settings_window(&mut self, ctx: &egui::Context) {
+fn ui_previous_shades_window(&mut self, ctx: &egui::Context) {
+if !self.show_previous_shades {
+    return;
+}
+let mut open = self.show_previous_shades;
+let mut requested_select: Option<String> = None;
+let mut requested_open: Option<String> = None;
+egui::Window::new("Previous shades")
+    .open(&mut open)
+    .resizable(true)
+    .default_size([980.0, 620.0])
+    .show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.previous_shades_query)
+                    .hint_text("Search project name or path...")
+                    .desired_width(320.0),
+            );
+            if !search.has_focus() {
+                let typed = ui.input(|input| {
+                    if input.modifiers.ctrl || input.modifiers.alt || input.modifiers.command {
+                        String::new()
+                    } else {
+                        input
+                            .events
+                            .iter()
+                            .filter_map(|event| match event {
+                                egui::Event::Text(text) => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>()
+                    }
+                });
+                if !typed.is_empty() {
+                    self.previous_shades_query.push_str(&typed);
+                    search.request_focus();
+                }
+            }
+            egui::ComboBox::from_id_salt("previous-shades-sort")
+                .selected_text(self.previous_shades_sort.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.previous_shades_sort,
+                        previous_shades::PreviousShadesSort::LastOpened,
+                        "Last opened",
+                    );
+                    ui.selectable_value(
+                        &mut self.previous_shades_sort,
+                        previous_shades::PreviousShadesSort::ProjectName,
+                        "Project name",
+                    );
+                    ui.selectable_value(
+                        &mut self.previous_shades_sort,
+                        previous_shades::PreviousShadesSort::SavedAt,
+                        "Saved time",
+                    );
+                    ui.selectable_value(
+                        &mut self.previous_shades_sort,
+                        previous_shades::PreviousShadesSort::Path,
+                        "Path",
+                    );
+                });
+            ui.add_enabled(false, egui::Button::new("Load all shades from system"))
+                .on_hover_text("Reserved for the Everything Search integration. History already uses the same importable entry model.");
+        });
+        ui.small("All .shade projects opened or saved by Shade Editor are retained here. Missing paths stay in history so moved/offline projects are visible.");
+        ui.separator();
+
+        let query = self.previous_shades_query.trim().to_lowercase();
+        let mut rows = self.previous_shades.entries().to_vec();
+        if !query.is_empty() {
+            rows.retain(|entry| {
+                entry.project_name.to_lowercase().contains(&query)
+                    || entry.path.to_lowercase().contains(&query)
+            });
+        }
+        match self.previous_shades_sort {
+            previous_shades::PreviousShadesSort::LastOpened => {
+                rows.sort_by(|a, b| b.last_opened_unix_ms.cmp(&a.last_opened_unix_ms));
+            }
+            previous_shades::PreviousShadesSort::ProjectName => {
+                rows.sort_by(|a, b| {
+                    a.project_name
+                        .to_lowercase()
+                        .cmp(&b.project_name.to_lowercase())
+                        .then_with(|| b.last_opened_unix_ms.cmp(&a.last_opened_unix_ms))
+                });
+            }
+            previous_shades::PreviousShadesSort::SavedAt => {
+                rows.sort_by(|a, b| b.saved_at_unix_ms.cmp(&a.saved_at_unix_ms));
+            }
+            previous_shades::PreviousShadesSort::Path => {
+                rows.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+            }
+        }
+
+        if self.previous_shades_selected.is_none() {
+            requested_select = rows.first().map(|entry| entry.path.clone());
+        }
+
+        ui.columns(2, |columns| {
+            columns[0].strong(format!("History · {}", rows.len()));
+            columns[0].add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt("previous-shades-history")
+                .show(&mut columns[0], |ui| {
+                    for entry in &rows {
+                        let fallback = Path::new(&entry.path)
+                            .file_stem()
+                            .map(|value| value.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Shade project".to_owned());
+                        let display_name = if entry.project_name.trim().is_empty() {
+                            fallback
+                        } else {
+                            entry.project_name.clone()
+                        };
+                        let label = if Path::new(&entry.path).is_file() {
+                            display_name
+                        } else {
+                            format!("[missing] {display_name}")
+                        };
+                        let opened = format_previous_shade_time(entry.last_opened_unix_ms);
+                        let selected = self.previous_shades_selected.as_deref()
+                            == Some(entry.path.as_str());
+                        if clickable_row(ui, selected, &label, Some(&opened), None, 38.0)
+                            .on_hover_text(&entry.path)
+                            .clicked()
+                        {
+                            requested_select = Some(entry.path.clone());
+                        }
+                    }
+                });
+
+            columns[1].strong("Preview");
+            columns[1].add_space(4.0);
+            if let Some(err) = self.previous_shade_preview_error.as_ref() {
+                columns[1].colored_label(egui::Color32::LIGHT_RED, err);
+                if let Some(path) = self.previous_shades_selected.as_deref() {
+                    columns[1].label(path);
+                }
+            } else if let Some(preview) = self.previous_shade_preview.as_ref() {
+                columns[1].heading(&preview.project_name);
+                if let Some(texture) = self.previous_shade_texture.as_ref() {
+                    let natural = texture.size_vec2();
+                    if natural.x > 0.0 && natural.y > 0.0 {
+                        let max_size = egui::vec2(columns[1].available_width().min(420.0), 250.0);
+                        let scale = (max_size.x / natural.x)
+                            .min(max_size.y / natural.y)
+                            .min(1.0);
+                        columns[1].add(
+                            egui::Image::from_texture(texture)
+                                .fit_to_exact_size(natural * scale),
+                        );
+                    }
+                } else if let Some(err) = preview.thumbnail_error.as_ref() {
+                    columns[1].small(format!("Thumbnail unavailable: {err}"));
+                } else {
+                    columns[1].small("No embedded thumbnail in this .shade file.");
+                }
+                columns[1].add_space(6.0);
+                egui::Grid::new("previous-shade-preview-meta")
+                    .num_columns(2)
+                    .striped(true)
+                    .spacing([12.0, 5.0])
+                    .show(&mut columns[1], |ui| {
+                        ui.strong("Saved");
+                        ui.label(format_previous_shade_time(preview.saved_at_unix_ms));
+                        ui.end_row();
+                        ui.strong("File modified");
+                        ui.label(preview.file_modified_unix_ms.map(format_previous_shade_time).unwrap_or_else(|| "-".to_owned()));
+                        ui.end_row();
+                        ui.strong("Faces");
+                        ui.label(preview.face_count.to_string());
+                        ui.end_row();
+                        ui.strong("Snapshots");
+                        ui.label(preview.snapshot_count.to_string());
+                        ui.end_row();
+                        ui.strong("Active snapshot");
+                        ui.label(preview.active_snapshot_name.as_deref().unwrap_or("-") );
+                        ui.end_row();
+                        ui.strong("Test code");
+                        ui.label(if preview.test_code_enabled { "Enabled" } else { "Off" });
+                        ui.end_row();
+                        ui.strong("Source bytes");
+                        ui.label(format_byte_count(preview.total_source_bytes));
+                        ui.end_row();
+                    });
+                if let Some(face) = preview.active_face.as_ref() {
+                    columns[1].separator();
+                    columns[1].strong(format!(
+                        "Face {} of {} · {}",
+                        preview.active_face_index.saturating_add(1).min(preview.face_count.max(1)),
+                        preview.face_count,
+                        face.label
+                    ));
+                    columns[1].label(format!("{} · {} x {} px · {}-bit · {}", face.source_file_name, face.width, face.height, face.bit_depth, face.color_model));
+                    columns[1].label(format!("{:.0} x {:.0} DPI · {} channels · {}", face.dpi_x, face.dpi_y, face.channel_count, format_byte_count(face.file_size_bytes)));
+                    if !face.channel_names.is_empty() {
+                        columns[1].small(format!("Channels: {}", face.channel_names.join(", ")));
+                    }
+                }
+                columns[1].separator();
+                columns[1].small(preview.path.display().to_string());
+                if columns[1]
+                    .add_enabled(
+                        self.job.is_none() && preview.path.is_file(),
+                        egui::Button::new("Open selected .shade"),
+                    )
+                    .clicked()
+                {
+                    requested_open = Some(preview.path.to_string_lossy().into_owned());
+                }
+            } else {
+                columns[1].label("Select a project to inspect its embedded thumbnail and saved metadata.");
+            }
+        });
+    });
+self.show_previous_shades = open;
+if let Some(path) = requested_select {
+    self.load_previous_shade_preview(ctx, &path);
+}
+if let Some(path) = requested_open {
+    self.show_previous_shades = false;
+    self.open_project_path(PathBuf::from(path));
+}
+}
+
+fn ui_snapshot_save_reminder(&mut self, ctx: &egui::Context) {
+    if !self.show_snapshot_save_reminder {
+        return;
+    }
+    let unsaved_project = self.project_path.is_none();
+    let quick_target = self.quick_save_target();
+    let mut quick_save = false;
+    let mut save = false;
+    let mut save_as = false;
+    let mut later = false;
+    egui::Window::new("Save Snapshot/Test project state")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            if unsaved_project {
+                ui.strong("The TIFF export is saved, but this Snapshot/Test state is not stored in a .shade project yet.");
+                ui.label("This project has never been saved. Quick Save will create the project beside the source TIFF files so the exported test can be reproduced later.");
+                if let Some(path) = quick_target.as_ref() {
+                    ui.small(format!("Quick Save target: {}", path.display()));
+                }
+            } else {
+                ui.strong("The TIFF export is saved, but the Snapshot/Test state has unsaved project changes.");
+                ui.label("Save the .shade project now to keep the test state that produced this TIFF.");
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if unsaved_project {
+                    quick_save = ui
+                        .add_enabled(self.job.is_none() && quick_target.is_some(), egui::Button::new("Quick Save project"))
+                        .clicked();
+                    save_as = ui
+                        .add_enabled(self.job.is_none() && !self.faces.is_empty(), egui::Button::new("Save As..."))
+                        .clicked();
+                } else {
+                    save = ui
+                        .add_enabled(self.job.is_none(), egui::Button::new("Save project"))
+                        .clicked();
+                }
+                later = ui.button("Later").clicked();
+            });
+        });
+    if quick_save && self.quick_save_project() {
+        self.show_snapshot_save_reminder = false;
+    } else if save && self.save_project(false) {
+        self.show_snapshot_save_reminder = false;
+    } else if save_as && self.save_project(true) {
+        self.show_snapshot_save_reminder = false;
+    } else if later {
+        self.show_snapshot_save_reminder = false;
+    }
+}
+
+fn ui_settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
         }
@@ -3304,9 +3736,12 @@ impl eframe::App for ShadeApp {
         self.poll_render(ui.ctx());
         self.sync_update_state();
         self.poll_autosave();
+    self.handle_dropped_files(ui.ctx());
+    if !self.show_previous_shades {
         workflow_v0103::handle_shortcuts(self, ui.ctx());
         self.handle_history_shortcuts(ui.ctx());
-        self.maybe_autosave();
+    }
+    self.maybe_autosave();
         self.handle_close_request(ui.ctx());
         if self.close_after_save && self.job.is_none() && !self.project_dirty {
             self.close_after_save = false;
@@ -3341,12 +3776,55 @@ impl eframe::App for ShadeApp {
         self.ui_settings_window(ui.ctx());
         self.ui_about_window(ui.ctx());
         self.ui_logs_window(ui.ctx());
-        self.ui_recovery_window(ui.ctx());
-        self.ui_snapshot_discard_confirmation(ui.ctx());
+    self.ui_previous_shades_window(ui.ctx());
+    self.ui_recovery_window(ui.ctx());
+    self.ui_snapshot_discard_confirmation(ui.ctx());
+    self.ui_snapshot_save_reminder(ui.ctx());
         self.ui_close_confirmation(ui.ctx());
         self.commit_pending_history(ui.ctx(), false);
 
         self.start_render_if_needed(ui.ctx());
+    }
+}
+
+fn unique_shade_path(directory: &Path, stem: &str) -> PathBuf {
+    let candidate = directory.join(format!("{stem}.shade"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    for number in 2u32.. {
+        let candidate = directory.join(format!("{stem}-{number}.shade"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn format_previous_shade_time(unix_ms: i64) -> String {
+    if unix_ms <= 0 {
+        return "-".to_owned();
+    }
+    Local
+        .timestamp_millis_opt(unix_ms)
+        .single()
+        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let value = bytes as f64;
+    if value >= GB {
+        format!("{:.2} GB", value / GB)
+    } else if value >= MB {
+        format!("{:.1} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

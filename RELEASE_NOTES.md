@@ -1,3 +1,11 @@
+# Shade Editor 0.13.0
+
+- Add TIFF drag-and-drop directly into the Faces list.
+- Add Quick Save for unsaved projects, creating a unique `.shade` beside the active/source TIFF without a Save dialog.
+- Remind operators after TIFF export when the active Snapshot/Test state still has unsaved `.shade` project changes.
+- Add persistent Previous Shades history with search, sorting, embedded thumbnail/metadata preview, and missing-file retention.
+- Reserve `Load all shades from system` for the next Everything Search provider integration.
+
 # Shade Editor v0.12.1
 
 - Moved export/storage controls into a dedicated Settings section.
