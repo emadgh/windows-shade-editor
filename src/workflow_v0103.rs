@@ -27,9 +27,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
                 && input.modifiers.ctrl
                 && input.modifiers.shift
                 && !input.modifiers.alt,
-            input.key_pressed(egui::Key::Enter)
-                && input.modifiers.ctrl
-                && !input.modifiers.alt,
+            input.key_pressed(egui::Key::Enter) && input.modifiers.ctrl && !input.modifiers.alt,
         )
     });
     if save_as {
@@ -45,8 +43,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
         return;
     }
     let (fit, solo, channel) = ctx.input(|input| {
-        let no_modifiers =
-            !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
+        let no_modifiers = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
         let keys = [
             egui::Key::Num1,
             egui::Key::Num2,
@@ -117,9 +114,7 @@ pub(super) fn rebuild_previews(app: &mut ShadeApp) {
         let result = (|| -> Result<Vec<LoadedFace>, String> {
             let total = items.len().max(1);
             let mut faces = Vec::with_capacity(items.len());
-            for (index, (path, available, old_preview, old_dpi)) in
-                items.into_iter().enumerate()
-            {
+            for (index, (path, available, old_preview, old_dpi)) in items.into_iter().enumerate() {
                 ShadeApp::set_progress(
                     &progress,
                     Some(index as f32 / total as f32),
@@ -240,21 +235,21 @@ pub(super) fn relink_missing_faces_folder_dialog(app: &mut ShadeApp) {
                 Err(err) => errors.push(format!("{file_name}: {err}")),
             }
         }
-        ShadeApp::set_progress(
-            &progress,
-            Some(1.0),
-            "Relinking missing Faces",
-            "Complete",
-        );
+        ShadeApp::set_progress(&progress, Some(1.0), "Relinking missing Faces", "Complete");
         JobResult::RelinkFolder { faces, errors }
     });
 }
 
-pub(super) fn apply_relinked_face(app: &mut ShadeApp, index: usize, result: Result<LoadedFace, String>) {
+pub(super) fn apply_relinked_face(
+    app: &mut ShadeApp,
+    index: usize,
+    result: Result<LoadedFace, String>,
+) {
     match result {
         Ok(item) => {
             if index < app.faces.len() && index < app.project.faces.len() {
-                app.project.ensure_channels(&item.preview.metadata.channel_names);
+                app.project
+                    .ensure_channels(&item.preview.metadata.channel_names);
                 app.project.faces[index].path = item.path.to_string_lossy().into_owned();
                 app.faces[index] = ShadeApp::make_runtime_face(item);
                 app.current_face = index;
@@ -278,7 +273,8 @@ pub(super) fn apply_relinked_folder(
     let mut relinked = 0usize;
     for (index, item) in faces {
         if index < app.faces.len() && index < app.project.faces.len() {
-            app.project.ensure_channels(&item.preview.metadata.channel_names);
+            app.project
+                .ensure_channels(&item.preview.metadata.channel_names);
             app.project.faces[index].path = item.path.to_string_lossy().into_owned();
             app.faces[index] = ShadeApp::make_runtime_face(item);
             relinked += 1;
@@ -291,7 +287,10 @@ pub(super) fn apply_relinked_folder(
         app.report_info(format!("Relinked and verified {relinked} missing Face(s)"));
     }
     if !errors.is_empty() {
-        app.report_error(format!("Some Faces were not relinked: {}", errors.join(" | ")));
+        app.report_error(format!(
+            "Some Faces were not relinked: {}",
+            errors.join(" | ")
+        ));
     }
 }
 
@@ -498,10 +497,7 @@ fn missing_face_preview(expected: Option<&model::FaceFileMetadata>) -> PreviewFa
     }
 }
 
-fn missing_face_dpi(
-    expected: Option<&model::FaceFileMetadata>,
-    default_dpi: f64,
-) -> dpi::DpiInfo {
+fn missing_face_dpi(expected: Option<&model::FaceFileMetadata>, default_dpi: f64) -> dpi::DpiInfo {
     let Some(expected) = expected else {
         return dpi::DpiInfo::with_default(default_dpi);
     };

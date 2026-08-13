@@ -5,11 +5,10 @@ edition = "2024"
 description = "Native multi-channel TIFF shade editor for digital ceramic printing"
 license = "MIT"
 autobins = false
-build = "build_wrapper.rs"
 
 [[bin]]
 name = "ShadeEditor"
-path = "src/entry_v0103.rs"
+path = "src/app_main.rs"
 
 [dependencies]
 eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }

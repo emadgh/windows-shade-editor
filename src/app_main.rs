@@ -1,23 +1,43 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+trait ContextKeyboardCompat {
+    fn wants_keyboard_input(&self) -> bool;
+}
+
+impl ContextKeyboardCompat for eframe::egui::Context {
+    fn wants_keyboard_input(&self) -> bool {
+        self.egui_wants_keyboard_input()
+    }
+}
+
+#[path = "app_log.rs"]
 mod app_log;
+#[path = "dpi.rs"]
 mod dpi;
 #[path = "export_v6.rs"]
 mod export;
+#[path = "history.rs"]
 mod history;
 #[path = "model_v6.rs"]
 mod model;
+#[path = "palette.rs"]
 mod palette;
+#[path = "recovery.rs"]
 mod recovery;
+#[path = "render.rs"]
 mod render;
-#[path = "settings_v6.rs"]
+#[path = "D:/a/windows-shade-editor/windows-shade-editor/target/x86_64-pc-windows-msvc/debug/build/windows-shade-editor-012cff5d06356448/out/settings_v0103.rs"]
 mod settings;
+#[path = "thumbnail.rs"]
 mod thumbnail;
 #[path = "tiff_io.rs"]
 mod tiff_io;
 #[path = "update_v4.rs"]
 mod update;
+#[path = "D:/a/windows-shade-editor/windows-shade-editor/target/x86_64-pc-windows-msvc/debug/build/windows-shade-editor-012cff5d06356448/out/validation_v0103.rs"]
 mod validation;
+#[path = "workflow_v0103.rs"]
+mod workflow_v0103;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -69,6 +89,7 @@ enum AdjustmentScope {
 
 struct RuntimeFace {
     path: PathBuf,
+    available: bool,
     preview: Arc<PreviewFace>,
     dpi: dpi::DpiInfo,
     adjusted: Vec<Vec<u16>>,
@@ -80,6 +101,7 @@ struct RuntimeFace {
 
 struct LoadedFace {
     path: PathBuf,
+    available: bool,
     preview: PreviewFace,
     dpi: dpi::DpiInfo,
 }
@@ -116,6 +138,14 @@ enum JobResult {
         errors: Vec<String>,
     },
     RebuildPreviews(Result<Vec<LoadedFace>, String>),
+    RelinkFace {
+        index: usize,
+        result: Result<LoadedFace, String>,
+    },
+    RelinkFolder {
+        faces: Vec<(usize, LoadedFace)>,
+        errors: Vec<String>,
+    },
     Open(Result<OpenPayload, String>),
     Recover(Result<RecoveryPayload, String>),
     Save {
@@ -308,6 +338,7 @@ impl ShadeApp {
     fn make_runtime_face(item: LoadedFace) -> RuntimeFace {
         RuntimeFace {
             path: item.path,
+            available: item.available,
             preview: Arc::new(item.preview),
             dpi: item.dpi,
             adjusted: Vec::new(),
@@ -386,6 +417,7 @@ impl ShadeApp {
                     Ok(preview) => faces.push(LoadedFace {
                         dpi: dpi::read_dpi(&path, default_dpi),
                         path,
+                        available: true,
                         preview,
                     }),
                     Err(err) => errors.push(format!("{}: {err}", path.display())),
@@ -397,43 +429,7 @@ impl ShadeApp {
     }
 
     fn rebuild_previews(&mut self) {
-        if self.job.is_some() || self.faces.is_empty() {
-            return;
-        }
-        let paths = self
-            .faces
-            .iter()
-            .map(|face| face.path.clone())
-            .collect::<Vec<_>>();
-        let max_dimension = self.settings.max_preview_dimension;
-        let default_dpi = self.settings.default_dpi;
-        self.launch_job("Rebuilding previews", move |progress| {
-            let result = (|| -> Result<Vec<LoadedFace>, String> {
-                let total = paths.len().max(1);
-                let mut faces = Vec::with_capacity(paths.len());
-                for (index, path) in paths.into_iter().enumerate() {
-                    Self::set_progress(
-                        &progress,
-                        Some(index as f32 / total as f32),
-                        "Rebuilding previews",
-                        &path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    );
-                    let preview = tiff_io::load_preview(&path, max_dimension)
-                        .map_err(|err| format!("{}: {err}", path.display()))?;
-                    faces.push(LoadedFace {
-                        dpi: dpi::read_dpi(&path, default_dpi),
-                        path,
-                        preview,
-                    });
-                }
-                Self::set_progress(&progress, Some(1.0), "Rebuilding previews", "Complete");
-                Ok(faces)
-            })();
-            JobResult::RebuildPreviews(result)
-        });
+        workflow_v0103::rebuild_previews(self);
     }
 
     fn open_project_dialog(&mut self) {
@@ -466,16 +462,29 @@ impl ShadeApp {
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default(),
                     );
+                    let expected = project
+                        .file_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.faces.get(index))
+                        .cloned();
                     match tiff_io::load_preview(&source, max_dimension) {
                         Ok(preview) => {
                             project.ensure_channels(&preview.metadata.channel_names);
                             faces.push(LoadedFace {
                                 dpi: dpi::read_dpi(&source, default_dpi),
                                 path: source,
+                                available: true,
                                 preview,
                             });
                         }
-                        Err(err) => errors.push(format!("{}: {err}", source.display())),
+                        Err(err) => {
+                            errors.push(format!("{}: {err}", source.display()));
+                            faces.push(workflow_v0103::placeholder_loaded_face(
+                                source,
+                                expected.as_ref(),
+                                default_dpi,
+                            ));
+                        }
                     }
                 }
                 Self::set_progress(&progress, Some(1.0), "Opening project", "Complete");
@@ -523,6 +532,8 @@ impl ShadeApp {
         let thumbnail_face = self
             .faces
             .get(self.current_face)
+            .filter(|face| face.available)
+            .or_else(|| self.faces.iter().find(|face| face.available))
             .map(|face| Arc::clone(&face.preview));
         let face_paths = self
             .faces
@@ -562,6 +573,12 @@ impl ShadeApp {
         if self.job.is_some() {
             return;
         }
+        if !workflow_v0103::active_face_available(self) {
+            self.report_error(
+                "The active Face source TIFF is missing. Relink it before exporting.",
+            );
+            return;
+        }
         let Some(face) = self.faces.get(self.current_face) else {
             return;
         };
@@ -580,6 +597,7 @@ impl ShadeApp {
         let source = face.path.clone();
         let project = self.project.clone();
         let default_dpi = self.settings.default_dpi;
+        let validate_after_export = self.settings.validate_after_export;
         self.launch_job("Exporting TIFF", move |progress| {
             let result = export::export_face_with_progress(
                 &source,
@@ -587,10 +605,28 @@ impl ShadeApp {
                 &project,
                 default_dpi,
                 |fraction, detail| {
+                    let fraction = if validate_after_export {
+                        fraction * 0.88
+                    } else {
+                        fraction
+                    };
                     Self::set_progress(&progress, Some(fraction), "Exporting TIFF", detail);
                 },
             )
-            .map(|_| format!("Exported {}", destination.display()));
+            .and_then(|_| {
+                if validate_after_export {
+                    Self::set_progress(
+                        &progress,
+                        Some(0.92),
+                        "Validating exported TIFF",
+                        "Decoding strips and checking production metadata",
+                    );
+                    let verified = validation::validate_export_transport(&source, &destination)?;
+                    Ok(format!("Exported {} · {verified}", destination.display()))
+                } else {
+                    Ok(format!("Exported {}", destination.display()))
+                }
+            });
             JobResult::Export(SnapshotExportBatchResult {
                 result,
                 marks: Vec::new(),
@@ -600,6 +636,12 @@ impl ShadeApp {
 
     fn validate_current_face_dialog(&mut self) {
         if self.job.is_some() {
+            return;
+        }
+        if !workflow_v0103::active_face_available(self) {
+            self.report_error(
+                "The active Face source TIFF is missing. Relink it before validation.",
+            );
             return;
         }
         let Some(face) = self.faces.get(self.current_face) else {
@@ -645,6 +687,10 @@ impl ShadeApp {
         if self.job.is_some() || self.faces.is_empty() {
             return;
         }
+        if self.faces.iter().any(|face| !face.available) {
+            self.report_error("Export all requires every Face source TIFF to be available. Relink missing Faces first.");
+            return;
+        }
         let Some(folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
@@ -655,6 +701,7 @@ impl ShadeApp {
             .collect::<Vec<_>>();
         let project = self.project.clone();
         let default_dpi = self.settings.default_dpi;
+        let validate_after_export = self.settings.validate_after_export;
         self.launch_job("Exporting faces", move |progress| {
             let total = sources.len().max(1);
             let result = (|| -> Result<String, String> {
@@ -670,12 +717,34 @@ impl ShadeApp {
                         &project,
                         default_dpi,
                         |inner, detail| {
-                            let overall = (index as f32 + inner) / total as f32;
+                            let phase = if validate_after_export {
+                                inner * 0.88
+                            } else {
+                                inner
+                            };
+                            let overall = (index as f32 + phase) / total as f32;
                             Self::set_progress(&progress, Some(overall), "Exporting faces", detail);
                         },
                     )?;
+                    if validate_after_export {
+                        let overall = (index as f32 + 0.92) / total as f32;
+                        Self::set_progress(
+                            &progress,
+                            Some(overall),
+                            "Validating exported TIFF",
+                            &destination.display().to_string(),
+                        );
+                        validation::validate_export_transport(source, &destination)?;
+                    }
                 }
-                Ok(format!("Exported {total} face(s) to {}", folder.display()))
+                if validate_after_export {
+                    Ok(format!(
+                        "Exported and verified {total} face(s) to {}",
+                        folder.display()
+                    ))
+                } else {
+                    Ok(format!("Exported {total} face(s) to {}", folder.display()))
+                }
             })();
             JobResult::Export(SnapshotExportBatchResult {
                 result,
@@ -686,6 +755,12 @@ impl ShadeApp {
 
     fn export_snapshot_dialog(&mut self, snapshot_id: u64) {
         if self.job.is_some() {
+            return;
+        }
+        if !workflow_v0103::active_face_available(self) {
+            self.report_error(
+                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",
+            );
             return;
         }
         let Some(face) = self.faces.get(self.current_face) else {
@@ -754,6 +829,12 @@ impl ShadeApp {
 
     fn export_snapshot_group_dialog(&mut self, snapshot_ids: Vec<u64>, label: String) {
         if self.job.is_some() || snapshot_ids.is_empty() {
+            return;
+        }
+        if !workflow_v0103::active_face_available(self) {
+            self.report_error(
+                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",
+            );
             return;
         }
         let Some(face) = self.faces.get(self.current_face) else {
@@ -942,6 +1023,12 @@ impl ShadeApp {
                 }
                 Err(err) => self.report_error(format!("Preview rebuild failed: {err}")),
             },
+            JobResult::RelinkFace { index, result } => {
+                workflow_v0103::apply_relinked_face(self, index, result);
+            }
+            JobResult::RelinkFolder { faces, errors } => {
+                workflow_v0103::apply_relinked_folder(self, faces, errors);
+            }
             JobResult::Open(result) => match result {
                 Ok(payload) => {
                     self.project = payload.project;
@@ -1106,6 +1193,9 @@ impl ShadeApp {
         let Some(face) = self.faces.get(self.current_face) else {
             return;
         };
+        if !face.available {
+            return;
+        }
         if face.rendered_generation == face.generation {
             return;
         }
@@ -1693,16 +1783,29 @@ impl ShadeApp {
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default(),
                     );
+                    let expected = project
+                        .file_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.faces.get(index))
+                        .cloned();
                     match tiff_io::load_preview(&source, max_dimension) {
                         Ok(preview) => {
                             project.ensure_channels(&preview.metadata.channel_names);
                             faces.push(LoadedFace {
                                 dpi: dpi::read_dpi(&source, default_dpi),
                                 path: source,
+                                available: true,
                                 preview,
                             });
                         }
-                        Err(err) => errors.push(format!("{}: {err}", source.display())),
+                        Err(err) => {
+                            errors.push(format!("{}: {err}", source.display()));
+                            faces.push(workflow_v0103::placeholder_loaded_face(
+                                source,
+                                expected.as_ref(),
+                                default_dpi,
+                            ));
+                        }
                     }
                 }
                 Ok(RecoveryPayload {
@@ -1758,71 +1861,7 @@ impl ShadeApp {
     }
 
     fn ui_faces(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Faces");
-        if self.faces.is_empty() {
-            ui.label("Add TIFF files to create a shade project.");
-        } else {
-            let duplicate_counts = duplicate_face_counts(&self.faces);
-            let mut requested_face = None;
-            for (index, face) in self.faces.iter().enumerate() {
-                let label = self
-                    .project
-                    .faces
-                    .get(index)
-                    .map(|item| item.label.as_str())
-                    .unwrap_or_else(|| {
-                        face.path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("Face")
-                    });
-                let duplicate_count = duplicate_counts
-                    .get(&face_identity_key(&face.path))
-                    .copied()
-                    .unwrap_or(1);
-                let display_label = if duplicate_count > 1 {
-                    format!("{label}  [duplicate x{duplicate_count}]")
-                } else {
-                    label.to_owned()
-                };
-                let duplicate_accent =
-                    (duplicate_count > 1).then_some(egui::Color32::from_rgb(235, 155, 70));
-                if clickable_row(
-                    ui,
-                    self.current_face == index,
-                    &display_label,
-                    None,
-                    duplicate_accent,
-                    32.0,
-                )
-                .on_hover_text(if duplicate_count > 1 {
-                    "This TIFF is referenced more than once in the Faces list."
-                } else {
-                    "Face"
-                })
-                .clicked()
-                {
-                    requested_face = Some(index);
-                }
-            }
-            if let Some(index) = requested_face {
-                self.current_face = index;
-                self.selected_channel = 0;
-                self.solo_channel = None;
-                self.fit_requested = true;
-                self.viewport_recenter = true;
-                self.mark_current_preview_dirty();
-            }
-            ui.add_space(4.0);
-            if ui.button("Remove active face").clicked() {
-                self.remove_current_face();
-            }
-        }
-
-        ui.separator();
-        self.ui_snapshots(ui);
-        ui.separator();
-        self.ui_test_code(ui);
+        workflow_v0103::ui_faces(self, ui);
     }
     fn ui_snapshots(&mut self, ui: &mut egui::Ui) {
         let face_key = self
@@ -2037,9 +2076,8 @@ impl ShadeApp {
             update = ui.button("Update").clicked();
             delete = ui.button("Delete").clicked();
         });
-        if update && self.project.update_snapshot(active_id) {
-            self.project_dirty = true;
-            self.report_info("Snapshot updated");
+        if update {
+            workflow_v0103::update_active_snapshot(self);
         }
         if delete && self.project.delete_snapshot(active_id) {
             self.snapshot_rename_id = None;
@@ -2053,6 +2091,7 @@ impl ShadeApp {
         let channel_names = self
             .faces
             .get(self.current_face)
+            .filter(|face| face.available)
             .map(|face| face.preview.metadata.channel_names.clone())
             .unwrap_or_default();
         let palette = self.project.channel_palette.clone();
@@ -2175,6 +2214,11 @@ impl ShadeApp {
             ui.label("No active face");
             return;
         };
+        if !face.available {
+            ui.heading("Channels");
+            ui.label("Source TIFF missing. Relink this Face to inspect channels and histograms.");
+            return;
+        }
         let channel_names = face.preview.metadata.channel_names.clone();
         let original_histograms = face.preview.histograms.clone();
         let adjusted_histograms = face
@@ -2345,6 +2389,11 @@ impl ShadeApp {
             ui.label("No active face");
             return;
         };
+        if !face.available {
+            ui.heading("Adjustments");
+            ui.label("Source TIFF missing. Relink this Face before editing its channels.");
+            return;
+        }
         let channel_names = face.preview.metadata.channel_names.clone();
         if channel_names.is_empty() {
             return;
@@ -2757,6 +2806,10 @@ impl ShadeApp {
     }
 
     fn ui_viewport(&mut self, ui: &mut egui::Ui) {
+        if workflow_v0103::ui_missing_viewport(self, ui) {
+            return;
+        }
+
         let Some(face) = self.faces.get(self.current_face) else {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
@@ -2937,6 +2990,13 @@ impl ShadeApp {
                     }
                 });
                 ui.small("The max dimension is used when TIFF previews are loaded. Use Rebuild previews to apply a changed value to Faces already open in this project.");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.validate_after_export,
+                        "Validate TIFF after normal Export face / Export all",
+                    )
+                    .changed();
+                ui.small("When enabled, Shade Editor immediately re-decodes every exported TIFF and verifies channel layout/names, ICC/Photoshop resources, compression/predictor policy and complete strip decoding.");
                 let old_default_dpi = self.settings.default_dpi;
                 changed |= ui
                     .add(
@@ -3142,6 +3202,8 @@ impl ShadeApp {
                 );
                 ui.separator();
                 ui.label("Update controls are located on the right side of the main toolbar.");
+                ui.separator();
+                ui.label("Shortcuts: Ctrl+S Save · Ctrl+Shift+S Save As · F Fit · 1-9 channel · S Solo · Ctrl+Enter Update Snapshot · Curve arrows nudge; Shift+Arrow uses larger steps.");
             });
         self.show_about = open;
     }
@@ -3190,6 +3252,7 @@ impl eframe::App for ShadeApp {
         self.poll_render(ui.ctx());
         self.sync_update_state();
         self.poll_autosave();
+        workflow_v0103::handle_shortcuts(self, ui.ctx());
         self.handle_history_shortcuts(ui.ctx());
         self.maybe_autosave();
         self.handle_close_request(ui.ctx());
@@ -3427,6 +3490,9 @@ fn curve_editor_graph(
         selected = CurvePointKind::Black;
     }
     let mut changed = false;
+    if graph_response.clicked() {
+        graph_response.request_focus();
+    }
     let mut midpoint_removed_this_frame = false;
     let points = [
         CurvePointKind::Black,
@@ -3457,6 +3523,7 @@ fn curve_editor_graph(
         if response.clicked() || response.drag_started() {
             selected = point;
             ui.data_mut(|data| data.insert_temp(selection_id, point));
+            graph_response.request_focus();
         }
         if response.dragged() {
             if let Some(pointer) = response.interact_pointer_pos() {
@@ -3486,6 +3553,36 @@ fn curve_editor_graph(
                     changed = true;
                 }
             }
+        }
+    }
+
+    if graph_response.has_focus() {
+        let (left, right, up, down, shift) = ui.input(|input| {
+            (
+                input.key_pressed(egui::Key::ArrowLeft),
+                input.key_pressed(egui::Key::ArrowRight),
+                input.key_pressed(egui::Key::ArrowUp),
+                input.key_pressed(egui::Key::ArrowDown),
+                input.modifiers.shift,
+            )
+        });
+        if left || right || up || down {
+            let step = if shift { 10.0 / 255.0 } else { 1.0 / 255.0 };
+            let (mut input_value, mut output_value) = curve_point_xy(*curve, selected);
+            if left {
+                input_value -= step;
+            }
+            if right {
+                input_value += step;
+            }
+            if up {
+                output_value += step;
+            }
+            if down {
+                output_value -= step;
+            }
+            set_curve_point(curve, selected, input_value, output_value);
+            changed = true;
         }
     }
 

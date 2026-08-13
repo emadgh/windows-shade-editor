@@ -298,6 +298,111 @@ where
     })
 }
 
+pub fn validate_export_transport(source: &Path, exported: &Path) -> Result<String, String> {
+    let source_info = tiff_io::stream_info(source)
+        .map_err(|err| format!("Cannot inspect source TIFF for post-export validation: {err}"))?;
+    let output_info = tiff_io::stream_info(exported)
+        .map_err(|err| format!("Post-export TIFF validation failed while opening output: {err}"))?;
+    let source_meta = &source_info.metadata;
+    let output_meta = &output_info.metadata;
+    let mut mismatches = Vec::new();
+
+    if (source_meta.width, source_meta.height) != (output_meta.width, output_meta.height) {
+        mismatches.push("dimensions changed".to_owned());
+    }
+    if source_meta.bit_depth != output_meta.bit_depth {
+        mismatches.push("bit depth changed".to_owned());
+    }
+    if source_meta.color_model != output_meta.color_model {
+        mismatches.push("color model changed".to_owned());
+    }
+    if source_meta.samples_per_pixel != output_meta.samples_per_pixel
+        || source_meta.base_channel_count != output_meta.base_channel_count
+    {
+        mismatches.push("channel layout changed".to_owned());
+    }
+    if source_meta.channel_names != output_meta.channel_names {
+        mismatches.push("channel names/order changed".to_owned());
+    }
+    if source_meta.icc_profile != output_meta.icc_profile {
+        mismatches.push("ICC profile changed".to_owned());
+    }
+    if source_meta.photoshop_resources != output_meta.photoshop_resources {
+        mismatches.push("Photoshop Image Resources 34377 changed".to_owned());
+    }
+    if source_meta.photoshop_image_source_data != output_meta.photoshop_image_source_data {
+        mismatches.push("Photoshop ImageSourceData 37724 changed".to_owned());
+    }
+    if source_meta.orientation != output_meta.orientation {
+        mismatches.push("orientation changed".to_owned());
+    }
+    let expected_compression = expected_export_compression(source_meta.compression);
+    if output_meta.compression != expected_compression {
+        mismatches.push(format!(
+            "compression expected {:?}, got {:?}",
+            expected_compression, output_meta.compression
+        ));
+    }
+    if source_meta.predictor == Some(2)
+        && source_meta.samples_per_pixel == source_meta.base_channel_count
+    {
+        if output_meta.predictor != Some(2) {
+            mismatches.push(format!(
+                "horizontal predictor expected Some(2), got {:?}",
+                output_meta.predictor
+            ));
+        }
+    } else if output_meta.predictor == Some(2)
+        && output_meta.samples_per_pixel > output_meta.base_channel_count
+    {
+        mismatches.push("unsafe horizontal predictor remained enabled with ExtraSamples".to_owned());
+    }
+    if !mismatches.is_empty() {
+        return Err(format!(
+            "Post-export TIFF metadata validation failed: {}",
+            mismatches.join("; ")
+        ));
+    }
+
+    let mut next_row = 0u32;
+    let mut decoded_samples = 0u64;
+    tiff_io::for_each_decoded_strip(exported, &output_info, |row_start, row_count, samples| {
+        if row_start != next_row {
+            return Err(format!(
+                "Post-export TIFF strip order is invalid: expected row {next_row}, got {row_start}."
+            ));
+        }
+        let expected = u64::from(output_meta.width)
+            .checked_mul(u64::from(row_count))
+            .and_then(|value| value.checked_mul(output_meta.samples_per_pixel as u64))
+            .ok_or_else(|| "Post-export TIFF sample count overflow.".to_owned())?;
+        if samples.len() as u64 != expected {
+            return Err(format!(
+                "Post-export TIFF strip sample count mismatch: decoded {}, expected {expected}.",
+                samples.len()
+            ));
+        }
+        decoded_samples = decoded_samples.saturating_add(expected);
+        next_row = next_row.saturating_add(row_count);
+        Ok(())
+    })?;
+    let expected_samples = u64::from(output_meta.width)
+        .checked_mul(u64::from(output_meta.height))
+        .and_then(|value| value.checked_mul(output_meta.samples_per_pixel as u64))
+        .ok_or_else(|| "Post-export TIFF sample count overflow.".to_owned())?;
+    if next_row != output_meta.height || decoded_samples != expected_samples {
+        return Err(format!(
+            "Post-export TIFF decode incomplete: rows {next_row}/{}, samples {decoded_samples}/{expected_samples}.",
+            output_meta.height
+        ));
+    }
+
+    Ok(format!(
+        "validation PASS · {} channel(s) · compression {:?} · predictor {:?}",
+        output_meta.samples_per_pixel, output_meta.compression, output_meta.predictor
+    ))
+}
+
 fn push_check(checks: &mut Vec<ValidationCheck>, name: &str, passed: bool, detail: String) {
     checks.push(ValidationCheck {
         name: name.to_owned(),
@@ -465,6 +570,10 @@ mod tests {
         assert!(artifacts.report.passed, "{:#?}", artifacts.report.checks);
         assert!(artifacts.json_path.is_file());
         assert!(artifacts.markdown_path.is_file());
+        let exported = PathBuf::from(&artifacts.report.exported_tiff);
+        let transport = validate_export_transport(&source, &exported)
+            .expect("post-export transport validation should pass");
+        assert!(transport.contains("validation PASS"));
 
         let _ = fs::remove_dir_all(folder);
     }
