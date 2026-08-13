@@ -44,25 +44,18 @@ impl ContextKeyboardCompat for eframe::egui::Context {
         "egui keyboard compatibility",
     );
 
-    let old_viewport = r#"        let Some(face) = self.faces.get(self.current_face) else {
-            return;
-        };
-
-        if workflow_v0103::ui_missing_viewport(self, ui) {
-            return;
-        }
-
-        let file_name = face"#;
-    let new_viewport = r#"        if workflow_v0103::ui_missing_viewport(self, ui) {
-            return;
-        }
-
-        let Some(face) = self.faces.get(self.current_face) else {
-            return;
-        };
-
-        let file_name = face"#;
-    app = replace_once(app, old_viewport, new_viewport, "missing Face viewport borrow order");
+    app = replace_once(
+        app,
+        "    fn ui_viewport(&mut self, ui: &mut egui::Ui) {\n        let Some(face)",
+        "    fn ui_viewport(&mut self, ui: &mut egui::Ui) {\n        if workflow_v0103::ui_missing_viewport(self, ui) {\n            return;\n        }\n\n        let Some(face)",
+        "missing Face viewport early hook",
+    );
+    app = replace_once(
+        app,
+        "\n        if workflow_v0103::ui_missing_viewport(self, ui) {\n            return;\n        }\n\n        let file_name = face",
+        "\n        let file_name = face",
+        "remove late missing Face viewport hook",
+    );
 
     fs::write(&generated, app).expect("write compatibility-patched generated app source");
 }
