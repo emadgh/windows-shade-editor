@@ -1,0 +1,71 @@
+name: Retry Previous Shades milestone v2
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Retry Previous Shades materializer with correct method boundaries'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run corrected materializer
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/apply-previous-shades-milestone.yml').read_text(encoding='utf-8')
+          start = workflow.index("          @'\n") + len("          @'\n")
+          end = workflow.index("\n          '@ | python -", start)
+          lines = workflow[start:end].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines)
+
+          old_helper = '''def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, got {count}')
+              return text.replace(old, new, 1)
+          '''
+          new_helper = '''def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count == 1:
+                  return text.replace(old, new, 1)
+              old_lines = old.splitlines()
+              text_lines = text.splitlines(keepends=True)
+              matches = []
+              for i in range(0, len(text_lines) - len(old_lines) + 1):
+                  window = text_lines[i:i + len(old_lines)]
+                  if all(window[j].rstrip('\\r\\n').lstrip() == old_lines[j].lstrip() for j in range(len(old_lines))):
+                      matches.append(i)
+              if len(matches) != 1:
+                  raise RuntimeError(f'{label}: expected 1 whitespace-tolerant match, got {len(matches)}')
+              i = matches[0]
+              prefix = ''.join(text_lines[:i])
+              suffix = ''.join(text_lines[i + len(old_lines):])
+              if prefix and not prefix.endswith('\\n'):
+                  prefix += '\\n'
+              return prefix + new + ('\\n' if suffix and not new.endswith('\\n') else '') + suffix
+          '''
+          if old_helper not in script:
+              raise RuntimeError('replace_once helper was not found')
+          script = script.replace(old_helper, new_helper, 1)
+          exec(compile(script, 'previous-shades-materializer', 'exec'), {'__name__': '__main__'})
+          '@ | python -
+      - name: Check
+        run: cargo check --target x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+      - name: Commit source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app_main.rs src/previous_shades.rs Cargo.toml RELEASE_NOTES.md
+          git commit -m "Implement Previous Shades workflow"
+          git push origin HEAD:main
