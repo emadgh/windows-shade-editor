@@ -26,6 +26,13 @@ jobs:
         shell: pwsh
         run: |
           python scripts/apply_v011.py
+          $path = "src/tiff_io.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = "    use super::*;`n    use std::io::Cursor;"
+          $new = "    use super::*;`n    use std::fs;`n    use std::io::Cursor;`n    use std::path::PathBuf;"
+          if (-not $text.Contains($old)) { throw "TIFF test import anchor not found" }
+          $text = $text.Replace($old, $new)
+          [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
           cargo fmt --all
       - name: Check
         run: cargo check --target x86_64-pc-windows-msvc
