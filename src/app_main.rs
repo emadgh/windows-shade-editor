@@ -90,8 +90,8 @@ fn main() -> eframe::Result {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolPanel {
     Levels,
-    Curves,
     Mixer,
+    Curves,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2538,8 +2538,8 @@ impl ShadeApp {
                 let mut reset_tool = false;
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
-                    ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
                     ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
+                    ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         reset_tool = ui.small_button("Reset").clicked();
                     });
@@ -2582,6 +2582,20 @@ impl ShadeApp {
                 ui.add_space(4.0);
                 let (body_changed, reset) = adjustment_foldout(
                     ui,
+                    format!("selected-mixer-{output_name}"),
+                    "Channel Mixer",
+                    true,
+                    |ui| mixer_ui(ui, adjustment, output_name, channel_names, accent, palette),
+                );
+                changed |= body_changed.unwrap_or(false);
+                if reset {
+                    reset_mixer_row(adjustment, output_name, channel_names);
+                    changed = true;
+                }
+
+                ui.add_space(4.0);
+                let (body_changed, reset) = adjustment_foldout(
+                    ui,
                     format!("selected-curve-{output_name}"),
                     "Curve",
                     true,
@@ -2598,20 +2612,6 @@ impl ShadeApp {
                 changed |= body_changed.unwrap_or(false);
                 if reset {
                     adjustment.curve = model::Curve::default();
-                    changed = true;
-                }
-
-                ui.add_space(4.0);
-                let (body_changed, reset) = adjustment_foldout(
-                    ui,
-                    format!("selected-mixer-{output_name}"),
-                    "Channel Mixer",
-                    true,
-                    |ui| mixer_ui(ui, adjustment, output_name, channel_names, accent, palette),
-                );
-                changed |= body_changed.unwrap_or(false);
-                if reset {
-                    reset_mixer_row(adjustment, output_name, channel_names);
                     changed = true;
                 }
             }
@@ -2655,15 +2655,15 @@ impl ShadeApp {
             changed = true;
         }
         ui.small(
-            "Levels broadcasts to every channel. Curve keeps one Broadcast control plus independent per-channel foldouts. Mixer output rows remain independent.",
+            "Levels broadcasts to every channel. Mixer output rows remain independent. Curve keeps one Broadcast control plus independent per-channel foldouts.",
         );
 
         if self.settings.adjustment_tabs {
             let mut reset_tool = false;
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
-                ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
                 ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
+                ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     reset_tool = ui.small_button("Reset").clicked();
                 });
@@ -2734,6 +2734,28 @@ impl ShadeApp {
             ui.add_space(4.0);
             let (body_changed, reset) = adjustment_foldout(
                 ui,
+                "all-mixers-section",
+                "Channel Mixer - all output rows",
+                true,
+                |ui| {
+                    all_mixers_ui(
+                        ui,
+                        &mut self.project.adjustments,
+                        channel_names,
+                        self.settings.colorize_adjustments,
+                        palette,
+                    )
+                },
+            );
+            changed |= body_changed.unwrap_or(false);
+            if reset {
+                reset_all_mixers(&mut self.project.adjustments, channel_names);
+                changed = true;
+            }
+
+            ui.add_space(4.0);
+            let (body_changed, reset) = adjustment_foldout(
+                ui,
                 "all-curves-section",
                 "Curve - broadcast + per channel",
                 true,
@@ -2754,28 +2776,6 @@ impl ShadeApp {
             changed |= body_changed.unwrap_or(false);
             if reset {
                 reset_all_curves(&mut self.project.adjustments, channel_names);
-                changed = true;
-            }
-
-            ui.add_space(4.0);
-            let (body_changed, reset) = adjustment_foldout(
-                ui,
-                "all-mixers-section",
-                "Channel Mixer - all output rows",
-                true,
-                |ui| {
-                    all_mixers_ui(
-                        ui,
-                        &mut self.project.adjustments,
-                        channel_names,
-                        self.settings.colorize_adjustments,
-                        palette,
-                    )
-                },
-            );
-            changed |= body_changed.unwrap_or(false);
-            if reset {
-                reset_all_mixers(&mut self.project.adjustments, channel_names);
                 changed = true;
             }
         }
@@ -3070,7 +3070,7 @@ impl ShadeApp {
                 changed |= ui
                     .checkbox(
                         &mut self.settings.adjustment_tabs,
-                        "Use tabs for Levels / Curve / Mixer",
+                        "Use tabs for Levels / Mixer / Curve",
                     )
                     .changed();
                 changed |= ui
@@ -3091,7 +3091,7 @@ impl ShadeApp {
                 changed |= ui
                     .checkbox(
                         &mut self.settings.colorize_adjustments,
-                        "Colorize Levels / Curve / Mixer by channel",
+                        "Colorize Levels / Mixer / Curve by channel",
                     )
                     .changed();
                 changed |= ui

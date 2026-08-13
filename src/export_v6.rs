@@ -161,7 +161,7 @@ where
                 let raw = decoded.samples[base + channel] as f32 / 65535.0;
                 prepared[channel] = match project.adjustments.get(&names[channel]) {
                     Some(adjustment) if adjustment.enabled => {
-                        apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)
+                        apply_levels(raw, adjustment.levels)
                     }
                     _ => raw,
                 };
@@ -184,7 +184,7 @@ where
                                 });
                             mixed += prepared[source_channel] * coefficient;
                         }
-                        mixed
+                        apply_curve(mixed, adjustment.curve)
                     }
                     _ => prepared[out_channel],
                 };
@@ -411,7 +411,7 @@ fn adjusted_strip(
             let raw = input[base + channel] as f32 / 65535.0;
             prepared[channel] = match project.adjustments.get(&names[channel]) {
                 Some(adjustment) if adjustment.enabled => {
-                    apply_curve(apply_levels(raw, adjustment.levels), adjustment.curve)
+                    apply_levels(raw, adjustment.levels)
                 }
                 _ => raw,
             };
@@ -433,7 +433,7 @@ fn adjusted_strip(
                             });
                         mixed += prepared[source_channel] * coefficient;
                     }
-                    mixed
+                    apply_curve(mixed, adjustment.curve)
                 }
                 _ => prepared[out_channel],
             };
@@ -1252,6 +1252,41 @@ mod streaming_tests {
     use super::*;
     use tiff::encoder::{Compression, TiffEncoder, colortype};
     use tiff::tags::ExtraSamples;
+
+    #[test]
+    fn adjustment_pipeline_is_levels_then_mixer_then_curve() {
+        let names = vec!["A".to_owned(), "B".to_owned()];
+        let mut project = ShadeProject::default();
+        project.ensure_channels(&names);
+
+        {
+            let adjustment = project.adjustments.get_mut("A").unwrap();
+            adjustment.levels.output_white = 0.5;
+            adjustment.mixer.constant = 0.0;
+            adjustment.mixer.coefficients.insert("A".to_owned(), 0.5);
+            adjustment.mixer.coefficients.insert("B".to_owned(), 0.5);
+            adjustment.curve.midpoint_enabled = true;
+            adjustment.curve.midpoint_input = 0.5;
+            adjustment.curve.midpoint = 0.1;
+        }
+
+        let input = [13_107u16, 52_428u16];
+        let output = adjusted_strip(&input, 2, &names, &project);
+
+        let raw_a = input[0] as f32 / 65_535.0;
+        let raw_b = input[1] as f32 / 65_535.0;
+        let a = project.adjustments.get("A").unwrap();
+        let b = project.adjustments.get("B").unwrap();
+        let leveled_a = apply_levels(raw_a, a.levels);
+        let leveled_b = apply_levels(raw_b, b.levels);
+        let mixed = a.mixer.constant + leveled_a * 0.5 + leveled_b * 0.5;
+        let expected = apply_curve(mixed, a.curve);
+        let actual = output[0] as f32 / 65_535.0;
+        assert!((actual - expected).abs() <= 2.0 / 65_535.0);
+
+        let legacy = apply_curve(leveled_a, a.curve) * 0.5 + leveled_b * 0.5;
+        assert!((actual - legacy).abs() > 0.20);
+    }
 
     fn apply_dynamic_u8_predictor(data: &mut [u8], width: usize, height: usize, channels: usize) {
         let row_samples = width * channels;
