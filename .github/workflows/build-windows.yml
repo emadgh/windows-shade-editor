@@ -8,7 +8,6 @@ on:
   push:
     branches:
       - main
-      - feat/v012-shell-final
     tags:
       - 'v*'
   workflow_dispatch:
