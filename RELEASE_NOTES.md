@@ -1,3 +1,13 @@
+# Shade Editor 0.10.1
+
+Production round-trip validator.
+
+- Adds **Validate face** beside Export actions. It creates a no-adjustment TIFF through the exact production export backend, re-decodes both source and export, and writes JSON + Markdown validation reports.
+- Validation checks decoded sample equality, dimensions, bit depth, color model/channel order, compression/predictor/orientation, physical DPI, ICC, Photoshop Image Resources 34377, ImageSourceData 37724, and parsed Photoshop Spot display metadata.
+- The validator uses a fresh identity project and disables Test Code so the result is a true transport/interchange check independent of the current shade recipe.
+- Adds regression coverage proving the validator exercises the real six-channel export backend.
+- `.shade` schema remains v9. Photoshop/RIP application-level interpretation remains an external production gate even when the automated report passes.
+
 # Shade Editor 0.10.0
 
 Production interchange hardening and real Photoshop Spot display metadata.
