@@ -1,0 +1,43 @@
+name: Apply Shade Editor v0.11 backend hardening
+
+on:
+  push:
+    branches: [feat/v011-backend-recovery-hardening]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/v011-backend-recovery-hardening
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: shade-editor-windows
+      - name: Apply patch
+        shell: pwsh
+        run: |
+          python scripts/apply_v011.py
+          cargo fmt --all
+      - name: Check
+        run: cargo check --target x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+      - name: Release build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Commit source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock src/recovery.rs src/tiff_io.rs src/export_v6.rs RELEASE_NOTES.md docs/ROADMAP.md
+          git commit -m "Add tiled and planar TIFF streaming with recovery rotation"
+          git push origin HEAD:feat/v011-backend-recovery-hardening
