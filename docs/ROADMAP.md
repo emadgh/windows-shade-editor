@@ -18,8 +18,9 @@ This file tracks only work that is still intentionally in scope. Snapshot expans
 
 ## Native Windows integration
 
-- Windows Explorer `.shade` thumbnail provider using the embedded project PNG.
-- Windows Property Handler exposing physical/pixel dimensions, DPI, bit depth, channel/Face counts, and save metadata.
+- Implemented in v0.12: native `.shade` Explorer thumbnail provider using the embedded project PNG.
+- Implemented in v0.12: read-only Windows Property Handler exposing cached project/Face metadata.
+- Remaining Shell validation: clean-workstation install, thumbnail cache behavior, Details columns/search indexing, file association, upgrade, and removal while Explorer may have the DLL loaded.
 
 ## Explicitly out of scope
 
