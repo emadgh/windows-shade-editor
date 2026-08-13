@@ -1,3 +1,9 @@
+# Shade Editor v0.11.1
+
+- Fixes physical TIFF DPI detection: XResolution/YResolution are TIFF RATIONAL values and are now decoded as numerator/denominator instead of incorrectly requesting DOUBLE tags.
+- Honors TIFF 6.0's default ResolutionUnit of inches when tag 296 is omitted.
+- Adds a TIFF export conformance matrix covering Uncompressed, LZW, PackBits, Deflate, horizontal Predictor, 16-bit CMYK, CMYK + Spot ExtraSamples, ICC, Photoshop resources 34377/37724, and physical DPI.
+- `.shade` schema remains v9.
 # Shade Editor v0.11.0
 
 - Extended bounded-memory TIFF decoding to tiled and planar 8/16-bit RGB/CMYK layouts.
