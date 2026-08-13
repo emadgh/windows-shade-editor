@@ -79,9 +79,13 @@ pub fn read_dpi(path: &Path, default_dpi: f64) -> DpiInfo {
         .get_tag_f64(Tag::YResolution)
         .ok()
         .filter(|v| v.is_finite() && *v > 0.0);
+    // TIFF 6.0 defines ResolutionUnit's default as 2 (inch). A valid TIFF may
+    // therefore omit tag 296 while still providing physical X/Y resolution.
+    // Treating an omitted tag as 1 (no absolute unit) incorrectly discards
+    // that physical resolution and falls back to the application Default DPI.
     let unit = decoder
         .get_tag_unsigned::<u16>(Tag::ResolutionUnit)
-        .unwrap_or(1);
+        .unwrap_or(2);
 
     let convert = |value: Option<f64>| -> Option<f64> {
         let value = value?;
