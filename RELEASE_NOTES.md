@@ -1,3 +1,12 @@
+# Unreleased
+
+- Replace generic `ICC: managed` metadata text with the active ICC profile description; the profile label is clickable and opens Color Management.
+- Add project-owned non-destructive Preview Profile Assignment: use embedded ICC or assign a compatible ICC/ICM only for Shade Editor preview, with Rendering Intent and optional Black Point Compensation stored in `.shade`.
+- Add searchable Windows ICC/ICM catalog with Project View-style typing, Up/Down selection and Enter assignment, plus Browse and compatibility checks against the active TIFF base color model.
+- Keep assigned profiles strictly out of production export; TIFF samples, embedded ICC and Photoshop resources remain unchanged.
+- Consolidate active Rust sources under canonical filenames and remove obsolete versioned implementations and stale one-off documentation.
+- Update README/architecture/roadmap to reflect the actual Levels → Mixer → Curve order and current ICC preview boundary.
+
 # Shade Editor 0.16.0
 
 - Add ICC-aware preview color management using each TIFF's embedded RGB/CMYK/Gray profile and an sRGB display destination; rendering intent is selectable in Settings.

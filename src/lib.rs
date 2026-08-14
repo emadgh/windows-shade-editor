@@ -2,9 +2,7 @@
 
 #[path = "dpi.rs"]
 pub mod dpi;
-#[path = "export_v6.rs"]
 pub mod export;
-#[path = "model_v6.rs"]
 pub mod model;
 #[path = "palette.rs"]
 pub mod palette;

@@ -48,3 +48,8 @@ Then run one low-risk controlled print test. Shade Editor's viewport is an engin
 ## 5. Failure policy
 
 Do not promote a build if any production TIFF family fails the no-adjustment round trip. Keep the source TIFF immutable, retain the failing source/export pair, and record the TIFF tags plus Photoshop resource IDs so the compatibility path can be regression-tested.
+
+
+## Preview profile assignment boundary
+
+Color Management can temporarily assign another ICC/ICM profile to the project preview. This is deliberately excluded from production interchange validation because it must not affect exported TIFF samples or metadata. When validating a build, verify that changing the assigned preview profile changes only the on-screen composite and `.shade` JSON, while identity export retains the source TIFF's original embedded ICC bytes.

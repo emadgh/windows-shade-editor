@@ -42,7 +42,13 @@ pub fn validate_no_adjustment_roundtrip<F>(
 where
     F: FnMut(f32, &str),
 {
-    validate_no_adjustment_roundtrip_with_options(source, output_folder, default_dpi, true, progress)
+    validate_no_adjustment_roundtrip_with_options(
+        source,
+        output_folder,
+        default_dpi,
+        true,
+        progress,
+    )
 }
 
 pub fn validate_no_adjustment_roundtrip_with_options<F>(
@@ -168,7 +174,8 @@ where
         },
     );
 
-    let expected_compression = expected_export_compression(source_decoded.metadata.compression, force_lzw);
+    let expected_compression =
+        expected_export_compression(source_decoded.metadata.compression, force_lzw);
     push_check(
         &mut checks,
         "Compression",
@@ -377,7 +384,8 @@ pub fn validate_export_transport_with_options(
     } else if output_meta.predictor == Some(2)
         && output_meta.samples_per_pixel > output_meta.base_channel_count
     {
-        mismatches.push("unsafe horizontal predictor remained enabled with ExtraSamples".to_owned());
+        mismatches
+            .push("unsafe horizontal predictor remained enabled with ExtraSamples".to_owned());
     }
     if !mismatches.is_empty() {
         return Err(format!(

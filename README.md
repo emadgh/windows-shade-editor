@@ -2,33 +2,28 @@
 
 Native Windows shade editor for multi-channel TIFF artwork used in digital ceramic printing.
 
-Shade Editor keeps source TIFF faces unchanged and stores color-adjustment recipes in a small `.shade` project beside the artwork. The first version is intentionally focused on shade matching rather than general image editing.
+Shade Editor keeps source TIFF Faces immutable and stores non-destructive shade recipes and project preview settings in a `.shade` file beside the artwork. The application is native Rust/egui; there is no WebView/Electron runtime.
 
 ## Current features
 
-- Native Rust desktop UI; no WebView or Electron runtime.
 - Open multiple TIFF files as project **Faces** and switch between them.
-- Dynamic channel list for CMYK plus additional channels/spot separations.
-- Composite preview and isolated single-channel preview.
-- Per-channel histogram, including original and adjusted preview.
-- Per-channel **Levels**.
-- Per-channel **Curve**.
-- N×N **Channel Mixer**, including spot channels as inputs and outputs.
-- Non-destructive `.shade` projects with portable relative TIFF paths where possible.
-- Optional test-code raster in the selected output channel.
-- Export current Face or all Faces as TIFF.
-- Preserve source ICC profile and Photoshop Image Resources when available.
-- Preserve extra TIFF samples when exporting RGB/CMYK plus additional channels.
-- Parse Photoshop Spot display color/Solidity for preview and distinguish declared Spot vs Alpha channels.
-- Stream normal chunky strip TIFF preview/export with bounded working buffers.
-- Atomic same-directory TIFF export replacement to avoid partial destination files.
-- One-click current-Face production round-trip validation with pixel and critical TIFF/Photoshop metadata comparison reports.
-- Automatic GitHub Release update checking/downloading with SHA-256 asset verification, enabled by default and disableable in Settings.
-- About window with application version and manual update check.
+- Dynamic channel model for RGB/CMYK plus additional/Spot separations.
+- Composite preview and isolated separation preview.
+- Per-channel histogram, Levels, Curve and N×N Channel Mixer.
+- Preview clipping diagnostics for Levels/Curve.
+- Photoshop Spot DisplayInfo color/Solidity parsing; declared Alpha channels are excluded from the printing composite.
+- ICC-aware preview with embedded-profile support and non-destructive **preview profile assignment**.
+- Searchable installed Windows ICC/ICM profile list, keyboard navigation, rendering intent and optional black-point compensation.
+- Assigned preview profile is saved in `.shade`; TIFF ICC bytes and source/export samples are never changed by it.
+- Optional test-code raster in one separation or all separations.
+- Export current Face or all Faces with production-oriented metadata preservation.
+- BigTIFF selection/preservation, bounded strip/tile/planar processing and atomic destination replacement.
+- Production round-trip validator for sample and critical TIFF/Photoshop metadata comparison.
+- Persistent Project View, Snapshots, adjustment history, recovery and Windows Explorer Shell integration.
 
 ## `.shade` projects
 
-A `.shade` file contains project state and adjustment recipes, not TIFF pixel data. Keep it beside the Face files for the most portable layout:
+A `.shade` file contains project state, adjustment recipes, preview color settings, cached metadata and a compact thumbnail. It does not contain TIFF pixel data.
 
 ```text
 Moonstone/
@@ -38,63 +33,81 @@ Moonstone/
 └─ moonstone-test-1.shade
 ```
 
-The format is versioned JSON. Shade Editor 0.10 uses schema version 9; pre-production v1-v8 migration support was intentionally removed in v0.9. Source paths are saved relative to the `.shade` file when possible.
+Schema version 9 is the current clean project format. New optional fields use Serde defaults so the preview-profile settings can be added without changing the schema number. Source TIFF paths are stored relative to the `.shade` file when possible; an assigned external ICC path is stored as a preview-only reference.
 
-## Color pipeline
+## Adjustment pipeline
 
-For each channel, the first version processes:
+For every channel the production adjustment order is:
 
 ```text
-Source sample -> Levels -> Curve -> Channel Mixer -> Export sample
+Source sample -> Levels -> Channel Mixer -> Curve -> Export sample
 ```
 
-The mixer is dynamic: every discovered channel can contribute to every output channel. This avoids hard-coding color tools to four CMYK channels.
+The mixer is dynamic: every discovered channel can contribute to every output channel. No production adjustment is hard-coded to four channels.
 
-The on-screen composite is an engineering preview and is not yet a press/RIP color proof. Original TIFF files remain authoritative and are never modified in place.
+## Preview color management
+
+Composite preview uses a separate display-only pipeline:
+
+```text
+Adjusted base RGB/CMYK/Gray samples
+  -> embedded ICC OR assigned preview ICC
+  -> selected rendering intent (+ optional BPC)
+  -> sRGB preview
+  -> Photoshop Spot DisplayInfo composite
+```
+
+Click the ICC/profile name beside the active Face metadata to open **Color Management / Preview Profile**. The window lists compatible ICC/ICM profiles from the Windows color-profile directory, supports search plus Up/Down/Enter navigation, and also allows browsing to another `.icc`/`.icm` file.
+
+`Use embedded profile` returns the project to the TIFF profile. Assigning another profile reinterprets the base channel values only for Shade Editor's preview. It does **not** assign/write that profile into the TIFF and export does not consume the preview transform.
+
+This is profile assignment / color-managed preview, not a printer/RIP proof simulation. A real proofing transform would require a separate proof-device profile; that is intentionally not part of the current scope.
 
 ## TIFF compatibility scope
 
-The current production-oriented path targets 8-bit and 16-bit RGB/CMYK TIFF with optional additional samples/Spot Channels. It reads the embedded ICC profile and Photoshop Image Resources and copies them to exported files. Photoshop/RIP interoperability must still be validated against representative production TIFFs before relying on a new build in a production print workflow. See `docs/PRODUCTION_VALIDATION.md`.
+The production-oriented path targets 8-bit and 16-bit RGB/CMYK TIFF with optional additional samples/Spot Channels. ICC tag 34675, Photoshop Image Resources 34377 and ImageSourceData 37724 are retained where supported. Photoshop/RIP interoperability must still be validated with representative production TIFFs; see `docs/PRODUCTION_VALIDATION.md`.
 
-## Build
+## Build and test
 
 Requirements:
 
 - Windows 10/11 x64
 - Stable Rust toolchain with `x86_64-pc-windows-msvc`
-- Visual Studio Build Tools / MSVC C++ build tools
+- Visual Studio Build Tools / MSVC C++ tools
 
 ```powershell
+cargo check --target x86_64-pc-windows-msvc
 cargo test --target x86_64-pc-windows-msvc
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-The executable is created at:
+Executable:
 
 ```text
 target\x86_64-pc-windows-msvc\release\ShadeEditor.exe
 ```
 
-## Builds and automatic updates
-
-GitHub Actions builds Windows artifacts for validation and direct retrieval from workflow runs. The repository does not publish build artifacts as public GitHub Releases. The in-app updater remains compatible with a separately managed release source if one is configured in the future.
-
-The application checks `emadgh/windows-shade-editor` Releases. With automatic updates enabled, a newer `ShadeEditor.exe` is downloaded to the temporary directory. The user is then offered **Restart and update**, which replaces the current executable after the app closes and relaunches it. Automatic checking/downloading can be disabled in **Settings**; manual checks remain available from **About**.
+The repository CI uploads validation/build artifacts; project development does not require publishing GitHub Releases.
 
 ## Project structure
 
 ```text
 src/
-├─ main.rs       Native UI and application orchestration
-├─ model.rs      .shade schema and color-adjustment model
-├─ tiff_io.rs    TIFF decode, channel discovery, Photoshop resource parsing
-├─ render.rs     Non-destructive preview render pipeline
-├─ export.rs     Full-resolution adjustment and TIFF export
-├─ settings.rs   Persistent application settings
-└─ update.rs     GitHub Release updater
+├─ main.rs              Native UI and application orchestration
+├─ model.rs             .shade schema and adjustment/project model
+├─ color_management.rs  ICC preview transform and Windows ICC catalog
+├─ tiff_io.rs           TIFF decode/channel/Photoshop metadata discovery
+├─ render.rs            Non-destructive preview render pipeline
+├─ export.rs            Full-resolution TIFF export
+├─ validation.rs        Production round-trip validation
+├─ settings.rs          Application-only persistent preferences
+├─ previous_shades.rs   Project View history/index
+├─ recovery.rs          Crash recovery
+├─ update.rs            Update subsystem
+└─ workflow.rs          Missing-Face/relink workflow helpers
 ```
 
-See `docs/ARCHITECTURE.md` for extension points and constraints for future development.
+See `docs/ARCHITECTURE.md` for invariants and extension points.
 
 ## License
 

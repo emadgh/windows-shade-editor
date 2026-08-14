@@ -1,28 +1,31 @@
 # Shade Editor production roadmap
 
-This file tracks only work that is still intentionally in scope. Snapshot expansion and stronger duplicate-content detection were explicitly removed from the plan.
-
 ## Current blocking validation
 
-- Run a real no-adjustment `Validate face` round trip on production CMYK + Spot TIFFs in Photoshop and the production RIP.
-- Confirm Spot type/order/name, Photoshop display color/Solidity, ICC, Photoshop resources, DPI, predictor/compression, and press/RIP interpretation.
-- Production-test the v0.10.3 missing-Face relink workflow against moved project folders and changed storage roots.
-- Production-test automatic post-export validation on large CMYK + Spot artwork before considering default-on behavior.
+- Run no-adjustment `Validate face` round trips on representative production CMYK + Spot TIFFs in Photoshop and the production RIP.
+- Confirm Spot type/order/name, Photoshop DisplayInfo/Solidity, embedded ICC preservation, Photoshop resources, DPI, predictor/compression and RIP interpretation.
+- Production-test missing-Face relink behavior against moved project folders/storage roots.
+- Production-test optional post-export validation on large CMYK + Spot artwork before considering default-on behavior.
 
 ## Backend follow-up
 
-- Production-test BigTIFF export on >4 GiB ceramic artwork and confirm Photoshop/RIP acceptance.
-- Production-test bounded tiled/planar TIFF streaming against real Photoshop/RIP assets; synthetic planar-strip and tiled-edge fixtures are covered in CI.
-- Production-test the three-state recovery rotation and corrupted-latest fallback on Windows.
-- Continue TIFF conformance regression coverage across compression, predictors, bit depth, ExtraSamples, and Photoshop metadata.
+- Production-test BigTIFF output above 4 GiB and confirm Photoshop/RIP acceptance.
+- Production-test bounded tiled/planar streaming with real artwork; synthetic fixtures remain CI coverage.
+- Continue TIFF conformance coverage across compression, predictors, bit depth, ExtraSamples and Photoshop metadata.
+- Add fixtures for preview-profile assignment failure modes (missing external ICC, wrong color space, corrupt profile).
+
+## Color-management scope
+
+Implemented now: embedded ICC preview, project-owned temporary ICC assignment, rendering intents, optional black-point compensation, searchable installed Windows profiles and sRGB preview output.
+
+Intentionally deferred: monitor-profile output transforms and printer/RIP proof-device transforms. A true proofing transform should only be added when a real production proof profile/workflow is available to validate it; do not label source-profile assignment as printer soft proof.
 
 ## Native Windows integration
 
-- Implemented in v0.12: native `.shade` thumbnail provider and read-only Windows Property Handler using the embedded PNG and cached project metadata.
-- Remaining validation: clean-workstation install, Explorer thumbnail cache, Details columns/search indexing, file association, upgrade, and removal while the Shell DLL may be loaded.
+- Validate `.shade` thumbnail/property handler install, Explorer cache/indexing, file association, upgrade and removal on a clean workstation.
 
 ## Explicitly out of scope
 
-- More Snapshot features (notes/status/favorites/comparison/sorting).
-- More duplicate detection beyond the current duplicate-reference behavior.
-- Additional adjustment types until production transport and workflow validation are complete.
+- More Snapshot metadata/features beyond the current workflow.
+- Duplicate-content detection beyond current duplicate-reference behavior.
+- Additional adjustment types until production transport/interchange validation is complete.
