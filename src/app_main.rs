@@ -1054,16 +1054,18 @@ impl ShadeApp {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.export_all_folder)
-                            .desired_width(360.0),
+                            .desired_width(300.0),
                     );
                     browse = ui.button("Browse...").clicked();
+                    reveal = ui
+                        .add_enabled(folder.is_dir(), egui::Button::new("Reveal folder"))
+                        .clicked();
                 });
                 if existing_tiffs > 0 {
                     ui.colored_label(
                         egui::Color32::YELLOW,
                         format!("Warning: this folder already contains {existing_tiffs} TIFF file(s). Mixing source/old exports can cause mistakes."),
                     );
-                    reveal = ui.button("Reveal folder").clicked();
                 }
 
                 ui.add_space(8.0);
@@ -2915,8 +2917,15 @@ impl ShadeApp {
             } else {
                 output_display.to_owned()
             };
+            let channel_button_text = if selected && control_accent.is_some() {
+                egui::WidgetText::from(
+                    egui::RichText::new(channel_button_label).color(egui::Color32::WHITE),
+                )
+            } else {
+                egui::WidgetText::from(channel_button_label)
+            };
             let response = with_accent(ui, control_accent, |ui| {
-                ui.add(egui::Button::new(channel_button_label).selected(selected))
+                ui.add(egui::Button::new(channel_button_text).selected(selected))
             });
             if response.clicked() {
                 self.adjustment_scope = AdjustmentScope::Selected;
@@ -3597,6 +3606,10 @@ impl ShadeApp {
                     .default_size(420.0)
                     .size_range(320.0..=580.0)
                     .show(ui, |preview_ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("project-view-preview-scroll")
+                            .auto_shrink([false, false])
+                            .show(preview_ui, |preview_ui| {
                         preview_ui.strong("Preview");
                         preview_ui.add_space(4.0);
                         let Some(path) = selected_path.as_deref() else {
@@ -3669,13 +3682,12 @@ impl ShadeApp {
 
                         preview_ui.add_space(6.0);
                         egui::Grid::new("project-view-preview-meta")
-                            .num_columns(2)
+                            .num_columns(4)
                             .striped(true)
                             .spacing([12.0, 5.0])
                             .show(preview_ui, |ui| {
                                 ui.strong("Saved");
                                 ui.label(format_previous_shade_time(preview.saved_at_unix_ms));
-                                ui.end_row();
                                 ui.strong("File modified");
                                 ui.label(
                                     preview
@@ -3686,19 +3698,16 @@ impl ShadeApp {
                                 ui.end_row();
                                 ui.strong("Faces");
                                 ui.label(preview.face_count.to_string());
-                                ui.end_row();
                                 ui.strong("Active Face");
                                 ui.label(preview.active_face_index.saturating_add(1).to_string());
                                 ui.end_row();
                                 ui.strong("Snapshots");
                                 ui.label(preview.snapshot_count.to_string());
-                                ui.end_row();
                                 ui.strong("Active snapshot");
                                 ui.label(preview.active_snapshot_name.as_deref().unwrap_or("-"));
                                 ui.end_row();
                                 ui.strong("Test code");
                                 ui.label(if preview.test_code_enabled { "Enabled" } else { "Off" });
-                                ui.end_row();
                                 ui.strong("Source bytes");
                                 ui.label(format_byte_count(preview.total_source_bytes));
                                 ui.end_row();
@@ -3706,36 +3715,52 @@ impl ShadeApp {
 
                         if let Some(face) = preview.active_face.as_ref() {
                             preview_ui.separator();
-                            preview_ui.strong(format!(
-                                "Face {} of {} · {}",
-                                preview
-                                    .active_face_index
-                                    .saturating_add(1)
-                                    .min(preview.face_count.max(1)),
-                                preview.face_count,
-                                face.label
-                            ));
-                            preview_ui.label(format!(
-                                "{} · {} x {} px · {}-bit · {}",
-                                face.source_file_name,
-                                face.width,
-                                face.height,
-                                face.bit_depth,
-                                face.color_model
-                            ));
-                            preview_ui.label(format!(
-                                "{:.0} x {:.0} DPI · {} channels · {}",
-                                face.dpi_x,
-                                face.dpi_y,
-                                face.channel_count,
-                                format_byte_count(face.file_size_bytes)
-                            ));
-                            if !face.channel_names.is_empty() {
-                                preview_ui.small(format!(
-                                    "Channels: {}",
-                                    face.channel_names.join(", ")
-                                ));
-                            }
+                            preview_ui
+                                .strong(format!(
+                                    "TIFF details · Face {} of {}",
+                                    preview
+                                        .active_face_index
+                                        .saturating_add(1)
+                                        .min(preview.face_count.max(1)),
+                                    preview.face_count,
+                                ))
+                                .on_hover_text(&face.source_file_name);
+                            egui::Grid::new("project-view-active-face-meta")
+                                .num_columns(4)
+                                .striped(true)
+                                .spacing([12.0, 5.0])
+                                .show(preview_ui, |ui| {
+                                    ui.strong("Face");
+                                    ui.label(
+                                        preview
+                                            .active_face_index
+                                            .saturating_add(1)
+                                            .min(preview.face_count.max(1))
+                                            .to_string(),
+                                    );
+                                    ui.strong("Dimensions");
+                                    ui.label(format!("{} x {} px", face.width, face.height));
+                                    ui.end_row();
+                                    ui.strong("Bit depth");
+                                    ui.label(format!("{}-bit", face.bit_depth));
+                                    ui.strong("Color model");
+                                    ui.label(&face.color_model);
+                                    ui.end_row();
+                                    ui.strong("DPI");
+                                    ui.label(format!("{:.0} x {:.0}", face.dpi_x, face.dpi_y));
+                                    ui.strong("Channels");
+                                    ui.label(face.channel_count.to_string());
+                                    ui.end_row();
+                                    ui.strong("File size");
+                                    ui.label(format_byte_count(face.file_size_bytes));
+                                    ui.strong("Channel names");
+                                    ui.label(if face.channel_names.is_empty() {
+                                        "-".to_owned()
+                                    } else {
+                                        face.channel_names.join(", ")
+                                    });
+                                    ui.end_row();
+                                });
                         }
 
                         preview_ui.separator();
@@ -3743,32 +3768,50 @@ impl ShadeApp {
                         if preview.snapshots.is_empty() {
                             preview_ui.small("No saved Snapshots in this project.");
                         } else {
-                            egui::ScrollArea::vertical()
-                                .id_salt("project-view-snapshots")
-                                .max_height(180.0)
+                            let mut snapshots = preview.snapshots.iter().collect::<Vec<_>>();
+                            snapshots.sort_by(|left, right| {
+                                (right.created_at_unix_ms, right.id)
+                                    .cmp(&(left.created_at_unix_ms, left.id))
+                            });
+                            egui::Grid::new("project-view-snapshots-grid")
+                                .num_columns(2)
+                                .striped(true)
+                                .spacing([14.0, 4.0])
                                 .show(preview_ui, |ui| {
-                                    for snapshot in &preview.snapshots {
-                                        let active = preview.active_snapshot_name.as_deref()
-                                            == Some(snapshot.name.as_str());
-                                        ui.horizontal_wrapped(|ui| {
-                                            if active {
-                                                ui.strong(format!("#{}", snapshot.id));
-                                                ui.strong(format!("{} · active", snapshot.name));
+                                    for pair in snapshots.chunks(2) {
+                                        for snapshot in pair {
+                                            let active = preview.active_snapshot_name.as_deref()
+                                                == Some(snapshot.name.as_str());
+                                            let label = if active {
+                                                format!("#{}  {} · active", snapshot.id, snapshot.name)
                                             } else {
-                                                ui.strong(format!("#{}", snapshot.id));
-                                                ui.label(&snapshot.name);
+                                                format!("#{}  {}", snapshot.id, snapshot.name)
+                                            };
+                                            let response = if active {
+                                                ui.strong(label)
+                                            } else {
+                                                ui.label(label)
+                                            };
+                                            if !snapshot.code.trim().is_empty()
+                                                && !snapshot
+                                                    .code
+                                                    .eq_ignore_ascii_case(&snapshot.name)
+                                            {
+                                                response.on_hover_text(format!(
+                                                    "Code: {}", snapshot.code
+                                                ));
                                             }
-                                        });
-                                        if !snapshot.code.trim().is_empty()
-                                            && !snapshot.code.eq_ignore_ascii_case(&snapshot.name)
-                                        {
-                                            ui.small(format!("Code: {}", snapshot.code));
                                         }
+                                        if pair.len() == 1 {
+                                            ui.label("");
+                                        }
+                                        ui.end_row();
                                     }
                                 });
                         }
                         preview_ui.separator();
                         preview_ui.small(preview.path.display().to_string());
+                            });
                     });
 
                 ui.strong(format!("Projects · {}", paths.len()));
@@ -3779,37 +3822,47 @@ impl ShadeApp {
                     egui::ScrollArea::vertical()
                         .id_salt("project-view-list")
                         .auto_shrink([false, false])
-                        .show_rows(ui, 72.0, indices.len(), |ui, range| {
+                        .show_rows(ui, 88.0, indices.len(), |ui, range| {
                             for row in range {
                                 let entry = self.previous_shades.entries()[indices[row]].clone();
                                 self.ensure_previous_shade_list_texture(ctx, &entry);
-                                let label = entry.display_name();
+                                let display_name = entry.display_name();
+                                let label = if entry.is_missing() {
+                                    format!("[missing] {display_name}")
+                                } else {
+                                    display_name
+                                };
                                 let source_bytes = if entry.total_source_bytes > 0 {
                                     format_byte_count(entry.total_source_bytes)
                                 } else {
                                     "-".to_owned()
                                 };
+                                let pixel_size = entry
+                                    .active_face_pixel_size()
+                                    .map(|(width, height)| format!("{width} x {height} px"))
+                                    .unwrap_or_else(|| "-".to_owned());
                                 let metadata = format!(
                                     "{} face(s) · {} · {}",
-                                    entry.face_count,
-                                    source_bytes,
-                                    entry.active_face_display(),
+                                    entry.face_count, source_bytes, pixel_size,
                                 );
-                                let latest = entry
-                                    .latest_snapshot()
-                                    .map(|snapshot| {
-                                        let code = snapshot.code.trim();
-                                        if code.is_empty() || code == snapshot.name.trim() {
-                                            format!("Latest: {}", snapshot.name)
-                                        } else {
-                                            format!("Latest: {} · {}", snapshot.name, code)
-                                        }
-                                    })
-                                    .unwrap_or_else(|| "No Snapshots".to_owned());
-                                let detail = if entry.is_missing() {
-                                    format!("{latest} · MISSING")
+                                let recent_names = entry
+                                    .recent_snapshots(8)
+                                    .into_iter()
+                                    .map(|snapshot| snapshot.name.trim())
+                                    .filter(|name| !name.is_empty())
+                                    .collect::<Vec<_>>();
+                                let snapshot_line_1 = if recent_names.is_empty() {
+                                    "No Snapshots".to_owned()
                                 } else {
-                                    latest
+                                    format!(
+                                        "Snapshots: {}",
+                                        recent_names[..recent_names.len().min(4)].join(" · ")
+                                    )
+                                };
+                                let snapshot_line_2 = if recent_names.len() > 4 {
+                                    recent_names[4..].join(" · ")
+                                } else {
+                                    String::new()
                                 };
                                 let selected = requested_select
                                     .as_deref()
@@ -3821,7 +3874,8 @@ impl ShadeApp {
                                     selected,
                                     &label,
                                     &metadata,
-                                    &detail,
+                                    &snapshot_line_1,
+                                    &snapshot_line_2,
                                     thumbnail,
                                 )
                                 .on_hover_text(&entry.path);
@@ -4236,10 +4290,13 @@ impl ShadeApp {
                     .striped(true)
                     .show(ui, |ui| {
                         ui.strong("File");
-                        ui.label("Ctrl+S  Save   |   Ctrl+Shift+S  Save As");
+                        ui.label("Ctrl+N  New   |   Ctrl+S  Save   |   Ctrl+Shift+S  Save As");
                         ui.end_row();
-                        ui.strong("View");
-                        ui.label("F  Fit image");
+                        ui.strong("Export");
+                        ui.label("Ctrl+E  Export Face   |   Ctrl+Shift+E  Export All");
+                        ui.end_row();
+                        ui.strong("View / Settings");
+                        ui.label("F  Fit image   |   G  Settings");
                         ui.end_row();
                         ui.strong("Channels");
                         ui.label("1-9  Select channel   |   S  Solo channel");
@@ -4307,6 +4364,9 @@ impl eframe::App for ShadeApp {
         if !self.show_previous_shades {
             self.handle_history_shortcuts(ui.ctx());
         }
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("shade-editor-curve-graph-focused"), false);
+        });
         self.maybe_autosave();
         self.handle_close_request(ui.ctx());
         if self.close_after_save && self.job.is_none() && !self.project_dirty {
@@ -4370,11 +4430,12 @@ fn previous_shade_history_row(
     selected: bool,
     label: &str,
     metadata: &str,
-    detail: &str,
+    detail_primary: &str,
+    detail_secondary: &str,
     thumbnail: Option<&egui::TextureHandle>,
 ) -> egui::Response {
     let width = ui.available_width().max(1.0);
-    let height = 68.0;
+    let height = 84.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let visuals = ui.visuals();
     let fill = if selected {
@@ -4389,8 +4450,8 @@ fn previous_shade_history_row(
     }
 
     let thumb_rect = egui::Rect::from_min_size(
-        rect.left_top() + egui::vec2(7.0, 8.0),
-        egui::vec2(52.0, 52.0),
+        rect.left_top() + egui::vec2(7.0, 14.0),
+        egui::vec2(56.0, 56.0),
     );
     if let Some(texture) = thumbnail {
         let natural = texture.size_vec2();
@@ -4428,7 +4489,7 @@ fn previous_shade_history_row(
 
     let text_left = thumb_rect.right() + 9.0;
     ui.painter().text(
-        egui::pos2(text_left, rect.top() + 16.0),
+        egui::pos2(text_left, rect.top() + 14.0),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(14.5),
@@ -4439,7 +4500,7 @@ fn previous_shade_history_row(
         },
     );
     ui.painter().text(
-        egui::pos2(text_left, rect.top() + 36.0),
+        egui::pos2(text_left, rect.top() + 34.0),
         egui::Align2::LEFT_CENTER,
         metadata,
         egui::FontId::proportional(12.0),
@@ -4448,10 +4509,19 @@ fn previous_shade_history_row(
     ui.painter().text(
         egui::pos2(text_left, rect.top() + 54.0),
         egui::Align2::LEFT_CENTER,
-        detail,
+        detail_primary,
         egui::FontId::proportional(11.5),
         visuals.weak_text_color(),
     );
+    if !detail_secondary.is_empty() {
+        ui.painter().text(
+            egui::pos2(text_left, rect.top() + 72.0),
+            egui::Align2::LEFT_CENTER,
+            detail_secondary,
+            egui::FontId::proportional(11.5),
+            visuals.weak_text_color(),
+        );
+    }
     response
 }
 
@@ -4884,6 +4954,11 @@ fn curve_editor_graph(
         };
         painter.circle_filled(center, radius, fill);
         painter.circle_stroke(center, radius, egui::Stroke::new(2.0, curve_color));
+    }
+    if graph_response.has_focus() {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("shade-editor-curve-graph-focused"), true);
+        });
     }
     (changed, selected)
 }

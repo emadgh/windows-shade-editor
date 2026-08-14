@@ -75,9 +75,9 @@ The executable is created at:
 target\x86_64-pc-windows-msvc\release\ShadeEditor.exe
 ```
 
-## Releases and automatic updates
+## Builds and automatic updates
 
-GitHub Actions builds Windows artifacts on pull requests and `main`. Pushing a version tag such as `v0.1.0` also publishes a GitHub Release containing `ShadeEditor.exe`.
+GitHub Actions builds Windows artifacts for validation and direct retrieval from workflow runs. The repository does not publish build artifacts as public GitHub Releases. The in-app updater remains compatible with a separately managed release source if one is configured in the future.
 
 The application checks `emadgh/windows-shade-editor` Releases. With automatic updates enabled, a newer `ShadeEditor.exe` is downloaded to the temporary directory. The user is then offered **Restart and update**, which replaces the current executable after the app closes and relaunches it. Automatic checking/downloading can be disabled in **Settings**; manual checks remain available from **About**.
 

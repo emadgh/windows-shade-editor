@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{FaceFileMetadata, ProjectThumbnail, ShadeProject};
 use crate::thumbnail;
 
-const SNAPSHOT_CACHE_VERSION: u32 = 3;
+const SNAPSHOT_CACHE_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -39,6 +39,8 @@ pub struct PreviousShadeEntry {
     pub face_count: usize,
     pub active_face_index: usize,
     pub active_face_label: String,
+    pub active_face_width: u32,
+    pub active_face_height: u32,
     pub total_source_bytes: u64,
     pub thumbnail: Option<ProjectThumbnail>,
 }
@@ -57,6 +59,8 @@ impl Default for PreviousShadeEntry {
             face_count: 0,
             active_face_index: 0,
             active_face_label: String::new(),
+            active_face_width: 0,
+            active_face_height: 0,
             total_source_bytes: 0,
             thumbnail: None,
         }
@@ -156,6 +160,14 @@ impl PreviousShadeEntry {
                     .filter(|value| !value.is_empty())
             })
             .unwrap_or_default();
+        let active_face_metadata = project.file_metadata.as_ref().and_then(|metadata| {
+            metadata
+                .faces
+                .get(self.active_face_index)
+                .or_else(|| metadata.faces.first())
+        });
+        self.active_face_width = active_face_metadata.map(|face| face.width).unwrap_or(0);
+        self.active_face_height = active_face_metadata.map(|face| face.height).unwrap_or(0);
         self.total_source_bytes = project
             .file_metadata
             .as_ref()
@@ -204,6 +216,20 @@ impl PreviousShadeEntry {
         self.snapshots
             .iter()
             .max_by_key(|snapshot| (snapshot.created_at_unix_ms, snapshot.id))
+    }
+
+    pub fn recent_snapshots(&self, limit: usize) -> Vec<&CachedSnapshot> {
+        let mut snapshots = self.snapshots.iter().collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            (right.created_at_unix_ms, right.id).cmp(&(left.created_at_unix_ms, left.id))
+        });
+        snapshots.truncate(limit);
+        snapshots
+    }
+
+    pub fn active_face_pixel_size(&self) -> Option<(u32, u32)> {
+        (self.active_face_width > 0 && self.active_face_height > 0)
+            .then_some((self.active_face_width, self.active_face_height))
     }
 
     pub fn active_face_display(&self) -> String {
@@ -307,6 +333,8 @@ impl PreviousShadesStore {
             existing.face_count = entry.face_count;
             existing.active_face_index = entry.active_face_index;
             existing.active_face_label = entry.active_face_label;
+            existing.active_face_width = entry.active_face_width;
+            existing.active_face_height = entry.active_face_height;
             existing.total_source_bytes = entry.total_source_bytes;
             existing.thumbnail = entry.thumbnail;
         } else {
@@ -424,6 +452,8 @@ impl PreviousShadesStore {
                     existing.face_count = entry.face_count;
                     existing.active_face_index = entry.active_face_index;
                     existing.active_face_label = entry.active_face_label.clone();
+                    existing.active_face_width = entry.active_face_width;
+                    existing.active_face_height = entry.active_face_height;
                     existing.total_source_bytes = entry.total_source_bytes;
                     existing.thumbnail = entry.thumbnail.clone();
                 } else if entry.snapshot_cache_version > existing.snapshot_cache_version {
@@ -433,6 +463,8 @@ impl PreviousShadesStore {
                     existing.face_count = entry.face_count;
                     existing.active_face_index = entry.active_face_index;
                     existing.active_face_label = entry.active_face_label.clone();
+                    existing.active_face_width = entry.active_face_width;
+                    existing.active_face_height = entry.active_face_height;
                     existing.total_source_bytes = entry.total_source_bytes;
                     existing.thumbnail = entry.thumbnail.clone();
                 }
@@ -693,6 +725,23 @@ mod tests {
         assert!(entry.matches_query("tc-043"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recent_snapshots_are_newest_first_and_limited() {
+        let mut entry = PreviousShadeEntry::default();
+        for id in 1..=10 {
+            entry.snapshots.push(CachedSnapshot {
+                id,
+                name: format!("S{id}"),
+                code: String::new(),
+                created_at_unix_ms: id as i64 * 100,
+            });
+        }
+        let recent = entry.recent_snapshots(8);
+        assert_eq!(recent.len(), 8);
+        assert_eq!(recent[0].name, "S10");
+        assert_eq!(recent[7].name, "S3");
     }
 
     #[test]

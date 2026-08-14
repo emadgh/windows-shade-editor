@@ -62,10 +62,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
         update_active_snapshot(app);
     }
 
-    if ctx.wants_keyboard_input() {
-        return;
-    }
-    let (settings, fit, solo, channel) = ctx.input(|input| {
+    let channel = ctx.input(|input| {
         let no_modifiers = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
         let keys = [
             egui::Key::Num1,
@@ -78,15 +75,28 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
             egui::Key::Num8,
             egui::Key::Num9,
         ];
+        no_modifiers
+            .then(|| keys.iter().position(|key| input.key_pressed(*key)))
+            .flatten()
+    });
+    let curve_graph_focused = ctx.data(|data| {
+        data.get_temp::<bool>(egui::Id::new("shade-editor-curve-graph-focused"))
+            .unwrap_or(false)
+    });
+    if ctx.wants_keyboard_input() {
+        if curve_graph_focused {
+            if let Some(channel) = channel {
+                select_channel_shortcut(app, channel);
+            }
+        }
+        return;
+    }
+    let (settings, fit, solo) = ctx.input(|input| {
+        let no_modifiers = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
         (
             no_modifiers && input.key_pressed(egui::Key::G),
             no_modifiers && input.key_pressed(egui::Key::F),
             no_modifiers && input.key_pressed(egui::Key::S),
-            if no_modifiers {
-                keys.iter().position(|key| input.key_pressed(*key))
-            } else {
-                None
-            },
         )
     });
     if settings {
@@ -100,14 +110,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
         app.viewport_recenter = true;
     }
     if let Some(channel) = channel {
-        if app
-            .faces
-            .get(app.current_face)
-            .filter(|face| face.available)
-            .is_some_and(|face| channel < face.preview.metadata.channel_names.len())
-        {
-            app.select_channel(channel, false);
-        }
+        select_channel_shortcut(app, channel);
     }
     if solo && active_face_available(app) {
         let previous = app.solo_channel;
@@ -119,6 +122,17 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
         if app.solo_channel != previous {
             app.mark_current_preview_dirty();
         }
+    }
+}
+
+fn select_channel_shortcut(app: &mut ShadeApp, channel: usize) {
+    if app
+        .faces
+        .get(app.current_face)
+        .filter(|face| face.available)
+        .is_some_and(|face| channel < face.preview.metadata.channel_names.len())
+    {
+        app.select_channel(channel, false);
     }
 }
 

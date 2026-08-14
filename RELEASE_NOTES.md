@@ -1,3 +1,12 @@
+# Shade Editor 0.14.2
+
+- Make the Project View Preview pane vertically scrollable while preserving its resizable width and 350px thumbnail cap.
+- Project rows show Face count, total source bytes, active-Face pixel dimensions, and the eight newest Snapshot names without repeating the Face filename.
+- Reformat Project View project/TIFF metadata into compact two-pair grids and display Snapshots two per row.
+- Force white text on the selected accent-filled adjustment channel button.
+- Keep 1-9 channel shortcuts active while the Curve graph owns keyboard focus without stealing digits from text/numeric editors.
+- Move Export All Reveal folder beside Browse.
+
 # Shade Editor 0.14.1
 
 - Keep Export All Faces compact at a ~500px default width and prevent its text fields from expanding the dialog to the application width.
