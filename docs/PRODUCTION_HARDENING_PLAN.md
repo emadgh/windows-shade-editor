@@ -25,15 +25,17 @@ Validation: Windows `cargo fmt`, `cargo check` and full `cargo test` passed in A
 
 Issue: #27
 
-- [ ] `{snapshot}` means Snapshot name; add `{testcode}` for effective test code; keep legacy tokens compatible.
-- [ ] Make cancellation semantics explicit and safe; no partial destination TIFF may survive cancellation/failure.
-- [ ] Persist recoverable queue recipes across restart.
-- [ ] Replace full `ShadeProject` queue clones with a compact immutable `ExportRecipe`.
-- [ ] Fingerprint source TIFFs at enqueue and verify before processing.
-- [ ] Add Gray TIFF export parity where supported by the TIFF transport.
-- [ ] Add queue persistence, fingerprint, cancellation, token and Gray transport tests.
+- [x] `{snapshot}` means Snapshot name; add `{testcode}` for effective test code; keep legacy tokens compatible.
+- [x] Make cancellation semantics explicit and safe; no partial destination TIFF may survive cancellation/failure.
+- [x] Persist recoverable queue recipes across restart.
+- [x] Replace full `ShadeProject` queue clones with a compact immutable `ExportRecipe`.
+- [x] Fingerprint source TIFFs at enqueue and verify before processing.
+- [x] Add Gray TIFF export parity where supported by the TIFF transport.
+- [x] Add queue persistence, fingerprint, cancellation, token and Gray transport tests.
 
 Acceptance: queued recipes are stable, restart-safe, memory-bounded, source-aware and semantically unambiguous.
+
+Validation: Windows `cargo fmt`, `cargo check` and full `cargo test` passed in Actions run `31840174261`; validated Phase 1 source commit is `906667b50face24e29f775cf9f21fd3553c97cfd`.
 
 ## Phase 2 — Color management completion (without ICC embedding)
 
