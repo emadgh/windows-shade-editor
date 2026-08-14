@@ -23,7 +23,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Apply source migration
         shell: pwsh
-        run: python scripts/apply_v0150_history_project_ui.py
+        run: python -X utf8 scripts/apply_v0150_history_project_ui.py
       - name: Format
         shell: pwsh
         run: cargo fmt --all
