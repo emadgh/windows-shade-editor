@@ -28,7 +28,8 @@ impl ConflictPolicy {
 pub struct ExportNameContext<'a> {
     pub shade_name: Option<&'a str>,
     pub project_name: &'a str,
-    pub snapshot_code: &'a str,
+    pub snapshot_name: &'a str,
+    pub test_code: &'a str,
     pub face_number: usize,
     pub face_name: &'a str,
     pub source_name: &'a str,
@@ -41,7 +42,8 @@ fn render_tokens(template: &str, context: &ExportNameContext<'_>) -> String {
         .shade_name
         .and_then(nonempty)
         .unwrap_or(project_name);
-    let snapshot = nonempty(context.snapshot_code).unwrap_or("Working");
+    let snapshot = nonempty(context.snapshot_name).unwrap_or("Working");
+    let test_code = nonempty(context.test_code).unwrap_or(snapshot);
     let face = nonempty(context.face_name).unwrap_or("face");
     let source = nonempty(context.source_name).unwrap_or(face);
     let mut value = template.to_owned();
@@ -49,13 +51,16 @@ fn render_tokens(template: &str, context: &ExportNameContext<'_>) -> String {
     value = value.replace("{project}", project_name);
     value = value.replace("{face}", face);
     value = value.replace("{snapshot}", snapshot);
+    value = value.replace("{testcode}", test_code);
     value = value.replace("{source}", source);
     value = value.replace("{date}", context.date);
 
     value = value.replace("{shade-name|project-name}", shade_name);
     value = value.replace("{shade-name}", shade_name);
     value = value.replace("{project-name}", project_name);
-    value = value.replace("{snapshot-code}", snapshot);
+    // Legacy `{snapshot-code}` historically meant effective Test Code, so keep
+    // that behavior while the compact `{snapshot}` token now means Snapshot name.
+    value = value.replace("{snapshot-code}", test_code);
     value = value.replace("{face-number}", &context.face_number.to_string());
     value = value.replace("{face-name}", face);
     value
@@ -213,7 +218,8 @@ mod tests {
         ExportNameContext {
             shade_name: Some("Tile Blue"),
             project_name: "Project A",
-            snapshot_code: "T-42",
+            snapshot_name: "Test 7",
+            test_code: "T-42",
             face_number: 3,
             face_name: "Face 3",
             source_name: "source-file",
@@ -222,13 +228,16 @@ mod tests {
     }
 
     #[test]
-    fn new_template_tokens_render() {
-        let name = render_export_filename("{project}_{face}_{snapshot}_{date}", &context());
-        assert_eq!(name, "Project A_Face 3_T-42_2026-08-14.tif");
+    fn compact_snapshot_and_testcode_tokens_are_distinct() {
+        let name = render_export_filename(
+            "{project}_{snapshot}_{testcode}_{date}",
+            &context(),
+        );
+        assert_eq!(name, "Project A_Test 7_T-42_2026-08-14.tif");
     }
 
     #[test]
-    fn legacy_tokens_still_render() {
+    fn legacy_snapshot_code_keeps_test_code_semantics() {
         let name = render_export_filename(
             "{shade-name|project-name} - ({snapshot-code}) - {face-number}",
             &context(),
@@ -243,7 +252,7 @@ mod tests {
             "{project}/{date}/{snapshot}",
             &context(),
         );
-        assert!(folder.ends_with(Path::new(r"Project A\2026-08-14\T-42")));
+        assert!(folder.ends_with(Path::new(r"Project A\2026-08-14\Test 7")));
     }
 
     #[test]
