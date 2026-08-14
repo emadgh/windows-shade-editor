@@ -8,6 +8,7 @@ use crate::palette::ChannelPalette;
 
 pub const SHADE_SCHEMA_VERSION: u32 = 9;
 pub const TEST_CODE_ALL_CHANNELS: &str = "__all_channels__";
+pub const MAX_SNAPSHOT_HISTORY_STATES: usize = 50;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShadeProject {
@@ -41,7 +42,7 @@ impl Default for ShadeProject {
     fn default() -> Self {
         Self {
             schema_version: SHADE_SCHEMA_VERSION,
-            name: "Untitled Shade".to_owned(),
+            name: String::new(),
             faces: Vec::new(),
             adjustments: BTreeMap::new(),
             snapshots: Vec::new(),
@@ -202,6 +203,20 @@ pub struct SnapshotExportRecord {
     pub exported_at_unix_ms: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct SnapshotHistoryState {
+    pub label: String,
+    pub adjustments: BTreeMap<String, ChannelAdjustment>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct SnapshotAdjustmentHistory {
+    pub entries: Vec<SnapshotHistoryState>,
+    pub cursor: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdjustmentSnapshot {
     pub id: u64,
@@ -214,6 +229,11 @@ pub struct AdjustmentSnapshot {
     /// never prevents another export.
     #[serde(default)]
     pub exports: Vec<SnapshotExportRecord>,
+    /// Adjustment undo/redo history owned by this Snapshot. Stored in the
+    /// .shade project so switching Snapshots and reopening a project preserves
+    /// each Snapshot's independent edit trail.
+    #[serde(default)]
+    pub history: SnapshotAdjustmentHistory,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,7 +280,7 @@ impl ShadeProject {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text =
             fs::read_to_string(path).map_err(|err| format!("Cannot read .shade file: {err}"))?;
-        let project: Self =
+        let mut project: Self =
             serde_json::from_str(&text).map_err(|err| format!("Invalid .shade file: {err}"))?;
         if project.schema_version != SHADE_SCHEMA_VERSION {
             return Err(format!(
@@ -268,6 +288,7 @@ impl ShadeProject {
                 project.schema_version, SHADE_SCHEMA_VERSION
             ));
         }
+        project.ensure_snapshot_histories();
         Ok(project)
     }
 
@@ -319,6 +340,28 @@ impl ShadeProject {
         ensure_adjustment_channels(&mut self.adjustments, names);
     }
 
+    pub fn ensure_snapshot_histories(&mut self) {
+        for snapshot in &mut self.snapshots {
+            if snapshot.history.entries.is_empty() {
+                snapshot.history.entries.push(SnapshotHistoryState {
+                    label: "Snapshot state".to_owned(),
+                    adjustments: snapshot.adjustments.clone(),
+                });
+                snapshot.history.cursor = 0;
+                continue;
+            }
+            if snapshot.history.entries.len() > MAX_SNAPSHOT_HISTORY_STATES {
+                let overflow = snapshot.history.entries.len() - MAX_SNAPSHOT_HISTORY_STATES;
+                snapshot.history.entries.drain(0..overflow);
+                snapshot.history.cursor = snapshot.history.cursor.saturating_sub(overflow);
+            }
+            snapshot.history.cursor = snapshot
+                .history
+                .cursor
+                .min(snapshot.history.entries.len().saturating_sub(1));
+        }
+    }
+
     fn next_snapshot_name(&self) -> String {
         let Some(first) = self.snapshots.first() else {
             return "Test 1".to_owned();
@@ -360,6 +403,13 @@ impl ShadeProject {
             created_at_unix_ms: now_unix_ms(),
             adjustments: self.adjustments.clone(),
             exports: Vec::new(),
+            history: SnapshotAdjustmentHistory {
+                entries: vec![SnapshotHistoryState {
+                    label: "Snapshot created".to_owned(),
+                    adjustments: self.adjustments.clone(),
+                }],
+                cursor: 0,
+            },
         });
         self.active_snapshot_id = Some(id);
         id

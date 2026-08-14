@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::model::ChannelAdjustment;
-
-const MAX_HISTORY_STATES: usize = 120;
+use crate::model::{
+    ChannelAdjustment, MAX_SNAPSHOT_HISTORY_STATES, SnapshotAdjustmentHistory, SnapshotHistoryState,
+};
 
 #[derive(Clone, Debug)]
 pub struct HistoryEntry {
@@ -30,6 +30,46 @@ impl AdjustmentHistory {
         self.cursor = 0;
     }
 
+    pub fn from_persisted(
+        persisted: &SnapshotAdjustmentHistory,
+        fallback: &BTreeMap<String, ChannelAdjustment>,
+        fallback_label: impl Into<String>,
+    ) -> Self {
+        if persisted.entries.is_empty() {
+            let mut history = Self::default();
+            history.reset(fallback, fallback_label);
+            return history;
+        }
+        let mut entries = persisted
+            .entries
+            .iter()
+            .map(|entry| HistoryEntry {
+                label: entry.label.clone(),
+                adjustments: entry.adjustments.clone(),
+            })
+            .collect::<Vec<_>>();
+        if entries.len() > MAX_SNAPSHOT_HISTORY_STATES {
+            let overflow = entries.len() - MAX_SNAPSHOT_HISTORY_STATES;
+            entries.drain(0..overflow);
+        }
+        let cursor = persisted.cursor.min(entries.len().saturating_sub(1));
+        Self { entries, cursor }
+    }
+
+    pub fn to_persisted(&self) -> SnapshotAdjustmentHistory {
+        SnapshotAdjustmentHistory {
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| SnapshotHistoryState {
+                    label: entry.label.clone(),
+                    adjustments: entry.adjustments.clone(),
+                })
+                .collect(),
+            cursor: self.cursor.min(self.entries.len().saturating_sub(1)),
+        }
+    }
+
     pub fn record(
         &mut self,
         adjustments: &BTreeMap<String, ChannelAdjustment>,
@@ -47,8 +87,8 @@ impl AdjustmentHistory {
             label: label.into(),
             adjustments: adjustments.clone(),
         });
-        if self.entries.len() > MAX_HISTORY_STATES {
-            let overflow = self.entries.len() - MAX_HISTORY_STATES;
+        if self.entries.len() > MAX_SNAPSHOT_HISTORY_STATES {
+            let overflow = self.entries.len() - MAX_SNAPSHOT_HISTORY_STATES;
             self.entries.drain(0..overflow);
         }
         self.cursor = self.entries.len().saturating_sub(1);
@@ -89,6 +129,10 @@ impl AdjustmentHistory {
 
     pub fn entries(&self) -> &[HistoryEntry] {
         &self.entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn cursor(&self) -> usize {
@@ -176,6 +220,31 @@ mod tests {
         let d = state(1.8);
         assert!(history.record(&d, "Levels - Cyan"));
         assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn history_is_capped_at_fifty_states() {
+        let mut history = AdjustmentHistory::default();
+        history.reset(&state(1.0), "Start");
+        for index in 1..80 {
+            history.record(&state(1.0 + index as f32 / 100.0), format!("State {index}"));
+        }
+        assert_eq!(history.len(), MAX_SNAPSHOT_HISTORY_STATES);
+        assert_eq!(history.cursor(), MAX_SNAPSHOT_HISTORY_STATES - 1);
+    }
+
+    #[test]
+    fn persisted_history_roundtrips_cursor_and_states() {
+        let mut history = AdjustmentHistory::default();
+        history.reset(&state(1.0), "Start");
+        history.record(&state(1.2), "Second");
+        history.record(&state(1.4), "Third");
+        history.undo();
+        let persisted = history.to_persisted();
+        let restored = AdjustmentHistory::from_persisted(&persisted, &state(9.0), "Fallback");
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored.cursor(), 1);
+        assert!(restored.current_matches(&state(1.2)));
     }
 
     #[test]

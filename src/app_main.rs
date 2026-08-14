@@ -61,6 +61,11 @@ const ERROR_TOAST_LIFETIME: Duration = Duration::from_secs(8);
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
 const HISTORY_COMMIT_DELAY: Duration = Duration::from_millis(300);
 const PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT: usize = 64;
+const APP_WINDOW_TITLE: &str = concat!(
+    "Shader Editor v",
+    env!("CARGO_PKG_VERSION"),
+    " - (EmadGhasemi.ir)"
+);
 
 fn main() -> eframe::Result {
     let startup_project = std::env::args_os()
@@ -74,13 +79,13 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_title("Shade Editor")
+            .with_title(APP_WINDOW_TITLE)
             .with_inner_size([1550.0, 920.0])
             .with_min_inner_size([1100.0, 700.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "Shade Editor",
+        APP_WINDOW_TITLE,
         native_options,
         Box::new(move |cc| {
             let mut app = ShadeApp::new(cc);
@@ -245,6 +250,7 @@ struct ShadeApp {
     close_after_save: bool,
     allow_close_once: bool,
     history: history::AdjustmentHistory,
+    history_clear_backup: Option<(Option<u64>, history::AdjustmentHistory)>,
     history_pending_label: Option<String>,
     history_pending_at: Option<Instant>,
     recovery_candidate: Option<recovery::RecoveryFile>,
@@ -332,6 +338,7 @@ impl ShadeApp {
             close_after_save: false,
             allow_close_once: false,
             history,
+            history_clear_backup: None,
             history_pending_label: None,
             history_pending_at: None,
             recovery_candidate,
@@ -385,6 +392,7 @@ impl ShadeApp {
         self.remind_after_export = false;
         self.show_snapshot_save_reminder = false;
         self.history.reset(&self.project.adjustments, "New project");
+        self.history_clear_backup = None;
         self.history_pending_label = None;
         self.history_pending_at = None;
         self.report_info("New shade project");
@@ -598,8 +606,11 @@ impl ShadeApp {
         if self.job.is_some() || self.faces.is_empty() {
             return false;
         }
+        self.flush_history_now();
+        self.sync_history_to_active_snapshot();
+        self.project.name = project_name_for_path(&self.project.name, &path);
         let mut project = self.project.clone();
-        project.name = project_name_for_path(&project.name, &path);
+        project.ensure_snapshot_histories();
         project.file_metadata = Some(build_project_file_metadata(
             &self.project,
             &self.faces,
@@ -1473,8 +1484,8 @@ impl ShadeApp {
                     self.remind_after_export = false;
                     self.show_snapshot_save_reminder = false;
                     self.remember_previous_shade(&payload.path);
-                    self.history
-                        .reset(&self.project.adjustments, "Open project");
+                    self.load_history_for_active_snapshot("Open project");
+                    self.history_clear_backup = None;
                     self.history_pending_label = None;
                     self.history_pending_at = None;
                     self.report_info(format!("Opened {}", payload.path.display()));
@@ -1503,8 +1514,8 @@ impl ShadeApp {
                     self.fit_requested = true;
                     self.viewport_recenter = true;
                     self.project_dirty = true;
-                    self.history
-                        .reset(&self.project.adjustments, "Recovered project");
+                    self.load_history_for_active_snapshot("Recovered project");
+                    self.history_clear_backup = None;
                     self.history_pending_label = None;
                     self.history_pending_at = None;
                     self.last_autosave = Instant::now();
@@ -1932,6 +1943,8 @@ impl ShadeApp {
     }
 
     fn apply_snapshot_now(&mut self, id: u64) {
+        self.flush_history_now();
+        self.sync_history_to_active_snapshot();
         if self.project.apply_snapshot(id) {
             if let Some(snapshot) = self
                 .project
@@ -1948,7 +1961,8 @@ impl ShadeApp {
                 .active_snapshot_name()
                 .map(|name| format!("Snapshot - {name}"))
                 .unwrap_or_else(|| "Snapshot".to_owned());
-            self.history.reset(&self.project.adjustments, history_label);
+            self.load_history_for_active_snapshot(&history_label);
+            self.history_clear_backup = None;
             self.history_pending_label = None;
             self.history_pending_at = None;
             self.report_info("Snapshot loaded");
@@ -2067,6 +2081,60 @@ impl ShadeApp {
         }
     }
 
+    fn sync_history_to_active_snapshot(&mut self) -> bool {
+        let Some(active_id) = self.project.active_snapshot_id else {
+            return false;
+        };
+        let persisted = self.history.to_persisted();
+        let Some(snapshot) = self
+            .project
+            .snapshots
+            .iter_mut()
+            .find(|snapshot| snapshot.id == active_id)
+        else {
+            return false;
+        };
+        if snapshot.history == persisted {
+            return false;
+        }
+        snapshot.history = persisted;
+        self.project_dirty = true;
+        true
+    }
+
+    fn load_history_for_active_snapshot(&mut self, fallback_label: &str) {
+        let persisted = self.project.active_snapshot_id.and_then(|active_id| {
+            self.project
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == active_id)
+                .map(|snapshot| snapshot.history.clone())
+        });
+        self.history = if let Some(persisted) = persisted {
+            history::AdjustmentHistory::from_persisted(
+                &persisted,
+                &self.project.adjustments,
+                fallback_label,
+            )
+        } else {
+            let mut history = history::AdjustmentHistory::default();
+            history.reset(&self.project.adjustments, fallback_label);
+            history
+        };
+        self.history_pending_label = None;
+        self.history_pending_at = None;
+    }
+
+    fn flush_history_now(&mut self) {
+        if let Some(label) = self.history_pending_label.take() {
+            self.history_pending_at = None;
+            if self.history.record(&self.project.adjustments, label) {
+                self.history_clear_backup = None;
+            }
+        }
+        self.sync_history_to_active_snapshot();
+    }
+
     fn queue_adjustment_history(&mut self, before: &BTreeMap<String, ChannelAdjustment>) {
         if *before == self.project.adjustments {
             return;
@@ -2088,7 +2156,10 @@ impl ShadeApp {
         if !ready {
             return;
         }
-        self.history.record(&self.project.adjustments, label);
+        if self.history.record(&self.project.adjustments, label) {
+            self.history_clear_backup = None;
+            self.sync_history_to_active_snapshot();
+        }
         self.history_pending_label = None;
         self.history_pending_at = None;
     }
@@ -2101,19 +2172,21 @@ impl ShadeApp {
         self.project.adjustments = adjustments;
         self.history_pending_label = None;
         self.history_pending_at = None;
+        self.history_clear_backup = None;
         self.mark_all_previews_dirty();
+        self.sync_history_to_active_snapshot();
         self.report_info(message);
     }
 
-    fn undo_adjustment(&mut self, ctx: &egui::Context) {
-        self.commit_pending_history(ctx, true);
+    fn undo_adjustment(&mut self, _ctx: &egui::Context) {
+        self.flush_history_now();
         if let Some(adjustments) = self.history.undo() {
             self.apply_history_adjustments(adjustments, "Undo adjustment");
         }
     }
 
-    fn redo_adjustment(&mut self, ctx: &egui::Context) {
-        self.commit_pending_history(ctx, true);
+    fn redo_adjustment(&mut self, _ctx: &egui::Context) {
+        self.flush_history_now();
         if let Some(adjustments) = self.history.redo() {
             self.apply_history_adjustments(adjustments, "Redo adjustment");
         }
@@ -2135,6 +2208,13 @@ impl ShadeApp {
     }
 
     fn ui_history(&mut self, ui: &mut egui::Ui) {
+        let scope = self.project.active_snapshot_id;
+        let can_undo_clear = self
+            .history_clear_backup
+            .as_ref()
+            .is_some_and(|(backup_scope, _)| *backup_scope == scope);
+        let mut clear = false;
+        let mut undo_clear = false;
         ui.horizontal(|ui| {
             ui.strong("History");
             if ui
@@ -2151,8 +2231,43 @@ impl ShadeApp {
             {
                 self.redo_adjustment(ui.ctx());
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if can_undo_clear {
+                    undo_clear = ui.small_button("Undo clear").clicked();
+                }
+                clear = ui
+                    .add_enabled(
+                        self.history.len() > 1,
+                        egui::Button::new("Clear history").small(),
+                    )
+                    .clicked();
+            });
         });
-        ui.small("Adjustment history only. Faces, Snapshots and Palette changes are intentionally excluded.");
+        if let Some(name) = self.project.active_snapshot_name() {
+            ui.small(format!(
+                "Snapshot: {name} · up to 50 adjustment states are saved in this .shade file."
+            ));
+        } else {
+            ui.small("Working adjustment history. Create/select a Snapshot to keep an independent saved history.");
+        }
+
+        if clear {
+            self.flush_history_now();
+            self.history_clear_backup = Some((scope, self.history.clone()));
+            self.history
+                .reset(&self.project.adjustments, "Current state");
+            self.sync_history_to_active_snapshot();
+            self.report_info("History cleared - Undo clear is available once");
+        } else if undo_clear {
+            if let Some((backup_scope, backup)) = self.history_clear_backup.take() {
+                if backup_scope == scope {
+                    self.history = backup;
+                    self.sync_history_to_active_snapshot();
+                    self.report_info("Cleared history restored");
+                }
+            }
+        }
+
         let rows = self
             .history
             .entries()
@@ -2173,7 +2288,7 @@ impl ShadeApp {
                 }
             });
         if let Some(index) = requested {
-            self.commit_pending_history(ui.ctx(), true);
+            self.flush_history_now();
             if let Some(adjustments) = self.history.jump(index) {
                 self.apply_history_adjustments(adjustments, "History state selected");
             }
@@ -2358,20 +2473,22 @@ impl ShadeApp {
         let mut open_all_folder = false;
         ui.horizontal(|ui| {
             ui.heading("Snapshots");
-            new_snapshot = ui.small_button("+ New").clicked();
-            export_all = ui
-                .add_enabled(
-                    self.job.is_none() && !all_ids.is_empty() && !self.faces.is_empty(),
-                    VectorIconButton::export().min_size(egui::vec2(20.0, 20.0)),
-                )
-                .on_hover_text("Export all snapshots for the active Face")
-                .clicked();
-            if all_exported {
-                open_all_folder = ui
-                    .add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))
-                    .on_hover_text("Open the latest export folder for these snapshots")
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if all_exported {
+                    open_all_folder = ui
+                        .add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))
+                        .on_hover_text("Open the latest export folder for these snapshots")
+                        .clicked();
+                }
+                export_all = ui
+                    .add_enabled(
+                        self.job.is_none() && !all_ids.is_empty() && !self.faces.is_empty(),
+                        VectorIconButton::export().min_size(egui::vec2(20.0, 20.0)),
+                    )
+                    .on_hover_text("Export all snapshots for the active Face")
                     .clicked();
-            }
+                new_snapshot = ui.small_button("+ New").clicked();
+            });
         });
         ui.small(
             "Saved adjustment test states. Export always remains available after a successful run.",
@@ -2379,6 +2496,8 @@ impl ShadeApp {
         ui.add_space(4.0);
 
         if new_snapshot {
+            self.flush_history_now();
+            self.sync_history_to_active_snapshot();
             let id = self.project.create_snapshot();
             if let Some(snapshot) = self
                 .project
@@ -2389,6 +2508,8 @@ impl ShadeApp {
                 self.snapshot_rename_id = Some(id);
                 self.snapshot_rename_buffer = snapshot.name.clone();
             }
+            self.load_history_for_active_snapshot("Snapshot created");
+            self.history_clear_backup = None;
             self.project_dirty = true;
         }
         if export_all {
@@ -2427,24 +2548,26 @@ impl ShadeApp {
                 .map(|(folder, _)| folder.clone());
             ui.horizontal(|ui| {
                 ui.strong(&day);
-                if ui
-                    .add_enabled(
-                        self.job.is_none() && !day_ids.is_empty() && !self.faces.is_empty(),
-                        VectorIconButton::export().min_size(egui::vec2(20.0, 20.0)),
-                    )
-                    .on_hover_text("Export all snapshots from this day for the active Face")
-                    .clicked()
-                {
-                    requested_group_export = Some((day_ids.clone(), day.clone()));
-                }
-                if day_exported
-                    && ui
-                        .add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))
-                        .on_hover_text("Open the latest export folder for this day")
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if day_exported
+                        && ui
+                            .add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))
+                            .on_hover_text("Open the latest export folder for this day")
+                            .clicked()
+                    {
+                        requested_folder = day_latest_folder.clone();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.job.is_none() && !day_ids.is_empty() && !self.faces.is_empty(),
+                            VectorIconButton::export().min_size(egui::vec2(20.0, 20.0)),
+                        )
+                        .on_hover_text("Export all snapshots from this day for the active Face")
                         .clicked()
-                {
-                    requested_folder = day_latest_folder.clone();
-                }
+                    {
+                        requested_group_export = Some((day_ids.clone(), day.clone()));
+                    }
+                });
             });
 
             for (id, name, created_at, export_record) in day_rows {
@@ -2540,6 +2663,9 @@ impl ShadeApp {
         if delete && self.project.delete_snapshot(active_id) {
             self.snapshot_rename_id = None;
             self.snapshot_rename_buffer.clear();
+            self.history
+                .reset(&self.project.adjustments, "Snapshot deleted");
+            self.history_clear_backup = None;
             self.project_dirty = true;
             self.report_info("Snapshot deleted");
         }
@@ -2861,12 +2987,14 @@ impl ShadeApp {
         let palette = self.project.channel_palette.clone();
         let output_display =
             channel_display_name(palette.as_ref(), &output_name, self.selected_channel);
+        let all_original_histograms = face.preview.histograms.clone();
         let all_adjusted_histograms = face
             .adjusted
             .iter()
             .map(|values| render::histogram(values))
             .collect::<Vec<_>>();
-        let active_histogram = all_adjusted_histograms.get(self.selected_channel).copied();
+        let active_original_histogram = all_original_histograms.get(self.selected_channel).copied();
+        let active_adjusted_histogram = all_adjusted_histograms.get(self.selected_channel).copied();
         let control_accent = self
             .settings
             .colorize_adjustments
@@ -3002,7 +3130,8 @@ impl ShadeApp {
                         ui,
                         &output_name,
                         &channel_names,
-                        active_histogram.as_ref(),
+                        active_original_histogram.as_ref(),
+                        active_adjusted_histogram.as_ref(),
                         control_accent,
                         palette.as_ref(),
                     ),
@@ -3010,6 +3139,7 @@ impl ShadeApp {
                         ui,
                         &output_name,
                         &channel_names,
+                        &all_original_histograms,
                         &all_adjusted_histograms,
                         control_accent,
                         palette.as_ref(),
@@ -3031,7 +3161,8 @@ impl ShadeApp {
         ui: &mut egui::Ui,
         output_name: &str,
         channel_names: &[String],
-        histogram: Option<&[u32; 256]>,
+        histogram_before: Option<&[u32; 256]>,
+        histogram_after: Option<&[u32; 256]>,
         accent: Option<egui::Color32>,
         palette: Option<&ChannelPalette>,
     ) -> bool {
@@ -3058,9 +3189,11 @@ impl ShadeApp {
                     ToolPanel::Curves => curves_ui(
                         ui,
                         adjustment,
-                        histogram.filter(|_| self.settings.show_curve_histogram),
+                        histogram_before.filter(|_| self.settings.show_curve_histogram),
+                        histogram_after.filter(|_| self.settings.show_curve_histogram),
                         accent,
                         compact_curve_controls,
+                        false,
                     ),
                     ToolPanel::Mixer => {
                         mixer_ui(ui, adjustment, output_name, channel_names, accent, palette)
@@ -3104,9 +3237,11 @@ impl ShadeApp {
                         curves_ui(
                             ui,
                             adjustment,
-                            histogram.filter(|_| self.settings.show_curve_histogram),
+                            histogram_before.filter(|_| self.settings.show_curve_histogram),
+                            histogram_after.filter(|_| self.settings.show_curve_histogram),
                             accent,
                             compact_curve_controls,
+                            false,
                         )
                     },
                 );
@@ -3125,7 +3260,8 @@ impl ShadeApp {
         ui: &mut egui::Ui,
         template_name: &str,
         channel_names: &[String],
-        histograms: &[[u32; 256]],
+        histograms_before: &[[u32; 256]],
+        histograms_after: &[[u32; 256]],
         accent: Option<egui::Color32>,
         palette: Option<&ChannelPalette>,
     ) -> bool {
@@ -3164,7 +3300,8 @@ impl ShadeApp {
                     &mut self.project.adjustments,
                     template_name,
                     channel_names,
-                    histograms,
+                    histograms_before,
+                    histograms_after,
                     self.settings.colorize_adjustments,
                     self.settings.show_curve_histogram,
                     compact_curve_controls,
@@ -3234,7 +3371,8 @@ impl ShadeApp {
                         &mut self.project.adjustments,
                         template_name,
                         channel_names,
-                        histograms,
+                        histograms_before,
+                        histograms_after,
                         self.settings.colorize_adjustments,
                         self.settings.show_curve_histogram,
                         compact_curve_controls,
@@ -4280,6 +4418,7 @@ impl ShadeApp {
                     "GitHub repository",
                     "https://github.com/emadgh/windows-shade-editor",
                 );
+                ui.hyperlink_to("EmadGhasemi.ir", "https://emadghasemi.ir");
                 ui.separator();
                 ui.label("Update controls are located on the right side of the main toolbar.");
                 ui.separator();
@@ -4787,8 +4926,10 @@ fn curve_point_screen(rect: egui::Rect, input: f32, output: f32) -> egui::Pos2 {
 fn curve_editor_graph(
     ui: &mut egui::Ui,
     curve: &mut model::Curve,
-    histogram: Option<&[u32; 256]>,
+    histogram_before: Option<&[u32; 256]>,
+    histogram_after: Option<&[u32; 256]>,
     accent: Option<egui::Color32>,
+    neutral_histogram: bool,
 ) -> (bool, CurvePointKind) {
     let desired = egui::vec2(ui.available_width().min(340.0).max(150.0), 210.0);
     let (rect, graph_response) = ui.allocate_exact_size(desired, egui::Sense::click());
@@ -4904,21 +5045,39 @@ fn curve_editor_graph(
         ui.visuals().widgets.noninteractive.bg_stroke,
         egui::StrokeKind::Inside,
     );
-    if let Some(bins) = histogram {
-        let max_value = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
-        let hist_color = accent
-            .unwrap_or(ui.visuals().weak_text_color())
-            .gamma_multiply(0.30);
-        for (index, value) in bins.iter().enumerate() {
-            let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
-            let h = *value as f32 / max_value * rect.height();
-            painter.line_segment(
-                [
-                    egui::pos2(x, rect.bottom()),
-                    egui::pos2(x, rect.bottom() - h),
-                ],
-                egui::Stroke::new(1.0, hist_color),
-            );
+    if histogram_before.is_some() || histogram_after.is_some() {
+        let max_value = histogram_before
+            .into_iter()
+            .chain(histogram_after)
+            .flat_map(|bins| bins.iter())
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1) as f32;
+        let before_color = ui.visuals().weak_text_color().gamma_multiply(0.20);
+        let after_base = if neutral_histogram {
+            ui.visuals().weak_text_color()
+        } else {
+            accent.unwrap_or(ui.visuals().selection.stroke.color)
+        };
+        let after_color = after_base.gamma_multiply(0.48);
+        for (bins, color) in [
+            (histogram_before, before_color),
+            (histogram_after, after_color),
+        ] {
+            if let Some(bins) = bins {
+                for (index, value) in bins.iter().enumerate() {
+                    let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
+                    let h = *value as f32 / max_value * rect.height();
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, rect.bottom()),
+                            egui::pos2(x, rect.bottom() - h),
+                        ],
+                        egui::Stroke::new(1.0, color),
+                    );
+                }
+            }
         }
     }
     painter.line_segment(
@@ -5008,13 +5167,32 @@ fn curve_point_fields(
 fn curves_ui(
     ui: &mut egui::Ui,
     adjustment: &mut ChannelAdjustment,
-    histogram: Option<&[u32; 256]>,
+    histogram_before: Option<&[u32; 256]>,
+    histogram_after: Option<&[u32; 256]>,
     accent: Option<egui::Color32>,
     compact_controls: bool,
+    neutral_histogram: bool,
 ) -> bool {
     with_accent(ui, accent, |ui| {
-        let (graph_changed, selected) =
-            curve_editor_graph(ui, &mut adjustment.curve, histogram, accent);
+        let (graph_changed, selected) = curve_editor_graph(
+            ui,
+            &mut adjustment.curve,
+            histogram_before,
+            histogram_after,
+            accent,
+            neutral_histogram,
+        );
+        if histogram_before.is_some() && histogram_after.is_some() {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().weak_text_color(), "Before");
+                let after_color = if neutral_histogram {
+                    ui.visuals().weak_text_color()
+                } else {
+                    accent.unwrap_or(ui.visuals().selection.stroke.color)
+                };
+                ui.colored_label(after_color, "After");
+            });
+        }
         let mut changed = graph_changed;
         if !compact_controls {
             ui.add_space(6.0);
@@ -5099,12 +5277,21 @@ fn broadcast_curves_ui(
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
     template_name: &str,
     channel_names: &[String],
-    histogram: Option<&[u32; 256]>,
+    histogram_before: Option<&[u32; 256]>,
+    histogram_after: Option<&[u32; 256]>,
     accent: Option<egui::Color32>,
     compact_controls: bool,
 ) -> bool {
     let mut draft = adjustments.get(template_name).cloned().unwrap_or_default();
-    if !curves_ui(ui, &mut draft, histogram, accent, compact_controls) {
+    if !curves_ui(
+        ui,
+        &mut draft,
+        histogram_before,
+        histogram_after,
+        accent,
+        compact_controls,
+        true,
+    ) {
         return false;
     }
     for name in channel_names {
@@ -5118,7 +5305,8 @@ fn all_curves_ui(
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
     template_name: &str,
     channel_names: &[String],
-    histograms: &[[u32; 256]],
+    histograms_before: &[[u32; 256]],
+    histograms_after: &[[u32; 256]],
     colorize: bool,
     show_histogram: bool,
     compact_controls: bool,
@@ -5130,8 +5318,11 @@ fn all_curves_ui(
         .position(|name| name == template_name)
         .unwrap_or(0);
     let broadcast_accent = colorize.then(|| channel_color(palette, template_name, template_index));
-    let broadcast_histogram = show_histogram
-        .then(|| histograms.get(template_index))
+    let broadcast_histogram_before = show_histogram
+        .then(|| histograms_before.get(template_index))
+        .flatten();
+    let broadcast_histogram_after = show_histogram
+        .then(|| histograms_after.get(template_index))
         .flatten();
 
     egui::Frame::new()
@@ -5146,7 +5337,8 @@ fn all_curves_ui(
                 adjustments,
                 template_name,
                 channel_names,
-                broadcast_histogram,
+                broadcast_histogram_before,
+                broadcast_histogram_after,
                 broadcast_accent,
                 compact_controls,
             );
@@ -5167,13 +5359,26 @@ fn all_curves_ui(
             .id_salt(format!("all-channel-curve-{index}-{name}"))
             .default_open(false)
             .show(ui, |ui| {
-                let histogram = if show_histogram {
-                    histograms.get(index)
+                let histogram_before = if show_histogram {
+                    histograms_before.get(index)
+                } else {
+                    None
+                };
+                let histogram_after = if show_histogram {
+                    histograms_after.get(index)
                 } else {
                     None
                 };
                 let adjustment = adjustments.entry(name.clone()).or_default();
-                changed |= curves_ui(ui, adjustment, histogram, accent, compact_controls);
+                changed |= curves_ui(
+                    ui,
+                    adjustment,
+                    histogram_before,
+                    histogram_after,
+                    accent,
+                    compact_controls,
+                    false,
+                );
             });
     }
     changed

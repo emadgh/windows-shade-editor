@@ -10,6 +10,8 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
     let Some(active_id) = app.project.active_snapshot_id else {
         return;
     };
+    app.flush_history_now();
+    app.sync_history_to_active_snapshot();
     if app.project.update_snapshot(active_id) {
         app.project_dirty = true;
         app.report_info("Snapshot updated");
@@ -339,6 +341,19 @@ pub(super) fn apply_relinked_folder(
 }
 
 pub(super) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
+    ui.label("Project title");
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut app.project.name)
+                .hint_text("Uses the .shade filename after first save")
+                .desired_width(f32::INFINITY),
+        )
+        .changed()
+    {
+        app.project_dirty = true;
+    }
+    ui.add_space(4.0);
+    ui.separator();
     ui.heading("Faces");
     if app.faces.is_empty() {
         ui.label("Add TIFF files to create a shade project.");
