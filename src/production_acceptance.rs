@@ -1,0 +1,115 @@
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TiffContainerKind {
+    ClassicLittleEndian,
+    ClassicBigEndian,
+    BigTiffLittleEndian,
+    BigTiffBigEndian,
+}
+
+pub fn classify_tiff_header(header: [u8; 4]) -> Option<TiffContainerKind> {
+    match header {
+        [b'I', b'I', 42, 0] => Some(TiffContainerKind::ClassicLittleEndian),
+        [b'M', b'M', 0, 42] => Some(TiffContainerKind::ClassicBigEndian),
+        [b'I', b'I', 43, 0] => Some(TiffContainerKind::BigTiffLittleEndian),
+        [b'M', b'M', 0, 43] => Some(TiffContainerKind::BigTiffBigEndian),
+        _ => None,
+    }
+}
+
+/// Checked production-size calculation used by conformance tests without allocating
+/// multi-gigabyte image buffers. u128 intentionally keeps >4 GiB layouts exact.
+pub fn uncompressed_sample_bytes(
+    width: u64,
+    height: u64,
+    samples_per_pixel: u64,
+    bits_per_sample: u64,
+) -> Option<u128> {
+    if bits_per_sample == 0 || bits_per_sample % 8 != 0 {
+        return None;
+    }
+    u128::from(width)
+        .checked_mul(u128::from(height))?
+        .checked_mul(u128::from(samples_per_pixel))?
+        .checked_mul(u128::from(bits_per_sample / 8))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BUILD_WORKFLOW: &str = include_str!("../.github/workflows/build-windows.yml");
+    const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
+    const EXPORT_TESTS: &str = include_str!("export.rs");
+
+    #[test]
+    fn classic_and_bigtiff_headers_are_classified_for_both_byte_orders() {
+        assert_eq!(
+            classify_tiff_header(*b"II*\0"),
+            Some(TiffContainerKind::ClassicLittleEndian)
+        );
+        assert_eq!(
+            classify_tiff_header(*b"MM\0*"),
+            Some(TiffContainerKind::ClassicBigEndian)
+        );
+        assert_eq!(
+            classify_tiff_header([b'I', b'I', 43, 0]),
+            Some(TiffContainerKind::BigTiffLittleEndian)
+        );
+        assert_eq!(
+            classify_tiff_header([b'M', b'M', 0, 43]),
+            Some(TiffContainerKind::BigTiffBigEndian)
+        );
+    }
+
+    #[test]
+    fn greater_than_four_gib_layout_is_reasoned_about_without_allocating_pixels() {
+        let bytes = uncompressed_sample_bytes(65_536, 65_536, 6, 16).unwrap();
+        assert!(bytes > u128::from(u32::MAX));
+        assert_eq!(bytes, 51_539_607_552u128);
+    }
+
+    #[test]
+    fn production_fixture_matrix_remains_in_the_test_suite() {
+        for required in [
+            "identity_export_defaults_to_lzw_for_supported_lossless_sources",
+            "identity_export_can_preserve_supported_lossless_compressions_when_lzw_is_disabled",
+            "identity_export_preserves_horizontal_predictor_for_base_rgb",
+            "identity_export_preserves_16bit_cmyk_samples",
+            "identity_export_preserves_spot_names_icc_photoshop_resources_and_dpi",
+        ] {
+            assert!(
+                CONFORMANCE_TESTS.contains(required),
+                "missing required TIFF conformance test: {required}"
+            );
+        }
+        for required in [
+            "strip_writer_preserves_planar_configuration_separate",
+            "tiled_contig_streaming_matches_reference_and_preserves_chunks",
+            "tiled_separate_streaming_matches_reference_and_preserves_chunks",
+            "large_layout_selects_bigtiff_without_allocating_pixels",
+            "identity_export_preserves_bigtiff_container",
+        ] {
+            assert!(
+                EXPORT_TESTS.contains(required),
+                "missing required transport test: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_windows_ci_keeps_shell_and_schema_validation_required() {
+        for required in [
+            "cargo check --locked --target x86_64-pc-windows-msvc",
+            "cargo test --locked --target x86_64-pc-windows-msvc",
+            "cargo build --release --locked --target x86_64-pc-windows-msvc",
+            "Build and test native Shell extension",
+            "Validate Shell property schema XML",
+            "actions/upload-artifact@v4",
+        ] {
+            assert!(
+                BUILD_WORKFLOW.contains(required),
+                "production Windows CI lost required step: {required}"
+            );
+        }
+    }
+}
