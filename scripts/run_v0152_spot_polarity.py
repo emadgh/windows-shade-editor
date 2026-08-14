@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 migration = Path('scripts/apply_v0151_spot_polarity.py')
 source = migration.read_text(encoding='utf-8')
@@ -16,5 +17,11 @@ new = '''    r'(\\[\\[package\\]\\]\\nname = "windows-shade-editor"\\nversion = 
 if old not in source:
     raise SystemExit('Could not adapt Cargo.lock migration version')
 source = source.replace(old, new, 1)
+
+pattern = r'''# Three production call sites\.\nfor label, old, new in \[.*?\n    export = replace_once\(export, old, new, label\)\n'''
+replacement = '''# Three production call sites.\nold_call = 'adjusted_strip(input, channels, names, project)'\nif export.count(old_call) != 3:\n    raise SystemExit(f'adjusted_strip production calls: expected 3 matches, found {export.count(old_call)}')\nexport = export.replace(old_call, 'adjusted_strip(input, &stream.metadata, project)', 2)\nexport = export.replace(old_call, 'adjusted_strip(input, metadata, project)', 1)\n'''
+source, count = re.subn(pattern, replacement, source, count=1, flags=re.S)
+if count != 1:
+    raise SystemExit('Could not adapt adjusted_strip call-site migration')
 
 exec(compile(source, str(migration), 'exec'))
