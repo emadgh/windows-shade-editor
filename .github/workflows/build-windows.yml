@@ -19,11 +19,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - name: Check
-        run: cargo check --target x86_64-pc-windows-msvc
+        run: cargo check --locked --target x86_64-pc-windows-msvc
       - name: Test
-        run: cargo test --target x86_64-pc-windows-msvc
+        run: cargo test --locked --target x86_64-pc-windows-msvc
       - name: Build release
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
       - name: Build and test native Shell extension
         shell: cmd
         run: |
