@@ -1,0 +1,39 @@
+name: Apply Previous Shades snapshot search
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Prepare Previous Shades snapshot search patch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply snapshot search cache patch
+        shell: pwsh
+        run: python scripts/apply_previous_shades_snapshot_search.py
+      - name: Format
+        shell: pwsh
+        run: cargo fmt --all
+      - name: Check locked build
+        shell: pwsh
+        run: cargo check --locked
+      - name: Test locked build
+        shell: pwsh
+        run: cargo test --locked
+      - name: Verify diff
+        shell: pwsh
+        run: git diff --check
+      - name: Commit source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/previous_shades.rs src/app_main.rs Cargo.toml Cargo.lock RELEASE_NOTES.md
+          git commit -m "Cache snapshot search metadata in Previous Shades"
+          git push
