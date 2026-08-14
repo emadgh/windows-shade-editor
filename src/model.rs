@@ -48,6 +48,10 @@ pub struct PreviewColorSettings {
     pub assigned_profile_path: Option<String>,
     pub rendering_intent: PreviewRenderingIntent,
     pub black_point_compensation: bool,
+    /// Optional printer/RIP proof-device profile used only for on-screen soft proof.
+    pub soft_proof_enabled: bool,
+    pub proof_profile_path: Option<String>,
+    pub proofing_intent: PreviewRenderingIntent,
 }
 
 impl Default for PreviewColorSettings {
@@ -57,6 +61,9 @@ impl Default for PreviewColorSettings {
             assigned_profile_path: None,
             rendering_intent: PreviewRenderingIntent::Perceptual,
             black_point_compensation: false,
+            soft_proof_enabled: false,
+            proof_profile_path: None,
+            proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
         }
     }
 }
@@ -733,6 +740,12 @@ mod tests {
             PreviewRenderingIntent::Perceptual
         );
         assert!(!project.preview_color.black_point_compensation);
+        assert!(!project.preview_color.soft_proof_enabled);
+        assert!(project.preview_color.proof_profile_path.is_none());
+        assert_eq!(
+            project.preview_color.proofing_intent,
+            PreviewRenderingIntent::RelativeColorimetric
+        );
 
         let json = serde_json::to_string(&project).expect("serialize project");
         let restored: ShadeProject = serde_json::from_str(&json).expect("deserialize project");

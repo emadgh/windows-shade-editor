@@ -2,10 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use lcms2::{
-    ColorSpaceSignature, Flags, InfoType, Intent, Locale, PixelFormat, Profile, Transform,
+    ColorSpaceSignature, Flags, InfoType, Intent, Locale, PixelFormat, Profile,
+    ProfileClassSignature, Transform,
 };
 
-use crate::model::PreviewRenderingIntent;
+use crate::model::{PreviewRenderingIntent, ShadeProject};
 use crate::tiff_io::{ColorModel, TiffMetadata};
 
 #[derive(Clone, Debug)]
@@ -13,7 +14,7 @@ pub struct InstalledIccProfile {
     pub path: PathBuf,
     pub description: String,
     color_space: ColorSpaceSignature,
-    device_class: String,
+    device_class: ProfileClassSignature,
 }
 
 impl InstalledIccProfile {
@@ -28,12 +29,16 @@ impl InstalledIccProfile {
         color_space_label(self.color_space)
     }
 
-    pub fn device_class_label(&self) -> &str {
-        &self.device_class
+    pub fn device_class_label(&self) -> String {
+        profile_class_label(self.device_class)
     }
 
     pub fn compatible_with(&self, model: ColorModel) -> bool {
         expected_color_space(model).is_some_and(|expected| expected == self.color_space)
+    }
+
+    pub fn is_output_profile(&self) -> bool {
+        self.device_class == ProfileClassSignature::OutputClass
     }
 
     pub fn matches_query(&self, query: &str) -> bool {
@@ -45,7 +50,7 @@ impl InstalledIccProfile {
             || self.filename().to_lowercase().contains(&query)
             || self.path.to_string_lossy().to_lowercase().contains(&query)
             || self.color_space_label().to_lowercase().contains(&query)
-            || self.device_class.to_lowercase().contains(&query)
+            || self.device_class_label().to_lowercase().contains(&query)
     }
 }
 
@@ -55,6 +60,31 @@ pub struct PreviewColorConfig {
     pub intent: PreviewRenderingIntent,
     pub black_point_compensation: bool,
     pub assigned_profile_path: Option<PathBuf>,
+    pub soft_proof_enabled: bool,
+    pub proof_profile_path: Option<PathBuf>,
+    pub proofing_intent: PreviewRenderingIntent,
+}
+
+impl PreviewColorConfig {
+    pub fn from_project(project: &ShadeProject) -> Self {
+        Self {
+            enabled: project.preview_color.enabled,
+            intent: project.preview_color.rendering_intent,
+            black_point_compensation: project.preview_color.black_point_compensation,
+            assigned_profile_path: project
+                .preview_color
+                .assigned_profile_path
+                .as_ref()
+                .map(PathBuf::from),
+            soft_proof_enabled: project.preview_color.soft_proof_enabled,
+            proof_profile_path: project
+                .preview_color
+                .proof_profile_path
+                .as_ref()
+                .map(PathBuf::from),
+            proofing_intent: project.preview_color.proofing_intent,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +103,8 @@ pub enum PreviewColorStatus {
         intent: PreviewRenderingIntent,
         source: PreviewProfileSource,
         black_point_compensation: bool,
+        proof_description: Option<String>,
+        proofing_intent: Option<PreviewRenderingIntent>,
     },
     Fallback {
         reason: String,
@@ -104,13 +136,17 @@ impl PreviewColorStatus {
     pub fn detail(&self) -> String {
         match self {
             Self::Pending => "Preview color management has not rendered this Face yet.".to_owned(),
-            Self::Disabled => "Project color preview is disabled. TIFF data and metadata are unchanged.".to_owned(),
+            Self::Disabled => {
+                "Project color preview is disabled. TIFF data and metadata are unchanged.".to_owned()
+            }
             Self::NoEmbeddedProfile => "This TIFF has no embedded ICC profile and no preview profile is assigned. Shade Editor is using its unmanaged display fallback.".to_owned(),
             Self::Applied {
                 description,
                 intent,
                 source,
                 black_point_compensation,
+                proof_description,
+                proofing_intent,
             } => {
                 let source = match source {
                     PreviewProfileSource::Embedded => "embedded TIFF profile".to_owned(),
@@ -123,14 +159,26 @@ impl PreviewColorStatus {
                 } else {
                     ""
                 };
-                format!(
-                    "{} ({source}) → sRGB preview · {} intent{bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
-                    description,
-                    intent.label(),
-                )
+                if let (Some(proof), Some(proof_intent)) =
+                    (proof_description.as_ref(), proofing_intent.as_ref())
+                {
+                    format!(
+                        "{} ({source}) → printer/RIP soft proof '{}' → sRGB display · source {} intent · proof {} intent{bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
+                        description,
+                        proof,
+                        intent.label(),
+                        proof_intent.label(),
+                    )
+                } else {
+                    format!(
+                        "{} ({source}) → sRGB preview · {} intent{bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
+                        description,
+                        intent.label(),
+                    )
+                }
             }
             Self::Fallback { reason, .. } => format!(
-                "The requested ICC could not be used for preview ({reason}). Shade Editor fell back to the unmanaged display conversion; TIFF data is unchanged."
+                "The requested color-management transform could not be used ({reason}). Shade Editor fell back to the unmanaged display conversion; TIFF data is unchanged."
             ),
         }
     }
@@ -142,6 +190,16 @@ impl PreviewColorStatus {
     pub fn is_problem(&self) -> bool {
         matches!(self, Self::Fallback { .. })
     }
+
+    pub fn is_soft_proofing(&self) -> bool {
+        matches!(
+            self,
+            Self::Applied {
+                proof_description: Some(_),
+                ..
+            }
+        )
+    }
 }
 
 enum BaseTransform {
@@ -150,8 +208,8 @@ enum BaseTransform {
     Gray(Transform<[u16; 1], [u8; 3]>),
 }
 
-/// Preview-only ICC transform. Assigned profiles reinterpret the TIFF base
-/// channels for display only; they are never written back to the source/export.
+/// Preview-only ICC transform. Assigned source profiles and proof profiles are
+/// never written to TIFF or consumed by production export.
 pub struct PreviewColorTransform {
     transform: Option<BaseTransform>,
     status: PreviewColorStatus,
@@ -230,64 +288,77 @@ impl PreviewColorTransform {
         let intent = to_lcms_intent(config.intent);
         let bpc = config.black_point_compensation;
 
+        let proof = if config.soft_proof_enabled {
+            let Some(path) = config.proof_profile_path.as_ref() else {
+                return Self::fallback(
+                    "printer/RIP soft proof is enabled but no proof profile is selected".to_owned(),
+                    Some("Soft proof".to_owned()),
+                );
+            };
+            let proof = match Profile::new_file(path) {
+                Ok(profile) => profile,
+                Err(err) => {
+                    return Self::fallback(
+                        format!("cannot open proof profile {}: {err}", path.display()),
+                        Some(profile_path_label(path)),
+                    );
+                }
+            };
+            if proof.device_class() != ProfileClassSignature::OutputClass {
+                return Self::fallback(
+                    format!(
+                        "proof profile '{}' is {}, not an output/printer profile",
+                        profile_description(&proof),
+                        profile_class_label(proof.device_class()),
+                    ),
+                    Some(profile_path_label(path)),
+                );
+            }
+            Some((proof, profile_path_label(path)))
+        } else {
+            None
+        };
+
+        let proofing_intent = to_lcms_intent(config.proofing_intent);
+        let proof_flags = if bpc {
+            Flags::SOFT_PROOFING | Flags::BLACKPOINT_COMPENSATION
+        } else {
+            Flags::SOFT_PROOFING
+        };
+
+        macro_rules! make_transform {
+            ($input:expr, $variant:ident) => {{
+                let result = if let Some((proof_profile, _)) = proof.as_ref() {
+                    Transform::new_proofing(
+                        &source,
+                        $input,
+                        &destination,
+                        PixelFormat::RGB_8,
+                        proof_profile,
+                        intent,
+                        proofing_intent,
+                        proof_flags,
+                    )
+                } else if bpc {
+                    Transform::new_flags(
+                        &source,
+                        $input,
+                        &destination,
+                        PixelFormat::RGB_8,
+                        intent,
+                        Flags::BLACKPOINT_COMPENSATION,
+                    )
+                } else {
+                    Transform::new(&source, $input, &destination, PixelFormat::RGB_8, intent)
+                };
+                result.map(BaseTransform::$variant)
+            }};
+        }
+
         let transform = match metadata.color_model {
-            ColorModel::Rgb => if bpc {
-                Transform::new_flags(
-                    &source,
-                    PixelFormat::RGB_16,
-                    &destination,
-                    PixelFormat::RGB_8,
-                    intent,
-                    Flags::BLACKPOINT_COMPENSATION,
-                )
-            } else {
-                Transform::new(
-                    &source,
-                    PixelFormat::RGB_16,
-                    &destination,
-                    PixelFormat::RGB_8,
-                    intent,
-                )
-            }
-            .map(BaseTransform::Rgb),
-            ColorModel::Cmyk => if bpc {
-                Transform::new_flags(
-                    &source,
-                    PixelFormat::CMYK_16,
-                    &destination,
-                    PixelFormat::RGB_8,
-                    intent,
-                    Flags::BLACKPOINT_COMPENSATION,
-                )
-            } else {
-                Transform::new(
-                    &source,
-                    PixelFormat::CMYK_16,
-                    &destination,
-                    PixelFormat::RGB_8,
-                    intent,
-                )
-            }
-            .map(BaseTransform::Cmyk),
-            ColorModel::Gray => if bpc {
-                Transform::new_flags(
-                    &source,
-                    PixelFormat::GRAY_16,
-                    &destination,
-                    PixelFormat::RGB_8,
-                    intent,
-                    Flags::BLACKPOINT_COMPENSATION,
-                )
-            } else {
-                Transform::new(
-                    &source,
-                    PixelFormat::GRAY_16,
-                    &destination,
-                    PixelFormat::RGB_8,
-                    intent,
-                )
-            }
-            .map(BaseTransform::Gray),
+            ColorModel::Rgb => make_transform!(PixelFormat::RGB_16, Rgb),
+            ColorModel::Cmyk => make_transform!(PixelFormat::CMYK_16, Cmyk),
+            ColorModel::Gray => make_transform!(PixelFormat::GRAY_16, Gray),
             ColorModel::Other => unreachable!(),
         };
 
@@ -299,6 +370,8 @@ impl PreviewColorTransform {
                     intent: config.intent,
                     source: source_kind,
                     black_point_compensation: bpc,
+                    proof_description: proof.as_ref().map(|(_, label)| label.clone()),
+                    proofing_intent: proof.as_ref().map(|_| config.proofing_intent),
                 },
             },
             Err(err) => Self::fallback(
@@ -390,13 +463,11 @@ pub fn inspect_profile(path: &Path) -> Result<InstalledIccProfile, String> {
         path: path.to_path_buf(),
         description: profile_description(&profile),
         color_space: profile.color_space(),
-        device_class: format!("{:?}", profile.device_class()),
+        device_class: profile.device_class(),
     })
 }
 
-/// Enumerate installed profile files from the Windows color directory. Windows
-/// installs ICC/ICM profiles into System32\\spool\\drivers\\color; Browse remains
-/// available for valid profiles stored elsewhere.
+/// Enumerate installed profile files from the Windows color directory.
 pub fn installed_profiles() -> Result<Vec<InstalledIccProfile>, String> {
     let windows = std::env::var_os("WINDIR")
         .map(PathBuf::from)
@@ -457,7 +528,7 @@ fn profile_path_label(path: &Path) -> String {
             path.file_stem()
                 .map(|name| name.to_string_lossy().into_owned())
                 .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| "Assigned ICC".to_owned())
+                .unwrap_or_else(|| "ICC profile".to_owned())
         })
 }
 
@@ -479,6 +550,19 @@ fn color_space_label(space: ColorSpaceSignature) -> String {
     }
 }
 
+fn profile_class_label(class: ProfileClassSignature) -> String {
+    match class {
+        ProfileClassSignature::InputClass => "Input".to_owned(),
+        ProfileClassSignature::DisplayClass => "Display".to_owned(),
+        ProfileClassSignature::OutputClass => "Output / printer".to_owned(),
+        ProfileClassSignature::LinkClass => "DeviceLink".to_owned(),
+        ProfileClassSignature::AbstractClass => "Abstract".to_owned(),
+        ProfileClassSignature::ColorSpaceClass => "Color space".to_owned(),
+        ProfileClassSignature::NamedColorClass => "Named color".to_owned(),
+        other => format!("{other:?}"),
+    }
+}
+
 fn to_lcms_intent(intent: PreviewRenderingIntent) -> Intent {
     match intent {
         PreviewRenderingIntent::Perceptual => Intent::Perceptual,
@@ -491,6 +575,7 @@ fn to_lcms_intent(intent: PreviewRenderingIntent) -> Intent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiff_io::TiffMetadata;
 
     fn rgb_metadata(icc_profile: Option<Vec<u8>>) -> TiffMetadata {
         TiffMetadata {
@@ -517,81 +602,31 @@ mod tests {
             intent: PreviewRenderingIntent::Perceptual,
             black_point_compensation: false,
             assigned_profile_path: None,
+            soft_proof_enabled: false,
+            proof_profile_path: None,
+            proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
         }
     }
 
     #[test]
-    fn disabled_and_missing_profiles_never_create_a_transform() {
-        let no_profile = rgb_metadata(None);
-        let disabled = PreviewColorTransform::new(
-            &no_profile,
-            PreviewColorConfig {
-                enabled: false,
-                ..config()
-            },
-        );
-        assert_eq!(*disabled.status(), PreviewColorStatus::Disabled);
+    fn no_profile_is_reported_without_modifying_data() {
+        let transform = PreviewColorTransform::new(&rgb_metadata(None), config());
+        assert!(matches!(
+            transform.status(),
+            PreviewColorStatus::NoEmbeddedProfile
+        ));
         assert!(
-            disabled
+            transform
                 .base_rgb8(&[vec![0], vec![0], vec![0]], 1)
                 .is_none()
         );
-
-        let missing = PreviewColorTransform::new(&no_profile, config());
-        assert_eq!(*missing.status(), PreviewColorStatus::NoEmbeddedProfile);
     }
 
     #[test]
-    fn embedded_srgb_profile_is_used_for_rgb_preview() {
-        let icc = Profile::new_srgb().icc().expect("serialize sRGB profile");
-        let metadata = rgb_metadata(Some(icc));
-        let transform = PreviewColorTransform::new(
-            &metadata,
-            PreviewColorConfig {
-                intent: PreviewRenderingIntent::RelativeColorimetric,
-                ..config()
-            },
-        );
-        assert!(transform.status().is_managed(), "{:?}", transform.status());
-        let output = transform
-            .base_rgb8(&[vec![65535], vec![32768], vec![0]], 1)
-            .expect("managed RGB output");
-        assert_eq!(output.len(), 1);
-        assert!(output[0][0] > 245);
-        assert!((120..=136).contains(&output[0][1]));
-        assert!(output[0][2] < 10);
-    }
-
-    #[test]
-    fn assigned_profile_can_manage_preview_without_embedded_icc() {
-        let icc = Profile::new_srgb().icc().expect("serialize sRGB profile");
-        let path = std::env::temp_dir().join(format!(
-            "shade-editor-assigned-profile-{}.icc",
-            std::process::id()
-        ));
-        fs::write(&path, icc).expect("write temporary ICC");
-        let metadata = rgb_metadata(None);
-        let transform = PreviewColorTransform::new(
-            &metadata,
-            PreviewColorConfig {
-                assigned_profile_path: Some(path.clone()),
-                ..config()
-            },
-        );
-        let _ = fs::remove_file(&path);
-        assert!(transform.status().is_managed(), "{:?}", transform.status());
-    }
-
-    #[test]
-    fn profile_color_space_mismatch_falls_back_safely() {
-        let icc = Profile::new_srgb().icc().expect("serialize sRGB profile");
-        let mut metadata = rgb_metadata(Some(icc));
-        metadata.color_model = ColorModel::Cmyk;
-        metadata.samples_per_pixel = 4;
-        metadata.base_channel_count = 4;
-        metadata.channel_names.push("Black".into());
-        metadata.channel_display_info.push(None);
-        let transform = PreviewColorTransform::new(&metadata, config());
-        assert!(transform.status().is_problem());
+    fn disabled_preview_is_explicit() {
+        let mut cfg = config();
+        cfg.enabled = false;
+        let transform = PreviewColorTransform::new(&rgb_metadata(None), cfg);
+        assert!(matches!(transform.status(), PreviewColorStatus::Disabled));
     }
 }

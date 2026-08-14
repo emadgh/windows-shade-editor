@@ -1,3 +1,13 @@
+# Shade Editor 0.17.0
+
+- Add true printer/RIP Soft Proof with a separate Output-class proof ICC, proof rendering intent and project persistence; the transform remains preview-only and never enters TIFF export.
+- Make project thumbnails use the exact same color-managed / soft-proof preview pipeline as the viewport.
+- Add non-blocking Export Queue with Waiting / Processing / Done / Failed / Cancelled states, safe cancel semantics and Retry.
+- Extend export naming with `{project}`, `{face}`, `{snapshot}`, `{date}`, `{source}` and nested Folder Templates while keeping legacy tokens compatible.
+- Add `File > Inspect TIFF` read-only production diagnostics with Copy report: TIFF/BigTIFF, dimensions, bits, photometric, planar configuration, compression, predictor, ExtraSamples, channel/Spot order, Photoshop resources, ICC, DPI and estimated uncompressed size.
+- Change History labels to Photoshop-style `Tool · Channel` naming.
+- Re-validate the existing Safe Project Save / Recovery path: `.tmp` + flush/sync + atomic replace, `.bak` backup, rotating recovery version/checksum and corrupt-state rejection.
+
 # Unreleased
 
 - Replace generic `ICC: managed` metadata text with the active ICC profile description; the profile label is clickable and opens Color Management.
