@@ -19,7 +19,9 @@ mod export_queue;
 mod history;
 mod model;
 mod palette;
+mod path_safety;
 mod previous_shades;
+mod project_lifecycle;
 mod recovery;
 mod render;
 mod safe_fs;
@@ -44,6 +46,7 @@ use model::{
     TestCodePosition,
 };
 use palette::ChannelPalette;
+use project_lifecycle::ProjectTransition;
 use settings::AppSettings;
 use tiff_io::PreviewFace;
 use update::{UpdateManager, UpdateStatus};
@@ -259,11 +262,10 @@ struct ShadeApp {
     snapshot_rename_id: Option<u64>,
     snapshot_rename_buffer: String,
     pending_snapshot_load: Option<u64>,
-    show_new_confirmation: bool,
-    new_after_save: bool,
-    show_close_confirmation: bool,
-    close_after_save: bool,
+    pending_transition: Option<ProjectTransition>,
+    transition_after_save: Option<ProjectTransition>,
     allow_close_once: bool,
+    project_session_id: u64,
     history: history::AdjustmentHistory,
     history_clear_backup: Option<(Option<u64>, history::AdjustmentHistory)>,
     history_pending_label: Option<String>,
@@ -362,11 +364,10 @@ impl ShadeApp {
             snapshot_rename_id: None,
             snapshot_rename_buffer: String::new(),
             pending_snapshot_load: None,
-            show_new_confirmation: false,
-            new_after_save: false,
-            show_close_confirmation: false,
-            close_after_save: false,
+            pending_transition: None,
+            transition_after_save: None,
             allow_close_once: false,
+            project_session_id: 1,
             history,
             history_clear_backup: None,
             history_pending_label: None,
@@ -400,18 +401,71 @@ impl ShadeApp {
     }
 
     fn new_project(&mut self) {
+        self.request_project_transition(ProjectTransition::New, None);
+    }
+
+    fn request_project_transition(
+        &mut self,
+        transition: ProjectTransition,
+        ctx: Option<&egui::Context>,
+    ) {
         if self.job.is_some() {
+            self.report_info("Finish the current operation before changing projects.");
             return;
         }
-        if should_confirm_new_project(
+        if self.export_queue.has_pending() {
+            self.show_export_queue = true;
+            self.report_info(
+                "Finish or cancel the Export Queue before changing projects or exiting.",
+            );
+            return;
+        }
+        if project_lifecycle::requires_save_confirmation(
             self.project_dirty,
             !self.faces.is_empty(),
             self.project_path.is_some(),
         ) {
-            self.show_new_confirmation = true;
+            self.pending_transition = Some(transition);
             return;
         }
-        self.reset_to_new_project();
+        self.execute_project_transition(transition, ctx);
+    }
+
+    fn execute_project_transition(
+        &mut self,
+        transition: ProjectTransition,
+        ctx: Option<&egui::Context>,
+    ) {
+        match transition {
+            ProjectTransition::New => self.reset_to_new_project(),
+            ProjectTransition::Open(path) => {
+                self.show_previous_shades = false;
+                self.open_project_path(path);
+            }
+            ProjectTransition::Exit => {
+                if let Some(ctx) = ctx {
+                    self.allow_close_once = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    self.pending_transition = Some(ProjectTransition::Exit);
+                }
+            }
+            ProjectTransition::Recover => self.recover_project_now(),
+        }
+    }
+
+    fn complete_transition_after_save(&mut self, ctx: &egui::Context) {
+        if self.job.is_some() || self.project_dirty {
+            return;
+        }
+        let Some(transition) = self.transition_after_save.take() else {
+            return;
+        };
+        self.execute_project_transition(transition, Some(ctx));
+    }
+
+    fn bump_project_session(&mut self) {
+        self.project_session_id = self.project_session_id.wrapping_add(1).max(1);
     }
 
     fn reset_to_new_project(&mut self) {
@@ -429,10 +483,8 @@ impl ShadeApp {
         self.snapshot_rename_id = None;
         self.snapshot_rename_buffer.clear();
         self.pending_snapshot_load = None;
-        self.show_new_confirmation = false;
-        self.new_after_save = false;
-        self.show_close_confirmation = false;
-        self.close_after_save = false;
+        self.pending_transition = None;
+        self.transition_after_save = None;
         self.show_color_management = false;
         self.icc_profile_query.clear();
         self.icc_profile_selected = None;
@@ -442,6 +494,7 @@ impl ShadeApp {
         self.history_clear_backup = None;
         self.history_pending_label = None;
         self.history_pending_at = None;
+        self.bump_project_session();
         self.report_info("New shade project");
     }
 
@@ -591,7 +644,7 @@ impl ShadeApp {
         else {
             return;
         };
-        self.open_project_path(path);
+        self.request_project_transition(ProjectTransition::Open(path), None);
     }
 
     fn open_project_path(&mut self, path: PathBuf) {
@@ -773,6 +826,25 @@ impl ShadeApp {
             && (self.project_dirty || self.project_path.is_none())
     }
 
+    fn enqueue_export(&mut self, spec: export_queue::ExportQueueSpec) -> bool {
+        let protected_sources = self
+            .faces
+            .iter()
+            .map(|face| face.path.clone())
+            .collect::<Vec<_>>();
+        match self.export_queue.enqueue_for_project(
+            spec,
+            protected_sources,
+            self.project_session_id,
+        ) {
+            Ok(_) => true,
+            Err(err) => {
+                self.report_error(err);
+                false
+            }
+        }
+    }
+
     fn export_current_dialog(&mut self) {
         if self.job.is_some() {
             return;
@@ -812,7 +884,7 @@ impl ShadeApp {
             .unwrap_or("Working")
             .to_owned();
         self.remind_after_export = self.snapshot_project_needs_save_reminder();
-        self.export_queue.enqueue(export_queue::ExportQueueSpec {
+        if !self.enqueue_export(export_queue::ExportQueueSpec {
             label: format!("{face_name} / {state_name}"),
             source,
             destination,
@@ -820,8 +892,11 @@ impl ShadeApp {
             default_dpi: self.settings.default_dpi,
             force_lzw: self.settings.lzw_compression,
             validate_after_export: self.settings.validate_after_export,
+            conflict_policy: export_batch::ConflictPolicy::Overwrite,
             mark: None,
-        });
+        }) {
+            return;
+        }
         self.show_export_queue = true;
         self.report_info("Export added to queue");
     }
@@ -835,6 +910,13 @@ impl ShadeApp {
         let mut completed = 0usize;
         let mut errors = Vec::new();
         for completion in completions {
+            if completion.project_session_id != self.project_session_id {
+                self.log.info(&format!(
+                    "Ignored queue completion #{} from previous project session {}",
+                    completion.id, completion.project_session_id
+                ));
+                continue;
+            }
             if let Some(mark) = completion.mark {
                 self.project.record_snapshot_export(
                     mark.snapshot_id,
@@ -1208,7 +1290,7 @@ impl ShadeApp {
         let mut project = self.project.clone();
         project.test_code.enabled = self.settings.export_all_test_code;
         let date = Local::now().format("%Y-%m-%d").to_string();
-        let mut reserved = BTreeSet::new();
+        let mut reserved = self.export_queue.reserved_destination_keys();
         let mut queued = 0usize;
         let mut skipped = 0usize;
 
@@ -1254,7 +1336,7 @@ impl ShadeApp {
                     continue;
                 }
             };
-            self.export_queue.enqueue(export_queue::ExportQueueSpec {
+            if !self.enqueue_export(export_queue::ExportQueueSpec {
                 label: format!("{face_name} / {snapshot_code}"),
                 source: source.clone(),
                 destination,
@@ -1262,8 +1344,11 @@ impl ShadeApp {
                 default_dpi: self.settings.default_dpi,
                 force_lzw: self.settings.lzw_compression,
                 validate_after_export: self.settings.validate_after_export,
+                conflict_policy,
                 mark: None,
-            });
+            }) {
+                return;
+            }
             queued += 1;
         }
 
@@ -1531,7 +1616,7 @@ impl ShadeApp {
         project.adjustments = snapshot.adjustments.clone();
         project.active_snapshot_id = Some(snapshot.id);
         self.remind_after_export = self.snapshot_project_needs_save_reminder();
-        self.export_queue.enqueue(export_queue::ExportQueueSpec {
+        if !self.enqueue_export(export_queue::ExportQueueSpec {
             label: format!("Face {} / {}", self.current_face + 1, snapshot.name),
             source,
             destination,
@@ -1539,12 +1624,15 @@ impl ShadeApp {
             default_dpi: self.settings.default_dpi,
             force_lzw: self.settings.lzw_compression,
             validate_after_export: self.settings.validate_after_export,
+            conflict_policy: export_batch::ConflictPolicy::Overwrite,
             mark: Some(export_queue::ExportQueueMark {
                 snapshot_id,
                 face_key,
                 folder,
             }),
-        });
+        }) {
+            return;
+        }
         self.show_export_queue = true;
         self.report_info("Snapshot export added to queue");
     }
@@ -1599,7 +1687,8 @@ impl ShadeApp {
             .map(|value| value.to_string_lossy().into_owned());
         let project_name = self.project.name.clone();
         let date = Local::now().format("%Y-%m-%d").to_string();
-        let mut reserved = BTreeSet::new();
+        let mut reserved = self.export_queue.reserved_destination_keys();
+        let conflict_policy = self.settings.export_all_conflict_policy;
         let mut queued = 0usize;
         let mut skipped = 0usize;
 
@@ -1643,7 +1732,7 @@ impl ShadeApp {
                     continue;
                 }
             };
-            self.export_queue.enqueue(export_queue::ExportQueueSpec {
+            if !self.enqueue_export(export_queue::ExportQueueSpec {
                 label: format!("{face_name} / {}", snapshot.name),
                 source: source.clone(),
                 destination,
@@ -1651,12 +1740,15 @@ impl ShadeApp {
                 default_dpi: self.settings.default_dpi,
                 force_lzw: self.settings.lzw_compression,
                 validate_after_export: self.settings.validate_after_export,
+                conflict_policy,
                 mark: Some(export_queue::ExportQueueMark {
                     snapshot_id: snapshot.id,
                     face_key: face_key.clone(),
                     folder,
                 }),
-            });
+            }) {
+                return;
+            }
             queued += 1;
         }
 
@@ -1794,6 +1886,7 @@ impl ShadeApp {
             JobResult::Open(result) => match result {
                 Ok(payload) => {
                     self.project = payload.project;
+                    self.bump_project_session();
                     self.snapshot_rename_id = None;
                     self.snapshot_rename_buffer.clear();
                     self.project_path = Some(payload.path.clone());
@@ -1833,6 +1926,7 @@ impl ShadeApp {
             JobResult::Recover(result) => match result {
                 Ok(payload) => {
                     self.project = payload.project;
+                    self.bump_project_session();
                     self.project_path = payload.origin_path;
                     self.faces = payload
                         .faces
@@ -1863,8 +1957,6 @@ impl ShadeApp {
             },
             JobResult::Save { path, result } => match result {
                 Ok(()) => {
-                    let create_new_after_save = self.new_after_save;
-                    self.new_after_save = false;
                     self.project.name = project_name_for_path(&self.project.name, &path);
                     self.project_path = Some(path.clone());
                     self.project_dirty = false;
@@ -1875,16 +1967,11 @@ impl ShadeApp {
                         self.log.error(&err);
                     }
                     self.report_info(format!("Saved {}", path.display()));
-                    if create_new_after_save {
-                        self.reset_to_new_project();
-                    }
                 }
                 Err(err) => {
-                    if self.new_after_save {
-                        self.new_after_save = false;
-                        self.show_new_confirmation = true;
+                    if let Some(transition) = self.transition_after_save.take() {
+                        self.pending_transition = Some(transition);
                     }
-                    self.close_after_save = false;
                     self.report_error(err);
                 }
             },
@@ -2478,13 +2565,13 @@ impl ShadeApp {
         }
     }
 
-    fn ui_new_project_confirmation(&mut self, ctx: &egui::Context) {
-        if !self.show_new_confirmation {
+    fn ui_project_transition_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(transition) = self.pending_transition.clone() else {
             return;
-        }
-
-        let mut save_and_new = false;
-        let mut discard_and_new = false;
+        };
+        let action = transition.action_label();
+        let mut save_and_continue = false;
+        let mut discard_and_continue = false;
         let mut cancel = false;
         egui::Window::new("Save current project?")
             .collapsible(false)
@@ -2496,40 +2583,44 @@ impl ShadeApp {
                 } else {
                     ui.strong("The current project has not been saved yet.");
                 }
-                ui.label("Creating a new project will remove the current Faces, Snapshots and adjustment state from the editor.");
-                ui.label("Save the current .shade project before continuing?");
-                if self.job.is_some() {
-                    ui.small("Wait for the current operation to finish before saving.");
-                }
+                ui.label(format!(
+                    "Shade Editor is about to {}. Save the current .shade project first?",
+                    transition.verb()
+                ));
+                ui.label("Faces, Snapshots and adjustment state remain untouched unless Save succeeds or Discard is explicit.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    save_and_new = ui
+                    save_and_continue = ui
                         .add_enabled(
                             self.job.is_none() && !self.faces.is_empty(),
-                            egui::Button::new("Save and create new"),
+                            egui::Button::new(format!("Save and {action}")),
                         )
                         .clicked();
-                    discard_and_new = ui.button("Discard and create new").clicked();
+                    discard_and_continue = ui
+                        .button(format!("Discard and {action}"))
+                        .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
 
         if cancel {
-            self.show_new_confirmation = false;
-            self.new_after_save = false;
-        } else if discard_and_new {
-            self.show_new_confirmation = false;
-            self.new_after_save = false;
-            if let Err(err) = recovery::clear() {
-                self.log.error(&err);
+            self.pending_transition = None;
+            self.transition_after_save = None;
+        } else if discard_and_continue {
+            self.pending_transition = None;
+            self.transition_after_save = None;
+            if !matches!(transition, ProjectTransition::Recover) {
+                if let Err(err) = recovery::clear() {
+                    self.log.error(&err);
+                }
             }
-            self.reset_to_new_project();
-        } else if save_and_new {
-            self.new_after_save = true;
-            if self.save_project(false) {
-                self.show_new_confirmation = false;
-            } else {
-                self.new_after_save = false;
+            self.execute_project_transition(transition, Some(ctx));
+        } else if save_and_continue {
+            self.pending_transition = None;
+            self.transition_after_save = Some(transition.clone());
+            if !self.save_project(false) {
+                self.transition_after_save = None;
+                self.pending_transition = Some(transition);
             }
         }
     }
@@ -2542,54 +2633,8 @@ impl ShadeApp {
             self.allow_close_once = false;
             return;
         }
-        if self.project_dirty {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.show_close_confirmation = true;
-        }
-    }
-
-    fn ui_close_confirmation(&mut self, ctx: &egui::Context) {
-        if !self.show_close_confirmation {
-            return;
-        }
-        let mut save_and_exit = false;
-        let mut discard_and_exit = false;
-        let mut stay = false;
-        egui::Window::new("Unsaved project changes")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label("This .shade project has changes that have not been saved.");
-                if self.job.is_some() {
-                    ui.small("Wait for the current operation to finish before saving.");
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    save_and_exit = ui
-                        .add_enabled(
-                            self.job.is_none() && !self.faces.is_empty(),
-                            egui::Button::new("Save and exit"),
-                        )
-                        .clicked();
-                    discard_and_exit = ui.button("Discard and exit").clicked();
-                    stay = ui.button("Stay").clicked();
-                });
-            });
-
-        if stay {
-            self.show_close_confirmation = false;
-        } else if discard_and_exit {
-            self.show_close_confirmation = false;
-            if let Err(err) = recovery::clear() {
-                self.log.error(&err);
-            }
-            self.allow_close_once = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if save_and_exit && self.save_project(false) {
-            self.show_close_confirmation = false;
-            self.close_after_save = true;
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.request_project_transition(ProjectTransition::Exit, Some(ctx));
     }
 
     fn sync_history_to_active_snapshot(&mut self) -> bool {
@@ -2841,6 +2886,10 @@ impl ShadeApp {
     }
 
     fn recover_project(&mut self) {
+        self.request_project_transition(ProjectTransition::Recover, None);
+    }
+
+    fn recover_project_now(&mut self) {
         if self.job.is_some() {
             return;
         }
@@ -4655,8 +4704,7 @@ impl ShadeApp {
             }
         }
         if let Some(path) = requested_open {
-            self.show_previous_shades = false;
-            self.open_project_path(PathBuf::from(path));
+            self.request_project_transition(ProjectTransition::Open(PathBuf::from(path)), None);
         }
     }
 
@@ -5514,6 +5562,7 @@ impl eframe::App for ShadeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(Duration::from_millis(100));
         self.poll_job();
+        self.complete_transition_after_save(ui.ctx());
         self.poll_export_queue();
         self.poll_render(ui.ctx());
         self.sync_update_state();
@@ -5528,11 +5577,6 @@ impl eframe::App for ShadeApp {
         });
         self.maybe_autosave();
         self.handle_close_request(ui.ctx());
-        if self.close_after_save && self.job.is_none() && !self.project_dirty {
-            self.close_after_save = false;
-            self.allow_close_once = true;
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        }
 
         egui::Panel::top("toolbar").show(ui, |ui| self.ui_toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.ui_status(ui));
@@ -5569,37 +5613,10 @@ impl eframe::App for ShadeApp {
         self.ui_recovery_window(ui.ctx());
         self.ui_snapshot_discard_confirmation(ui.ctx());
         self.ui_snapshot_save_reminder(ui.ctx());
-        self.ui_new_project_confirmation(ui.ctx());
-        self.ui_close_confirmation(ui.ctx());
+        self.ui_project_transition_confirmation(ui.ctx());
         self.commit_pending_history(ui.ctx(), false);
 
         self.start_render_if_needed(ui.ctx());
-    }
-}
-
-fn should_confirm_new_project(project_dirty: bool, has_faces: bool, has_saved_path: bool) -> bool {
-    project_dirty || (has_faces && !has_saved_path)
-}
-
-#[cfg(test)]
-mod new_project_guard_tests {
-    use super::should_confirm_new_project;
-
-    #[test]
-    fn dirty_project_always_requires_confirmation() {
-        assert!(should_confirm_new_project(true, true, true));
-        assert!(should_confirm_new_project(true, false, true));
-    }
-
-    #[test]
-    fn unsaved_project_with_faces_requires_confirmation_even_if_clean_flag_is_false() {
-        assert!(should_confirm_new_project(false, true, false));
-    }
-
-    #[test]
-    fn clean_saved_or_empty_project_can_be_replaced_without_prompt() {
-        assert!(!should_confirm_new_project(false, true, true));
-        assert!(!should_confirm_new_project(false, false, false));
     }
 }
 

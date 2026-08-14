@@ -334,10 +334,9 @@ impl ExportQueue {
         let id = self.items[index].id;
         let session_id = queued.project_session_id;
 
-        if let Err(err) = validate_destination(
-            &queued.export.destination,
-            &queued.protected_sources,
-        ) {
+        if let Err(err) =
+            validate_destination(&queued.export.destination, &queued.protected_sources)
+        {
             self.items[index].status = ExportQueueStatus::Processing;
             self.active_id = Some(id);
             let tx = self.tx.clone();
@@ -396,12 +395,14 @@ impl ExportQueue {
                         })
                         .map(|(_, item)| path_safety::path_key(&item.destination))
                         .collect::<BTreeSet<_>>();
-                    if let DestinationDecision::Write(path) = export_batch::resolve_destination_reserved(
-                        folder,
-                        &filename,
-                        ConflictPolicy::AutoNumber,
-                        &mut reserved,
-                    ) {
+                    if let DestinationDecision::Write(path) =
+                        export_batch::resolve_destination_reserved(
+                            folder,
+                            &filename,
+                            ConflictPolicy::AutoNumber,
+                            &mut reserved,
+                        )
+                    {
                         queued.export.destination = path.clone();
                         self.items[index].destination = path;
                         self.items[index].spec = queued.clone();
@@ -410,10 +411,9 @@ impl ExportQueue {
             }
         }
 
-        if let Err(err) = validate_destination(
-            &queued.export.destination,
-            &queued.protected_sources,
-        ) {
+        if let Err(err) =
+            validate_destination(&queued.export.destination, &queued.protected_sources)
+        {
             self.items[index].status = ExportQueueStatus::Processing;
             self.active_id = Some(id);
             let tx = self.tx.clone();
