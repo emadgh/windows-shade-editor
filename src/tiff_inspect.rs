@@ -82,10 +82,7 @@ pub fn inspect(path: &Path, default_dpi: f64) -> Result<TiffInspection, String> 
         "PlanarConfiguration: {}",
         planar_label(stream.planar_configuration)
     );
-    line!(
-        "Compression: {}",
-        compression_label(metadata.compression)
-    );
+    line!("Compression: {}", compression_label(metadata.compression));
     line!("Predictor: {}", predictor_label(metadata.predictor));
     line!("SamplesPerPixel: {}", metadata.samples_per_pixel);
     line!("Base color model: {}", metadata.color_model.title());

@@ -15,6 +15,7 @@ mod color_management;
 mod dpi;
 mod export;
 mod export_batch;
+mod export_queue;
 mod history;
 mod model;
 mod palette;
@@ -24,12 +25,13 @@ mod render;
 mod safe_fs;
 mod settings;
 mod thumbnail;
+mod tiff_inspect;
 mod tiff_io;
 mod update;
 mod validation;
 mod workflow;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -113,6 +115,8 @@ struct RuntimeFace {
     color_status: PreviewColorStatus,
     texture: Option<egui::TextureHandle>,
     original_texture: Option<egui::TextureHandle>,
+    embedded_original_texture: Option<egui::TextureHandle>,
+    embedded_original_status: PreviewColorStatus,
     generation: u64,
     rendered_generation: u64,
 }
@@ -193,6 +197,8 @@ struct RenderResult {
     color_status: PreviewColorStatus,
     rgba: Vec<u8>,
     original_rgba: Vec<u8>,
+    embedded_original_rgba: Option<Vec<u8>>,
+    embedded_original_status: Option<PreviewColorStatus>,
 }
 
 struct ErrorToast {
@@ -236,6 +242,12 @@ struct ShadeApp {
     previous_shade_list_texture_lru: VecDeque<String>,
     show_export_all: bool,
     export_all_folder: String,
+    show_export_queue: bool,
+    export_queue: export_queue::ExportQueue,
+    export_queue_open_folder_after: Option<PathBuf>,
+    show_tiff_inspector: bool,
+    tiff_inspection: Option<tiff_inspect::TiffInspection>,
+    tiff_inspect_error: Option<String>,
     remind_after_export: bool,
     show_snapshot_save_reminder: bool,
     log: app_log::AppLog,
@@ -331,6 +343,12 @@ impl ShadeApp {
             previous_shade_list_texture_lru: VecDeque::new(),
             show_export_all: false,
             export_all_folder: String::new(),
+            show_export_queue: false,
+            export_queue: export_queue::ExportQueue::new(),
+            export_queue_open_folder_after: None,
+            show_tiff_inspector: false,
+            tiff_inspection: None,
+            tiff_inspect_error: None,
             remind_after_export: false,
             show_snapshot_save_reminder: false,
             log,
@@ -420,6 +438,8 @@ impl ShadeApp {
             color_status: PreviewColorStatus::Pending,
             texture: None,
             original_texture: None,
+            embedded_original_texture: None,
+            embedded_original_status: PreviewColorStatus::Pending,
             generation: 1,
             rendered_generation: 0,
         }
@@ -761,50 +781,290 @@ impl ShadeApp {
             return;
         };
         let source = face.path.clone();
-        let project = self.project.clone();
-        let default_dpi = self.settings.default_dpi;
-        let force_lzw = self.settings.lzw_compression;
-        let validate_after_export = self.settings.validate_after_export;
+        let face_name = self
+            .project
+            .faces
+            .get(self.current_face)
+            .map(|face| face.label.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| stem.to_string());
+        let state_name = self
+            .project
+            .active_snapshot_name()
+            .unwrap_or("Working")
+            .to_owned();
         self.remind_after_export = self.snapshot_project_needs_save_reminder();
-        self.launch_job("Exporting TIFF", move |progress| {
-            let result = export::export_face_with_progress_options(
-                &source,
-                &destination,
-                &project,
-                default_dpi,
-                export::ExportOptions { force_lzw },
-                |fraction, detail| {
-                    let fraction = if validate_after_export {
-                        fraction * 0.88
-                    } else {
-                        fraction
-                    };
-                    Self::set_progress(&progress, Some(fraction), "Exporting TIFF", detail);
-                },
-            )
-            .and_then(|_| {
-                if validate_after_export {
-                    Self::set_progress(
-                        &progress,
-                        Some(0.92),
-                        "Validating exported TIFF",
-                        "Decoding strips and checking production metadata",
-                    );
-                    let verified = validation::validate_export_transport_with_options(
-                        &source,
-                        &destination,
-                        force_lzw,
-                    )?;
-                    Ok(format!("Exported {} · {verified}", destination.display()))
+        self.export_queue.enqueue(export_queue::ExportQueueSpec {
+            label: format!("{face_name} / {state_name}"),
+            source,
+            destination,
+            project: self.project.clone(),
+            default_dpi: self.settings.default_dpi,
+            force_lzw: self.settings.lzw_compression,
+            validate_after_export: self.settings.validate_after_export,
+            mark: None,
+        });
+        self.show_export_queue = true;
+        self.report_info("Export added to queue");
+    }
+
+    fn poll_export_queue(&mut self) {
+        let completions = self.export_queue.poll();
+        if completions.is_empty() {
+            return;
+        }
+
+        let mut completed = 0usize;
+        let mut errors = Vec::new();
+        for completion in completions {
+            if let Some(mark) = completion.mark {
+                self.project.record_snapshot_export(
+                    mark.snapshot_id,
+                    mark.face_key,
+                    mark.folder.to_string_lossy().into_owned(),
+                    unix_ms_now(),
+                );
+                self.project_dirty = true;
+            }
+            match completion.result {
+                Ok(_) => completed += 1,
+                Err(err) => errors.push(format!("Queue item #{}: {err}", completion.id)),
+            }
+        }
+
+        if errors.is_empty() {
+            self.report_info(format!("Export queue completed {completed} item(s)"));
+        } else {
+            self.report_error(errors.join(" | "));
+        }
+
+        if !self.export_queue.has_pending() {
+            if self.remind_after_export {
+                self.show_snapshot_save_reminder = true;
+            }
+            self.remind_after_export = false;
+            if let Some(folder) = self.export_queue_open_folder_after.take() {
+                if let Err(err) = open_folder(&folder) {
+                    self.report_error(err);
+                }
+            }
+        }
+    }
+
+    fn ui_export_queue_window(&mut self, ctx: &egui::Context) {
+        if !self.show_export_queue {
+            return;
+        }
+        let mut open = self.show_export_queue;
+        let rows = self
+            .export_queue
+            .items()
+            .iter()
+            .map(|item| {
+                (
+                    item.id,
+                    item.label.clone(),
+                    item.destination.clone(),
+                    item.status,
+                    item.progress,
+                    item.detail.clone(),
+                    item.error.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let pending = self.export_queue.pending_count();
+        let mut cancel_id = None;
+        let mut retry_id = None;
+        let mut cancel_waiting = false;
+        let mut clear_finished = false;
+
+        egui::Window::new("Export Queue")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([760.0, 520.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Export Queue");
+                    ui.label(format!("{pending} pending"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        clear_finished = ui.button("Clear finished").clicked();
+                        cancel_waiting = ui.button("Cancel waiting").clicked();
+                    });
+                });
+                ui.small("Processing items finish their current atomic TIFF write safely. Cancel on a Processing item stops the queue after that file is safely committed.");
+                ui.separator();
+
+                if rows.is_empty() {
+                    ui.label("No export jobs yet.");
                 } else {
-                    Ok(format!("Exported {}", destination.display()))
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (id, label, destination, status, progress, detail, error) in &rows {
+                            egui::Frame::new()
+                                .inner_margin(8)
+                                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                                .corner_radius(5)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.strong(label);
+                                        ui.label(status.label());
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            match status {
+                                                export_queue::ExportQueueStatus::Waiting
+                                                | export_queue::ExportQueueStatus::Processing => {
+                                                    if ui.small_button("Cancel").clicked() {
+                                                        cancel_id = Some(*id);
+                                                    }
+                                                }
+                                                export_queue::ExportQueueStatus::Failed
+                                                | export_queue::ExportQueueStatus::Cancelled => {
+                                                    if ui.small_button("Retry").clicked() {
+                                                        retry_id = Some(*id);
+                                                    }
+                                                }
+                                                export_queue::ExportQueueStatus::Done => {}
+                                            }
+                                        });
+                                    });
+                                    if matches!(
+                                        status,
+                                        export_queue::ExportQueueStatus::Waiting
+                                            | export_queue::ExportQueueStatus::Processing
+                                    ) {
+                                        ui.add(
+                                            egui::ProgressBar::new(*progress)
+                                                .desired_width(f32::INFINITY)
+                                                .text(if detail.trim().is_empty() {
+                                                    status.label().to_owned()
+                                                } else {
+                                                    detail.clone()
+                                                }),
+                                        );
+                                    } else if !detail.trim().is_empty() {
+                                        ui.small(detail);
+                                    }
+                                    ui.small(destination.display().to_string());
+                                    if let Some(error) = error {
+                                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                                    }
+                                });
+                            ui.add_space(5.0);
+                        }
+                    });
                 }
             });
-            JobResult::Export(SnapshotExportBatchResult {
-                result,
-                marks: Vec::new(),
-            })
-        });
+
+        self.show_export_queue = open;
+        if let Some(id) = cancel_id {
+            self.export_queue.cancel(id);
+        }
+        if let Some(id) = retry_id {
+            self.export_queue.retry(id);
+            self.show_export_queue = true;
+        }
+        if cancel_waiting {
+            self.export_queue.cancel_all_waiting();
+        }
+        if clear_finished {
+            self.export_queue.clear_finished();
+        }
+    }
+
+    fn inspect_tiff_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("TIFF image", &["tif", "tiff"]);
+        if let Some(parent) = self
+            .faces
+            .get(self.current_face)
+            .and_then(|face| face.path.parent())
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        match tiff_inspect::inspect(&path, self.settings.default_dpi) {
+            Ok(report) => {
+                self.tiff_inspection = Some(report);
+                self.tiff_inspect_error = None;
+            }
+            Err(err) => {
+                self.tiff_inspection = None;
+                self.tiff_inspect_error = Some(err);
+            }
+        }
+        self.show_tiff_inspector = true;
+    }
+
+    fn ui_tiff_inspector_window(&mut self, ctx: &egui::Context) {
+        if !self.show_tiff_inspector {
+            return;
+        }
+        let mut open = self.show_tiff_inspector;
+        let report = self
+            .tiff_inspection
+            .as_ref()
+            .map(|item| item.report.clone());
+        let path = self.tiff_inspection.as_ref().map(|item| item.path.clone());
+        let error = self.tiff_inspect_error.clone();
+        let mut copy_report = false;
+        let mut reveal = false;
+        let mut display_report = report.clone().unwrap_or_default();
+
+        egui::Window::new("Inspect TIFF")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([820.0, 680.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("TIFF Production Diagnostics");
+                    if ui
+                        .add_enabled(report.is_some(), egui::Button::new("Copy report"))
+                        .clicked()
+                    {
+                        copy_report = true;
+                    }
+                    if ui
+                        .add_enabled(path.is_some(), egui::Button::new("Reveal TIFF"))
+                        .clicked()
+                    {
+                        reveal = true;
+                    }
+                });
+                if let Some(path) = path.as_ref() {
+                    ui.small(path.display().to_string());
+                }
+                if let Some(error) = error.as_ref() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+                if report.is_some() {
+                    ui.separator();
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut display_report)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(34)
+                                    .interactive(false),
+                            );
+                        });
+                }
+            });
+
+        self.show_tiff_inspector = open;
+        if copy_report {
+            if let Some(report) = report {
+                ctx.copy_text(report);
+                self.report_info("TIFF inspection report copied");
+            }
+        }
+        if reveal {
+            if let Some(path) = path {
+                if let Err(err) = reveal_in_explorer(&path) {
+                    self.report_error(err);
+                }
+            }
+        }
     }
 
     fn validate_current_face_dialog(&mut self) {
@@ -888,15 +1148,15 @@ impl ShadeApp {
         if self.job.is_some() || self.faces.is_empty() {
             return;
         }
-        let folder = PathBuf::from(self.export_all_folder.trim());
+        let base_folder = PathBuf::from(self.export_all_folder.trim());
         if self.export_all_folder.trim().is_empty() {
             self.report_error("Choose an Export All folder first.");
             return;
         }
-        if let Err(err) = std::fs::create_dir_all(&folder) {
+        if let Err(err) = std::fs::create_dir_all(&base_folder) {
             self.report_error(format!(
                 "Cannot create Export All folder {}: {err}",
-                folder.display()
+                base_folder.display()
             ));
             return;
         }
@@ -924,110 +1184,89 @@ impl ShadeApp {
         let project_name = self.project.name.clone();
         let snapshot_code = self.project.effective_test_code_text();
         let template = self.settings.export_all_template.clone();
+        let folder_template = self.settings.export_folder_template.clone();
         let conflict_policy = self.settings.export_all_conflict_policy;
         let open_after = self.settings.export_all_open_folder;
         let mut project = self.project.clone();
         project.test_code.enabled = self.settings.export_all_test_code;
-        let default_dpi = self.settings.default_dpi;
-        let force_lzw = self.settings.lzw_compression;
-        let validate_after_export = self.settings.validate_after_export;
-        self.remind_after_export = self.snapshot_project_needs_save_reminder();
-        self.show_export_all = false;
-        let _ = self.settings.save();
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        let mut reserved = BTreeSet::new();
+        let mut queued = 0usize;
+        let mut skipped = 0usize;
 
-        self.launch_job("Exporting faces", move |progress| {
-            let total = sources.len().max(1);
-            let result = (|| -> Result<String, String> {
-                let mut written = 0usize;
-                let mut skipped = 0usize;
-                for (index, source) in sources.iter().enumerate() {
-                    let face_name = face_names
-                        .get(index)
-                        .map(String::as_str)
-                        .filter(|name| !name.trim().is_empty())
-                        .or_else(|| source.file_stem().and_then(|value| value.to_str()))
-                        .unwrap_or("face");
-                    let filename = export_batch::render_export_filename(
-                        &template,
-                        &export_batch::ExportNameContext {
-                            shade_name: shade_name.as_deref(),
-                            project_name: &project_name,
-                            snapshot_code: &snapshot_code,
-                            face_number: index + 1,
-                            face_name,
-                            source_name: "source",
-                            date: "",
-                        },
-                    );
-                    let destination = match export_batch::resolve_destination(
-                        &folder,
-                        &filename,
-                        conflict_policy,
-                    ) {
-                        export_batch::DestinationDecision::Write(path) => path,
-                        export_batch::DestinationDecision::Skip(path) => {
-                            skipped += 1;
-                            Self::set_progress(
-                                &progress,
-                                Some((index + 1) as f32 / total as f32),
-                                "Exporting faces",
-                                &format!(
-                                    "Skipped existing {}",
-                                    path.file_name()
-                                        .map(|value| value.to_string_lossy())
-                                        .unwrap_or_default()
-                                ),
-                            );
-                            continue;
-                        }
-                    };
-                    export::export_face_with_progress_options(
-                        source,
-                        &destination,
-                        &project,
-                        default_dpi,
-                        export::ExportOptions { force_lzw },
-                        |phase, detail| {
-                            let inner = if validate_after_export {
-                                phase * 0.88
-                            } else {
-                                phase
-                            };
-                            let overall = (index as f32 + inner) / total as f32;
-                            Self::set_progress(&progress, Some(overall), "Exporting faces", detail);
-                        },
-                    )?;
-                    if validate_after_export {
-                        let overall = (index as f32 + 0.92) / total as f32;
-                        Self::set_progress(
-                            &progress,
-                            Some(overall),
-                            "Validating exported TIFF",
-                            &destination.display().to_string(),
-                        );
-                        validation::validate_export_transport_with_options(
-                            source,
-                            &destination,
-                            force_lzw,
-                        )?;
-                    }
-                    written += 1;
+        for (index, source) in sources.iter().enumerate() {
+            let face_name = face_names
+                .get(index)
+                .map(String::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .or_else(|| source.file_stem().and_then(|value| value.to_str()))
+                .unwrap_or("face");
+            let source_name = source
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or(face_name);
+            let context = export_batch::ExportNameContext {
+                shade_name: shade_name.as_deref(),
+                project_name: &project_name,
+                snapshot_code: &snapshot_code,
+                face_number: index + 1,
+                face_name,
+                source_name,
+                date: &date,
+            };
+            let folder =
+                export_batch::render_export_folder(&base_folder, &folder_template, &context);
+            if let Err(err) = std::fs::create_dir_all(&folder) {
+                self.report_error(format!(
+                    "Cannot create export folder {}: {err}",
+                    folder.display()
+                ));
+                return;
+            }
+            let filename = export_batch::render_export_filename(&template, &context);
+            let destination = match export_batch::resolve_destination_reserved(
+                &folder,
+                &filename,
+                conflict_policy,
+                &mut reserved,
+            ) {
+                export_batch::DestinationDecision::Write(path) => path,
+                export_batch::DestinationDecision::Skip(_) => {
+                    skipped += 1;
+                    continue;
                 }
-                Self::set_progress(&progress, Some(1.0), "Exporting faces", "Complete");
-                if open_after {
-                    let _ = open_folder(&folder);
-                }
-                Ok(if skipped > 0 {
-                    format!("Exported {written} face(s) · skipped {skipped} existing file(s)")
-                } else {
-                    format!("Exported {written} face(s)")
-                })
-            })();
-            JobResult::Export(SnapshotExportBatchResult {
-                result,
-                marks: Vec::new(),
-            })
-        });
+            };
+            self.export_queue.enqueue(export_queue::ExportQueueSpec {
+                label: format!("{face_name} / {snapshot_code}"),
+                source: source.clone(),
+                destination,
+                project: project.clone(),
+                default_dpi: self.settings.default_dpi,
+                force_lzw: self.settings.lzw_compression,
+                validate_after_export: self.settings.validate_after_export,
+                mark: None,
+            });
+            queued += 1;
+        }
+
+        self.show_export_all = false;
+        self.show_export_queue = queued > 0;
+        self.remind_after_export = queued > 0 && self.snapshot_project_needs_save_reminder();
+        if open_after && queued > 0 {
+            self.export_queue_open_folder_after = Some(base_folder.clone());
+        }
+        let _ = self.settings.save();
+        if queued > 0 {
+            self.report_info(if skipped > 0 {
+                format!("Queued {queued} export(s) · skipped {skipped} existing file(s)")
+            } else {
+                format!("Queued {queued} export(s)")
+            });
+        } else if skipped > 0 {
+            self.report_info(format!(
+                "No exports queued · skipped {skipped} existing file(s)"
+            ));
+        }
     }
 
     fn ui_export_all_window(&mut self, ctx: &egui::Context) {
@@ -1047,6 +1286,16 @@ impl ShadeApp {
             .and_then(|path| path.file_stem())
             .map(|value| value.to_string_lossy().into_owned());
         let snapshot_code = self.project.effective_test_code_text();
+        let first_source = self
+            .faces
+            .first()
+            .map(|face| face.path.clone())
+            .unwrap_or_else(|| PathBuf::from("source.tif"));
+        let source_name = first_source
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("source")
+            .to_owned();
         let face_name = self
             .project
             .faces
@@ -1054,35 +1303,43 @@ impl ShadeApp {
             .map(|face| face.label.as_str())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or("face");
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let preview_context = export_batch::ExportNameContext {
+            shade_name: shade_name.as_deref(),
+            project_name: &self.project.name,
+            snapshot_code: &snapshot_code,
+            face_number: 1,
+            face_name,
+            source_name: &source_name,
+            date: &today,
+        };
         let preview_name = export_batch::render_export_filename(
             &self.settings.export_all_template,
-            &export_batch::ExportNameContext {
-                shade_name: shade_name.as_deref(),
-                project_name: &self.project.name,
-                snapshot_code: &snapshot_code,
-                face_number: 1,
-                face_name,
-                source_name: "source",
-                date: "",
-            },
+            &preview_context,
+        );
+        let preview_folder = export_batch::render_export_folder(
+            &folder,
+            &self.settings.export_folder_template,
+            &preview_context,
         );
         let mut browse = false;
         let mut reveal = false;
         let mut start = false;
         let mut cancel = false;
         let mut changed = false;
+
         egui::Window::new("Export All Faces")
             .open(&mut open)
             .resizable(true)
-            .default_width(500.0)
-            .min_width(460.0)
-            .max_width(560.0)
+            .default_width(540.0)
+            .min_width(480.0)
+            .max_width(620.0)
             .show(ctx, |ui| {
-                ui.strong("Export folder");
+                ui.strong("Export root folder");
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.export_all_folder)
-                            .desired_width(300.0),
+                            .desired_width(330.0),
                     );
                     browse = ui.button("Browse...").clicked();
                     reveal = ui
@@ -1092,7 +1349,7 @@ impl ShadeApp {
                 if existing_tiffs > 0 {
                     ui.colored_label(
                         egui::Color32::YELLOW,
-                        format!("Warning: this folder already contains {existing_tiffs} TIFF file(s). Mixing source/old exports can cause mistakes."),
+                        format!("Warning: this root already contains {existing_tiffs} TIFF file(s)."),
                     );
                 }
 
@@ -1101,14 +1358,27 @@ impl ShadeApp {
                 changed |= ui
                     .add(
                         egui::TextEdit::singleline(&mut self.settings.export_all_template)
-                            .desired_width(455.0),
+                            .desired_width(500.0),
                     )
                     .changed();
-                ui.small("Tokens: {shade-name|project-name}, {shade-name}, {project-name}, {snapshot-code}, {face-number}, {face-name}");
-                ui.small("Windows-reserved characters such as * are converted to '-' in the generated filename.");
+                ui.small("Tokens: {project}, {face}, {snapshot}, {source}, {date}. Legacy tokens remain supported.");
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Preview:");
                     ui.monospace(&preview_name);
+                });
+
+                ui.add_space(8.0);
+                ui.strong("Folder template");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.settings.export_folder_template)
+                            .hint_text("Example: {project}/{date}/{snapshot}/")
+                            .desired_width(500.0),
+                    )
+                    .changed();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Folder preview:");
+                    ui.monospace(preview_folder.display().to_string());
                 });
 
                 ui.add_space(8.0);
@@ -1136,13 +1406,12 @@ impl ShadeApp {
                         )
                         .changed();
                 });
-                ui.small("Auto-number is the safe default and produces names such as '... (2).tif'.");
 
                 ui.add_space(8.0);
                 changed |= ui
                     .checkbox(
                         &mut self.settings.export_all_open_folder,
-                        "Open folder after export",
+                        "Open root folder after queue finishes",
                     )
                     .changed();
                 changed |= ui
@@ -1159,12 +1428,13 @@ impl ShadeApp {
                             !self.export_all_folder.trim().is_empty()
                                 && self.job.is_none()
                                 && !self.faces.is_empty(),
-                            egui::Button::new("Export All"),
+                            egui::Button::new("Add all to Queue"),
                         )
                         .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
+
         if cancel {
             open = false;
         }
@@ -1240,35 +1510,25 @@ impl ShadeApp {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let mut project = self.project.clone();
-        let default_dpi = self.settings.default_dpi;
-        let force_lzw = self.settings.lzw_compression;
         project.adjustments = snapshot.adjustments.clone();
         project.active_snapshot_id = Some(snapshot.id);
         self.remind_after_export = self.snapshot_project_needs_save_reminder();
-        self.launch_job("Exporting snapshot", move |progress| {
-            let result = export::export_face_with_progress_options(
-                &source,
-                &destination,
-                &project,
-                default_dpi,
-                export::ExportOptions { force_lzw },
-                |fraction, detail| {
-                    Self::set_progress(&progress, Some(fraction), "Exporting snapshot", detail);
-                },
-            )
-            .map(|_| format!("Exported {}", destination.display()));
-            let marks = if result.is_ok() {
-                vec![SnapshotExportMark {
-                    snapshot_id,
-                    face_key,
-                    folder,
-                    exported_at_unix_ms: unix_ms_now(),
-                }]
-            } else {
-                Vec::new()
-            };
-            JobResult::Export(SnapshotExportBatchResult { result, marks })
+        self.export_queue.enqueue(export_queue::ExportQueueSpec {
+            label: format!("Face {} / {}", self.current_face + 1, snapshot.name),
+            source,
+            destination,
+            project,
+            default_dpi: self.settings.default_dpi,
+            force_lzw: self.settings.lzw_compression,
+            validate_after_export: self.settings.validate_after_export,
+            mark: Some(export_queue::ExportQueueMark {
+                snapshot_id,
+                face_key,
+                folder,
+            }),
         });
+        self.show_export_queue = true;
+        self.report_info("Snapshot export added to queue");
     }
 
     fn export_snapshot_group_dialog(&mut self, snapshot_ids: Vec<u64>, label: String) {
@@ -1284,18 +1544,23 @@ impl ShadeApp {
         let Some(face) = self.faces.get(self.current_face) else {
             return;
         };
-        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+        let Some(base_folder) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
         let source = face.path.clone();
         let face_key = source.to_string_lossy().into_owned();
-        let stem = source
+        let source_name = source
             .file_stem()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "face".to_owned());
-        let base_project = self.project.clone();
-        let default_dpi = self.settings.default_dpi;
-        let force_lzw = self.settings.lzw_compression;
+            .and_then(|value| value.to_str())
+            .unwrap_or("face")
+            .to_owned();
+        let face_name = self
+            .project
+            .faces
+            .get(self.current_face)
+            .map(|face| face.label.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| source_name.clone());
         let snapshots = snapshot_ids
             .into_iter()
             .filter_map(|id| {
@@ -1309,51 +1574,83 @@ impl ShadeApp {
         if snapshots.is_empty() {
             return;
         }
-        self.remind_after_export = self.snapshot_project_needs_save_reminder();
-        self.launch_job("Exporting snapshots", move |progress| {
-            let total = snapshots.len().max(1);
-            let mut marks = Vec::new();
-            let result = (|| -> Result<String, String> {
-                for (index, snapshot) in snapshots.iter().enumerate() {
-                    let destination = folder.join(format!(
-                        "{}-{}.tif",
-                        sanitize_filename(&stem),
-                        sanitize_filename(&snapshot.name)
-                    ));
-                    let mut project = base_project.clone();
-                    project.adjustments = snapshot.adjustments.clone();
-                    project.active_snapshot_id = Some(snapshot.id);
-                    export::export_face_with_progress_options(
-                        &source,
-                        &destination,
-                        &project,
-                        default_dpi,
-                        export::ExportOptions { force_lzw },
-                        |inner, detail| {
-                            let overall = (index as f32 + inner) / total as f32;
-                            Self::set_progress(
-                                &progress,
-                                Some(overall),
-                                "Exporting snapshots",
-                                &format!("{} · {detail}", snapshot.name),
-                            );
-                        },
-                    )?;
-                    marks.push(SnapshotExportMark {
-                        snapshot_id: snapshot.id,
-                        face_key: face_key.clone(),
-                        folder: folder.clone(),
-                        exported_at_unix_ms: unix_ms_now(),
-                    });
-                }
-                Ok(format!(
-                    "Exported {} snapshot(s) ({label}) to {}",
-                    snapshots.len(),
+        let shade_name = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map(|value| value.to_string_lossy().into_owned());
+        let project_name = self.project.name.clone();
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        let mut reserved = BTreeSet::new();
+        let mut queued = 0usize;
+        let mut skipped = 0usize;
+
+        for snapshot in snapshots {
+            let mut project = self.project.clone();
+            project.adjustments = snapshot.adjustments.clone();
+            project.active_snapshot_id = Some(snapshot.id);
+            let snapshot_code = project.effective_test_code_text();
+            let context = export_batch::ExportNameContext {
+                shade_name: shade_name.as_deref(),
+                project_name: &project_name,
+                snapshot_code: &snapshot_code,
+                face_number: self.current_face + 1,
+                face_name: &face_name,
+                source_name: &source_name,
+                date: &date,
+            };
+            let folder = export_batch::render_export_folder(
+                &base_folder,
+                &self.settings.export_folder_template,
+                &context,
+            );
+            if let Err(err) = std::fs::create_dir_all(&folder) {
+                self.report_error(format!(
+                    "Cannot create export folder {}: {err}",
                     folder.display()
-                ))
-            })();
-            JobResult::Export(SnapshotExportBatchResult { result, marks })
-        });
+                ));
+                return;
+            }
+            let filename =
+                export_batch::render_export_filename(&self.settings.export_all_template, &context);
+            let destination = match export_batch::resolve_destination_reserved(
+                &folder,
+                &filename,
+                self.settings.export_all_conflict_policy,
+                &mut reserved,
+            ) {
+                export_batch::DestinationDecision::Write(path) => path,
+                export_batch::DestinationDecision::Skip(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            self.export_queue.enqueue(export_queue::ExportQueueSpec {
+                label: format!("{face_name} / {}", snapshot.name),
+                source: source.clone(),
+                destination,
+                project,
+                default_dpi: self.settings.default_dpi,
+                force_lzw: self.settings.lzw_compression,
+                validate_after_export: self.settings.validate_after_export,
+                mark: Some(export_queue::ExportQueueMark {
+                    snapshot_id: snapshot.id,
+                    face_key: face_key.clone(),
+                    folder,
+                }),
+            });
+            queued += 1;
+        }
+
+        if queued > 0 {
+            self.remind_after_export = self.snapshot_project_needs_save_reminder();
+            self.show_export_queue = true;
+            self.report_info(if skipped > 0 {
+                format!("Queued {queued} snapshot(s) ({label}) · skipped {skipped}")
+            } else {
+                format!("Queued {queued} snapshot(s) ({label})")
+            });
+        }
     }
 
     fn ensure_project_palette_for_model(&mut self, color_model: tiff_io::ColorModel) -> bool {
@@ -1653,6 +1950,24 @@ impl ShadeApp {
                     options,
                 ));
             }
+            if let Some(source_rgba) = result.embedded_original_rgba {
+                let source_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [face.preview.width, face.preview.height],
+                    &source_rgba,
+                );
+                if let Some(texture) = &mut face.embedded_original_texture {
+                    texture.set(source_image, options);
+                } else {
+                    face.embedded_original_texture = Some(ctx.load_texture(
+                        format!("face-embedded-source-preview-{}", result.face_index),
+                        source_image,
+                        options,
+                    ));
+                }
+            }
+            if let Some(status) = result.embedded_original_status {
+                face.embedded_original_status = status;
+            }
             face.rendered_generation = result.generation;
         }
     }
@@ -1672,6 +1987,7 @@ impl ShadeApp {
         }
         let face_index = self.current_face;
         let generation = face.generation;
+        let needs_embedded_original = face.embedded_original_texture.is_none();
         let preview = Arc::clone(&face.preview);
         let project = self.project.clone();
         let solo_channel = self.solo_channel;
@@ -1691,6 +2007,32 @@ impl ShadeApp {
                 &color,
             );
             let color_status = color.status().clone();
+
+            let (embedded_original_rgba, embedded_original_status) = if needs_embedded_original {
+                let embedded_color = color_management::PreviewColorTransform::new(
+                    &preview.metadata,
+                    PreviewColorConfig {
+                        enabled: true,
+                        intent: PreviewRenderingIntent::Perceptual,
+                        black_point_compensation: false,
+                        assigned_profile_path: None,
+                        soft_proof_enabled: false,
+                        proof_profile_path: None,
+                        proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
+                    },
+                );
+                let status = embedded_color.status().clone();
+                let source_rgba = render::rgba_from_planes_with_color(
+                    &preview,
+                    &preview.channels,
+                    None,
+                    &embedded_color,
+                );
+                (Some(source_rgba), Some(status))
+            } else {
+                (None, None)
+            };
+
             let _ = tx.send(RenderResult {
                 face_index,
                 generation,
@@ -1699,6 +2041,8 @@ impl ShadeApp {
                 color_status,
                 rgba,
                 original_rgba,
+                embedded_original_rgba,
+                embedded_original_status,
             });
         });
     }
@@ -1839,9 +2183,36 @@ impl ShadeApp {
 
     fn ui_toolbar(&mut self, ui: &mut egui::Ui) {
         let mut dismiss_error = false;
+        let mut inspect_requested = false;
+        let mut queue_requested = false;
         ui.horizontal(|ui| {
             ui.horizontal_wrapped(|ui| {
                 let enabled = self.job.is_none();
+                ui.menu_button("File", |ui| {
+                    if ui.add_enabled(enabled, egui::Button::new("New project")).clicked() {
+                        self.new_project();
+                    }
+                    if ui.add_enabled(enabled, egui::Button::new("Open .shade...")).clicked() {
+                        self.open_project_dialog();
+                    }
+                    if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces...")).clicked() {
+                        self.add_faces_dialog();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() {
+                        self.save_project(false);
+                    }
+                    if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save As...")).clicked() {
+                        self.save_project(true);
+                    }
+                    ui.separator();
+                    if ui.button("Inspect TIFF...").clicked() {
+                        inspect_requested = true;
+                    }
+                    if ui.button("Export Queue").clicked() {
+                        queue_requested = true;
+                    }
+                });
                 if ui.add_enabled(enabled, egui::Button::new("New")).clicked() { self.new_project(); }
                 if ui.add_enabled(enabled, egui::Button::new("Open .shade")).clicked() { self.open_project_dialog(); }
                 if ui.button("Project View").clicked() { self.show_previous_shades = true; }
@@ -1853,6 +2224,8 @@ impl ShadeApp {
                 ui.separator();
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export face")).clicked() { self.export_current_dialog(); }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
+                let queue_label = format!("Queue ({})", self.export_queue.pending_count());
+                if ui.button(queue_label).clicked() { self.show_export_queue = true; }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Validate face")).on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.").clicked() { self.validate_current_face_dialog(); }
                 ui.separator();
                 if ui.button("Settings").clicked() { self.show_settings = true; }
@@ -1873,6 +2246,12 @@ impl ShadeApp {
                 }
             });
         });
+        if inspect_requested {
+            self.inspect_tiff_dialog();
+        }
+        if queue_requested {
+            self.show_export_queue = true;
+        }
         if dismiss_error {
             self.toast = None;
             if self.status_message == "Error - see Logs" {
@@ -1903,6 +2282,14 @@ impl ShadeApp {
                 .on_hover_text(full_text);
                 return;
             }
+        }
+        if let Some((value, text)) = self.export_queue.active_summary() {
+            ui.add(
+                egui::ProgressBar::new(value)
+                    .desired_width(300.0)
+                    .text(text),
+            );
+            return;
         }
         if self.render_busy.is_some() {
             ui.add(
@@ -3515,8 +3902,10 @@ impl ShadeApp {
         let meta = face.preview.metadata.clone();
         let dpi_info = face.dpi;
         let color_status = face.color_status.clone();
+        let embedded_original_status = face.embedded_original_status.clone();
         let texture = face.texture.clone();
         let original_texture = face.original_texture.clone();
+        let embedded_original_texture = face.embedded_original_texture.clone();
         let (width_cm, height_cm) = physical_dimensions_cm(meta.width, meta.height, dpi_info);
         ui.horizontal_wrapped(|ui| {
             ui.strong(file_name);
@@ -3548,8 +3937,7 @@ impl ShadeApp {
             let icc_response = ui.small_button(profile_text);
             let open_color_management = icc_response.clicked();
             icc_response.on_hover_text(format!(
-                "{}
-Click to manage the preview profile.",
+                "{}\nClick to manage source ICC and Printer/RIP Soft Proof.",
                 color_status.detail()
             ));
             if open_color_management {
@@ -3558,6 +3946,7 @@ Click to manage the preview profile.",
                     self.project.preview_color.assigned_profile_path.clone();
             }
         });
+        ui.small("Hold right mouse: BEFORE adjustments with current color-management setup · Hold middle mouse: original TIFF samples with Embedded ICC only (cached, no assigned profile / RIP Soft Proof).");
         ui.separator();
 
         let Some(texture) = texture else {
@@ -3594,9 +3983,18 @@ Click to manage the preview profile.",
                 );
                 let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
                 let image_rect = egui::Rect::from_center_size(canvas_rect.center(), image_size);
-                let show_before = ui.input(|input| input.pointer.secondary_down())
-                    && ui.rect_contains_pointer(image_rect);
-                let display_texture = if show_before {
+                let pointer_over = ui.rect_contains_pointer(image_rect);
+                let show_embedded_source =
+                    ui.input(|input| input.pointer.middle_down()) && pointer_over;
+                let show_before = !show_embedded_source
+                    && ui.input(|input| input.pointer.secondary_down())
+                    && pointer_over;
+                let display_texture = if show_embedded_source {
+                    embedded_original_texture
+                        .as_ref()
+                        .or(original_texture.as_ref())
+                        .unwrap_or(&texture)
+                } else if show_before {
                     original_texture.as_ref().unwrap_or(&texture)
                 } else {
                     &texture
@@ -3605,7 +4003,24 @@ Click to manage the preview profile.",
                     image_rect,
                     egui::Image::from_texture(display_texture).fit_to_exact_size(image_size),
                 );
-                if show_before {
+                if show_embedded_source {
+                    let source_label = if embedded_original_texture.is_none() {
+                        "SOURCE · PREPARING"
+                    } else if embedded_original_status.is_managed() {
+                        "SOURCE · EMBEDDED ICC"
+                    } else if embedded_original_status.is_problem() {
+                        "SOURCE · ICC FALLBACK"
+                    } else {
+                        "SOURCE · NO EMBEDDED ICC"
+                    };
+                    ui.painter().text(
+                        image_rect.left_top() + egui::vec2(10.0, 10.0),
+                        egui::Align2::LEFT_TOP,
+                        source_label,
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::WHITE,
+                    );
+                } else if show_before {
                     ui.painter().text(
                         image_rect.left_top() + egui::vec2(10.0, 10.0),
                         egui::Align2::LEFT_TOP,
@@ -4258,19 +4673,24 @@ Click to manage the preview profile.",
         let mut enabled = self.project.preview_color.enabled;
         let mut intent = self.project.preview_color.rendering_intent;
         let mut bpc = self.project.preview_color.black_point_compensation;
+        let mut soft_proof_enabled = self.project.preview_color.soft_proof_enabled;
+        let mut proofing_intent = self.project.preview_color.proofing_intent;
+        let proof_path = self.project.preview_color.proof_profile_path.clone();
         let mut show_incompatible = self.icc_show_incompatible;
         let mut requested_profile: Option<Option<PathBuf>> = None;
+        let mut requested_proof: Option<Option<PathBuf>> = None;
         let mut browse_requested = false;
+        let mut browse_proof_requested = false;
         let mut refresh_requested = false;
         let mut open = self.show_color_management;
 
-        egui::Window::new("Color Management / Preview Profile")
+        egui::Window::new("Color Management / ICC Preview")
             .open(&mut open)
             .resizable(true)
-            .default_size([760.0, 650.0])
+            .default_size([820.0, 760.0])
             .show(ctx, |ui| {
-                ui.heading("Preview profile assignment");
-                ui.small("This changes only Shade Editor's preview. The source TIFF, exported samples, embedded ICC tag and Photoshop resources are never rewritten by profile assignment.");
+                ui.heading("Color Management / ICC Preview");
+                ui.small("Source-profile assignment and Printer/RIP Soft Proof are display-only. TIFF samples, embedded ICC and Photoshop resources remain untouched by these preview settings.");
                 ui.add_space(5.0);
                 egui::Grid::new("preview-profile-current")
                     .num_columns(2)
@@ -4287,7 +4707,7 @@ Click to manage the preview profile.",
                         ui.strong("Embedded profile");
                         ui.label(&embedded_name);
                         ui.end_row();
-                        ui.strong("Assigned profile");
+                        ui.strong("Assigned source profile");
                         ui.label(
                             self.project
                                 .preview_color
@@ -4296,26 +4716,29 @@ Click to manage the preview profile.",
                                 .unwrap_or("Embedded profile"),
                         );
                         ui.end_row();
+                        ui.strong("Printer / RIP proof");
+                        ui.label(proof_path.as_deref().unwrap_or("Not selected"));
+                        ui.end_row();
                     });
 
                 ui.separator();
+                ui.heading("Document / source ICC");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Use embedded profile").clicked() {
                         requested_profile = Some(None);
                     }
-                    if ui.button("Browse ICC / ICM...").clicked() {
+                    if ui.button("Browse source ICC / ICM...").clicked() {
                         browse_requested = true;
                     }
                     if ui.button("Refresh system profiles").clicked() {
                         refresh_requested = true;
                     }
                 });
-
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut enabled, "Enable color-managed preview");
                     ui.checkbox(&mut bpc, "Black point compensation");
                 });
-                egui::ComboBox::from_label("Rendering intent")
+                egui::ComboBox::from_label("Source rendering intent")
                     .selected_text(intent.label())
                     .show_ui(ui, |ui| {
                         for value in [
@@ -4327,11 +4750,9 @@ Click to manage the preview profile.",
                             ui.selectable_value(&mut intent, value, value.label());
                         }
                     });
-                ui.small("Black point compensation is optional and is most useful with relative-colorimetric transforms. The preview destination remains sRGB; no monitor or printer/RIP proof profile is applied here.");
 
-                ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Search");
+                    ui.label("Search source profiles");
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut query)
                             .hint_text("Profile name, filename, RGB/CMYK/Gray, path")
@@ -4397,78 +4818,126 @@ Click to manage the preview profile.",
                     }
                 }
 
-                ui.add_space(4.0);
-                ui.strong(format!(
-                    "System profiles · {} compatible / {} loaded",
-                    profiles
-                        .iter()
-                        .filter(|profile| profile.compatible_with(active_model))
-                        .count(),
-                    profiles.len()
-                ));
                 if let Some(error) = scan_error.as_ref() {
                     ui.colored_label(egui::Color32::YELLOW, error);
                 }
-                if visible.is_empty() {
-                    ui.label("No matching assignable profiles.");
-                } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt("icc-profile-list")
-                        .auto_shrink([false, false])
-                        .max_height(330.0)
-                        .show(ui, |ui| {
-                            for profile in visible {
-                                let path_text = profile.path.to_string_lossy().into_owned();
-                                let compatible = profile.compatible_with(active_model);
-                                let label = format!(
-                                    "{}  ·  {}  ·  {}",
-                                    profile.description,
-                                    profile.color_space_label(),
-                                    profile.filename()
-                                );
-                                let response = ui
-                                    .add_enabled(
-                                        compatible,
-                                        egui::Button::new(label)
-                                            .selected(selected.as_deref() == Some(path_text.as_str())),
-                                    )
-                                    .on_hover_text(format!(
-                                        "{}\nClass: {}{}",
-                                        profile.path.display(),
-                                        profile.device_class_label(),
-                                        if compatible {
-                                            ""
-                                        } else {
-                                            "\nIncompatible with the active TIFF base color model."
-                                        }
-                                    ));
-                                if response.clicked() {
-                                    selected = Some(path_text.clone());
-                                }
-                                if response.double_clicked() && compatible {
-                                    requested_profile = Some(Some(profile.path.clone()));
-                                }
+                egui::ScrollArea::vertical()
+                    .id_salt("icc-profile-list")
+                    .auto_shrink([false, false])
+                    .max_height(210.0)
+                    .show(ui, |ui| {
+                        for profile in visible {
+                            let path_text = profile.path.to_string_lossy().into_owned();
+                            let compatible = profile.compatible_with(active_model);
+                            let label = format!(
+                                "{} · {} · {}",
+                                profile.description,
+                                profile.color_space_label(),
+                                profile.filename()
+                            );
+                            let response = ui
+                                .add_enabled(
+                                    compatible,
+                                    egui::Button::new(label)
+                                        .selected(selected.as_deref() == Some(path_text.as_str())),
+                                )
+                                .on_hover_text(format!(
+                                    "{}\nClass: {}",
+                                    profile.path.display(),
+                                    profile.device_class_label(),
+                                ));
+                            if response.clicked() {
+                                selected = Some(path_text.clone());
                             }
-                        });
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let can_assign = selected.as_deref().is_some_and(|path| {
-                        profiles.iter().any(|profile| {
-                            profile.path.to_string_lossy() == path
-                                && profile.compatible_with(active_model)
-                        })
+                            if response.double_clicked() && compatible {
+                                requested_profile = Some(Some(profile.path.clone()));
+                            }
+                        }
                     });
+                let can_assign = selected.as_deref().is_some_and(|path| {
+                    profiles.iter().any(|profile| {
+                        profile.path.to_string_lossy() == path
+                            && profile.compatible_with(active_model)
+                    })
+                });
+                if ui
+                    .add_enabled(can_assign, egui::Button::new("Assign selected source profile"))
+                    .clicked()
+                {
+                    requested_profile = selected
+                        .as_ref()
+                        .map(|path| Some(PathBuf::from(path)));
+                }
+
+                ui.separator();
+                ui.heading("Printer / RIP Soft Proof");
+                ui.small("Select an Output-class printer/RIP ICC. Shade Editor uses a LittleCMS proofing transform only for the viewport and project thumbnail; export remains separation/sample preserving.");
+                let output_profiles = profiles
+                    .iter()
+                    .filter(|profile| profile.is_output_profile())
+                    .collect::<Vec<_>>();
+                let proof_selected_text = proof_path
+                    .as_deref()
+                    .and_then(|path| {
+                        output_profiles
+                            .iter()
+                            .find(|profile| profile.path.to_string_lossy() == path)
+                            .map(|profile| profile.description.clone())
+                    })
+                    .or_else(|| proof_path.clone())
+                    .unwrap_or_else(|| "Choose printer/RIP output profile".to_owned());
+                egui::ComboBox::from_label("Installed output profile")
+                    .selected_text(proof_selected_text)
+                    .width(520.0)
+                    .show_ui(ui, |ui| {
+                        for profile in &output_profiles {
+                            let selected_now = proof_path.as_deref()
+                                == Some(profile.path.to_string_lossy().as_ref());
+                            if ui
+                                .selectable_label(
+                                    selected_now,
+                                    format!(
+                                        "{} · {} · {}",
+                                        profile.description,
+                                        profile.color_space_label(),
+                                        profile.filename()
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                requested_proof = Some(Some(profile.path.clone()));
+                            }
+                        }
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Browse Printer/RIP ICC...").clicked() {
+                        browse_proof_requested = true;
+                    }
                     if ui
-                        .add_enabled(can_assign, egui::Button::new("Assign selected profile"))
+                        .add_enabled(proof_path.is_some(), egui::Button::new("Clear proof profile"))
                         .clicked()
                     {
-                        requested_profile = selected
-                            .as_ref()
-                            .map(|path| Some(PathBuf::from(path)));
+                        requested_proof = Some(None);
+                        soft_proof_enabled = false;
                     }
-                    ui.small("Up/Down changes selection; Enter assigns it.");
+                    ui.checkbox(&mut soft_proof_enabled, "Enable Soft Proof");
                 });
+                egui::ComboBox::from_label("Proof rendering intent")
+                    .selected_text(proofing_intent.label())
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            PreviewRenderingIntent::Perceptual,
+                            PreviewRenderingIntent::RelativeColorimetric,
+                            PreviewRenderingIntent::Saturation,
+                            PreviewRenderingIntent::AbsoluteColorimetric,
+                        ] {
+                            ui.selectable_value(&mut proofing_intent, value, value.label());
+                        }
+                    });
+                if soft_proof_enabled && proof_path.is_none() && requested_proof.is_none() {
+                    ui.colored_label(egui::Color32::YELLOW, "Soft Proof is enabled but no printer/RIP profile is selected.");
+                }
+                ui.small("Middle-mouse source preview deliberately bypasses assigned source profiles and Soft Proof and uses only the TIFF's embedded ICC.");
             });
 
         self.show_color_management = open;
@@ -4480,13 +4949,20 @@ Click to manage the preview profile.",
             self.icc_profile_scan_done = false;
             self.refresh_icc_profile_catalog();
         }
-
         if browse_requested {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("ICC color profiles", &["icc", "icm"])
                 .pick_file()
             {
                 requested_profile = Some(Some(path));
+            }
+        }
+        if browse_proof_requested {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("ICC color profiles", &["icc", "icm"])
+                .pick_file()
+            {
+                requested_proof = Some(Some(path));
             }
         }
 
@@ -4501,6 +4977,14 @@ Click to manage the preview profile.",
         }
         if self.project.preview_color.black_point_compensation != bpc {
             self.project.preview_color.black_point_compensation = bpc;
+            changed = true;
+        }
+        if self.project.preview_color.soft_proof_enabled != soft_proof_enabled {
+            self.project.preview_color.soft_proof_enabled = soft_proof_enabled;
+            changed = true;
+        }
+        if self.project.preview_color.proofing_intent != proofing_intent {
+            self.project.preview_color.proofing_intent = proofing_intent;
             changed = true;
         }
 
@@ -4530,6 +5014,39 @@ Click to manage the preview profile.",
                         profile.description,
                         profile.color_space_label(),
                         active_model.title(),
+                    )),
+                    Err(err) => self.report_error(err),
+                },
+            }
+        }
+
+        if let Some(requested) = requested_proof {
+            match requested {
+                None => {
+                    if self.project.preview_color.proof_profile_path.is_some() {
+                        self.project.preview_color.proof_profile_path = None;
+                        self.project.preview_color.soft_proof_enabled = false;
+                        changed = true;
+                    }
+                }
+                Some(path) => match color_management::inspect_profile(&path) {
+                    Ok(profile) if profile.is_output_profile() => {
+                        let path_text = path.to_string_lossy().into_owned();
+                        if self.project.preview_color.proof_profile_path.as_deref()
+                            != Some(path_text.as_str())
+                        {
+                            self.project.preview_color.proof_profile_path = Some(path_text);
+                            changed = true;
+                        }
+                        if !self.project.preview_color.soft_proof_enabled {
+                            self.project.preview_color.soft_proof_enabled = true;
+                            changed = true;
+                        }
+                    }
+                    Ok(profile) => self.report_error(format!(
+                        "Cannot use '{}' for Soft Proof: profile class is {}, not Output/Printer.",
+                        profile.description,
+                        profile.device_class_label(),
                     )),
                     Err(err) => self.report_error(err),
                 },
@@ -4914,6 +5431,7 @@ impl eframe::App for ShadeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(Duration::from_millis(100));
         self.poll_job();
+        self.poll_export_queue();
         self.poll_render(ui.ctx());
         self.sync_update_state();
         self.poll_autosave();
@@ -4963,6 +5481,8 @@ impl eframe::App for ShadeApp {
         self.ui_logs_window(ui.ctx());
         self.ui_previous_shades_window(ui.ctx());
         self.ui_export_all_window(ui.ctx());
+        self.ui_export_queue_window(ui.ctx());
+        self.ui_tiff_inspector_window(ui.ctx());
         self.ui_recovery_window(ui.ctx());
         self.ui_snapshot_discard_confirmation(ui.ctx());
         self.ui_snapshot_save_reminder(ui.ctx());

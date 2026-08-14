@@ -135,7 +135,12 @@ impl ExportQueue {
     pub fn pending_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| matches!(item.status, ExportQueueStatus::Waiting | ExportQueueStatus::Processing))
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    ExportQueueStatus::Waiting | ExportQueueStatus::Processing
+                )
+            })
             .count()
     }
 
@@ -166,7 +171,8 @@ impl ExportQueue {
             }
             ExportQueueStatus::Processing => {
                 self.stop_after_current = true;
-                item.detail = "Stop requested · current atomic export will finish safely".to_owned();
+                item.detail =
+                    "Stop requested · current atomic export will finish safely".to_owned();
                 true
             }
             _ => false,
@@ -177,7 +183,10 @@ impl ExportQueue {
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
-        if !matches!(item.status, ExportQueueStatus::Failed | ExportQueueStatus::Cancelled) {
+        if !matches!(
+            item.status,
+            ExportQueueStatus::Failed | ExportQueueStatus::Cancelled
+        ) {
             return false;
         }
         item.status = ExportQueueStatus::Waiting;

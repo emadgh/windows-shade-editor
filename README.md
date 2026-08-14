@@ -14,6 +14,7 @@ Shade Editor keeps source TIFF Faces immutable and stores non-destructive shade 
 - Photoshop Spot DisplayInfo color/Solidity parsing; declared Alpha channels are excluded from the printing composite.
 - ICC-aware preview with embedded-profile support and non-destructive **preview profile assignment**.
 - True printer/RIP **Soft Proof** using an output-device ICC proofing transform; proof settings remain preview-only.
+- Hold the middle mouse button over the viewport for a cached original-source preview using only the TIFF embedded ICC; right mouse remains the current-color-management BEFORE preview.
 - Searchable installed Windows ICC/ICM profile list, keyboard navigation, rendering intent and optional black-point compensation.
 - Assigned preview/proof profiles are saved in `.shade`; TIFF ICC bytes and source/export samples are never changed by them.
 - Color-managed project thumbnails use the same assigned profile and printer/RIP soft-proof transform as the viewport.

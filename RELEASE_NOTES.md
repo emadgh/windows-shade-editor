@@ -1,3 +1,12 @@
+# Shade Editor 0.17.1
+
+- Wire the previously-added Export Queue and TIFF Inspector backends into the actual application UI and export workflows.
+- Expose Printer/RIP Soft Proof in Color Management with Output-class profile selection, proof intent and persistent enable state.
+- Add `File > Inspect TIFF` plus a report window with Copy report and Explorer reveal.
+- Route Face, Export All and Snapshot batch exports through the non-blocking queue with Cancel/Retry and safe atomic completion semantics.
+- Expose filename and folder templates in Export All, including `{project}`, `{face}`, `{snapshot}`, `{source}` and `{date}`.
+- Add a cached middle-mouse SOURCE preview: original TIFF samples rendered only through the TIFF embedded ICC, bypassing edits, assigned source ICC and Printer/RIP Soft Proof. Right mouse remains BEFORE using the current preview color-management setup.
+
 # Shade Editor 0.17.0
 
 - Add true printer/RIP Soft Proof with a separate Output-class proof ICC, proof rendering intent and project persistence; the transform remains preview-only and never enters TIFF export.
