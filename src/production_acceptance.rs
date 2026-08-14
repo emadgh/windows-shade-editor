@@ -40,6 +40,7 @@ mod tests {
     const BUILD_WORKFLOW: &str = include_str!("../.github/workflows/build-windows.yml");
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
     const EXPORT_TESTS: &str = include_str!("export.rs");
+    const WORKFLOW_SRC: &str = include_str!("workflow.rs");
 
     #[test]
     fn classic_and_bigtiff_headers_are_classified_for_both_byte_orders() {
@@ -92,6 +93,23 @@ mod tests {
             assert!(
                 EXPORT_TESTS.contains(required),
                 "missing required transport test: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_face_relink_safety_paths_remain_wired() {
+        for required in [
+            "placeholder_loaded_face",
+            "verify_relink_metadata",
+            "load_relink_candidate",
+            "find_named_file_recursive",
+            "The active Face source TIFF is missing",
+            "Export all requires every Face source TIFF to be available",
+        ] {
+            assert!(
+                WORKFLOW_SRC.contains(required) || EXPORT_TESTS.contains(required),
+                "missing required missing-Face/relink guard: {required}"
             );
         }
     }
