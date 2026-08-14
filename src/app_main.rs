@@ -555,10 +555,7 @@ impl ShadeApp {
                         &progress,
                         Some(index as f32 / total as f32),
                         "Opening project",
-                        &source
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
+                        &format!("Loading Face {}/{}", index + 1, total),
                     );
                     let expected = project
                         .file_metadata
@@ -1049,13 +1046,15 @@ impl ShadeApp {
         egui::Window::new("Export All Faces")
             .open(&mut open)
             .resizable(true)
-            .default_width(620.0)
+            .default_width(500.0)
+            .min_width(460.0)
+            .max_width(560.0)
             .show(ctx, |ui| {
                 ui.strong("Export folder");
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.export_all_folder)
-                            .desired_width(f32::INFINITY),
+                            .desired_width(360.0),
                     );
                     browse = ui.button("Browse...").clicked();
                 });
@@ -1072,7 +1071,7 @@ impl ShadeApp {
                 changed |= ui
                     .add(
                         egui::TextEdit::singleline(&mut self.settings.export_all_template)
-                            .desired_width(f32::INFINITY),
+                            .desired_width(455.0),
                     )
                     .changed();
                 ui.small("Tokens: {shade-name|project-name}, {shade-name}, {project-name}, {snapshot-code}, {face-number}, {face-name}");
@@ -1791,7 +1790,7 @@ impl ShadeApp {
                 let enabled = self.job.is_none();
                 if ui.add_enabled(enabled, egui::Button::new("New")).clicked() { self.new_project(); }
                 if ui.add_enabled(enabled, egui::Button::new("Open .shade")).clicked() { self.open_project_dialog(); }
-                if ui.button("Previous shades").clicked() { self.show_previous_shades = true; }
+                if ui.button("Project View").clicked() { self.show_previous_shades = true; }
                 if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces")).clicked() { self.add_faces_dialog(); }
                 ui.separator();
                 if self.project_path.is_none() && ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Quick Save")).on_hover_text("Create the first .shade project beside the source TIFF files without opening a Save dialog").clicked() { self.quick_save_project(); }
@@ -1806,9 +1805,9 @@ impl ShadeApp {
                 if ui.button("About").clicked() { self.show_about = true; }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.ui_operation_progress(ui);
                 if ui.small_button("Logs").clicked() { self.log_cache = self.log.read(); self.show_logs = true; }
                 self.ui_update_compact(ui);
-                self.ui_operation_progress(ui);
                 if let Some(toast) = &self.toast {
                     ui.horizontal(|ui| {
                         dismiss_error = ui.small_button("x").on_hover_text("Dismiss error").clicked();
@@ -1832,30 +1831,29 @@ impl ShadeApp {
         if let Some(job) = &self.job {
             if let Ok(progress) = job.progress.lock() {
                 let value = progress.fraction.unwrap_or(0.5);
-                let label = progress.label.clone();
-                let detail = progress.detail.clone();
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::ProgressBar::new(value)
-                            .desired_width(300.0)
-                            .text(label)
-                            .animate(progress.fraction.is_none()),
-                    );
-                    if !detail.is_empty() {
-                        let mut compact = detail.chars().take(48).collect::<String>();
-                        if detail.chars().count() > 48 {
-                            compact.push('…');
-                        }
-                        ui.small(compact).on_hover_text(detail);
-                    }
-                });
+                let full_text = if progress.detail.trim().is_empty() {
+                    progress.label.clone()
+                } else {
+                    format!("{} - {}", progress.label, progress.detail)
+                };
+                let mut compact = full_text.chars().take(64).collect::<String>();
+                if full_text.chars().count() > 64 {
+                    compact.push('…');
+                }
+                ui.add(
+                    egui::ProgressBar::new(value)
+                        .desired_width(380.0)
+                        .text(compact)
+                        .animate(progress.fraction.is_none()),
+                )
+                .on_hover_text(full_text);
                 return;
             }
         }
         if self.render_busy.is_some() {
             ui.add(
                 egui::ProgressBar::new(0.45)
-                    .desired_width(240.0)
+                    .desired_width(300.0)
                     .text("Rendering preview")
                     .animate(true),
             );
@@ -2888,11 +2886,21 @@ impl ShadeApp {
             .get(&output_name)
             .is_some_and(adjustment_is_modified);
 
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             ui.heading("Adjustments");
-            if modified_count > 0 {
-                ui.small(format!("{modified_count}/{} modified", channel_names.len()));
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let layout_label = if self.settings.adjustment_tabs {
+                    "Tabs"
+                } else {
+                    "Stacked"
+                };
+                if ui.small_button(layout_label).clicked() {
+                    self.settings.adjustment_tabs = !self.settings.adjustment_tabs;
+                    self.save_settings_quietly();
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
             let mut all_channels = self.adjustment_scope == AdjustmentScope::All;
             if ui.checkbox(&mut all_channels, "All channels").changed() {
                 self.adjustment_scope = if all_channels {
@@ -2913,14 +2921,8 @@ impl ShadeApp {
             if response.clicked() {
                 self.adjustment_scope = AdjustmentScope::Selected;
             }
-            let layout_label = if self.settings.adjustment_tabs {
-                "Tabs"
-            } else {
-                "Stacked"
-            };
-            if ui.small_button(layout_label).clicked() {
-                self.settings.adjustment_tabs = !self.settings.adjustment_tabs;
-                self.save_settings_quietly();
+            if modified_count > 0 {
+                ui.small(format!("Modified {modified_count}/{}", channel_names.len()));
             }
         });
 
@@ -3468,14 +3470,14 @@ impl ShadeApp {
         let mut requested_remove: Option<String> = None;
         let mut requested_relink: Option<String> = None;
 
-        egui::Window::new("Previous Shades")
+        egui::Window::new("Project View")
             .open(&mut open)
             .default_width(1040.0)
             .default_height(680.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Project Browser");
+                    ui.heading("Project View");
                     ui.separator();
                     ui.label(format!("{} project(s)", self.previous_shades.entries().len()));
                 });
@@ -3578,81 +3580,32 @@ impl ShadeApp {
                 }
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    columns[0].set_min_width(520.0);
-                    if paths.is_empty() {
-                        columns[0].label("No matching .shade projects.");
-                    } else {
-                        egui::ScrollArea::vertical()
-                            .id_salt("previous-shades-list")
-                            .auto_shrink([false, false])
-                            .show_rows(&mut columns[0], 72.0, indices.len(), |ui, range| {
-                                for row in range {
-                                    let entry = self.previous_shades.entries()[indices[row]].clone();
-                                    self.ensure_previous_shade_list_texture(ctx, &entry);
-                                    let label = entry.display_name();
-                                    let source_bytes = if entry.total_source_bytes > 0 {
-                                        format_byte_count(entry.total_source_bytes)
-                                    } else {
-                                        "-".to_owned()
-                                    };
-                                    let metadata = format!(
-                                        "{} face(s) · {} · {}",
-                                        entry.face_count,
-                                        source_bytes,
-                                        entry.active_face_display(),
-                                    );
-                                    let latest = entry
-                                        .latest_snapshot()
-                                        .map(|snapshot| {
-                                            let code = snapshot.code.trim();
-                                            if code.is_empty() || code == snapshot.name.trim() {
-                                                format!("Latest: {}", snapshot.name)
-                                            } else {
-                                                format!("Latest: {} · {}", snapshot.name, code)
-                                            }
-                                        })
-                                        .unwrap_or_else(|| "No Snapshots".to_owned());
-                                    let detail = if entry.is_missing() {
-                                        format!("{latest} · MISSING")
-                                    } else {
-                                        latest
-                                    };
-                                    let selected = requested_select
-                                        .as_deref()
-                                        .or(self.previous_shades_selected.as_deref())
-                                        == Some(entry.path.as_str());
-                                    let thumbnail = self.previous_shade_list_textures.get(&entry.path);
-                                    let response = previous_shade_history_row(
-                                        ui,
-                                        selected,
-                                        &label,
-                                        &metadata,
-                                        &detail,
-                                        thumbnail,
-                                    );
-                                    if response.clicked() {
-                                        requested_select = Some(entry.path.clone());
-                                    }
-                                    if response.double_clicked() && !entry.is_missing() {
-                                        requested_open = Some(entry.path.clone());
-                                    }
-                                }
-                            });
-                    }
 
-                    let selected_path = requested_select
-                        .as_deref()
-                        .or(self.previous_shades_selected.as_deref());
-                    if let Some(path) = selected_path {
-                        let cached = self
-                            .previous_shades
-                            .entries()
-                            .iter()
-                            .find(|entry| entry.path == path)
-                            .cloned();
-                        columns[1].horizontal_wrapped(|ui| {
-                            let exists = Path::new(path).is_file();
+                let selected_path = requested_select
+                    .clone()
+                    .or_else(|| self.previous_shades_selected.clone());
+                let cached_selected = selected_path.as_deref().and_then(|path| {
+                    self.previous_shades
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.path == path)
+                        .cloned()
+                });
+
+                egui::Panel::right("project-view-preview-pane")
+                    .resizable(true)
+                    .default_size(420.0)
+                    .size_range(320.0..=580.0)
+                    .show(ui, |preview_ui| {
+                        preview_ui.strong("Preview");
+                        preview_ui.add_space(4.0);
+                        let Some(path) = selected_path.as_deref() else {
+                            preview_ui.label("Select a project to inspect its thumbnail, Snapshots and metadata.");
+                            return;
+                        };
+
+                        let exists = Path::new(path).is_file();
+                        preview_ui.horizontal_wrapped(|ui| {
                             if ui.add_enabled(exists, egui::Button::new("Open")).clicked() {
                                 requested_open = Some(path.to_owned());
                             }
@@ -3666,67 +3619,221 @@ impl ShadeApp {
                                 requested_remove = Some(path.to_owned());
                             }
                         });
-                        columns[1].separator();
-                        if let Some(texture) = self.previous_shade_texture.as_ref() {
-                            let available = columns[1].available_width().min(420.0);
-                            let size = texture.size_vec2();
-                            let scale = (available / size.x.max(1.0)).min(1.0);
-                            columns[1].image((texture.id(), size * scale));
+                        preview_ui.separator();
+
+                        if let Some(error) = self.previous_shade_preview_error.as_ref() {
+                            preview_ui.colored_label(egui::Color32::YELLOW, error);
+                            if let Some(entry) = cached_selected.as_ref() {
+                                preview_ui.label(format!(
+                                    "Cached: {} face(s) · {}",
+                                    entry.face_count,
+                                    entry.active_face_display()
+                                ));
+                                if let Some(snapshot) = entry.latest_snapshot() {
+                                    preview_ui.label(format!(
+                                        "Latest Snapshot: {} · #{}",
+                                        snapshot.name, snapshot.id
+                                    ));
+                                }
+                            }
+                            preview_ui.small(path);
+                            return;
                         }
-                        if let Some(preview) = self.previous_shade_preview.as_ref() {
-                            columns[1].heading(&preview.project_name);
-                            egui::Grid::new("previous-shade-metadata")
-                                .num_columns(2)
-                                .striped(true)
-                                .show(&mut columns[1], |ui| {
-                                    ui.strong("Saved");
-                                    ui.label(format_previous_shade_time(preview.saved_at_unix_ms));
-                                    ui.end_row();
-                                    ui.strong("Faces");
-                                    ui.label(preview.face_count.to_string());
-                                    ui.end_row();
-                                    ui.strong("Active Face");
-                                    ui.label(format!("{}", preview.active_face_index.saturating_add(1)));
-                                    ui.end_row();
-                                    ui.strong("Source bytes");
-                                    ui.label(format_byte_count(preview.total_source_bytes));
-                                    ui.end_row();
-                                });
-                            columns[1].separator();
-                            columns[1].strong(format!("Snapshots · {}", preview.snapshots.len()));
+
+                        let Some(preview) = self.previous_shade_preview.as_ref() else {
+                            preview_ui.label("Loading project inspection...");
+                            return;
+                        };
+
+                        preview_ui.heading(&preview.project_name);
+                        if let Some(texture) = self.previous_shade_texture.as_ref() {
+                            let natural = texture.size_vec2();
+                            if natural.x > 0.0 && natural.y > 0.0 {
+                                let max_size = egui::vec2(
+                                    preview_ui.available_width().min(350.0),
+                                    350.0,
+                                );
+                                let scale = (max_size.x / natural.x)
+                                    .min(max_size.y / natural.y)
+                                    .min(1.0);
+                                preview_ui.add(
+                                    egui::Image::from_texture(texture)
+                                        .fit_to_exact_size(natural * scale),
+                                );
+                            }
+                        } else if let Some(error) = preview.thumbnail_error.as_ref() {
+                            preview_ui.small(format!("Thumbnail unavailable: {error}"));
+                        } else {
+                            preview_ui.small("No embedded thumbnail in this .shade file.");
+                        }
+
+                        preview_ui.add_space(6.0);
+                        egui::Grid::new("project-view-preview-meta")
+                            .num_columns(2)
+                            .striped(true)
+                            .spacing([12.0, 5.0])
+                            .show(preview_ui, |ui| {
+                                ui.strong("Saved");
+                                ui.label(format_previous_shade_time(preview.saved_at_unix_ms));
+                                ui.end_row();
+                                ui.strong("File modified");
+                                ui.label(
+                                    preview
+                                        .file_modified_unix_ms
+                                        .map(format_previous_shade_time)
+                                        .unwrap_or_else(|| "-".to_owned()),
+                                );
+                                ui.end_row();
+                                ui.strong("Faces");
+                                ui.label(preview.face_count.to_string());
+                                ui.end_row();
+                                ui.strong("Active Face");
+                                ui.label(preview.active_face_index.saturating_add(1).to_string());
+                                ui.end_row();
+                                ui.strong("Snapshots");
+                                ui.label(preview.snapshot_count.to_string());
+                                ui.end_row();
+                                ui.strong("Active snapshot");
+                                ui.label(preview.active_snapshot_name.as_deref().unwrap_or("-"));
+                                ui.end_row();
+                                ui.strong("Test code");
+                                ui.label(if preview.test_code_enabled { "Enabled" } else { "Off" });
+                                ui.end_row();
+                                ui.strong("Source bytes");
+                                ui.label(format_byte_count(preview.total_source_bytes));
+                                ui.end_row();
+                            });
+
+                        if let Some(face) = preview.active_face.as_ref() {
+                            preview_ui.separator();
+                            preview_ui.strong(format!(
+                                "Face {} of {} · {}",
+                                preview
+                                    .active_face_index
+                                    .saturating_add(1)
+                                    .min(preview.face_count.max(1)),
+                                preview.face_count,
+                                face.label
+                            ));
+                            preview_ui.label(format!(
+                                "{} · {} x {} px · {}-bit · {}",
+                                face.source_file_name,
+                                face.width,
+                                face.height,
+                                face.bit_depth,
+                                face.color_model
+                            ));
+                            preview_ui.label(format!(
+                                "{:.0} x {:.0} DPI · {} channels · {}",
+                                face.dpi_x,
+                                face.dpi_y,
+                                face.channel_count,
+                                format_byte_count(face.file_size_bytes)
+                            ));
+                            if !face.channel_names.is_empty() {
+                                preview_ui.small(format!(
+                                    "Channels: {}",
+                                    face.channel_names.join(", ")
+                                ));
+                            }
+                        }
+
+                        preview_ui.separator();
+                        preview_ui.strong(format!("Snapshots · {}", preview.snapshots.len()));
+                        if preview.snapshots.is_empty() {
+                            preview_ui.small("No saved Snapshots in this project.");
+                        } else {
                             egui::ScrollArea::vertical()
-                                .id_salt("previous-shade-snapshots")
-                                .max_height(220.0)
-                                .show(&mut columns[1], |ui| {
+                                .id_salt("project-view-snapshots")
+                                .max_height(180.0)
+                                .show(preview_ui, |ui| {
                                     for snapshot in &preview.snapshots {
-                                        let active = preview.active_snapshot_name.as_deref() == Some(snapshot.name.as_str());
-                                        let suffix = if snapshot.code.trim().is_empty() || snapshot.code == snapshot.name {
-                                            format!("#{}", snapshot.id)
-                                        } else {
-                                            format!("#{} · {}", snapshot.id, snapshot.code)
-                                        };
-                                        if active {
-                                            ui.strong(format!("{} · {} · active", snapshot.name, suffix));
-                                        } else {
-                                            ui.label(format!("{} · {}", snapshot.name, suffix));
+                                        let active = preview.active_snapshot_name.as_deref()
+                                            == Some(snapshot.name.as_str());
+                                        ui.horizontal_wrapped(|ui| {
+                                            if active {
+                                                ui.strong(format!("#{}", snapshot.id));
+                                                ui.strong(format!("{} · active", snapshot.name));
+                                            } else {
+                                                ui.strong(format!("#{}", snapshot.id));
+                                                ui.label(&snapshot.name);
+                                            }
+                                        });
+                                        if !snapshot.code.trim().is_empty()
+                                            && !snapshot.code.eq_ignore_ascii_case(&snapshot.name)
+                                        {
+                                            ui.small(format!("Code: {}", snapshot.code));
                                         }
                                     }
                                 });
-                        } else if let Some(error) = self.previous_shade_preview_error.as_ref() {
-                            columns[1].colored_label(egui::Color32::YELLOW, error);
-                            if let Some(entry) = cached.as_ref() {
-                                columns[1].label(format!("Cached: {} face(s) · {}", entry.face_count, entry.active_face_display()));
-                                if let Some(snapshot) = entry.latest_snapshot() {
-                                    columns[1].label(format!("Latest Snapshot: {} · #{}", snapshot.name, snapshot.id));
+                        }
+                        preview_ui.separator();
+                        preview_ui.small(preview.path.display().to_string());
+                    });
+
+                ui.strong(format!("Projects · {}", paths.len()));
+                ui.add_space(4.0);
+                if paths.is_empty() {
+                    ui.label("No matching .shade projects.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("project-view-list")
+                        .auto_shrink([false, false])
+                        .show_rows(ui, 72.0, indices.len(), |ui, range| {
+                            for row in range {
+                                let entry = self.previous_shades.entries()[indices[row]].clone();
+                                self.ensure_previous_shade_list_texture(ctx, &entry);
+                                let label = entry.display_name();
+                                let source_bytes = if entry.total_source_bytes > 0 {
+                                    format_byte_count(entry.total_source_bytes)
+                                } else {
+                                    "-".to_owned()
+                                };
+                                let metadata = format!(
+                                    "{} face(s) · {} · {}",
+                                    entry.face_count,
+                                    source_bytes,
+                                    entry.active_face_display(),
+                                );
+                                let latest = entry
+                                    .latest_snapshot()
+                                    .map(|snapshot| {
+                                        let code = snapshot.code.trim();
+                                        if code.is_empty() || code == snapshot.name.trim() {
+                                            format!("Latest: {}", snapshot.name)
+                                        } else {
+                                            format!("Latest: {} · {}", snapshot.name, code)
+                                        }
+                                    })
+                                    .unwrap_or_else(|| "No Snapshots".to_owned());
+                                let detail = if entry.is_missing() {
+                                    format!("{latest} · MISSING")
+                                } else {
+                                    latest
+                                };
+                                let selected = requested_select
+                                    .as_deref()
+                                    .or(self.previous_shades_selected.as_deref())
+                                    == Some(entry.path.as_str());
+                                let thumbnail = self.previous_shade_list_textures.get(&entry.path);
+                                let response = previous_shade_history_row(
+                                    ui,
+                                    selected,
+                                    &label,
+                                    &metadata,
+                                    &detail,
+                                    thumbnail,
+                                )
+                                .on_hover_text(&entry.path);
+                                if response.clicked() {
+                                    requested_select = Some(entry.path.clone());
+                                }
+                                if response.double_clicked() && !entry.is_missing() {
+                                    requested_open = Some(entry.path.clone());
                                 }
                             }
-                        } else {
-                            columns[1].label("Select a project to inspect its thumbnail, Snapshots and metadata.");
-                        }
-                    } else {
-                        columns[1].label("Select a project to inspect its thumbnail, Snapshots and metadata.");
-                    }
-                });
+                        });
+                }
             });
 
         self.show_previous_shades = open;
@@ -4196,8 +4303,8 @@ impl eframe::App for ShadeApp {
         self.sync_update_state();
         self.poll_autosave();
         self.handle_dropped_files(ui.ctx());
+        workflow_v0103::handle_shortcuts(self, ui.ctx());
         if !self.show_previous_shades {
-            workflow_v0103::handle_shortcuts(self, ui.ctx());
             self.handle_history_shortcuts(ui.ctx());
         }
         self.maybe_autosave();
@@ -4349,12 +4456,16 @@ fn previous_shade_history_row(
 }
 
 fn adjustment_tab_bar(ui: &mut egui::Ui, tool: &mut ToolPanel) -> bool {
-    ui.add_space(9.0);
+    ui.add_space(7.0);
     let mut reset = false;
     ui.horizontal(|ui| {
+        let spacing = ui.spacing().item_spacing.x;
+        let reset_width = 54.0;
+        let available = ui.available_width();
+        let tab_width = ((available - reset_width - spacing * 3.0) / 3.0).clamp(54.0, 76.0);
         if ui
             .add_sized(
-                [82.0, 32.0],
+                [tab_width, 30.0],
                 egui::Button::new("Levels").selected(*tool == ToolPanel::Levels),
             )
             .clicked()
@@ -4363,7 +4474,7 @@ fn adjustment_tab_bar(ui: &mut egui::Ui, tool: &mut ToolPanel) -> bool {
         }
         if ui
             .add_sized(
-                [82.0, 32.0],
+                [tab_width, 30.0],
                 egui::Button::new("Mixer").selected(*tool == ToolPanel::Mixer),
             )
             .clicked()
@@ -4372,20 +4483,18 @@ fn adjustment_tab_bar(ui: &mut egui::Ui, tool: &mut ToolPanel) -> bool {
         }
         if ui
             .add_sized(
-                [82.0, 32.0],
+                [tab_width, 30.0],
                 egui::Button::new("Curve").selected(*tool == ToolPanel::Curves),
             )
             .clicked()
         {
             *tool = ToolPanel::Curves;
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            reset = ui
-                .add_sized([64.0, 32.0], egui::Button::new("Reset"))
-                .clicked();
-        });
+        reset = ui
+            .add_sized([reset_width, 30.0], egui::Button::new("Reset"))
+            .clicked();
     });
-    ui.add_space(9.0);
+    ui.add_space(7.0);
     reset
 }
 

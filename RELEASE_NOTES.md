@@ -1,24 +1,33 @@
+# Shade Editor 0.14.1
+
+- Keep Export All Faces compact at a ~500px default width and prevent its text fields from expanding the dialog to the application width.
+- Rename the user-facing Previous Shades workspace to Project View and restore the complete v0.13.2 preview metadata while keeping v0.14 relink/remove/reveal/lazy-thumbnail behavior.
+- Make the Project View preview pane horizontally resizable and cap its embedded thumbnail display at 350x350px.
+- Reflow the Adjustments header and use compact adaptive Levels/Mixer/Curve/Reset tabs so the sidebar stays usable at narrow widths while retaining modified-state indicators.
+- Add Ctrl+N, Ctrl+E, Ctrl+Shift+E and G shortcuts for New, Export Face, Export All and Settings.
+- Keep operation progress in the right toolbar, widen it, and render operation + stage inside the progress bar without a second detail line.
+
 # Shade Editor 0.14.0
 
 - Export All workspace with destination field, folder TIFF warning, template naming, overwrite/skip/auto-number policies, and optional Explorer reveal after export.
-- Previous Shades promoted to a Project Browser with Remove from history, relink for missing .shade files, row-level latest Snapshot/active Face details, Explorer reveal, lazy row rendering, and a bounded thumbnail LRU cache.
+- Project View promoted to a Project Browser with Remove from history, relink for missing .shade files, row-level latest Snapshot/active Face details, Explorer reveal, lazy row rendering, and a bounded thumbnail LRU cache.
 - Project thumbnails now persist thumbnail_version and encoded_bytes metadata alongside width/height.
 - Adjustment panel shows per-channel modified state and the total number of modified channels.
 
 # Shade Editor 0.13.2
 
 - Upgrade embedded project thumbnails to 512px PNG with bilinear resampling, high PNG compression, and RGB encoding when alpha is fully opaque.
-- Cache a compact 72px Previous Shades list thumbnail plus Face count and source bytes for fast history rows, including offline entries.
+- Cache a compact 72px Project View list thumbnail plus Face count and source bytes for fast history rows, including offline entries.
 - Use the `.shade` filename when a project still carries the default `Untitled Shade` name, and normalize the name on the next successful Save/Quick Save.
-- Previous Shades now supports Enter to open, Up/Down navigation while Search has focus, first-result selection while searching, an Open shade folder action, and a Snapshot list in the preview pane.
+- Project View now supports Enter to open, Up/Down navigation while Search has focus, first-result selection while searching, an Open shade folder action, and a Snapshot list in the preview pane.
 - Export all omits Test Code by default; a persistent Export & storage setting can explicitly enable Test Code for all Face exports.
 - Adjustments defaults to All channels, moves the enable toggle into the Editing header, swaps the All channels/channel controls, and uses larger, spaced Levels/Mixer/Curve tabs.
 
 # Shade Editor 0.13.1
 
-- Index Snapshot names, Snapshot IDs and effective Test Code values in the persistent Previous Shades cache.
-- Previous Shades search can now find projects by a specific Snapshot/Test code without reopening `.shade` files during search.
-- Existing Previous Shades history is migrated once when cached Snapshot metadata is missing and the `.shade` file is available.
+- Index Snapshot names, Snapshot IDs and effective Test Code values in the persistent Project View cache.
+- Project View search can now find projects by a specific Snapshot/Test code without reopening `.shade` files during search.
+- Existing Project View history is migrated once when cached Snapshot metadata is missing and the `.shade` file is available.
 - Opening, Save and Quick Save refresh the cached Snapshot/Test index immediately so renamed/new tests become searchable at once.
 - Search results show the matching Snapshot name/code when a Snapshot term produced the match.
 
@@ -27,7 +36,7 @@
 - Add TIFF drag-and-drop directly into the Faces list.
 - Add Quick Save for unsaved projects, creating a unique `.shade` beside the active/source TIFF without a Save dialog.
 - Remind operators after TIFF export when the active Snapshot/Test state still has unsaved `.shade` project changes.
-- Add persistent Previous Shades history with search, sorting, embedded thumbnail/metadata preview, and missing-file retention.
+- Add persistent Project View history with search, sorting, embedded thumbnail/metadata preview, and missing-file retention.
 - Reserve `Load all shades from system` for the next Everything Search provider integration.
 
 # Shade Editor v0.12.1

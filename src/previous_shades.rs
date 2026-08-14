@@ -31,7 +31,7 @@ pub struct PreviousShadeEntry {
     pub last_opened_unix_ms: i64,
     pub saved_at_unix_ms: i64,
     pub open_count: u64,
-    /// Versioned local index so old Previous Shades JSON can be upgraded once
+    /// Versioned local index so old Project View JSON can be upgraded once
     /// without rereading every .shade file on each application start.
     pub snapshot_cache_version: u32,
     pub snapshots: Vec<CachedSnapshot>,
@@ -238,7 +238,7 @@ impl PreviousShadesStore {
             return Ok(Self::default());
         };
         let mut store: Self = serde_json::from_str(&text)
-            .map_err(|err| format!("Cannot parse Previous Shades history: {err}"))?;
+            .map_err(|err| format!("Cannot parse Project View history: {err}"))?;
         store.sanitize();
         // Cache migration is intentionally one-shot. Existing history entries
         // created before snapshot indexing are hydrated from the .shade file
@@ -253,11 +253,11 @@ impl PreviousShadesStore {
         let path = history_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|err| format!("Cannot create Previous Shades directory: {err}"))?;
+                .map_err(|err| format!("Cannot create Project View directory: {err}"))?;
         }
         let text = serde_json::to_string_pretty(self)
-            .map_err(|err| format!("Cannot serialize Previous Shades history: {err}"))?;
-        fs::write(path, text).map_err(|err| format!("Cannot save Previous Shades history: {err}"))
+            .map_err(|err| format!("Cannot serialize Project View history: {err}"))?;
+        fs::write(path, text).map_err(|err| format!("Cannot save Project View history: {err}"))
     }
 
     pub fn entries(&self) -> &[PreviousShadeEntry] {
@@ -279,7 +279,7 @@ impl PreviousShadesStore {
             .iter()
             .position(|entry| same_path(&entry.path, old_path))
         else {
-            return Err("Previous Shades entry no longer exists.".to_owned());
+            return Err("Project View entry no longer exists.".to_owned());
         };
         let mut entry = self.entries.remove(index);
         entry.path = display.clone();
@@ -353,7 +353,7 @@ impl PreviousShadesStore {
             if let Some(project) = loaded_project.as_ref() {
                 // This path is used after Open, Save and Quick Save, so every
                 // successful project save immediately refreshes its snapshot
-                // names/codes in the persistent Previous Shades cache.
+                // names/codes in the persistent Project View cache.
                 entry.refresh_from_project(project);
             }
         } else {

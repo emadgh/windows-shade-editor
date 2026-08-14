@@ -17,23 +17,46 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
 }
 
 pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
-    let (save, save_as, update_snapshot) = ctx.input(|input| {
-        (
-            input.key_pressed(egui::Key::S)
-                && input.modifiers.ctrl
-                && !input.modifiers.shift
-                && !input.modifiers.alt,
-            input.key_pressed(egui::Key::S)
-                && input.modifiers.ctrl
-                && input.modifiers.shift
-                && !input.modifiers.alt,
-            input.key_pressed(egui::Key::Enter) && input.modifiers.ctrl && !input.modifiers.alt,
-        )
-    });
+    let (new_project, save, save_as, export_face, export_all, update_snapshot) =
+        ctx.input(|input| {
+            (
+                input.key_pressed(egui::Key::N)
+                    && input.modifiers.ctrl
+                    && !input.modifiers.shift
+                    && !input.modifiers.alt,
+                input.key_pressed(egui::Key::S)
+                    && input.modifiers.ctrl
+                    && !input.modifiers.shift
+                    && !input.modifiers.alt,
+                input.key_pressed(egui::Key::S)
+                    && input.modifiers.ctrl
+                    && input.modifiers.shift
+                    && !input.modifiers.alt,
+                input.key_pressed(egui::Key::E)
+                    && input.modifiers.ctrl
+                    && !input.modifiers.shift
+                    && !input.modifiers.alt,
+                input.key_pressed(egui::Key::E)
+                    && input.modifiers.ctrl
+                    && input.modifiers.shift
+                    && !input.modifiers.alt,
+                input.key_pressed(egui::Key::Enter) && input.modifiers.ctrl && !input.modifiers.alt,
+            )
+        });
+
+    if new_project {
+        app.show_previous_shades = false;
+        app.new_project();
+    }
     if save_as {
         app.save_project(true);
     } else if save {
         app.save_project(false);
+    }
+    if export_all {
+        app.export_all_dialog();
+    } else if export_face {
+        app.export_current_dialog();
     }
     if update_snapshot {
         update_active_snapshot(app);
@@ -42,7 +65,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
     if ctx.wants_keyboard_input() {
         return;
     }
-    let (fit, solo, channel) = ctx.input(|input| {
+    let (settings, fit, solo, channel) = ctx.input(|input| {
         let no_modifiers = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
         let keys = [
             egui::Key::Num1,
@@ -56,6 +79,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
             egui::Key::Num9,
         ];
         (
+            no_modifiers && input.key_pressed(egui::Key::G),
             no_modifiers && input.key_pressed(egui::Key::F),
             no_modifiers && input.key_pressed(egui::Key::S),
             if no_modifiers {
@@ -65,6 +89,12 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
             },
         )
     });
+    if settings {
+        app.show_settings = true;
+    }
+    if app.show_previous_shades {
+        return;
+    }
     if fit {
         app.fit_requested = true;
         app.viewport_recenter = true;
