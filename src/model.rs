@@ -37,6 +37,13 @@ impl PreviewRenderingIntent {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IccProfileIdentity {
+    pub description: String,
+    pub sha256: String,
+}
+
 /// Project-owned display-only color setup. It is serialized in `.shade`, but is
 /// never consumed by TIFF export and never changes source TIFF metadata/samples.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,11 +53,15 @@ pub struct PreviewColorSettings {
     /// None = use the active TIFF's embedded profile. Some(path) = temporarily
     /// assign that ICC/ICM profile to the TIFF base channels for app preview.
     pub assigned_profile_path: Option<String>,
+    /// Identity metadata only; ICC payloads are never embedded in `.shade`.
+    pub assigned_profile_identity: Option<IccProfileIdentity>,
     pub rendering_intent: PreviewRenderingIntent,
     pub black_point_compensation: bool,
     /// Optional printer/RIP proof-device profile used only for on-screen soft proof.
     pub soft_proof_enabled: bool,
     pub proof_profile_path: Option<String>,
+    /// Identity metadata only; ICC payloads are never embedded in `.shade`.
+    pub proof_profile_identity: Option<IccProfileIdentity>,
     pub proofing_intent: PreviewRenderingIntent,
 }
 
@@ -59,10 +70,12 @@ impl Default for PreviewColorSettings {
         Self {
             enabled: true,
             assigned_profile_path: None,
+            assigned_profile_identity: None,
             rendering_intent: PreviewRenderingIntent::Perceptual,
             black_point_compensation: false,
             soft_proof_enabled: false,
             proof_profile_path: None,
+            proof_profile_identity: None,
             proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
         }
     }

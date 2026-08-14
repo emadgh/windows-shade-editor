@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::export_batch::{ConflictPolicy, DEFAULT_EXPORT_TEMPLATE, DEFAULT_FOLDER_TEMPLATE};
+use crate::model::IccProfileIdentity;
 use crate::palette::{
     AUTO_PALETTE_ID, ChannelPalette, ChannelPaletteEntry, builtin_palettes, is_builtin_id,
 };
@@ -32,6 +33,9 @@ pub struct AppSettings {
     pub export_all_conflict_policy: ConflictPolicy,
     pub export_all_open_folder: bool,
     pub lzw_compression: bool,
+    pub monitor_profile_path: Option<String>,
+    pub monitor_profile_identity: Option<IccProfileIdentity>,
+    pub gamut_warning: bool,
     pub default_dpi: f64,
     pub default_palette_id: String,
     pub custom_palettes: Vec<ChannelPalette>,
@@ -58,6 +62,9 @@ impl Default for AppSettings {
             export_all_conflict_policy: ConflictPolicy::AutoNumber,
             export_all_open_folder: false,
             lzw_compression: true,
+            monitor_profile_path: None,
+            monitor_profile_identity: None,
+            gamut_warning: false,
             default_dpi: DEFAULT_DPI,
             default_palette_id: AUTO_PALETTE_ID.to_owned(),
             custom_palettes: Vec::new(),
@@ -94,6 +101,14 @@ impl AppSettings {
         self.default_dpi = self.default_dpi.clamp(36.0, 2400.0);
         if self.export_all_template.trim().is_empty() {
             self.export_all_template = DEFAULT_EXPORT_TEMPLATE.to_owned();
+        }
+        if self
+            .monitor_profile_path
+            .as_ref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            self.monitor_profile_path = None;
+            self.monitor_profile_identity = None;
         }
 
         let mut used_ids = HashSet::new();
@@ -226,6 +241,14 @@ mod tests {
     #[test]
     fn lzw_compression_defaults_on() {
         assert!(AppSettings::default().lzw_compression);
+    }
+
+    #[test]
+    fn monitor_color_management_defaults_are_non_intrusive() {
+        let settings = AppSettings::default();
+        assert!(settings.monitor_profile_path.is_none());
+        assert!(settings.monitor_profile_identity.is_none());
+        assert!(!settings.gamut_warning);
     }
 
     #[test]

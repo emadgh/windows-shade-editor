@@ -11,9 +11,7 @@ use lcms2::{
 use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
-use windows_sys::Win32::UI::ColorSystem::{
-    ENUM_TYPE_VERSION, ENUMTYPEW, EnumColorProfilesW,
-};
+use windows_sys::Win32::UI::ColorSystem::{ENUM_TYPE_VERSION, ENUMTYPEW, EnumColorProfilesW};
 
 use crate::model::{IccProfileIdentity, PreviewRenderingIntent, ShadeProject};
 use crate::settings::AppSettings;
@@ -348,7 +346,9 @@ impl PreviewColorTransform {
         }
 
         let description = profile_description(&source);
-        let (destination, monitor_description) = if let Some(path) = config.monitor_profile_path.as_ref() {
+        let (destination, monitor_description) = if let Some(path) =
+            config.monitor_profile_path.as_ref()
+        {
             if let Err(err) = verify_profile_identity(
                 path,
                 config.monitor_profile_identity.as_ref(),
@@ -693,7 +693,10 @@ pub fn relink_project_profiles(
     changed
 }
 
-pub fn relink_monitor_profile(settings: &mut AppSettings, profiles: &[InstalledIccProfile]) -> bool {
+pub fn relink_monitor_profile(
+    settings: &mut AppSettings,
+    profiles: &[InstalledIccProfile],
+) -> bool {
     relink_path(
         &mut settings.monitor_profile_path,
         settings.monitor_profile_identity.as_ref(),
@@ -993,7 +996,10 @@ mod tests {
         let mut cfg = config();
         cfg.assigned_profile_path = Some(PathBuf::from(r"Z:\missing\profile.icc"));
         let transform = PreviewColorTransform::new(&metadata(ColorModel::Rgb, None), cfg);
-        assert!(matches!(transform.status(), PreviewColorStatus::Fallback { .. }));
+        assert!(matches!(
+            transform.status(),
+            PreviewColorStatus::Fallback { .. }
+        ));
     }
 
     #[test]
@@ -1012,7 +1018,10 @@ mod tests {
         cfg.assigned_profile_path = Some(path.clone());
         cfg.assigned_profile_identity = Some(inspected.identity().clone());
         let transform = PreviewColorTransform::new(&metadata(ColorModel::Cmyk, None), cfg);
-        assert!(matches!(transform.status(), PreviewColorStatus::Fallback { .. }));
+        assert!(matches!(
+            transform.status(),
+            PreviewColorStatus::Fallback { .. }
+        ));
         let _ = fs::remove_file(path);
     }
 
@@ -1022,32 +1031,32 @@ mod tests {
         let inspected = inspect_profile(&path).unwrap();
         assert!(inspected.is_display_profile());
         assert!(!inspected.is_output_profile());
-        let mut source_profile = Profile::new_srgb();
-        let mut bytes = Vec::new();
-        source_profile.write_icc(&mut bytes).unwrap();
+        let source_profile = Profile::new_srgb();
+        let bytes = source_profile.icc().unwrap();
         let mut cfg = config();
         cfg.soft_proof_enabled = true;
         cfg.proof_profile_path = Some(path.clone());
         cfg.proof_profile_identity = Some(inspected.identity().clone());
         let transform = PreviewColorTransform::new(&metadata(ColorModel::Rgb, Some(bytes)), cfg);
-        assert!(matches!(transform.status(), PreviewColorStatus::Fallback { .. }));
+        assert!(matches!(
+            transform.status(),
+            PreviewColorStatus::Fallback { .. }
+        ));
         let _ = fs::remove_file(path);
     }
 
     #[test]
     fn identity_relinks_moved_profile_without_embedding_it() {
         let original = temp_profile("identity-a");
-        let moved = original.with_file_name(format!("shade-color-moved-{}.icc", std::process::id()));
+        let moved =
+            original.with_file_name(format!("shade-color-moved-{}.icc", std::process::id()));
         fs::copy(&original, &moved).unwrap();
         let expected = inspect_profile(&original).unwrap().identity().clone();
         let moved_profile = inspect_profile(&moved).unwrap();
         fs::remove_file(&original).unwrap();
-        let resolved = resolve_external_profile_path(
-            original.to_str(),
-            Some(&expected),
-            &[moved_profile],
-        )
-        .unwrap();
+        let resolved =
+            resolve_external_profile_path(original.to_str(), Some(&expected), &[moved_profile])
+                .unwrap();
         assert_eq!(resolved, moved);
         let _ = fs::remove_file(resolved);
     }
