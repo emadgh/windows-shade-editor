@@ -69,7 +69,7 @@ adjusted base RGB/CMYK/Gray
 
 Solo-channel view intentionally remains an engineering separation view, not a colorimetric composite.
 
-Assigned ICC is an **input/source-profile override for preview**. It is not a proofing profile. A true printer/RIP soft proof would require LittleCMS proofing transforms and a separate proof-device profile and is currently out of scope.
+Assigned ICC is an **input/source-profile override for preview**. Printer/RIP Soft Proof is a separate project-owned output-device ICC using a LittleCMS proofing transform. Both remain display-only and are forbidden inputs to `export.rs`.
 
 ## ICC profile catalog
 
@@ -101,3 +101,12 @@ Photoshop Spot samples are normalized internally to ink-coverage polarity and co
 - Keep regression fixtures/baselines for each production TIFF family.
 - Validate large BigTIFF and tiled/planar production artwork.
 - Validate Windows Shell install/upgrade/removal on clean workstations.
+
+
+## Export queue
+
+`export_queue.rs` owns queued TIFF exports independently from UI state. Every queue item captures an immutable clone of the project/snapshot recipe at enqueue time. The existing export backend still writes a temporary TIFF and atomically replaces the destination only after successful completion. Waiting items cancel immediately; a Processing cancel is a safe stop-after-current request so the atomic export is never interrupted into a partial destination.
+
+## Production TIFF inspector
+
+`tiff_inspect.rs` is read-only. It combines decoded TIFF metadata with raw transport tags for diagnostics and never loads an inspected file into the editing project.

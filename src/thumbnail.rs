@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
+use crate::color_management::{PreviewColorConfig, PreviewColorTransform};
 use crate::model::{ProjectThumbnail, ShadeProject};
 use crate::render;
 use crate::tiff_io::PreviewFace;
@@ -12,7 +13,9 @@ pub fn build_project_thumbnail(
     project: &ShadeProject,
 ) -> Result<ProjectThumbnail, String> {
     let planes = render::adjusted_planes(face, project);
-    let rgba = render::rgba_from_planes(face, &planes, None);
+    let color =
+        PreviewColorTransform::new(&face.metadata, PreviewColorConfig::from_project(project));
+    let rgba = render::rgba_from_planes_with_color(face, &planes, None, &color);
     let (width, height, resized) =
         resize_rgba(face.width, face.height, &rgba, THUMBNAIL_MAX_DIMENSION)?;
     let png = encode_png(width as u32, height as u32, &resized)?;

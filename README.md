@@ -13,8 +13,13 @@ Shade Editor keeps source TIFF Faces immutable and stores non-destructive shade 
 - Preview clipping diagnostics for Levels/Curve.
 - Photoshop Spot DisplayInfo color/Solidity parsing; declared Alpha channels are excluded from the printing composite.
 - ICC-aware preview with embedded-profile support and non-destructive **preview profile assignment**.
+- True printer/RIP **Soft Proof** using an output-device ICC proofing transform; proof settings remain preview-only.
 - Searchable installed Windows ICC/ICM profile list, keyboard navigation, rendering intent and optional black-point compensation.
-- Assigned preview profile is saved in `.shade`; TIFF ICC bytes and source/export samples are never changed by it.
+- Assigned preview/proof profiles are saved in `.shade`; TIFF ICC bytes and source/export samples are never changed by them.
+- Color-managed project thumbnails use the same assigned profile and printer/RIP soft-proof transform as the viewport.
+- Export Queue provides Waiting / Processing / Done / Failed states with safe cancel/retry controls.
+- Export filename/folder templates support `{project}`, `{face}`, `{snapshot}`, `{date}` and `{source}`.
+- `File > Inspect TIFF` reports production transport metadata and can copy a diagnostic report.
 - Optional test-code raster in one separation or all separations.
 - Export current Face or all Faces with production-oriented metadata preservation.
 - BigTIFF selection/preservation, bounded strip/tile/planar processing and atomic destination replacement.
@@ -61,7 +66,7 @@ Click the ICC/profile name beside the active Face metadata to open **Color Manag
 
 `Use embedded profile` returns the project to the TIFF profile. Assigning another profile reinterprets the base channel values only for Shade Editor's preview. It does **not** assign/write that profile into the TIFF and export does not consume the preview transform.
 
-This is profile assignment / color-managed preview, not a printer/RIP proof simulation. A real proofing transform would require a separate proof-device profile; that is intentionally not part of the current scope.
+When a printer/RIP output ICC is selected and Soft Proof is enabled, Shade Editor uses a LittleCMS proofing transform before the sRGB display conversion. This is still display-only: no proof profile is embedded into or applied to exported TIFF samples.
 
 ## TIFF compatibility scope
 

@@ -18,7 +18,7 @@
 
 Implemented now: embedded ICC preview, project-owned temporary ICC assignment, rendering intents, optional black-point compensation, searchable installed Windows profiles and sRGB preview output.
 
-Intentionally deferred: monitor-profile output transforms and printer/RIP proof-device transforms. A true proofing transform should only be added when a real production proof profile/workflow is available to validate it; do not label source-profile assignment as printer soft proof.
+Implemented: printer/RIP proof-device transforms using a selected Output-class ICC. Still deferred: monitor-profile output transforms and production-specific gamut-alarm UX. Validate proof appearance against the real RIP/printer workflow before treating the screen as a contractual press match.
 
 ## Native Windows integration
 

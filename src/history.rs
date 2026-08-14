@@ -185,11 +185,11 @@ pub fn describe_change(
         "Adjustments"
     };
     if channels.len() == 1 {
-        format!("{kind} - {}", channels[0])
+        format!("{kind} · {}", channels[0])
     } else if channels.is_empty() {
         "Adjustments".to_owned()
     } else {
-        format!("{kind} - {} channels", channels.len())
+        format!("{kind} · {} channels", channels.len())
     }
 }
 
@@ -212,13 +212,13 @@ mod tests {
         let b = state(1.2);
         let c = state(1.4);
         history.reset(&a, "Start");
-        assert!(history.record(&b, "Levels - Cyan"));
-        assert!(history.record(&c, "Levels - Cyan"));
+        assert!(history.record(&b, "Levels · Cyan"));
+        assert!(history.record(&c, "Levels · Cyan"));
         assert_eq!(history.undo().unwrap(), b);
         assert_eq!(history.undo().unwrap(), a);
         assert_eq!(history.redo().unwrap(), b);
         let d = state(1.8);
-        assert!(history.record(&d, "Levels - Cyan"));
+        assert!(history.record(&d, "Levels · Cyan"));
         assert!(!history.can_redo());
     }
 
@@ -251,6 +251,6 @@ mod tests {
     fn change_description_detects_adjustment_type() {
         let a = state(1.0);
         let b = state(1.5);
-        assert_eq!(describe_change(&a, &b), "Levels - Cyan");
+        assert_eq!(describe_change(&a, &b), "Levels · Cyan");
     }
 }

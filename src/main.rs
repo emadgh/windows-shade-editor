@@ -955,6 +955,8 @@ impl ShadeApp {
                             snapshot_code: &snapshot_code,
                             face_number: index + 1,
                             face_name,
+                            source_name: "source",
+                            date: "",
                         },
                     );
                     let destination = match export_batch::resolve_destination(
@@ -1060,6 +1062,8 @@ impl ShadeApp {
                 snapshot_code: &snapshot_code,
                 face_number: 1,
                 face_name,
+                source_name: "source",
+                date: "",
             },
         );
         let mut browse = false;
@@ -1671,17 +1675,7 @@ impl ShadeApp {
         let preview = Arc::clone(&face.preview);
         let project = self.project.clone();
         let solo_channel = self.solo_channel;
-        let color_config = PreviewColorConfig {
-            enabled: self.project.preview_color.enabled,
-            intent: self.project.preview_color.rendering_intent,
-            black_point_compensation: self.project.preview_color.black_point_compensation,
-            assigned_profile_path: self
-                .project
-                .preview_color
-                .assigned_profile_path
-                .as_ref()
-                .map(PathBuf::from),
-        };
+        let color_config = PreviewColorConfig::from_project(&self.project);
         let tx = self.render_tx.clone();
         self.render_busy = Some((face_index, generation));
         std::thread::spawn(move || {
