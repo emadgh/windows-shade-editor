@@ -17,7 +17,10 @@ mod tests {
             "mod color_management;",
             "mod project_lifecycle;",
         ] {
-            assert!(MAIN.contains(module), "missing production module wiring: {module}");
+            assert!(
+                MAIN.contains(module),
+                "missing production module wiring: {module}"
+            );
         }
     }
 
@@ -35,14 +38,17 @@ mod tests {
 
     #[test]
     fn toolbar_and_color_management_entry_points_remain_present() {
-        for label in [
-            super::EXPORT_QUEUE_LABEL,
-            super::TIFF_INSPECTOR_LABEL,
-            super::COLOR_MANAGEMENT_LABEL,
+        for entry in [
+            "app_features::EXPORT_QUEUE_LABEL",
+            "app_features::TIFF_INSPECTOR_LABEL",
+            "Color Management / ICC Preview",
             super::SOFT_PROOF_LABEL,
             super::MONITOR_PROFILE_LABEL,
         ] {
-            assert!(MAIN.contains(label), "missing production feature entry point: {label}");
+            assert!(
+                MAIN.contains(entry),
+                "missing production feature entry point: {entry}"
+            );
         }
     }
 

@@ -10,6 +10,8 @@ impl ContextKeyboardCompat for eframe::egui::Context {
     }
 }
 
+mod app_controllers;
+mod app_features;
 mod app_log;
 mod color_management;
 mod dpi;
@@ -34,20 +36,23 @@ mod update;
 mod validation;
 mod workflow;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use app_controllers::{ColorManagementController, ExportController, TiffInspectorController};
 use chrono::{Local, TimeZone};
-use color_management::{InstalledIccProfile, PreviewColorConfig, PreviewColorStatus};
+use color_management::{PreviewColorConfig, PreviewColorStatus};
 use eframe::egui;
 use model::{
     ChannelAdjustment, PreviewRenderingIntent, ShadeProject, TEST_CODE_ALL_CHANNELS,
     TestCodePosition,
 };
 use palette::ChannelPalette;
-use project_lifecycle::ProjectTransition;
+use project_lifecycle::{
+    BackupRestoreCandidate, ProjectLifecycleController, ProjectTransition, TransitionRequest,
+};
 use settings::AppSettings;
 use tiff_io::PreviewFace;
 use update::{UpdateManager, UpdateStatus};
@@ -211,13 +216,6 @@ struct ErrorToast {
     created: Instant,
 }
 
-#[derive(Clone)]
-struct BackupRestoreCandidate {
-    primary_path: PathBuf,
-    backup_path: PathBuf,
-    primary_error: String,
-}
-
 struct ShadeApp {
     project: ShadeProject,
     project_path: Option<PathBuf>,
@@ -233,13 +231,7 @@ struct ShadeApp {
     settings: AppSettings,
     updater: UpdateManager,
     show_settings: bool,
-    show_color_management: bool,
-    icc_profile_query: String,
-    icc_profiles: Vec<InstalledIccProfile>,
-    icc_profile_selected: Option<String>,
-    icc_profile_scan_done: bool,
-    icc_profile_scan_error: Option<String>,
-    icc_show_incompatible: bool,
+    color: ColorManagementController,
     show_about: bool,
     show_logs: bool,
     show_previous_shades: bool,
@@ -252,18 +244,9 @@ struct ShadeApp {
     previous_shade_texture: Option<egui::TextureHandle>,
     previous_shade_list_textures: BTreeMap<String, egui::TextureHandle>,
     previous_shade_list_texture_lru: VecDeque<String>,
-    show_export_all: bool,
-    export_all_folder: String,
-    show_export_queue: bool,
-    export_queue: export_queue::ExportQueue,
-    export_queue_open_folder_after: Option<PathBuf>,
-    show_tiff_inspector: bool,
-    tiff_inspection: Option<tiff_inspect::TiffInspection>,
-    tiff_inspect_error: Option<String>,
-    opening_project_path: Option<PathBuf>,
-    backup_restore_candidate: Option<BackupRestoreCandidate>,
-    remind_after_export: bool,
-    show_snapshot_save_reminder: bool,
+    export: ExportController,
+    inspector: TiffInspectorController,
+    lifecycle: ProjectLifecycleController,
     log: app_log::AppLog,
     log_cache: String,
     last_update_failure: Option<String>,
@@ -273,10 +256,6 @@ struct ShadeApp {
     snapshot_rename_id: Option<u64>,
     snapshot_rename_buffer: String,
     pending_snapshot_load: Option<u64>,
-    pending_transition: Option<ProjectTransition>,
-    transition_after_save: Option<ProjectTransition>,
-    allow_close_once: bool,
-    project_session_id: u64,
     history: history::AdjustmentHistory,
     history_clear_backup: Option<(Option<u64>, history::AdjustmentHistory)>,
     history_pending_label: Option<String>,
@@ -341,13 +320,7 @@ impl ShadeApp {
             settings,
             updater,
             show_settings: false,
-            show_color_management: false,
-            icc_profile_query: String::new(),
-            icc_profiles: Vec::new(),
-            icc_profile_selected: None,
-            icc_profile_scan_done: false,
-            icc_profile_scan_error: None,
-            icc_show_incompatible: false,
+            color: ColorManagementController::default(),
             show_about: false,
             show_logs: false,
             show_previous_shades: false,
@@ -360,18 +333,9 @@ impl ShadeApp {
             previous_shade_texture: None,
             previous_shade_list_textures: BTreeMap::new(),
             previous_shade_list_texture_lru: VecDeque::new(),
-            show_export_all: false,
-            export_all_folder: String::new(),
-            show_export_queue: false,
-            export_queue,
-            export_queue_open_folder_after: None,
-            show_tiff_inspector: false,
-            tiff_inspection: None,
-            tiff_inspect_error: None,
-            opening_project_path: None,
-            backup_restore_candidate: None,
-            remind_after_export: false,
-            show_snapshot_save_reminder: false,
+            export: ExportController::new(export_queue),
+            inspector: TiffInspectorController::default(),
+            lifecycle: ProjectLifecycleController::default(),
             log,
             log_cache: String::new(),
             last_update_failure: None,
@@ -381,10 +345,6 @@ impl ShadeApp {
             snapshot_rename_id: None,
             snapshot_rename_buffer: String::new(),
             pending_snapshot_load: None,
-            pending_transition: None,
-            transition_after_save: None,
-            allow_close_once: false,
-            project_session_id: 1,
             history,
             history_clear_backup: None,
             history_pending_label: None,
@@ -426,26 +386,28 @@ impl ShadeApp {
         transition: ProjectTransition,
         ctx: Option<&egui::Context>,
     ) {
-        if self.job.is_some() {
-            self.report_info("Finish the current operation before changing projects.");
-            return;
-        }
-        if self.export_queue.has_pending() {
-            self.show_export_queue = true;
-            self.report_info(
-                "Finish or cancel the Export Queue before changing projects or exiting.",
-            );
-            return;
-        }
-        if project_lifecycle::requires_save_confirmation(
+        match self.lifecycle.request(
+            transition,
+            self.job.is_some(),
+            self.export.queue.has_pending(),
             self.project_dirty,
             !self.faces.is_empty(),
             self.project_path.is_some(),
         ) {
-            self.pending_transition = Some(transition);
-            return;
+            TransitionRequest::BlockedByOperation => {
+                self.report_info("Finish the current operation before changing projects.");
+            }
+            TransitionRequest::BlockedByExportQueue => {
+                self.export.show_queue = true;
+                self.report_info(
+                    "Finish or cancel the Export Queue before changing projects or exiting.",
+                );
+            }
+            TransitionRequest::AwaitingConfirmation => {}
+            TransitionRequest::Execute(transition) => {
+                self.execute_project_transition(transition, ctx);
+            }
         }
-        self.execute_project_transition(transition, ctx);
     }
 
     fn execute_project_transition(
@@ -461,10 +423,10 @@ impl ShadeApp {
             }
             ProjectTransition::Exit => {
                 if let Some(ctx) = ctx {
-                    self.allow_close_once = true;
+                    self.lifecycle.allow_close_once = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 } else {
-                    self.pending_transition = Some(ProjectTransition::Exit);
+                    self.lifecycle.pending = Some(ProjectTransition::Exit);
                 }
             }
             ProjectTransition::Recover => self.recover_project_now(),
@@ -472,17 +434,16 @@ impl ShadeApp {
     }
 
     fn complete_transition_after_save(&mut self, ctx: &egui::Context) {
-        if self.job.is_some() || self.project_dirty {
-            return;
+        if let Some(transition) = self
+            .lifecycle
+            .take_after_successful_save(self.job.is_some(), self.project_dirty)
+        {
+            self.execute_project_transition(transition, Some(ctx));
         }
-        let Some(transition) = self.transition_after_save.take() else {
-            return;
-        };
-        self.execute_project_transition(transition, Some(ctx));
     }
 
     fn bump_project_session(&mut self) {
-        self.project_session_id = self.project_session_id.wrapping_add(1).max(1);
+        self.lifecycle.bump_session();
     }
 
     fn reset_to_new_project(&mut self) {
@@ -500,13 +461,12 @@ impl ShadeApp {
         self.snapshot_rename_id = None;
         self.snapshot_rename_buffer.clear();
         self.pending_snapshot_load = None;
-        self.pending_transition = None;
-        self.transition_after_save = None;
-        self.show_color_management = false;
-        self.icc_profile_query.clear();
-        self.icc_profile_selected = None;
-        self.remind_after_export = false;
-        self.show_snapshot_save_reminder = false;
+        self.lifecycle.cancel_pending();
+        self.color.show = false;
+        self.color.query.clear();
+        self.color.selected = None;
+        self.export.remind_after_export = false;
+        self.export.show_snapshot_save_reminder = false;
         self.history.reset(&self.project.adjustments, "New project");
         self.history_clear_backup = None;
         self.history_pending_label = None;
@@ -669,8 +629,8 @@ impl ShadeApp {
             return;
         }
         self.recovery_candidate = None;
-        self.backup_restore_candidate = None;
-        self.opening_project_path = Some(path.clone());
+        self.lifecycle.backup_restore = None;
+        self.lifecycle.opening_path = Some(path.clone());
         let max_dimension = self.settings.max_preview_dimension;
         let default_dpi = self.settings.default_dpi;
         self.launch_job("Opening project", move |progress| {
@@ -851,10 +811,10 @@ impl ShadeApp {
             .iter()
             .map(|face| face.path.clone())
             .collect::<Vec<_>>();
-        match self.export_queue.enqueue_for_project(
+        match self.export.queue.enqueue_for_project(
             spec,
             protected_sources,
-            self.project_session_id,
+            self.lifecycle.session_id,
         ) {
             Ok(_) => true,
             Err(err) => {
@@ -902,7 +862,7 @@ impl ShadeApp {
             .active_snapshot_name()
             .unwrap_or("Working")
             .to_owned();
-        self.remind_after_export = self.snapshot_project_needs_save_reminder();
+        self.export.remind_after_export = self.snapshot_project_needs_save_reminder();
         if !self.enqueue_export(export_queue::ExportQueueSpec {
             label: format!("{face_name} / {state_name}"),
             source,
@@ -916,13 +876,13 @@ impl ShadeApp {
         }) {
             return;
         }
-        self.show_export_queue = true;
+        self.export.show_queue = true;
         self.report_info("Export added to queue");
     }
 
     fn poll_export_queue(&mut self) {
-        let completions = self.export_queue.poll();
-        if let Some(err) = self.export_queue.take_persistence_error() {
+        let completions = self.export.queue.poll();
+        if let Some(err) = self.export.queue.take_persistence_error() {
             self.log.error(&format!("Export Queue persistence: {err}"));
         }
         if completions.is_empty() {
@@ -932,7 +892,7 @@ impl ShadeApp {
         let mut completed = 0usize;
         let mut errors = Vec::new();
         for completion in completions {
-            if completion.project_session_id != self.project_session_id {
+            if completion.project_session_id != self.lifecycle.session_id {
                 self.log.info(&format!(
                     "Ignored queue completion #{} from previous project session {}",
                     completion.id, completion.project_session_id
@@ -960,12 +920,12 @@ impl ShadeApp {
             self.report_error(errors.join(" | "));
         }
 
-        if !self.export_queue.has_pending() {
-            if self.remind_after_export {
-                self.show_snapshot_save_reminder = true;
+        if !self.export.queue.has_pending() {
+            if self.export.remind_after_export {
+                self.export.show_snapshot_save_reminder = true;
             }
-            self.remind_after_export = false;
-            if let Some(folder) = self.export_queue_open_folder_after.take() {
+            self.export.remind_after_export = false;
+            if let Some(folder) = self.export.open_folder_after.take() {
                 if let Err(err) = open_folder(&folder) {
                     self.report_error(err);
                 }
@@ -974,12 +934,13 @@ impl ShadeApp {
     }
 
     fn ui_export_queue_window(&mut self, ctx: &egui::Context) {
-        if !self.show_export_queue {
+        if !self.export.show_queue {
             return;
         }
-        let mut open = self.show_export_queue;
+        let mut open = self.export.show_queue;
         let rows = self
-            .export_queue
+            .export
+            .queue
             .items()
             .iter()
             .map(|item| {
@@ -994,7 +955,7 @@ impl ShadeApp {
                 )
             })
             .collect::<Vec<_>>();
-        let pending = self.export_queue.pending_count();
+        let pending = self.export.queue.pending_count();
         let mut cancel_id = None;
         let mut retry_id = None;
         let mut cancel_waiting = false;
@@ -1080,19 +1041,19 @@ impl ShadeApp {
                 }
             });
 
-        self.show_export_queue = open;
+        self.export.show_queue = open;
         if let Some(id) = cancel_id {
-            self.export_queue.cancel(id);
+            self.export.queue.cancel(id);
         }
         if let Some(id) = retry_id {
-            self.export_queue.retry(id);
-            self.show_export_queue = true;
+            self.export.queue.retry(id);
+            self.export.show_queue = true;
         }
         if cancel_waiting {
-            self.export_queue.cancel_all_waiting();
+            self.export.queue.cancel_all_waiting();
         }
         if clear_finished {
-            self.export_queue.clear_finished();
+            self.export.queue.clear_finished();
         }
     }
 
@@ -1126,7 +1087,7 @@ impl ShadeApp {
     }
 
     fn ui_backup_restore_window(&mut self, ctx: &egui::Context) {
-        let Some(candidate) = self.backup_restore_candidate.clone() else {
+        let Some(candidate) = self.lifecycle.backup_restore.clone() else {
             return;
         };
         let mut restore = false;
@@ -1147,7 +1108,7 @@ impl ShadeApp {
                 });
             });
         if cancel {
-            self.backup_restore_candidate = None;
+            self.lifecycle.backup_restore = None;
         } else if restore {
             let corrupt = append_path_suffix(&candidate.primary_path, ".corrupt");
             let result = (|| -> Result<(), String> {
@@ -1161,7 +1122,7 @@ impl ShadeApp {
             })();
             match result {
                 Ok(()) => {
-                    self.backup_restore_candidate = None;
+                    self.lifecycle.backup_restore = None;
                     self.open_project_path(candidate.primary_path);
                 }
                 Err(err) => self.report_error(format!("Backup restore failed: {err}")),
@@ -1170,16 +1131,21 @@ impl ShadeApp {
     }
 
     fn ui_tiff_inspector_window(&mut self, ctx: &egui::Context) {
-        if !self.show_tiff_inspector {
+        if !self.inspector.show {
             return;
         }
-        let mut open = self.show_tiff_inspector;
+        let mut open = self.inspector.show;
         let report = self
-            .tiff_inspection
+            .inspector
+            .inspection
             .as_ref()
             .map(|item| item.report.clone());
-        let path = self.tiff_inspection.as_ref().map(|item| item.path.clone());
-        let error = self.tiff_inspect_error.clone();
+        let path = self
+            .inspector
+            .inspection
+            .as_ref()
+            .map(|item| item.path.clone());
+        let error = self.inspector.error.clone();
         let mut copy_report = false;
         let mut reveal = false;
         let mut display_report = report.clone().unwrap_or_default();
@@ -1226,7 +1192,7 @@ impl ShadeApp {
                 }
             });
 
-        self.show_tiff_inspector = open;
+        self.inspector.show = open;
         if copy_report {
             if let Some(report) = report {
                 ctx.copy_text(report);
@@ -1265,7 +1231,7 @@ impl ShadeApp {
         let source = face.path.clone();
         let default_dpi = self.settings.default_dpi;
         let force_lzw = self.settings.lzw_compression;
-        self.remind_after_export = false;
+        self.export.remind_after_export = false;
         self.launch_job("Validating TIFF", move |progress| {
             let result = validation::validate_no_adjustment_roundtrip_with_options(
                 &source,
@@ -1302,7 +1268,7 @@ impl ShadeApp {
             self.report_error("Export all requires every Face source TIFF to be available. Relink missing Faces first.");
             return;
         }
-        if self.export_all_folder.trim().is_empty() {
+        if self.export.all_folder.trim().is_empty() {
             let initial = self
                 .project_path
                 .as_ref()
@@ -1314,17 +1280,17 @@ impl ShadeApp {
                 })
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            self.export_all_folder = initial;
+            self.export.all_folder = initial;
         }
-        self.show_export_all = true;
+        self.export.show_all = true;
     }
 
     fn start_export_all(&mut self) {
         if self.job.is_some() || self.faces.is_empty() {
             return;
         }
-        let base_folder = PathBuf::from(self.export_all_folder.trim());
-        if self.export_all_folder.trim().is_empty() {
+        let base_folder = PathBuf::from(self.export.all_folder.trim());
+        if self.export.all_folder.trim().is_empty() {
             self.report_error("Choose an Export All folder first.");
             return;
         }
@@ -1370,7 +1336,7 @@ impl ShadeApp {
         let mut project = self.project.clone();
         project.test_code.enabled = self.settings.export_all_test_code;
         let date = Local::now().format("%Y-%m-%d").to_string();
-        let mut reserved = self.export_queue.reserved_destination_keys();
+        let mut reserved = self.export.queue.reserved_destination_keys();
         let mut queued = 0usize;
         let mut skipped = 0usize;
 
@@ -1433,11 +1399,11 @@ impl ShadeApp {
             queued += 1;
         }
 
-        self.show_export_all = false;
-        self.show_export_queue = queued > 0;
-        self.remind_after_export = queued > 0 && self.snapshot_project_needs_save_reminder();
+        self.export.show_all = false;
+        self.export.show_queue = queued > 0;
+        self.export.remind_after_export = queued > 0 && self.snapshot_project_needs_save_reminder();
         if open_after && queued > 0 {
-            self.export_queue_open_folder_after = Some(base_folder.clone());
+            self.export.open_folder_after = Some(base_folder.clone());
         }
         let _ = self.settings.save();
         if queued > 0 {
@@ -1454,11 +1420,11 @@ impl ShadeApp {
     }
 
     fn ui_export_all_window(&mut self, ctx: &egui::Context) {
-        if !self.show_export_all {
+        if !self.export.show_all {
             return;
         }
-        let mut open = self.show_export_all;
-        let folder = PathBuf::from(self.export_all_folder.trim());
+        let mut open = self.export.show_all;
+        let folder = PathBuf::from(self.export.all_folder.trim());
         let existing_tiffs = if folder.is_dir() {
             export_batch::folder_tiff_count(&folder)
         } else {
@@ -1528,7 +1494,7 @@ impl ShadeApp {
                 ui.strong("Export root folder");
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.export_all_folder)
+                        egui::TextEdit::singleline(&mut self.export.all_folder)
                             .desired_width(330.0),
                     );
                     browse = ui.button("Browse...").clicked();
@@ -1615,7 +1581,7 @@ impl ShadeApp {
                 ui.horizontal(|ui| {
                     start = ui
                         .add_enabled(
-                            !self.export_all_folder.trim().is_empty()
+                            !self.export.all_folder.trim().is_empty()
                                 && self.job.is_none()
                                 && !self.faces.is_empty(),
                             egui::Button::new("Add all to Queue"),
@@ -1628,7 +1594,7 @@ impl ShadeApp {
         if cancel {
             open = false;
         }
-        self.show_export_all = open;
+        self.export.show_all = open;
         if changed {
             self.settings.sanitize();
             if let Err(err) = self.settings.save() {
@@ -1641,7 +1607,7 @@ impl ShadeApp {
                 dialog = dialog.set_directory(&folder);
             }
             if let Some(selected) = dialog.pick_folder() {
-                self.export_all_folder = selected.to_string_lossy().into_owned();
+                self.export.all_folder = selected.to_string_lossy().into_owned();
             }
         }
         if reveal && folder.is_dir() {
@@ -1702,7 +1668,7 @@ impl ShadeApp {
         let mut project = self.project.clone();
         project.adjustments = snapshot.adjustments.clone();
         project.active_snapshot_id = Some(snapshot.id);
-        self.remind_after_export = self.snapshot_project_needs_save_reminder();
+        self.export.remind_after_export = self.snapshot_project_needs_save_reminder();
         if !self.enqueue_export(export_queue::ExportQueueSpec {
             label: format!("Face {} / {}", self.current_face + 1, snapshot.name),
             source,
@@ -1720,7 +1686,7 @@ impl ShadeApp {
         }) {
             return;
         }
-        self.show_export_queue = true;
+        self.export.show_queue = true;
         self.report_info("Snapshot export added to queue");
     }
 
@@ -1774,7 +1740,7 @@ impl ShadeApp {
             .map(|value| value.to_string_lossy().into_owned());
         let project_name = self.project.name.clone();
         let date = Local::now().format("%Y-%m-%d").to_string();
-        let mut reserved = self.export_queue.reserved_destination_keys();
+        let mut reserved = self.export.queue.reserved_destination_keys();
         let conflict_policy = self.settings.export_all_conflict_policy;
         let mut queued = 0usize;
         let mut skipped = 0usize;
@@ -1841,8 +1807,8 @@ impl ShadeApp {
         }
 
         if queued > 0 {
-            self.remind_after_export = self.snapshot_project_needs_save_reminder();
-            self.show_export_queue = true;
+            self.export.remind_after_export = self.snapshot_project_needs_save_reminder();
+            self.export.show_queue = true;
             self.report_info(if skipped > 0 {
                 format!("Queued {queued} snapshot(s) ({label}) · skipped {skipped}")
             } else {
@@ -1973,8 +1939,8 @@ impl ShadeApp {
             }
             JobResult::Open(result) => match result {
                 Ok(payload) => {
-                    self.opening_project_path = None;
-                    self.backup_restore_candidate = None;
+                    self.lifecycle.opening_path = None;
+                    self.lifecycle.backup_restore = None;
                     self.project = payload.project;
                     self.bump_project_session();
                     self.snapshot_rename_id = None;
@@ -1996,8 +1962,8 @@ impl ShadeApp {
                     self.fit_requested = true;
                     self.viewport_recenter = true;
                     self.project_dirty = false;
-                    self.remind_after_export = false;
-                    self.show_snapshot_save_reminder = false;
+                    self.export.remind_after_export = false;
+                    self.export.show_snapshot_save_reminder = false;
                     self.remember_previous_shade(&payload.path);
                     self.load_history_for_active_snapshot("Open project");
                     self.history_clear_backup = None;
@@ -2012,11 +1978,11 @@ impl ShadeApp {
                     }
                 }
                 Err(err) => {
-                    let primary_path = self.opening_project_path.take();
+                    let primary_path = self.lifecycle.opening_path.take();
                     if let Some(primary_path) = primary_path {
                         let backup_path = safe_fs::backup_path(&primary_path);
                         if backup_path.is_file() && ShadeProject::load(&backup_path).is_ok() {
-                            self.backup_restore_candidate = Some(BackupRestoreCandidate {
+                            self.lifecycle.backup_restore = Some(BackupRestoreCandidate {
                                 primary_path,
                                 backup_path,
                                 primary_error: err.clone(),
@@ -2063,8 +2029,8 @@ impl ShadeApp {
                     self.project.name = project_name_for_path(&self.project.name, &path);
                     self.project_path = Some(path.clone());
                     self.project_dirty = false;
-                    self.remind_after_export = false;
-                    self.show_snapshot_save_reminder = false;
+                    self.export.remind_after_export = false;
+                    self.export.show_snapshot_save_reminder = false;
                     self.remember_previous_shade(&path);
                     if let Err(err) = recovery::clear() {
                         self.log.error(&err);
@@ -2072,24 +2038,22 @@ impl ShadeApp {
                     self.report_info(format!("Saved {}", path.display()));
                 }
                 Err(err) => {
-                    if let Some(transition) = self.transition_after_save.take() {
-                        self.pending_transition = Some(transition);
-                    }
+                    self.lifecycle.save_failed();
                     self.report_error(err);
                 }
             },
             JobResult::InspectTiff(result) => {
                 match result {
                     Ok(report) => {
-                        self.tiff_inspection = Some(report);
-                        self.tiff_inspect_error = None;
+                        self.inspector.inspection = Some(report);
+                        self.inspector.error = None;
                     }
                     Err(err) => {
-                        self.tiff_inspection = None;
-                        self.tiff_inspect_error = Some(err);
+                        self.inspector.inspection = None;
+                        self.inspector.error = Some(err);
                     }
                 }
-                self.show_tiff_inspector = true;
+                self.inspector.show = true;
             }
             JobResult::Export(payload) => {
                 let export_ok = payload.result.is_ok();
@@ -2108,10 +2072,10 @@ impl ShadeApp {
                     Ok(message) => self.report_info(message),
                     Err(err) => self.report_error(format!("Export failed: {err}")),
                 }
-                if export_ok && self.remind_after_export {
-                    self.show_snapshot_save_reminder = true;
+                if export_ok && self.export.remind_after_export {
+                    self.export.show_snapshot_save_reminder = true;
                 }
-                self.remind_after_export = false;
+                self.export.remind_after_export = false;
             }
         }
     }
@@ -2441,10 +2405,10 @@ impl ShadeApp {
                         self.save_project(true);
                     }
                     ui.separator();
-                    if ui.button("Inspect TIFF...").clicked() {
+                    if ui.button(app_features::TIFF_INSPECTOR_LABEL).clicked() {
                         inspect_requested = true;
                     }
-                    if ui.button("Export Queue").clicked() {
+                    if ui.button(app_features::EXPORT_QUEUE_LABEL).clicked() {
                         queue_requested = true;
                     }
                 });
@@ -2459,8 +2423,8 @@ impl ShadeApp {
                 ui.separator();
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export face")).clicked() { self.export_current_dialog(); }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
-                let queue_label = format!("Queue ({})", self.export_queue.pending_count());
-                if ui.button(queue_label).clicked() { self.show_export_queue = true; }
+                let queue_label = format!("Queue ({})", self.export.queue.pending_count());
+                if ui.button(queue_label).clicked() { self.export.show_queue = true; }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Validate face")).on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.").clicked() { self.validate_current_face_dialog(); }
                 ui.separator();
                 if ui.button("Settings").clicked() { self.show_settings = true; }
@@ -2485,7 +2449,7 @@ impl ShadeApp {
             self.inspect_tiff_dialog();
         }
         if queue_requested {
-            self.show_export_queue = true;
+            self.export.show_queue = true;
         }
         if dismiss_error {
             self.toast = None;
@@ -2518,7 +2482,7 @@ impl ShadeApp {
                 return;
             }
         }
-        if let Some((value, text)) = self.export_queue.active_summary() {
+        if let Some((value, text)) = self.export.queue.active_summary() {
             ui.add(
                 egui::ProgressBar::new(value)
                     .desired_width(300.0)
@@ -2687,7 +2651,7 @@ impl ShadeApp {
     }
 
     fn ui_project_transition_confirmation(&mut self, ctx: &egui::Context) {
-        let Some(transition) = self.pending_transition.clone() else {
+        let Some(transition) = self.lifecycle.pending.clone() else {
             return;
         };
         let action = transition.action_label();
@@ -2725,11 +2689,9 @@ impl ShadeApp {
             });
 
         if cancel {
-            self.pending_transition = None;
-            self.transition_after_save = None;
+            self.lifecycle.cancel_pending();
         } else if discard_and_continue {
-            self.pending_transition = None;
-            self.transition_after_save = None;
+            self.lifecycle.cancel_pending();
             if !matches!(transition, ProjectTransition::Recover) {
                 if let Err(err) = recovery::clear() {
                     self.log.error(&err);
@@ -2737,11 +2699,9 @@ impl ShadeApp {
             }
             self.execute_project_transition(transition, Some(ctx));
         } else if save_and_continue {
-            self.pending_transition = None;
-            self.transition_after_save = Some(transition.clone());
+            self.lifecycle.begin_save_then(transition);
             if !self.save_project(false) {
-                self.transition_after_save = None;
-                self.pending_transition = Some(transition);
+                self.lifecycle.save_failed();
             }
         }
     }
@@ -2750,8 +2710,8 @@ impl ShadeApp {
         if !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
-        if self.allow_close_once {
-            self.allow_close_once = false;
+        if self.lifecycle.allow_close_once {
+            self.lifecycle.allow_close_once = false;
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -4194,9 +4154,8 @@ impl ShadeApp {
                 color_status.detail()
             ));
             if open_color_management {
-                self.show_color_management = true;
-                self.icc_profile_selected =
-                    self.project.preview_color.assigned_profile_path.clone();
+                self.color.show = true;
+                self.color.selected = self.project.preview_color.assigned_profile_path.clone();
             }
         });
         ui.small("Hold right mouse: BEFORE adjustments with current color-management setup · Hold middle mouse: original TIFF samples with Embedded ICC only (cached, no assigned profile / RIP Soft Proof).");
@@ -4830,7 +4789,7 @@ impl ShadeApp {
     }
 
     fn ui_snapshot_save_reminder(&mut self, ctx: &egui::Context) {
-        if !self.show_snapshot_save_reminder {
+        if !self.export.show_snapshot_save_reminder {
             return;
         }
         let unsaved_project = self.project_path.is_none();
@@ -4872,29 +4831,29 @@ impl ShadeApp {
             });
         });
         if quick_save && self.quick_save_project() {
-            self.show_snapshot_save_reminder = false;
+            self.export.show_snapshot_save_reminder = false;
         } else if save && self.save_project(false) {
-            self.show_snapshot_save_reminder = false;
+            self.export.show_snapshot_save_reminder = false;
         } else if save_as && self.save_project(true) {
-            self.show_snapshot_save_reminder = false;
+            self.export.show_snapshot_save_reminder = false;
         } else if later {
-            self.show_snapshot_save_reminder = false;
+            self.export.show_snapshot_save_reminder = false;
         }
     }
 
     fn refresh_icc_profile_catalog(&mut self) {
-        self.icc_profile_scan_done = true;
+        self.color.scan_done = true;
         match color_management::installed_profiles() {
             Ok(profiles) => {
-                self.icc_profiles = profiles;
-                self.icc_profile_scan_error = None;
+                self.color.profiles = profiles;
+                self.color.scan_error = None;
                 let project_relinked = color_management::relink_project_profiles(
                     &mut self.project,
-                    &self.icc_profiles,
+                    &self.color.profiles,
                 );
                 let monitor_relinked = color_management::relink_monitor_profile(
                     &mut self.settings,
-                    &self.icc_profiles,
+                    &self.color.profiles,
                 );
                 if project_relinked {
                     self.project_dirty = true;
@@ -4908,36 +4867,37 @@ impl ShadeApp {
                 }
             }
             Err(err) => {
-                self.icc_profiles.clear();
-                self.icc_profile_scan_error = Some(err);
+                self.color.profiles.clear();
+                self.color.scan_error = Some(err);
             }
         }
     }
 
     fn ui_color_management_window(&mut self, ctx: &egui::Context) {
-        if !self.show_color_management {
+        if !self.color.show {
             return;
         }
-        if !self.icc_profile_scan_done {
+        if !self.color.scan_done {
             self.refresh_icc_profile_catalog();
         }
 
         let Some(active_face) = self.faces.get(self.current_face) else {
-            self.show_color_management = false;
+            self.color.show = false;
             return;
         };
         let active_model = active_face.preview.metadata.color_model;
         let embedded_name =
             color_management::embedded_profile_description(&active_face.preview.metadata)
                 .unwrap_or_else(|| "No embedded ICC".to_owned());
-        let profiles = self.icc_profiles.clone();
-        let scan_error = self.icc_profile_scan_error.clone();
+        let profiles = self.color.profiles.clone();
+        let scan_error = self.color.scan_error.clone();
         let current_status = active_face.color_status.clone();
 
-        let original_query = self.icc_profile_query.clone();
+        let original_query = self.color.query.clone();
         let mut query = original_query.clone();
         let mut selected = self
-            .icc_profile_selected
+            .color
+            .selected
             .clone()
             .or_else(|| self.project.preview_color.assigned_profile_path.clone());
         let mut enabled = self.project.preview_color.enabled;
@@ -4948,7 +4908,7 @@ impl ShadeApp {
         let proof_path = self.project.preview_color.proof_profile_path.clone();
         let monitor_path = self.settings.monitor_profile_path.clone();
         let mut gamut_warning = self.settings.gamut_warning;
-        let mut show_incompatible = self.icc_show_incompatible;
+        let mut show_incompatible = self.color.show_incompatible;
         let mut requested_profile: Option<Option<PathBuf>> = None;
         let mut requested_proof: Option<Option<PathBuf>> = None;
         let mut requested_monitor: Option<Option<PathBuf>> = None;
@@ -4956,7 +4916,7 @@ impl ShadeApp {
         let mut browse_proof_requested = false;
         let mut browse_monitor_requested = false;
         let mut refresh_requested = false;
-        let mut open = self.show_color_management;
+        let mut open = self.color.show;
 
         egui::Window::new("Color Management / ICC Preview")
             .open(&mut open)
@@ -5264,13 +5224,13 @@ impl ShadeApp {
                 ui.small("Gamut warning is active only with Printer/RIP Soft Proof. Middle-mouse source preview deliberately bypasses assigned source, proof and monitor profiles and uses only the TIFF embedded ICC.");
             });
 
-        self.show_color_management = open;
-        self.icc_profile_query = query;
-        self.icc_profile_selected = selected;
-        self.icc_show_incompatible = show_incompatible;
+        self.color.show = open;
+        self.color.query = query;
+        self.color.selected = selected;
+        self.color.show_incompatible = show_incompatible;
 
         if refresh_requested {
-            self.icc_profile_scan_done = false;
+            self.color.scan_done = false;
             self.refresh_icc_profile_catalog();
         }
         if browse_requested {
@@ -5327,7 +5287,7 @@ impl ShadeApp {
                     if self.project.preview_color.assigned_profile_path.is_some() {
                         self.project.preview_color.assigned_profile_path = None;
                         self.project.preview_color.assigned_profile_identity = None;
-                        self.icc_profile_selected = None;
+                        self.color.selected = None;
                         changed = true;
                     }
                 }
@@ -5341,7 +5301,7 @@ impl ShadeApp {
                                 Some(path_text.clone());
                             self.project.preview_color.assigned_profile_identity =
                                 Some(profile.identity().clone());
-                            self.icc_profile_selected = Some(path_text);
+                            self.color.selected = Some(path_text);
                             changed = true;
                         }
                     }
