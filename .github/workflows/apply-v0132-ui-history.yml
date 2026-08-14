@@ -9,7 +9,7 @@ on:
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'Retry v0.13.2 UI and history patch'
+    if: github.event.head_commit.message == 'Retry v0.13.2 patch with regression test fix'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -18,6 +18,8 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Fix patch matcher
         run: python scripts/fix_v0132_patcher.py
+      - name: Fix regression tests
+        run: python scripts/fix_v0132_tests.py
       - name: Apply source patch
         run: python scripts/apply_v0132_previous_shades_ui.py
       - name: Format
@@ -33,6 +35,7 @@ jobs:
           Select-String -Path src/thumbnail.rs -Pattern 'THUMBNAIL_MAX_DIMENSION: usize = 512' | Out-Null
           Select-String -Path src/settings_v6.rs -Pattern 'export_all_test_code' | Out-Null
           Select-String -Path src/previous_shades.rs -Pattern 'SNAPSHOT_CACHE_VERSION: u32 = 2' | Out-Null
+          Select-String -Path src/previous_shades.rs -Pattern 'untitled_history_uses_shade_filename' | Out-Null
           Select-String -Path Cargo.toml -Pattern 'version = "0.13.2"' | Out-Null
       - name: Commit source
         shell: pwsh
