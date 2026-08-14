@@ -41,29 +41,33 @@ Validation: Windows `cargo fmt`, `cargo check` and full `cargo test` passed in A
 
 Issue: #28
 
-- [ ] Add optional monitor/display ICC output transform after document/proof conversion.
-- [ ] Add optional gamut-warning visualization for printer/RIP soft proof.
-- [ ] Persist external ICC identity metadata (description/hash/profile identity) without embedding payloads.
-- [ ] Relink missing external ICC paths to matching installed profiles when identity matches.
-- [ ] Improve Windows installed-profile discovery using registered color-management sources with filesystem scan fallback.
-- [ ] Cache reusable ICC/profile inspection state where safe.
-- [ ] Add profile failure-mode tests: missing, corrupt, wrong color space, wrong device class.
+- [x] Add optional monitor/display ICC output transform after document/proof conversion.
+- [x] Add optional gamut-warning visualization for printer/RIP soft proof.
+- [x] Persist external ICC identity metadata (description/hash/profile identity) without embedding payloads.
+- [x] Relink missing external ICC paths to matching installed profiles when identity matches.
+- [x] Improve Windows installed-profile discovery using registered color-management sources with filesystem scan fallback.
+- [x] Cache reusable ICC/profile inspection state where safe.
+- [x] Add profile failure-mode tests: missing, corrupt, wrong color space, wrong device class.
 
 Acceptance: preview can model source → printer/RIP proof → monitor, remains strictly preview-only, and external profiles survive path movement when an equivalent installed profile is available.
+
+Validation: Windows `cargo fmt`, `cargo check` and full `cargo test` passed in Actions run `31841006134`; validated Phase 2 source commit is `12882d50d29e9d138b612e9b65fc95c0a8ebf769`. ICC payload embedding remains explicitly excluded.
 
 ## Phase 3 — TIFF diagnostics, backup restore and recovery hardening
 
 Issue: #29
 
-- [ ] Run TIFF inspection off the UI thread.
-- [ ] Use bounded parser limits rather than unlimited decoder limits.
-- [ ] Expand TIFF report: byte order, SampleFormat, FillOrder, Orientation, strip/tile geometry, IFD/page count, InkSet, NumberOfInks, InkNames and richer Photoshop resource diagnostics.
-- [ ] Add a concise `Warnings / RIP risks` section.
-- [ ] If `.shade` load fails, detect/validate `.shade.bak` and provide explicit restore path.
-- [ ] Migrate readable legacy recovery v1 state to checksummed v2 and rely on verified states thereafter.
-- [ ] Extend malformed TIFF, backup restore and recovery migration tests.
+- [x] Run TIFF inspection off the UI thread.
+- [x] Use bounded parser limits rather than unlimited decoder limits.
+- [x] Expand TIFF report: byte order, SampleFormat, FillOrder, Orientation, strip/tile geometry, IFD/page count, InkSet, NumberOfInks, InkNames and richer Photoshop resource diagnostics.
+- [x] Add a concise `Warnings / RIP risks` section.
+- [x] If `.shade` load fails, detect/validate `.shade.bak` and provide explicit restore path.
+- [x] Migrate readable legacy recovery v1 state to checksummed v2 and rely on verified states thereafter.
+- [x] Extend malformed TIFF, backup restore and recovery migration tests.
 
 Acceptance: inspector is non-blocking/read-only and project backup/recovery has a verified fallback path.
+
+Validation: Windows `cargo fmt`, `cargo check` and full `cargo test` passed in Actions run `31841665133`; validated Phase 3 source commit is `3258881c277e89b8080a4f5a2d3e9dbd9bc30bd8`.
 
 ## Phase 4 — Architecture decomposition and integration regression coverage
 
