@@ -9,13 +9,15 @@ on:
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'Run v0.13.2 UI and history patch'
+    if: github.event.head_commit.message == 'Retry v0.13.2 UI and history patch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Fix patch matcher
+        run: python scripts/fix_v0132_patcher.py
       - name: Apply source patch
         run: python scripts/apply_v0132_previous_shades_ui.py
       - name: Format
