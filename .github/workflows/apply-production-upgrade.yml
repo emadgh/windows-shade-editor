@@ -26,6 +26,7 @@ jobs:
         run: |
           python tools/decode_upgrade.py
           python tools/apply_production_upgrade.py
+          python tools/post_upgrade_fix.py
 
       - name: Format
         run: cargo fmt --all
@@ -63,6 +64,7 @@ jobs:
           git rm -r tools/upgrade_chunks
           git rm tools/decode_upgrade.py
           git rm tools/apply_production_upgrade.py
+          git rm tools/post_upgrade_fix.py
           git rm .github/workflows/dev-inspect.yml
           git rm .github/workflows/apply-production-upgrade.yml
 
