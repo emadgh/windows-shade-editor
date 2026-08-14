@@ -9,7 +9,7 @@ on:
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'Enable one-shot v0.14 source migration'
+    if: github.event.head_commit.message == 'Retry v0.14 source migration'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -18,6 +18,8 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Apply source patch
         run: python scripts/apply_v014_project_browser_export.py
+      - name: Apply compile fixes
+        run: python scripts/fix_v014_compile.py
       - name: Format
         run: rustfmt --edition 2024 src/app_main.rs src/model_v6.rs src/previous_shades.rs src/thumbnail.rs src/settings_v6.rs src/export_batch.rs
       - name: Check locked Windows build
