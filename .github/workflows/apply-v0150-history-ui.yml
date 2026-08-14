@@ -1,0 +1,47 @@
+name: Apply v0.15.0 history and UI migration
+
+on:
+  push:
+    paths:
+      - scripts/apply_v0150_history_project_ui.py
+      - .github/workflows/apply-v0150-history-ui.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply source migration
+        shell: pwsh
+        run: python scripts/apply_v0150_history_project_ui.py
+      - name: Format
+        shell: pwsh
+        run: cargo fmt --all
+      - name: Verify diff
+        shell: pwsh
+        run: git diff --check
+      - name: Check locked Windows build
+        shell: pwsh
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+      - name: Test locked Windows build
+        shell: pwsh
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Commit source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock src/history.rs src/model_v6.rs src/workflow_v0103.rs src/app_main.rs
+          if (git diff --cached --quiet) { throw "Migration produced no source changes" }
+          git commit -m "Add persistent per-snapshot history and project title UI"
+          git push origin HEAD:main
