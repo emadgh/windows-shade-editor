@@ -12,6 +12,8 @@ impl ContextKeyboardCompat for eframe::egui::Context {
 
 #[path = "app_log.rs"]
 mod app_log;
+#[path = "color_management.rs"]
+mod color_management;
 #[path = "dpi.rs"]
 mod dpi;
 #[path = "export_v6.rs"]
@@ -51,6 +53,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone};
+use color_management::{PreviewColorConfig, PreviewColorStatus, PreviewRenderingIntent};
 use eframe::egui;
 use model::{ChannelAdjustment, ShadeProject, TEST_CODE_ALL_CHANNELS, TestCodePosition};
 use palette::ChannelPalette;
@@ -121,6 +124,8 @@ struct RuntimeFace {
     preview: Arc<PreviewFace>,
     dpi: dpi::DpiInfo,
     adjusted: Vec<Vec<u16>>,
+    clipping: Vec<render::ChannelClippingStats>,
+    color_status: PreviewColorStatus,
     texture: Option<egui::TextureHandle>,
     original_texture: Option<egui::TextureHandle>,
     generation: u64,
@@ -199,6 +204,8 @@ struct RenderResult {
     face_index: usize,
     generation: u64,
     adjusted: Vec<Vec<u16>>,
+    clipping: Vec<render::ChannelClippingStats>,
+    color_status: PreviewColorStatus,
     rgba: Vec<u8>,
     original_rgba: Vec<u8>,
 }
@@ -407,6 +414,8 @@ impl ShadeApp {
             preview: Arc::new(item.preview),
             dpi: item.dpi,
             adjusted: Vec::new(),
+            clipping: Vec::new(),
+            color_status: PreviewColorStatus::Pending,
             texture: None,
             original_texture: None,
             generation: 1,
@@ -1587,6 +1596,16 @@ impl ShadeApp {
         }
     }
 
+    /// Re-render textures for application-only display settings without marking
+    /// the .shade project dirty. ICC preview settings never alter project/TIFF data.
+    fn invalidate_display_previews(&mut self) {
+        for face in &mut self.faces {
+            face.generation = face.generation.wrapping_add(1).max(1);
+            face.color_status = PreviewColorStatus::Pending;
+        }
+        self.render_busy = None;
+    }
+
     fn poll_render(&mut self, ctx: &egui::Context) {
         while let Ok(result) = self.render_rx.try_recv() {
             if self.render_busy == Some((result.face_index, result.generation)) {
@@ -1599,6 +1618,8 @@ impl ShadeApp {
                 continue;
             }
             face.adjusted = result.adjusted;
+            face.clipping = result.clipping;
+            face.color_status = result.color_status;
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [face.preview.width, face.preview.height],
                 &result.rgba,
@@ -1648,16 +1669,31 @@ impl ShadeApp {
         let preview = Arc::clone(&face.preview);
         let project = self.project.clone();
         let solo_channel = self.solo_channel;
+        let color_config = PreviewColorConfig {
+            enabled: self.settings.icc_preview,
+            intent: self.settings.icc_rendering_intent,
+        };
         let tx = self.render_tx.clone();
         self.render_busy = Some((face_index, generation));
         std::thread::spawn(move || {
-            let adjusted = render::adjusted_planes(&preview, &project);
-            let rgba = render::rgba_from_planes(&preview, &adjusted, solo_channel);
-            let original_rgba = render::rgba_from_planes(&preview, &preview.channels, solo_channel);
+            let (adjusted, clipping) = render::adjusted_planes_with_stats(&preview, &project);
+            let color =
+                color_management::PreviewColorTransform::new(&preview.metadata, color_config);
+            let rgba =
+                render::rgba_from_planes_with_color(&preview, &adjusted, solo_channel, &color);
+            let original_rgba = render::rgba_from_planes_with_color(
+                &preview,
+                &preview.channels,
+                solo_channel,
+                &color,
+            );
+            let color_status = color.status().clone();
             let _ = tx.send(RenderResult {
                 face_index,
                 generation,
                 adjusted,
+                clipping,
+                color_status,
                 rgba,
                 original_rgba,
             });
@@ -2812,6 +2848,7 @@ impl ShadeApp {
             .iter()
             .map(|values| render::histogram(values))
             .collect::<Vec<_>>();
+        let clipping = face.clipping.clone();
         let base_count = face.preview.metadata.base_channel_count;
         let color_model = face.preview.metadata.color_model;
         let photoshop_display = face.preview.metadata.channel_display_info.clone();
@@ -2890,7 +2927,7 @@ impl ShadeApp {
             let is_solo = self.solo_channel == Some(index);
             let display_name = channel_display_name(active_palette.as_ref(), name, index);
             let label = format!("{display_name}{suffix}");
-            let hover = match display_info {
+            let mut hover = match display_info {
                 Some(info) if info.is_spot() => format!(
                     "Photoshop Spot Channel · Solidity {:.0}% · click to select; click again to toggle solo preview.",
                     info.solidity * 100.0
@@ -2898,12 +2935,26 @@ impl ShadeApp {
                 Some(_) => "Photoshop Alpha/auxiliary channel · click to select; click again to toggle solo preview.".to_owned(),
                 None => "Extra TIFF channel (Spot/Alpha type not declared) · click to select; click again to toggle solo preview.".to_owned(),
             };
+            let warning = if self.settings.show_clipping_warnings {
+                clipping
+                    .get(index)
+                    .copied()
+                    .and_then(clipping_warning_color)
+            } else {
+                None
+            };
+            if self.settings.show_clipping_warnings {
+                if let Some(stats) = clipping.get(index).copied() {
+                    hover.push_str(&format!("\n{}", clipping_tooltip(stats)));
+                }
+            }
             let response = clickable_channel_row(
                 ui,
                 self.selected_channel == index,
                 is_solo,
                 &label,
                 accent,
+                warning,
                 32.0,
             )
             .on_hover_text(hover);
@@ -2997,6 +3048,7 @@ impl ShadeApp {
             .collect::<Vec<_>>();
         let active_original_histogram = all_original_histograms.get(self.selected_channel).copied();
         let active_adjusted_histogram = all_adjusted_histograms.get(self.selected_channel).copied();
+        let active_clipping = face.clipping.get(self.selected_channel).copied();
         let control_accent = self
             .settings
             .colorize_adjustments
@@ -3064,6 +3116,11 @@ impl ShadeApp {
                 ui.small(format!("Modified {modified_count}/{}", channel_names.len()));
             }
         });
+        if self.settings.show_clipping_warnings {
+            if let Some(stats) = active_clipping {
+                clipping_summary_ui(ui, stats);
+            }
+        }
 
         let mut frame = egui::Frame::new().inner_margin(8).corner_radius(6);
         if let Some(color) = panel_accent {
@@ -3454,6 +3511,7 @@ impl ShadeApp {
             .unwrap_or_else(|| face.path.display().to_string());
         let meta = face.preview.metadata.clone();
         let dpi_info = face.dpi;
+        let color_status = face.color_status.clone();
         let texture = face.texture.clone();
         let original_texture = face.original_texture.clone();
         let (width_cm, height_cm) = physical_dimensions_cm(meta.width, meta.height, dpi_info);
@@ -3477,6 +3535,14 @@ impl ShadeApp {
             }
             ui.label(meta.color_model.title());
             ui.label(format!("{} channels", meta.samples_per_pixel));
+            let icc_response = if color_status.is_problem() {
+                ui.colored_label(egui::Color32::YELLOW, color_status.short_label())
+            } else if color_status.is_managed() {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, color_status.short_label())
+            } else {
+                ui.label(color_status.short_label())
+            };
+            icc_response.on_hover_text(color_status.detail());
         });
         ui.separator();
 
@@ -4141,6 +4207,10 @@ impl ShadeApp {
         }
         let mut open = self.show_settings;
         let mut rebuild_previews_requested = false;
+        let color_preview_before = (
+            self.settings.icc_preview,
+            self.settings.icc_rendering_intent,
+        );
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(true)
@@ -4178,6 +4248,41 @@ impl ShadeApp {
                     }
                 });
                 ui.small("The max dimension is used when TIFF previews are loaded. Use Rebuild previews to apply a changed value to Faces already open in this project.");
+                ui.separator();
+                ui.heading("Color management & clipping");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.icc_preview,
+                        "ICC-aware preview (embedded profile → sRGB)",
+                    )
+                    .changed();
+                egui::ComboBox::from_label("Preview rendering intent")
+                    .selected_text(self.settings.icc_rendering_intent.label())
+                    .show_ui(ui, |ui| {
+                        for intent in [
+                            PreviewRenderingIntent::Perceptual,
+                            PreviewRenderingIntent::RelativeColorimetric,
+                            PreviewRenderingIntent::Saturation,
+                            PreviewRenderingIntent::AbsoluteColorimetric,
+                        ] {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.settings.icc_rendering_intent,
+                                    intent,
+                                    intent.label(),
+                                )
+                                .changed();
+                        }
+                    });
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.show_clipping_warnings,
+                        "Show per-channel clipping warnings",
+                    )
+                    .changed();
+                ui.small("ICC is preview-only: it converts the TIFF base RGB/CMYK/Gray channels to sRGB for the screen, then composites declared Photoshop Spot channels. Alpha channels remain excluded. Exported samples, embedded ICC bytes and Photoshop resources are not changed by this setting.");
+                ui.small("Clipping percentages are estimates from the loaded preview samples. Yellow starts at 0.10%; red at 1.00%. Full-resolution export data is not sampled or modified for these warnings.");
+                ui.small("The color-management stage is isolated so a printer/RIP Soft Proof profile can be added later without changing the TIFF export pipeline.");
                 ui.separator();
                 ui.heading("Export & storage");
                 changed |= ui
@@ -4395,6 +4500,14 @@ impl ShadeApp {
                 });
             });
         self.show_settings = open;
+        if color_preview_before
+            != (
+                self.settings.icc_preview,
+                self.settings.icc_rendering_intent,
+            )
+        {
+            self.invalidate_display_previews();
+        }
         if rebuild_previews_requested {
             self.rebuild_previews();
         }
@@ -5693,12 +5806,69 @@ fn clickable_row(
     response
 }
 
+fn clipping_warning_color(stats: render::ChannelClippingStats) -> Option<egui::Color32> {
+    let max = stats.max_percent();
+    if max >= 1.0 {
+        Some(egui::Color32::RED)
+    } else if max >= 0.10 {
+        Some(egui::Color32::YELLOW)
+    } else {
+        None
+    }
+}
+
+fn clipping_tooltip(stats: render::ChannelClippingStats) -> String {
+    format!(
+        "Preview clipping estimate · Levels: black ~{:.2}%, white ~{:.2}% · Curve: black ~{:.2}%, white ~{:.2}% · {} sampled pixels",
+        stats.levels_black_percent(),
+        stats.levels_white_percent(),
+        stats.curve_black_percent(),
+        stats.curve_white_percent(),
+        stats.sample_count,
+    )
+}
+
+fn clipping_summary_ui(ui: &mut egui::Ui, stats: render::ChannelClippingStats) {
+    let warning = clipping_warning_color(stats);
+    egui::Frame::new()
+        .inner_margin(6)
+        .corner_radius(4)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(color) = warning {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.0, color);
+                }
+                ui.strong("Clipping estimate");
+                ui.label(format!(
+                    "Levels  Black ~{:.2}%  White ~{:.2}%",
+                    stats.levels_black_percent(),
+                    stats.levels_white_percent(),
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "Curve  Black ~{:.2}%  White ~{:.2}%",
+                    stats.curve_black_percent(),
+                    stats.curve_white_percent(),
+                ));
+            });
+            ui.small(format!(
+                "Preview estimate from {} sampled pixels · yellow ≥0.10% · red ≥1.00%",
+                stats.sample_count,
+            ));
+        });
+    ui.add_space(5.0);
+}
+
 fn clickable_channel_row(
     ui: &mut egui::Ui,
     selected: bool,
     solo: bool,
     label: &str,
     accent: egui::Color32,
+    warning: Option<egui::Color32>,
     height: f32,
 ) -> egui::Response {
     let width = ui.available_width().max(1.0);
@@ -5736,6 +5906,10 @@ fn clickable_channel_row(
         egui::FontId::proportional(14.0),
         accent,
     );
+    if let Some(color) = warning {
+        ui.painter()
+            .circle_filled(egui::pos2(rect.right() - 10.0, rect.center().y), 4.5, color);
+    }
     response
 }
 

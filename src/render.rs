@@ -1,13 +1,73 @@
+use crate::color_management::PreviewColorTransform;
 use crate::model::{ShadeProject, apply_curve, apply_levels};
 use crate::tiff_io::{self, ColorModel, PreviewFace};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelClippingStats {
+    pub sample_count: u64,
+    pub levels_black_count: u64,
+    pub levels_white_count: u64,
+    pub curve_black_count: u64,
+    pub curve_white_count: u64,
+}
+
+impl ChannelClippingStats {
+    fn percent(count: u64, total: u64) -> f32 {
+        if total == 0 {
+            0.0
+        } else {
+            count as f32 * 100.0 / total as f32
+        }
+    }
+
+    pub fn levels_black_percent(self) -> f32 {
+        Self::percent(self.levels_black_count, self.sample_count)
+    }
+
+    pub fn levels_white_percent(self) -> f32 {
+        Self::percent(self.levels_white_count, self.sample_count)
+    }
+
+    pub fn curve_black_percent(self) -> f32 {
+        Self::percent(self.curve_black_count, self.sample_count)
+    }
+
+    pub fn curve_white_percent(self) -> f32 {
+        Self::percent(self.curve_white_count, self.sample_count)
+    }
+
+    pub fn max_percent(self) -> f32 {
+        self.levels_black_percent()
+            .max(self.levels_white_percent())
+            .max(self.curve_black_percent())
+            .max(self.curve_white_percent())
+    }
+}
+
 pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u16>> {
+    adjusted_planes_with_stats(face, project).0
+}
+
+/// Apply the production adjustment order to preview samples and collect clipping
+/// estimates from the same downsampled working-space data. These statistics are
+/// diagnostic only; export still processes the full-resolution TIFF separately.
+pub fn adjusted_planes_with_stats(
+    face: &PreviewFace,
+    project: &ShadeProject,
+) -> (Vec<Vec<u16>>, Vec<ChannelClippingStats>) {
     let channel_count = face.channels.len();
     if channel_count == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let pixel_count = face.channels[0].len();
     let names = &face.metadata.channel_names;
+    let mut stats = vec![
+        ChannelClippingStats {
+            sample_count: pixel_count as u64,
+            ..ChannelClippingStats::default()
+        };
+        channel_count
+    ];
 
     let mut prepared = (0..channel_count)
         .map(|_| vec![0.0f32; pixel_count])
@@ -19,6 +79,14 @@ pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u1
             let raw = face.channels[channel][pixel] as f32 / 65535.0;
             prepared[channel][pixel] = if let Some(adjustment) = adjustment {
                 if adjustment.enabled {
+                    let black = adjustment.levels.input_black.clamp(0.0, 0.9999);
+                    let white = adjustment.levels.input_white.clamp(black + 0.0001, 1.0);
+                    if black > 0.0 && raw <= black {
+                        stats[channel].levels_black_count += 1;
+                    }
+                    if white < 1.0 && raw >= white {
+                        stats[channel].levels_white_count += 1;
+                    }
                     apply_levels(raw, adjustment.levels)
                 } else {
                     raw
@@ -51,6 +119,17 @@ pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u1
                             .unwrap_or(if source == out_channel { 1.0 } else { 0.0 });
                         mixed += prepared[source][pixel] * coefficient;
                     }
+                    let curve_black = adjustment.curve.input_black.clamp(0.0, 1.0);
+                    let curve_white = adjustment
+                        .curve
+                        .input_white
+                        .clamp(curve_black + 1.0 / 65535.0, 1.0);
+                    if mixed < 0.0 || (curve_black > 0.0 && mixed <= curve_black) {
+                        stats[out_channel].curve_black_count += 1;
+                    }
+                    if mixed > 1.0 || (curve_white < 1.0 && mixed >= curve_white) {
+                        stats[out_channel].curve_white_count += 1;
+                    }
                     apply_curve(mixed, adjustment.curve)
                 }
             } else {
@@ -60,22 +139,38 @@ pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u1
         }
     }
 
-    output
+    (output, stats)
 }
 
-/// Build a display preview. This is not a press proof, but it must preserve the
-/// image geometry and base color model. v0.1 incorrectly treated every 4+
-/// channel file as CMYK, which corrupted RGB+spot previews.
 pub fn rgba_from_planes(
     face: &PreviewFace,
     planes: &[Vec<u16>],
     solo_channel: Option<usize>,
+) -> Vec<u8> {
+    rgba_from_planes_impl(face, planes, solo_channel, None)
+}
+
+pub fn rgba_from_planes_with_color(
+    face: &PreviewFace,
+    planes: &[Vec<u16>],
+    solo_channel: Option<usize>,
+    color: &PreviewColorTransform,
+) -> Vec<u8> {
+    rgba_from_planes_impl(face, planes, solo_channel, Some(color))
+}
+
+fn rgba_from_planes_impl(
+    face: &PreviewFace,
+    planes: &[Vec<u16>],
+    solo_channel: Option<usize>,
+    color: Option<&PreviewColorTransform>,
 ) -> Vec<u8> {
     let width = face.width;
     let height = face.height;
     let pixel_count = width.saturating_mul(height);
     let mut rgba = Vec::with_capacity(pixel_count.saturating_mul(4));
 
+    // Solo is an engineering separation view, not a colorimetric composite.
     if let Some(channel) = solo_channel.filter(|index| *index < planes.len()) {
         let invert = tiff_io::solo_channel_uses_ink_coverage(&face.metadata, channel);
         for value in &planes[channel] {
@@ -86,6 +181,20 @@ pub fn rgba_from_planes(
                 byte
             };
             rgba.extend_from_slice(&[gray, gray, gray, 255]);
+        }
+        return rgba;
+    }
+
+    if let Some(base_rgb) = color.and_then(|color| color.base_rgb8(planes, pixel_count)) {
+        for (pixel, base) in base_rgb.into_iter().enumerate() {
+            let mut rgb = [
+                base[0] as f32 / 255.0,
+                base[1] as f32 / 255.0,
+                base[2] as f32 / 255.0,
+            ];
+            // Spot channels deliberately stay outside the base ICC transform.
+            composite_extra_channels(face, planes, pixel, &mut rgb);
+            push_rgb(&mut rgba, rgb);
         }
         return rgba;
     }
@@ -180,18 +289,12 @@ fn composite_extra_channels(
                 let tint = info.rgb.unwrap_or(
                     DIAGNOSTIC_TINTS[(channel_index - first_extra) % DIAGNOSTIC_TINTS.len()],
                 );
-                // Photoshop Solidity affects composite/on-screen simulation only,
-                // not the actual separation. Honor the stored value exactly.
                 blend_tint(rgb, tint, (coverage * info.solidity).clamp(0.0, 1.0));
             }
             Some(_) => {
-                // Known Alpha/protected display channels are not printing inks;
-                // do not contaminate the composite preview with them.
+                // Known Alpha/protected display channels are not printing inks.
             }
             None => {
-                // Files without DisplayInfo cannot tell us Spot vs Alpha here.
-                // Retain a deterministic engineering tint so extra separations
-                // remain visible during diagnosis.
                 let tint = DIAGNOSTIC_TINTS[(channel_index - first_extra) % DIAGNOSTIC_TINTS.len()];
                 blend_tint(rgb, tint, (coverage * 0.72).clamp(0.0, 0.72));
             }
@@ -224,4 +327,88 @@ pub fn histogram(values: &[u16]) -> [u32; 256] {
         bins[index] = bins[index].saturating_add(1);
     }
     bins
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ChannelAdjustment, Curve, Levels, MixerRow};
+    use crate::tiff_io::TiffMetadata;
+    use std::collections::BTreeMap;
+
+    fn face(values: Vec<u16>) -> PreviewFace {
+        PreviewFace {
+            metadata: TiffMetadata {
+                width: values.len() as u32,
+                height: 1,
+                bit_depth: 16,
+                samples_per_pixel: 1,
+                base_channel_count: 1,
+                color_model: ColorModel::Gray,
+                channel_names: vec!["Ink".to_owned()],
+                channel_display_info: vec![None],
+                compression: None,
+                predictor: None,
+                orientation: None,
+                icc_profile: None,
+                photoshop_resources: None,
+                photoshop_image_source_data: None,
+            },
+            width: values.len(),
+            height: 1,
+            channels: vec![values.clone()],
+            histograms: vec![histogram(&values)],
+        }
+    }
+
+    fn project(adjustment: ChannelAdjustment) -> ShadeProject {
+        let mut project = ShadeProject::default();
+        project.adjustments.insert("Ink".to_owned(), adjustment);
+        project
+    }
+
+    #[test]
+    fn default_adjustment_reports_no_clipping() {
+        let face = face(vec![0, 16384, 32768, 49152, 65535]);
+        let (_, stats) = adjusted_planes_with_stats(&face, &project(ChannelAdjustment::default()));
+        assert_eq!(stats[0].levels_black_count, 0);
+        assert_eq!(stats[0].levels_white_count, 0);
+        assert_eq!(stats[0].curve_black_count, 0);
+        assert_eq!(stats[0].curve_white_count, 0);
+    }
+
+    #[test]
+    fn levels_thresholds_report_shadow_and_highlight_clipping() {
+        let face = face(vec![0, 10000, 30000, 55000, 65535]);
+        let adjustment = ChannelAdjustment {
+            levels: Levels {
+                input_black: 0.20,
+                input_white: 0.80,
+                ..Levels::default()
+            },
+            ..ChannelAdjustment::default()
+        };
+        let (_, stats) = adjusted_planes_with_stats(&face, &project(adjustment));
+        assert_eq!(stats[0].levels_black_count, 2);
+        assert_eq!(stats[0].levels_white_count, 2);
+        assert!((stats[0].levels_black_percent() - 40.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn mixer_overflow_is_reported_at_curve_stage() {
+        let face = face(vec![32768, 65535]);
+        let mut coefficients = BTreeMap::new();
+        coefficients.insert("Ink".to_owned(), 2.0);
+        let adjustment = ChannelAdjustment {
+            levels: Levels::default(),
+            curve: Curve::default(),
+            mixer: MixerRow {
+                coefficients,
+                constant: 0.1,
+            },
+            enabled: true,
+        };
+        let (_, stats) = adjusted_planes_with_stats(&face, &project(adjustment));
+        assert_eq!(stats[0].curve_white_count, 2);
+    }
 }

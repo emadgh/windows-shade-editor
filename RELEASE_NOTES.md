@@ -1,3 +1,12 @@
+# Shade Editor 0.16.0
+
+- Add ICC-aware preview color management using each TIFF's embedded RGB/CMYK/Gray profile and an sRGB display destination; rendering intent is selectable in Settings.
+- Keep ICC conversion strictly in the preview path. Export continues to use the original TIFF samples and preserve embedded ICC/Photoshop metadata without applying display transforms.
+- Composite declared Photoshop Spot separations after the base ICC transform using their existing DisplayInfo color/solidity; known Alpha channels remain excluded from the printing composite.
+- Add per-channel Levels and Curve clipping estimates from preview working-space samples, with yellow/red warning indicators in the channel list and detailed percentages in Adjustments.
+- Isolate color management behind a dedicated preview module so a future printer/RIP Soft Proof profile can use a proofing transform without changing production TIFF export.
+- Keep the adjustment order Levels → Mixer → Curve and keep `.shade` schema v9 unchanged.
+
 # Shade Editor 0.14.2
 
 - Make the Project View Preview pane vertically scrollable while preserving its resizable width and 350px thumbnail cap.

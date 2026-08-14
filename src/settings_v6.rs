@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::color_management::PreviewRenderingIntent;
 use crate::export_batch::{ConflictPolicy, DEFAULT_EXPORT_TEMPLATE};
 use crate::palette::{
     AUTO_PALETTE_ID, ChannelPalette, ChannelPaletteEntry, builtin_palettes, is_builtin_id,
@@ -17,6 +18,9 @@ pub struct AppSettings {
     pub auto_update: bool,
     pub dark_mode: bool,
     pub max_preview_dimension: u32,
+    pub icc_preview: bool,
+    pub icc_rendering_intent: PreviewRenderingIntent,
+    pub show_clipping_warnings: bool,
     pub adjustment_tabs: bool,
     pub show_all_histograms: bool,
     pub sidebar_two_columns: bool,
@@ -41,6 +45,9 @@ impl Default for AppSettings {
             auto_update: true,
             dark_mode: true,
             max_preview_dimension: 1800,
+            icc_preview: true,
+            icc_rendering_intent: PreviewRenderingIntent::Perceptual,
+            show_clipping_warnings: true,
             adjustment_tabs: false,
             show_all_histograms: false,
             sidebar_two_columns: false,
@@ -202,6 +209,17 @@ mod tests {
     #[test]
     fn default_dpi_is_220() {
         assert_eq!(AppSettings::default().default_dpi, 220.0);
+    }
+
+    #[test]
+    fn color_management_and_clipping_defaults_are_safe() {
+        let settings = AppSettings::default();
+        assert!(settings.icc_preview);
+        assert_eq!(
+            settings.icc_rendering_intent,
+            PreviewRenderingIntent::Perceptual
+        );
+        assert!(settings.show_clipping_warnings);
     }
 
     #[test]
