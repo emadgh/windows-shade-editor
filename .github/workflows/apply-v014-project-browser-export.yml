@@ -1,0 +1,43 @@
+name: Apply v0.14 Project Browser and Export All
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Enable one-shot v0.14 source migration'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply source patch
+        run: python scripts/apply_v014_project_browser_export.py
+      - name: Format
+        run: rustfmt --edition 2024 src/app_main.rs src/model_v6.rs src/previous_shades.rs src/thumbnail.rs src/settings_v6.rs src/export_batch.rs
+      - name: Check locked Windows build
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+      - name: Test locked Windows build
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Verify diff
+        shell: pwsh
+        run: |
+          git diff --check
+          Select-String -Path Cargo.toml -Pattern 'version = "0.14.0"' | Out-Null
+          Select-String -Path src/export_batch.rs -Pattern 'DEFAULT_EXPORT_TEMPLATE' | Out-Null
+          Select-String -Path src/model_v6.rs -Pattern 'encoded_bytes' | Out-Null
+          Select-String -Path src/previous_shades.rs -Pattern 'relink_path' | Out-Null
+          Select-String -Path src/app_main.rs -Pattern 'PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT' | Out-Null
+      - name: Commit source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app_main.rs src/model_v6.rs src/previous_shades.rs src/thumbnail.rs src/settings_v6.rs src/export_batch.rs Cargo.toml Cargo.lock RELEASE_NOTES.md
+          git commit -m "Add professional Export All and Project Browser"
+          git push
