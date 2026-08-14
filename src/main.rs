@@ -259,6 +259,8 @@ struct ShadeApp {
     snapshot_rename_id: Option<u64>,
     snapshot_rename_buffer: String,
     pending_snapshot_load: Option<u64>,
+    show_new_confirmation: bool,
+    new_after_save: bool,
     show_close_confirmation: bool,
     close_after_save: bool,
     allow_close_once: bool,
@@ -360,6 +362,8 @@ impl ShadeApp {
             snapshot_rename_id: None,
             snapshot_rename_buffer: String::new(),
             pending_snapshot_load: None,
+            show_new_confirmation: false,
+            new_after_save: false,
             show_close_confirmation: false,
             close_after_save: false,
             allow_close_once: false,
@@ -399,6 +403,18 @@ impl ShadeApp {
         if self.job.is_some() {
             return;
         }
+        if should_confirm_new_project(
+            self.project_dirty,
+            !self.faces.is_empty(),
+            self.project_path.is_some(),
+        ) {
+            self.show_new_confirmation = true;
+            return;
+        }
+        self.reset_to_new_project();
+    }
+
+    fn reset_to_new_project(&mut self) {
         self.project = ShadeProject::default();
         self.project.channel_palette = self.settings.default_project_palette();
         self.project_path = None;
@@ -413,6 +429,8 @@ impl ShadeApp {
         self.snapshot_rename_id = None;
         self.snapshot_rename_buffer.clear();
         self.pending_snapshot_load = None;
+        self.show_new_confirmation = false;
+        self.new_after_save = false;
         self.show_close_confirmation = false;
         self.close_after_save = false;
         self.show_color_management = false;
@@ -1845,6 +1863,8 @@ impl ShadeApp {
             },
             JobResult::Save { path, result } => match result {
                 Ok(()) => {
+                    let create_new_after_save = self.new_after_save;
+                    self.new_after_save = false;
                     self.project.name = project_name_for_path(&self.project.name, &path);
                     self.project_path = Some(path.clone());
                     self.project_dirty = false;
@@ -1855,8 +1875,15 @@ impl ShadeApp {
                         self.log.error(&err);
                     }
                     self.report_info(format!("Saved {}", path.display()));
+                    if create_new_after_save {
+                        self.reset_to_new_project();
+                    }
                 }
                 Err(err) => {
+                    if self.new_after_save {
+                        self.new_after_save = false;
+                        self.show_new_confirmation = true;
+                    }
                     self.close_after_save = false;
                     self.report_error(err);
                 }
@@ -2448,6 +2475,62 @@ impl ShadeApp {
         } else if discard {
             self.pending_snapshot_load = None;
             self.apply_snapshot_now(target_id);
+        }
+    }
+
+    fn ui_new_project_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.show_new_confirmation {
+            return;
+        }
+
+        let mut save_and_new = false;
+        let mut discard_and_new = false;
+        let mut cancel = false;
+        egui::Window::new("Save current project?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                if self.project_path.is_some() {
+                    ui.strong("The current project has unsaved changes.");
+                } else {
+                    ui.strong("The current project has not been saved yet.");
+                }
+                ui.label("Creating a new project will remove the current Faces, Snapshots and adjustment state from the editor.");
+                ui.label("Save the current .shade project before continuing?");
+                if self.job.is_some() {
+                    ui.small("Wait for the current operation to finish before saving.");
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    save_and_new = ui
+                        .add_enabled(
+                            self.job.is_none() && !self.faces.is_empty(),
+                            egui::Button::new("Save and create new"),
+                        )
+                        .clicked();
+                    discard_and_new = ui.button("Discard and create new").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+
+        if cancel {
+            self.show_new_confirmation = false;
+            self.new_after_save = false;
+        } else if discard_and_new {
+            self.show_new_confirmation = false;
+            self.new_after_save = false;
+            if let Err(err) = recovery::clear() {
+                self.log.error(&err);
+            }
+            self.reset_to_new_project();
+        } else if save_and_new {
+            self.new_after_save = true;
+            if self.save_project(false) {
+                self.show_new_confirmation = false;
+            } else {
+                self.new_after_save = false;
+            }
         }
     }
 
@@ -5486,10 +5569,37 @@ impl eframe::App for ShadeApp {
         self.ui_recovery_window(ui.ctx());
         self.ui_snapshot_discard_confirmation(ui.ctx());
         self.ui_snapshot_save_reminder(ui.ctx());
+        self.ui_new_project_confirmation(ui.ctx());
         self.ui_close_confirmation(ui.ctx());
         self.commit_pending_history(ui.ctx(), false);
 
         self.start_render_if_needed(ui.ctx());
+    }
+}
+
+fn should_confirm_new_project(project_dirty: bool, has_faces: bool, has_saved_path: bool) -> bool {
+    project_dirty || (has_faces && !has_saved_path)
+}
+
+#[cfg(test)]
+mod new_project_guard_tests {
+    use super::should_confirm_new_project;
+
+    #[test]
+    fn dirty_project_always_requires_confirmation() {
+        assert!(should_confirm_new_project(true, true, true));
+        assert!(should_confirm_new_project(true, false, true));
+    }
+
+    #[test]
+    fn unsaved_project_with_faces_requires_confirmation_even_if_clean_flag_is_false() {
+        assert!(should_confirm_new_project(false, true, false));
+    }
+
+    #[test]
+    fn clean_saved_or_empty_project_can_be_replaced_without_prompt() {
+        assert!(!should_confirm_new_project(false, true, true));
+        assert!(!should_confirm_new_project(false, false, false));
     }
 }
 

@@ -1,3 +1,9 @@
+# Shade Editor 0.17.2
+
+- Protect `New project` from destructive state loss: dirty projects and unsaved projects with Faces now require an explicit Save / Discard / Cancel decision.
+- `Save and create new` waits for the asynchronous `.shade` save to complete successfully before resetting the editor; save cancellation or failure keeps the current project intact.
+- Clear recovery state only after an explicit discard, successful save, or normal safe project transition.
+
 # Shade Editor 0.17.1
 
 - Wire the previously-added Export Queue and TIFF Inspector backends into the actual application UI and export workflows.
