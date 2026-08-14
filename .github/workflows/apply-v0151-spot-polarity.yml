@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - scripts/apply_v0151_spot_polarity.py
+      - scripts/trigger_v0151_spot_polarity.txt
   workflow_dispatch:
 
 permissions:
