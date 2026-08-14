@@ -6,6 +6,7 @@ pub mod export;
 pub mod model;
 #[path = "palette.rs"]
 pub mod palette;
+pub mod production_acceptance;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
 #[path = "tiff_io.rs"]
