@@ -21,6 +21,8 @@ jobs:
           components: rustfmt
       - name: Apply source cleanup and preview profile assignment
         run: python tools/apply_preview_profile.py
+      - name: Apply compile cleanup
+        run: python tools/fix_preview_profile_compile.py
       - name: Format
         run: cargo fmt --all
       - name: Check Windows target
@@ -32,6 +34,7 @@ jobs:
         run: |
           git rm .github/workflows/apply-preview-profile.yml
           git rm tools/apply_preview_profile.py
+          git rm tools/fix_preview_profile_compile.py
       - name: Commit validated changes
         shell: pwsh
         run: |
