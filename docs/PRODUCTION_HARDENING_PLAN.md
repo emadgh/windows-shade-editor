@@ -8,16 +8,18 @@ Explicit exclusion: ICC payloads will **not** be embedded into `.shade` projects
 
 Issue: #26
 
-- [ ] Prevent Export Face / Export All / Snapshot export from ever targeting a source TIFF, including path aliases/case differences where Windows identity can be resolved.
-- [ ] Centralize destructive project transitions: New, Open, Previous/Project View open, Recovery replacement and Exit.
-- [ ] Use one Save / Discard / Cancel policy for dirty or never-saved projects.
-- [ ] Define transition behavior while Export Queue contains Waiting/Processing work.
-- [ ] Attach project identity to queued completion marks so completion can never mutate a different project.
-- [ ] Make destination reservations global across the complete queue.
-- [ ] Re-check destination conflicts and source/destination safety immediately before processing.
-- [ ] Add orchestration/integration smoke tests for required application feature wiring.
+- [x] Prevent Export Face / Export All / Snapshot export from ever targeting a source TIFF, including path aliases/case differences where Windows identity can be resolved.
+- [x] Centralize destructive project transitions: New, Open, Previous/Project View open, Recovery replacement and Exit.
+- [x] Use one Save / Discard / Cancel policy for dirty or never-saved projects.
+- [x] Define transition behavior while Export Queue contains Waiting/Processing work.
+- [x] Attach project identity to queued completion marks so completion can never mutate a different project.
+- [x] Make destination reservations global across the complete queue.
+- [x] Re-check destination conflicts and source/destination safety immediately before processing.
+- [x] Add orchestration/integration smoke tests for required application feature wiring.
 
 Acceptance: current project state and source TIFFs cannot be silently destroyed; queued work cannot cross-contaminate project state.
+
+Validation: Windows `cargo fmt`, `cargo check` and full `cargo test` passed in Actions run `31839334247`; validated Phase 0 source commit is `a33079fdbc92f40bb595792e8e5e56750fab3337`.
 
 ## Phase 1 — Export queue semantics, persistence and transport coverage
 
