@@ -30,6 +30,8 @@ mod previous_shades;
 mod recovery;
 #[path = "render.rs"]
 mod render;
+#[path = "safe_fs.rs"]
+mod safe_fs;
 #[path = "settings_v6.rs"]
 mod settings;
 #[path = "thumbnail.rs"]

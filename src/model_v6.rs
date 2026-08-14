@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::safe_fs;
+
 use crate::palette::ChannelPalette;
 
 pub const SHADE_SCHEMA_VERSION: u32 = 9;
@@ -301,7 +303,9 @@ impl ShadeProject {
         }
         let text = serde_json::to_string_pretty(&portable)
             .map_err(|err| format!("Cannot serialize project: {err}"))?;
-        fs::write(path, text).map_err(|err| format!("Cannot save .shade file: {err}"))
+        let backup = safe_fs::backup_path(path);
+        safe_fs::atomic_write(path, text.as_bytes(), Some(&backup))
+            .map_err(|err| format!("Cannot safely save .shade file {}: {err}", path.display()))
     }
 
     pub fn resolve_face_paths(&self, shade_path: &Path) -> Vec<PathBuf> {

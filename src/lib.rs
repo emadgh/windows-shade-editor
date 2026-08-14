@@ -8,6 +8,8 @@ pub mod export;
 pub mod model;
 #[path = "palette.rs"]
 pub mod palette;
+#[path = "safe_fs.rs"]
+pub mod safe_fs;
 #[path = "tiff_io.rs"]
 pub mod tiff_io;
 

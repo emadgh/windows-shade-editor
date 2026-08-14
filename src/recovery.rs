@@ -2,10 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::model::ShadeProject;
+use crate::{model::ShadeProject, safe_fs};
 
-const RECOVERY_FORMAT_VERSION: u32 = 1;
+const RECOVERY_FORMAT_VERSION: u32 = 2;
+const LEGACY_RECOVERY_FORMAT_VERSION: u32 = 1;
 const RECOVERY_STATE_COUNT: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -15,6 +17,8 @@ pub struct RecoveryFile {
     pub origin_project_path: Option<String>,
     pub face_paths: Vec<String>,
     pub project: ShadeProject,
+    #[serde(default)]
+    pub checksum_sha256: String,
 }
 
 impl RecoveryFile {
@@ -33,6 +37,7 @@ impl RecoveryFile {
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
             project,
+            checksum_sha256: String::new(),
         }
     }
 
@@ -43,6 +48,48 @@ impl RecoveryFile {
     pub fn resolved_face_paths(&self) -> Vec<PathBuf> {
         self.face_paths.iter().map(PathBuf::from).collect()
     }
+}
+
+#[derive(Serialize)]
+struct RecoveryChecksumPayload<'a> {
+    format_version: u32,
+    saved_at_unix_ms: i64,
+    origin_project_path: &'a Option<String>,
+    face_paths: &'a [String],
+    project: &'a ShadeProject,
+}
+
+fn recovery_checksum(recovery: &RecoveryFile) -> Result<String, String> {
+    let payload = RecoveryChecksumPayload {
+        format_version: recovery.format_version,
+        saved_at_unix_ms: recovery.saved_at_unix_ms,
+        origin_project_path: &recovery.origin_project_path,
+        face_paths: &recovery.face_paths,
+        project: &recovery.project,
+    };
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|err| format!("Cannot serialize recovery checksum payload: {err}"))?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn stamped_recovery(recovery: &RecoveryFile) -> Result<RecoveryFile, String> {
+    let mut stamped = recovery.clone();
+    stamped.format_version = RECOVERY_FORMAT_VERSION;
+    stamped.checksum_sha256.clear();
+    stamped.checksum_sha256 = recovery_checksum(&stamped)?;
+    Ok(stamped)
+}
+
+fn verify_recovery_checksum(recovery: &RecoveryFile) -> Result<(), String> {
+    if recovery.checksum_sha256.trim().is_empty() {
+        return Err("Recovery integrity checksum is missing.".to_owned());
+    }
+    let expected = recovery_checksum(recovery)?;
+    if !recovery.checksum_sha256.eq_ignore_ascii_case(&expected) {
+        return Err("Recovery integrity checksum does not match the saved payload.".to_owned());
+    }
+    Ok(())
 }
 
 pub fn recovery_path() -> PathBuf {
@@ -89,15 +136,20 @@ fn load_from_paths(paths: &[PathBuf]) -> Result<Option<RecoveryFile>, String> {
 fn read_recovery(path: &Path) -> Result<RecoveryFile, String> {
     let text = fs::read_to_string(path)
         .map_err(|err| format!("Cannot read recovery file {}: {err}", path.display()))?;
-    let recovery: RecoveryFile = serde_json::from_str(&text)
+    let mut recovery: RecoveryFile = serde_json::from_str(&text)
         .map_err(|err| format!("Invalid recovery file {}: {err}", path.display()))?;
-    if recovery.format_version != RECOVERY_FORMAT_VERSION {
-        return Err(format!(
-            "Unsupported recovery format {} in {} (expected {}).",
-            recovery.format_version,
-            path.display(),
-            RECOVERY_FORMAT_VERSION
-        ));
+    match recovery.format_version {
+        LEGACY_RECOVERY_FORMAT_VERSION => {}
+        RECOVERY_FORMAT_VERSION => verify_recovery_checksum(&recovery)
+            .map_err(|err| format!("Invalid recovery integrity in {}: {err}", path.display()))?,
+        other => {
+            return Err(format!(
+                "Unsupported recovery format {other} in {} (expected {} or legacy {}).",
+                path.display(),
+                RECOVERY_FORMAT_VERSION,
+                LEGACY_RECOVERY_FORMAT_VERSION
+            ));
+        }
     }
     if recovery.project.schema_version != crate::model::SHADE_SCHEMA_VERSION {
         return Err(format!(
@@ -107,6 +159,7 @@ fn read_recovery(path: &Path) -> Result<RecoveryFile, String> {
             crate::model::SHADE_SCHEMA_VERSION
         ));
     }
+    recovery.project.ensure_snapshot_histories();
     Ok(recovery)
 }
 
@@ -123,37 +176,24 @@ fn write_to_paths(recovery: &RecoveryFile, paths: &[PathBuf]) -> Result<PathBuf,
             .map_err(|err| format!("Cannot create recovery folder {}: {err}", parent.display()))?;
     }
 
-    for index in (1..paths.len()).rev() {
-        if paths[index].exists() {
-            fs::remove_file(&paths[index]).map_err(|err| {
-                format!(
-                    "Cannot rotate recovery file {}: {err}",
-                    paths[index].display()
-                )
-            })?;
-        }
-        if paths[index - 1].exists() {
-            fs::rename(&paths[index - 1], &paths[index]).map_err(|err| {
-                format!(
-                    "Cannot rotate recovery file {} to {}: {err}",
-                    paths[index - 1].display(),
-                    paths[index].display()
-                )
-            })?;
+    let stamped = stamped_recovery(recovery)?;
+    let bytes = serde_json::to_vec_pretty(&stamped)
+        .map_err(|err| format!("Cannot serialize recovery state: {err}"))?;
+    let verify: RecoveryFile = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("Cannot verify serialized recovery state: {err}"))?;
+    verify_recovery_checksum(&verify)?;
+
+    // Keep the older generations intact until the new state has been fully
+    // serialized and verified. Rotate generation 1 -> 2 first, then let the
+    // atomic latest write create generation 1 as its backup.
+    for index in (2..paths.len()).rev() {
+        let source = &paths[index - 1];
+        if source.exists() {
+            safe_fs::atomic_copy(source, &paths[index])?;
         }
     }
 
-    let temp = latest.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(recovery)
-        .map_err(|err| format!("Cannot serialize recovery state: {err}"))?;
-    fs::write(&temp, text)
-        .map_err(|err| format!("Cannot write recovery file {}: {err}", temp.display()))?;
-    if latest.exists() {
-        fs::remove_file(latest)
-            .map_err(|err| format!("Cannot replace recovery file {}: {err}", latest.display()))?;
-    }
-    fs::rename(&temp, latest)
-        .map_err(|err| format!("Cannot finalize recovery file {}: {err}", latest.display()))?;
+    safe_fs::atomic_write(latest, &bytes, paths.get(1).map(PathBuf::as_path))?;
     Ok(latest.clone())
 }
 
@@ -244,6 +284,37 @@ mod tests {
         fs::write(&paths[0], "{broken json").unwrap();
         let loaded = load_from_paths(&paths).unwrap().unwrap();
         assert_eq!(loaded.saved_at_unix_ms, 20);
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn recovery_v2_rejects_valid_json_with_tampered_payload() {
+        let (folder, paths) = temp_paths("checksum");
+        let mut recovery = RecoveryFile::new(ShadeProject::default(), vec![], None);
+        recovery.saved_at_unix_ms = 100;
+        write_to_paths(&recovery, &paths).unwrap();
+
+        let text = fs::read_to_string(&paths[0]).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["saved_at_unix_ms"] = serde_json::Value::from(101);
+        fs::write(&paths[0], serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let err = read_recovery(&paths[0]).unwrap_err();
+        assert!(err.contains("checksum"), "unexpected error: {err}");
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn legacy_v1_recovery_remains_readable() {
+        let (folder, paths) = temp_paths("legacy");
+        fs::create_dir_all(&folder).unwrap();
+        let mut recovery = RecoveryFile::new(ShadeProject::default(), vec![], None);
+        recovery.format_version = LEGACY_RECOVERY_FORMAT_VERSION;
+        recovery.checksum_sha256.clear();
+        fs::write(&paths[0], serde_json::to_vec_pretty(&recovery).unwrap()).unwrap();
+
+        let loaded = read_recovery(&paths[0]).unwrap();
+        assert_eq!(loaded.format_version, LEGACY_RECOVERY_FORMAT_VERSION);
         let _ = fs::remove_dir_all(folder);
     }
 }
