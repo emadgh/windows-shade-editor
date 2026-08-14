@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - scripts/apply_v0150_history_project_ui.py
+      - scripts/run_v0150_history_migration.py
       - .github/workflows/apply-v0150-history-ui.yml
   workflow_dispatch:
 
@@ -23,7 +24,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Apply source migration
         shell: pwsh
-        run: python -X utf8 scripts/apply_v0150_history_project_ui.py
+        run: python -X utf8 scripts/run_v0150_history_migration.py
       - name: Format
         shell: pwsh
         run: cargo fmt --all
