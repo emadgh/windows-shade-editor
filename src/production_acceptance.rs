@@ -40,6 +40,7 @@ mod tests {
     const BUILD_WORKFLOW: &str = include_str!("../.github/workflows/build-windows.yml");
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
     const EXPORT_TESTS: &str = include_str!("export.rs");
+    const TIFF_IO_TESTS: &str = include_str!("tiff_io.rs");
     const WORKFLOW_SRC: &str = include_str!("workflow.rs");
     const MAIN_SRC: &str = include_str!("main.rs");
 
@@ -85,7 +86,6 @@ mod tests {
             );
         }
         for required in [
-            "strip_writer_preserves_planar_configuration_separate",
             "tiled_contig_streaming_matches_reference_and_preserves_chunks",
             "tiled_separate_streaming_matches_reference_and_preserves_chunks",
             "large_layout_selects_bigtiff_without_allocating_pixels",
@@ -96,6 +96,10 @@ mod tests {
                 "missing required transport test: {required}"
             );
         }
+        assert!(
+            TIFF_IO_TESTS.contains("region_stream_interleaves_planar_strips_without_full_decode"),
+            "missing planar-separate strip streaming coverage"
+        );
     }
 
     #[test]
