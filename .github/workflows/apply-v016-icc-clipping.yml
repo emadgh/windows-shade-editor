@@ -22,6 +22,15 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Apply source migration
         run: python scripts/apply_v016_icc_clipping.py
+      - name: Correct clipping regression fixture
+        shell: pwsh
+        run: |
+          $path = 'src/render.rs'
+          $text = [System.IO.File]::ReadAllText($path)
+          $old = 'let face = face(vec![0, 10000, 30000, 50000, 65535]);'
+          $new = 'let face = face(vec![0, 10000, 30000, 55000, 65535]);'
+          if (($text.Split($old).Count - 1) -ne 1) { throw 'Unexpected clipping fixture shape' }
+          [System.IO.File]::WriteAllText($path, $text.Replace($old, $new))
       - name: Format
         run: cargo fmt --all
       - name: Resolve dependency lock and check Windows build
