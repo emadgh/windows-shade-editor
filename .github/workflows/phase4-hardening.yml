@@ -24,7 +24,22 @@ jobs:
       - name: Format
         run: cargo fmt --all
       - name: Check Windows target
-        run: cargo check --target x86_64-pc-windows-msvc
+        id: phase4_check
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo check --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath phase4-check.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Phase 4 compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4-check-log
+          path: phase4-check.log
+      - name: Fail on compiler errors
+        if: steps.phase4_check.outcome == 'failure'
+        shell: pwsh
+        run: exit 1
       - name: Test Windows target
         run: cargo test --target x86_64-pc-windows-msvc
       - name: Remove temporary Phase 4 infrastructure
