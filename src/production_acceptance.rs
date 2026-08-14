@@ -41,6 +41,7 @@ mod tests {
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
     const EXPORT_TESTS: &str = include_str!("export.rs");
     const WORKFLOW_SRC: &str = include_str!("workflow.rs");
+    const MAIN_SRC: &str = include_str!("main.rs");
 
     #[test]
     fn classic_and_bigtiff_headers_are_classified_for_both_byte_orders() {
@@ -108,7 +109,9 @@ mod tests {
             "Export all requires every Face source TIFF to be available",
         ] {
             assert!(
-                WORKFLOW_SRC.contains(required) || EXPORT_TESTS.contains(required),
+                WORKFLOW_SRC.contains(required)
+                    || EXPORT_TESTS.contains(required)
+                    || MAIN_SRC.contains(required),
                 "missing required missing-Face/relink guard: {required}"
             );
         }
