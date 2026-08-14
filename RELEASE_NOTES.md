@@ -1,3 +1,12 @@
+# Shade Editor 0.13.2
+
+- Upgrade embedded project thumbnails to 512px PNG with bilinear resampling, high PNG compression, and RGB encoding when alpha is fully opaque.
+- Cache a compact 72px Previous Shades list thumbnail plus Face count and source bytes for fast history rows, including offline entries.
+- Use the `.shade` filename when a project still carries the default `Untitled Shade` name, and normalize the name on the next successful Save/Quick Save.
+- Previous Shades now supports Enter to open, Up/Down navigation while Search has focus, first-result selection while searching, an Open shade folder action, and a Snapshot list in the preview pane.
+- Export all omits Test Code by default; a persistent Export & storage setting can explicitly enable Test Code for all Face exports.
+- Adjustments defaults to All channels, moves the enable toggle into the Editing header, swaps the All channels/channel controls, and uses larger, spaced Levels/Mixer/Curve tabs.
+
 # Shade Editor 0.13.1
 
 - Index Snapshot names, Snapshot IDs and effective Test Code values in the persistent Previous Shades cache.

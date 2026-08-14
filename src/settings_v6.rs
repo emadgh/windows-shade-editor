@@ -24,6 +24,7 @@ pub struct AppSettings {
     pub show_curve_histogram: bool,
     pub compact_curve_controls: bool,
     pub validate_after_export: bool,
+    pub export_all_test_code: bool,
     pub lzw_compression: bool,
     pub default_dpi: f64,
     pub default_palette_id: String,
@@ -44,6 +45,7 @@ impl Default for AppSettings {
             show_curve_histogram: true,
             compact_curve_controls: false,
             validate_after_export: false,
+            export_all_test_code: false,
             lzw_compression: true,
             default_dpi: DEFAULT_DPI,
             default_palette_id: AUTO_PALETTE_ID.to_owned(),
@@ -205,6 +207,11 @@ mod tests {
     #[test]
     fn lzw_compression_defaults_on() {
         assert!(AppSettings::default().lzw_compression);
+    }
+
+    #[test]
+    fn export_all_test_code_defaults_off() {
+        assert!(!AppSettings::default().export_all_test_code);
     }
 
     #[test]

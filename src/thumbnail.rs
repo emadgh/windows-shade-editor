@@ -5,7 +5,7 @@ use crate::model::{ProjectThumbnail, ShadeProject};
 use crate::render;
 use crate::tiff_io::PreviewFace;
 
-const THUMBNAIL_MAX_DIMENSION: usize = 256;
+const THUMBNAIL_MAX_DIMENSION: usize = 512;
 
 pub fn build_project_thumbnail(
     face: &PreviewFace,
@@ -24,7 +24,7 @@ pub fn build_project_thumbnail(
     })
 }
 
-fn resize_rgba(
+pub(crate) fn resize_rgba(
     width: usize,
     height: usize,
     rgba: &[u8],
@@ -48,35 +48,75 @@ fn resize_rgba(
         return Ok((width, height, rgba[..expected].to_vec()));
     }
 
+    // Bilinear filtering removes the blocky nearest-neighbour look that was
+    // especially visible in Explorer and Previous Shades thumbnails.
     let mut output = vec![0u8; out_width * out_height * 4];
+    let x_scale = width as f64 / out_width as f64;
+    let y_scale = height as f64 / out_height as f64;
     for y in 0..out_height {
-        let source_y = ((y as f64 + 0.5) * height as f64 / out_height as f64 - 0.5)
-            .round()
-            .clamp(0.0, (height - 1) as f64) as usize;
+        let source_y = ((y as f64 + 0.5) * y_scale - 0.5).clamp(0.0, (height - 1) as f64);
+        let y0 = source_y.floor() as usize;
+        let y1 = (y0 + 1).min(height - 1);
+        let fy = source_y - y0 as f64;
         for x in 0..out_width {
-            let source_x = ((x as f64 + 0.5) * width as f64 / out_width as f64 - 0.5)
-                .round()
-                .clamp(0.0, (width - 1) as f64) as usize;
-            let source = (source_y * width + source_x) * 4;
+            let source_x = ((x as f64 + 0.5) * x_scale - 0.5).clamp(0.0, (width - 1) as f64);
+            let x0 = source_x.floor() as usize;
+            let x1 = (x0 + 1).min(width - 1);
+            let fx = source_x - x0 as f64;
             let target = (y * out_width + x) * 4;
-            output[target..target + 4].copy_from_slice(&rgba[source..source + 4]);
+            for channel in 0..4 {
+                let p00 = rgba[(y0 * width + x0) * 4 + channel] as f64;
+                let p10 = rgba[(y0 * width + x1) * 4 + channel] as f64;
+                let p01 = rgba[(y1 * width + x0) * 4 + channel] as f64;
+                let p11 = rgba[(y1 * width + x1) * 4 + channel] as f64;
+                let top = p00 + (p10 - p00) * fx;
+                let bottom = p01 + (p11 - p01) * fx;
+                output[target + channel] =
+                    (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8;
+            }
         }
     }
     Ok((out_width, out_height, output))
 }
 
-fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() < expected {
+        return Err("Thumbnail RGBA data is incomplete.".to_owned());
+    }
+    let opaque = rgba[..expected]
+        .chunks_exact(4)
+        .all(|pixel| pixel[3] == 255);
+    let rgb = opaque.then(|| {
+        let mut bytes = Vec::with_capacity(width as usize * height as usize * 3);
+        for pixel in rgba[..expected].chunks_exact(4) {
+            bytes.extend_from_slice(&pixel[..3]);
+        }
+        bytes
+    });
+
     let mut bytes = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut bytes, width, height);
-        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_color(if opaque {
+            png::ColorType::Rgb
+        } else {
+            png::ColorType::Rgba
+        });
         encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::High);
         let mut writer = encoder
             .write_header()
             .map_err(|err| format!("Cannot initialize project thumbnail PNG: {err}"))?;
-        writer
-            .write_image_data(rgba)
-            .map_err(|err| format!("Cannot encode project thumbnail PNG: {err}"))?;
+        if let Some(rgb) = rgb.as_ref() {
+            writer
+                .write_image_data(rgb)
+                .map_err(|err| format!("Cannot encode project thumbnail PNG: {err}"))?;
+        } else {
+            writer
+                .write_image_data(&rgba[..expected])
+                .map_err(|err| format!("Cannot encode project thumbnail PNG: {err}"))?;
+        }
     }
     Ok(bytes)
 }
@@ -87,10 +127,10 @@ mod tests {
 
     #[test]
     fn thumbnail_resize_preserves_aspect_ratio() {
-        let rgba = vec![255u8; 400 * 200 * 4];
-        let (width, height, output) = resize_rgba(400, 200, &rgba, 256).unwrap();
-        assert_eq!((width, height), (256, 128));
-        assert_eq!(output.len(), 256 * 128 * 4);
+        let rgba = vec![255u8; 1024 * 512 * 4];
+        let (width, height, output) = resize_rgba(1024, 512, &rgba, 512).unwrap();
+        assert_eq!((width, height), (512, 256));
+        assert_eq!(output.len(), 512 * 256 * 4);
     }
 
     #[test]

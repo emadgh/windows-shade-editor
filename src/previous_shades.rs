@@ -8,8 +8,9 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{FaceFileMetadata, ProjectThumbnail, ShadeProject};
+use crate::thumbnail;
 
-const SNAPSHOT_CACHE_VERSION: u32 = 1;
+const SNAPSHOT_CACHE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -35,6 +36,9 @@ pub struct PreviousShadeEntry {
     pub snapshot_cache_version: u32,
     pub snapshots: Vec<CachedSnapshot>,
     pub test_code_text: String,
+    pub face_count: usize,
+    pub total_source_bytes: u64,
+    pub thumbnail: Option<ProjectThumbnail>,
 }
 
 impl Default for PreviousShadeEntry {
@@ -48,6 +52,9 @@ impl Default for PreviousShadeEntry {
             snapshot_cache_version: 0,
             snapshots: Vec::new(),
             test_code_text: String::new(),
+            face_count: 0,
+            total_source_bytes: 0,
+            thumbnail: None,
         }
     }
 }
@@ -91,6 +98,7 @@ pub struct ShadeInspection {
     pub project_name: String,
     pub snapshot_count: usize,
     pub active_snapshot_name: Option<String>,
+    pub snapshots: Vec<CachedSnapshot>,
     pub test_code_enabled: bool,
     pub saved_at_unix_ms: i64,
     pub face_count: usize,
@@ -104,27 +112,29 @@ pub struct ShadeInspection {
 
 impl PreviousShadeEntry {
     fn refresh_from_project(&mut self, project: &ShadeProject) {
-        self.project_name = project.name.trim().to_owned();
+        self.project_name = project_display_name(&project.name, Path::new(&self.path));
         self.test_code_text = project.test_code.text.trim().to_owned();
-        let explicit_code = self.test_code_text.as_str();
-        self.snapshots = project
-            .snapshots
-            .iter()
-            .map(|snapshot| {
-                let name = snapshot.name.trim().to_owned();
-                CachedSnapshot {
-                    id: snapshot.id,
-                    code: if explicit_code.is_empty() {
-                        name.clone()
-                    } else {
-                        explicit_code.to_owned()
-                    },
-                    name,
-                    created_at_unix_ms: snapshot.created_at_unix_ms,
-                }
-            })
-            .collect();
+        self.snapshots = snapshot_cache_from_project(project);
+        self.face_count = project
+            .file_metadata
+            .as_ref()
+            .map(|metadata| metadata.face_count)
+            .filter(|count| *count > 0)
+            .unwrap_or(project.faces.len());
+        self.total_source_bytes = project
+            .file_metadata
+            .as_ref()
+            .map(|metadata| metadata.total_source_bytes)
+            .unwrap_or(0);
+        self.thumbnail = project
+            .thumbnail
+            .as_ref()
+            .and_then(build_cached_list_thumbnail);
         self.snapshot_cache_version = SNAPSHOT_CACHE_VERSION;
+    }
+
+    pub fn display_name(&self) -> String {
+        project_display_name(&self.project_name, Path::new(&self.path))
     }
 
     pub fn matches_query(&self, query_lower: &str) -> bool {
@@ -132,7 +142,7 @@ impl PreviousShadeEntry {
         if query.is_empty() {
             return true;
         }
-        contains_case_insensitive(&self.project_name, query)
+        contains_case_insensitive(&self.display_name(), query)
             || contains_case_insensitive(&self.path, query)
             || self.test_code_matches(query)
             || self.matching_snapshot(query).is_some()
@@ -211,10 +221,8 @@ impl PreviousShadesStore {
             });
         let cached_name = loaded_project
             .as_ref()
-            .map(|project| project.name.trim())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| project_name.trim())
-            .to_owned();
+            .map(|project| project_display_name(&project.name, path))
+            .unwrap_or_else(|| project_display_name(project_name, path));
 
         if let Some(entry) = self
             .entries
@@ -297,10 +305,16 @@ impl PreviousShadesStore {
                     existing.snapshot_cache_version = entry.snapshot_cache_version;
                     existing.snapshots = entry.snapshots.clone();
                     existing.test_code_text = entry.test_code_text.clone();
+                    existing.face_count = entry.face_count;
+                    existing.total_source_bytes = entry.total_source_bytes;
+                    existing.thumbnail = entry.thumbnail.clone();
                 } else if entry.snapshot_cache_version > existing.snapshot_cache_version {
                     existing.snapshot_cache_version = entry.snapshot_cache_version;
                     existing.snapshots = entry.snapshots.clone();
                     existing.test_code_text = entry.test_code_text.clone();
+                    existing.face_count = entry.face_count;
+                    existing.total_source_bytes = entry.total_source_bytes;
+                    existing.thumbnail = entry.thumbnail.clone();
                 }
                 existing.open_count = existing.open_count.max(entry.open_count).max(1);
             } else {
@@ -353,9 +367,10 @@ pub fn inspect(path: &Path) -> Result<ShadeInspection, String> {
 
     Ok(ShadeInspection {
         path: path.to_path_buf(),
-        project_name: project.name.clone(),
+        project_name: project_display_name(&project.name, path),
         snapshot_count: project.snapshots.len(),
         active_snapshot_name: project.active_snapshot_name().map(str::to_owned),
+        snapshots: snapshot_cache_from_project(&project),
         test_code_enabled: project.test_code.enabled,
         saved_at_unix_ms,
         face_count,
@@ -390,13 +405,76 @@ fn decode_thumbnail(thumbnail: &ProjectThumbnail) -> Result<DecodedThumbnail, St
         .next_frame(&mut buffer)
         .map_err(|err| format!("Cannot decode project thumbnail PNG: {err}"))?;
     let pixels = &buffer[..info.buffer_size()];
-    if info.bit_depth != png::BitDepth::Eight || info.color_type != png::ColorType::Rgba {
-        return Err("Project thumbnail PNG is not 8-bit RGBA.".to_owned());
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err("Project thumbnail PNG is not 8-bit.".to_owned());
     }
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => pixels.to_vec(),
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity(info.width as usize * info.height as usize * 4);
+            for pixel in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(pixel);
+                rgba.push(255);
+            }
+            rgba
+        }
+        _ => return Err("Project thumbnail PNG must be RGB or RGBA.".to_owned()),
+    };
     Ok(DecodedThumbnail {
         width: info.width as usize,
         height: info.height as usize,
-        rgba: pixels.to_vec(),
+        rgba,
+    })
+}
+
+pub fn decode_cached_thumbnail(
+    entry: &PreviousShadeEntry,
+) -> Result<Option<DecodedThumbnail>, String> {
+    entry.thumbnail.as_ref().map(decode_thumbnail).transpose()
+}
+
+fn project_display_name(project_name: &str, path: &Path) -> String {
+    let trimmed = project_name.trim();
+    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("Untitled Shade") {
+        return trimmed.to_owned();
+    }
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Shade project".to_owned())
+}
+
+fn snapshot_cache_from_project(project: &ShadeProject) -> Vec<CachedSnapshot> {
+    let explicit_code = project.test_code.text.trim();
+    project
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            let name = snapshot.name.trim().to_owned();
+            CachedSnapshot {
+                id: snapshot.id,
+                code: if explicit_code.is_empty() {
+                    name.clone()
+                } else {
+                    explicit_code.to_owned()
+                },
+                name,
+                created_at_unix_ms: snapshot.created_at_unix_ms,
+            }
+        })
+        .collect()
+}
+
+fn build_cached_list_thumbnail(source: &ProjectThumbnail) -> Option<ProjectThumbnail> {
+    let decoded = decode_thumbnail(source).ok()?;
+    let (width, height, rgba) =
+        thumbnail::resize_rgba(decoded.width, decoded.height, &decoded.rgba, 72).ok()?;
+    let png = thumbnail::encode_png(width as u32, height as u32, &rgba).ok()?;
+    Some(ProjectThumbnail {
+        mime_type: "image/png".to_owned(),
+        width: width as u32,
+        height: height as u32,
+        data_base64: BASE64_STANDARD.encode(png),
     })
 }
 
@@ -453,6 +531,7 @@ mod tests {
         assert_eq!(store.entries().len(), 1);
         assert_eq!(store.entries()[0].project_name, "Second");
         assert_eq!(store.entries()[0].open_count, 2);
+        assert_eq!(store.entries()[0].display_name(), "Second");
     }
 
     #[test]
@@ -491,6 +570,16 @@ mod tests {
         assert!(entry.matches_query("tc-043"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn untitled_history_uses_shade_filename() {
+        let entry = PreviousShadeEntry {
+            path: "C:/work/blue-17.shade".to_owned(),
+            project_name: "Untitled Shade".to_owned(),
+            ..PreviousShadeEntry::default()
+        };
+        assert_eq!(entry.display_name(), "blue-17");
     }
 
     #[test]
