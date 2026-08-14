@@ -53,24 +53,24 @@ path.write_text(text, encoding='utf-8')
 
 path = Path('src/export_batch.rs')
 text = path.read_text(encoding='utf-8')
-old = '''    let mut output = String::with_capacity(value.len());
-    let mut previous_separator = false;
-    for ch in value.chars() {
-        let invalid = ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
-        let mapped = if invalid { '-' } else { ch };
-        let separator = mapped == '-' || mapped.is_whitespace();
-        if separator && previous_separator {
-            continue;
-        }
-        output.push(mapped);
-        previous_separator = separator;
-    }'''
-new = '''    let mut output = String::with_capacity(value.len());
+start = text.find('pub fn sanitize_filename_stem(value: &str) -> String {')
+end = text.find('pub enum DestinationDecision {', start)
+if start < 0 or end < 0:
+    raise RuntimeError('filename sanitizer function boundaries not found')
+replacement = r'''pub fn sanitize_filename_stem(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
     for ch in value.chars() {
         let invalid = ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
         output.push(if invalid { '-' } else { ch });
-    }'''
-if old not in text:
-    raise RuntimeError('filename sanitizer marker not found')
-text = text.replace(old, new, 1)
+    }
+    let trimmed = output.trim().trim_matches('.').trim().trim_matches('-').trim();
+    if trimmed.is_empty() {
+        "shade-export".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+'''
+text = text[:start] + replacement + text[end:]
 path.write_text(text, encoding='utf-8')
