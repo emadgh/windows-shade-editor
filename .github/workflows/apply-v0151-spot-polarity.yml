@@ -1,10 +1,10 @@
-name: Apply v0.15.1 Spot polarity migration
+name: Apply v0.15.2 Spot polarity migration
 
 on:
   push:
     paths:
       - scripts/apply_v0151_spot_polarity.py
-      - scripts/trigger_v0151_spot_polarity.txt
+      - scripts/run_v0152_spot_polarity.py
   workflow_dispatch:
 
 permissions:
@@ -22,7 +22,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Apply source migration
         shell: pwsh
-        run: python scripts/apply_v0151_spot_polarity.py
+        run: python scripts/run_v0152_spot_polarity.py
       - name: Format
         run: cargo fmt --all
       - name: Check locked Windows build
