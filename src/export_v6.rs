@@ -17,7 +17,7 @@ use crate::model::{
 };
 use crate::tiff_io::{
     ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_region,
-    for_each_decoded_strip, stream_info,
+    for_each_decoded_strip, stream_info, tiff_sample_from_working, working_sample_from_tiff,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -158,11 +158,14 @@ where
             let pixel = y * width + x;
             let base = pixel * channels;
             for channel in 0..channels {
-                let raw = decoded.samples[base + channel] as f32 / 65535.0;
+                let raw = working_sample_from_tiff(
+                    &decoded.metadata,
+                    channel,
+                    decoded.samples[base + channel],
+                ) as f32
+                    / 65535.0;
                 prepared[channel] = match project.adjustments.get(&names[channel]) {
-                    Some(adjustment) if adjustment.enabled => {
-                        apply_levels(raw, adjustment.levels)
-                    }
+                    Some(adjustment) if adjustment.enabled => apply_levels(raw, adjustment.levels),
                     _ => raw,
                 };
             }
@@ -188,7 +191,9 @@ where
                     }
                     _ => prepared[out_channel],
                 };
-                output[base + out_channel] = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                let working = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                output[base + out_channel] =
+                    tiff_sample_from_working(&decoded.metadata, out_channel, working);
             }
         }
         if y % progress_step == 0 {
@@ -396,23 +401,19 @@ where
     result
 }
 
-fn adjusted_strip(
-    input: &[u16],
-    channels: usize,
-    names: &[String],
-    project: &ShadeProject,
-) -> Vec<u16> {
+fn adjusted_strip(input: &[u16], metadata: &TiffMetadata, project: &ShadeProject) -> Vec<u16> {
+    let channels = metadata.samples_per_pixel;
+    let names = &metadata.channel_names;
     let pixel_count = input.len() / channels.max(1);
     let mut output = vec![0u16; pixel_count.saturating_mul(channels)];
     let mut prepared = vec![0.0f32; channels];
     for pixel in 0..pixel_count {
         let base = pixel * channels;
         for channel in 0..channels {
-            let raw = input[base + channel] as f32 / 65535.0;
+            let raw =
+                working_sample_from_tiff(metadata, channel, input[base + channel]) as f32 / 65535.0;
             prepared[channel] = match project.adjustments.get(&names[channel]) {
-                Some(adjustment) if adjustment.enabled => {
-                    apply_levels(raw, adjustment.levels)
-                }
+                Some(adjustment) if adjustment.enabled => apply_levels(raw, adjustment.levels),
                 _ => raw,
             };
         }
@@ -437,7 +438,8 @@ fn adjusted_strip(
                 }
                 _ => prepared[out_channel],
             };
-            output[base + out_channel] = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+            let working = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+            output[base + out_channel] = tiff_sample_from_working(metadata, out_channel, working);
         }
     }
     output
@@ -459,7 +461,7 @@ where
     let names = &stream.metadata.channel_names;
     let width = stream.metadata.width as usize;
     for_each_decoded_strip(source, stream, |row_start, row_count, input| {
-        let mut adjusted = adjusted_strip(input, channels, names, project);
+        let mut adjusted = adjusted_strip(input, &stream.metadata, project);
         if let Some(overlay) = overlay {
             apply_text_overlay_to_rows(
                 &mut adjusted,
@@ -507,7 +509,7 @@ where
     let names = &stream.metadata.channel_names;
     let width = stream.metadata.width as usize;
     for_each_decoded_strip(source, stream, |row_start, row_count, input| {
-        let mut adjusted = adjusted_strip(input, channels, names, project);
+        let mut adjusted = adjusted_strip(input, &stream.metadata, project);
         if let Some(overlay) = overlay {
             apply_text_overlay_to_rows(
                 &mut adjusted,
@@ -584,7 +586,7 @@ where
     for_each_decoded_region(source, stream, |x, y, width, height, input| {
         let region_width = width as usize;
         let region_height = height as usize;
-        let mut adjusted = adjusted_strip(input, channels, names, project);
+        let mut adjusted = adjusted_strip(input, metadata, project);
         if let Some(overlay) = overlay {
             apply_text_overlay_to_region(
                 &mut adjusted,
@@ -1253,6 +1255,29 @@ mod streaming_tests {
     use tiff::encoder::{Compression, TiffEncoder, colortype};
     use tiff::tags::ExtraSamples;
 
+    fn test_metadata(
+        names: &[String],
+        base_channel_count: usize,
+        channel_display_info: Vec<Option<crate::tiff_io::PhotoshopChannelDisplay>>,
+    ) -> TiffMetadata {
+        TiffMetadata {
+            width: 1,
+            height: 1,
+            bit_depth: 16,
+            samples_per_pixel: names.len(),
+            base_channel_count,
+            color_model: ColorModel::Cmyk,
+            channel_names: names.to_vec(),
+            channel_display_info,
+            compression: None,
+            predictor: None,
+            orientation: None,
+            icc_profile: None,
+            photoshop_resources: None,
+            photoshop_image_source_data: None,
+        }
+    }
+
     #[test]
     fn adjustment_pipeline_is_levels_then_mixer_then_curve() {
         let names = vec!["A".to_owned(), "B".to_owned()];
@@ -1271,7 +1296,8 @@ mod streaming_tests {
         }
 
         let input = [13_107u16, 52_428u16];
-        let output = adjusted_strip(&input, 2, &names, &project);
+        let metadata = test_metadata(&names, 2, vec![None; 2]);
+        let output = adjusted_strip(&input, &metadata, &project);
 
         let raw_a = input[0] as f32 / 65_535.0;
         let raw_b = input[1] as f32 / 65_535.0;
@@ -1286,6 +1312,59 @@ mod streaming_tests {
 
         let legacy = apply_curve(leveled_a, a.curve) * 0.5 + leveled_b * 0.5;
         assert!((actual - legacy).abs() > 0.20);
+    }
+
+    #[test]
+    fn spot_zero_working_coverage_exports_as_no_ink_with_photoshop_polarity() {
+        let names = vec![
+            "Cyan".to_owned(),
+            "Magenta".to_owned(),
+            "Yellow".to_owned(),
+            "Black".to_owned(),
+            "Spot Red".to_owned(),
+        ];
+        let mut display = vec![None; 5];
+        display[4] = Some(crate::tiff_io::PhotoshopChannelDisplay {
+            rgb: Some([0.9, 0.2, 0.1]),
+            solidity: 1.0,
+            kind: 2,
+        });
+        let metadata = test_metadata(&names, 4, display);
+        let mut project = ShadeProject::default();
+        project.ensure_channels(&names);
+        project
+            .adjustments
+            .get_mut("Yellow")
+            .unwrap()
+            .levels
+            .output_white = 0.0;
+        project
+            .adjustments
+            .get_mut("Spot Red")
+            .unwrap()
+            .levels
+            .output_white = 0.0;
+
+        // Equivalent 50% ink: CMYK raw uses direct coverage; Photoshop Spot raw is inverted.
+        let input = [0u16, 0, 32_768, 0, u16::MAX - 32_768];
+        let output = adjusted_strip(&input, &metadata, &project);
+
+        assert_eq!(
+            output[2], 0,
+            "Yellow 0 working coverage must export as no ink"
+        );
+        if crate::tiff_io::NORMALIZE_PHOTOSHOP_SPOT_POLARITY {
+            assert_eq!(
+                output[4],
+                u16::MAX,
+                "Spot 0 working coverage must be restored to Photoshop's no-ink raw value"
+            );
+        } else {
+            assert_eq!(
+                output[4], 0,
+                "legacy Spot polarity must remain available when disabled"
+            );
+        }
     }
 
     fn apply_dynamic_u8_predictor(data: &mut [u8], width: usize, height: usize, channels: usize) {

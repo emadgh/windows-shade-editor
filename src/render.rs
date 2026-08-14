@@ -1,5 +1,5 @@
 use crate::model::{ShadeProject, apply_curve, apply_levels};
-use crate::tiff_io::{ColorModel, PreviewFace};
+use crate::tiff_io::{self, ColorModel, PreviewFace};
 
 pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u16>> {
     let channel_count = face.channels.len();
@@ -77,8 +77,7 @@ pub fn rgba_from_planes(
     let mut rgba = Vec::with_capacity(pixel_count.saturating_mul(4));
 
     if let Some(channel) = solo_channel.filter(|index| *index < planes.len()) {
-        let invert = face.metadata.color_model == ColorModel::Cmyk
-            && channel < face.metadata.base_channel_count;
+        let invert = tiff_io::solo_channel_uses_ink_coverage(&face.metadata, channel);
         for value in &planes[channel] {
             let byte = (*value >> 8) as u8;
             let gray = if invert {
@@ -166,7 +165,8 @@ fn composite_extra_channels(
         if pixel >= plane.len() {
             continue;
         }
-        let coverage = 1.0 - plane[pixel] as f32 / 65535.0;
+        let coverage =
+            tiff_io::extra_channel_preview_coverage(&face.metadata, channel_index, plane[pixel]);
         if coverage <= 0.001 {
             continue;
         }

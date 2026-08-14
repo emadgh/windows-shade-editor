@@ -64,6 +64,69 @@ pub struct TiffMetadata {
     pub photoshop_image_source_data: Option<Vec<u8>>,
 }
 
+/// Normalize Photoshop Spot separations to the same working-space polarity as
+/// CMYK ink coverage: 0 = no ink, 65535 = full ink. Keep this as a compile-time
+/// switch for now so the legacy raw-Spot behavior can be restored easily or
+/// exposed as a user setting later without changing the conversion contract.
+pub const NORMALIZE_PHOTOSHOP_SPOT_POLARITY: bool = true;
+
+pub fn is_photoshop_spot_channel(metadata: &TiffMetadata, channel: usize) -> bool {
+    channel >= metadata.base_channel_count
+        && metadata
+            .channel_display_info
+            .get(channel)
+            .and_then(|value| *value)
+            .is_some_and(PhotoshopChannelDisplay::is_spot)
+}
+
+fn map_spot_polarity(enabled: bool, is_spot: bool, sample: u16) -> u16 {
+    if enabled && is_spot {
+        u16::MAX - sample
+    } else {
+        sample
+    }
+}
+
+/// Convert a raw TIFF sample into Shade Editor's adjustment working space.
+pub fn working_sample_from_tiff(metadata: &TiffMetadata, channel: usize, sample: u16) -> u16 {
+    map_spot_polarity(
+        NORMALIZE_PHOTOSHOP_SPOT_POLARITY,
+        is_photoshop_spot_channel(metadata, channel),
+        sample,
+    )
+}
+
+/// Convert a working-space sample back to the TIFF/Photoshop channel polarity.
+pub fn tiff_sample_from_working(metadata: &TiffMetadata, channel: usize, sample: u16) -> u16 {
+    map_spot_polarity(
+        NORMALIZE_PHOTOSHOP_SPOT_POLARITY,
+        is_photoshop_spot_channel(metadata, channel),
+        sample,
+    )
+}
+
+/// Coverage used to tint an extra separation in the composite preview. Unknown
+/// extras keep the historical mask-style interpretation; declared Photoshop
+/// Spot channels use normalized ink coverage when the policy is enabled.
+pub fn extra_channel_preview_coverage(
+    metadata: &TiffMetadata,
+    channel: usize,
+    working_sample: u16,
+) -> f32 {
+    let value = working_sample as f32 / u16::MAX as f32;
+    if is_photoshop_spot_channel(metadata, channel) && NORMALIZE_PHOTOSHOP_SPOT_POLARITY {
+        value
+    } else {
+        1.0 - value
+    }
+}
+
+/// Solo preview should render ink coverage as white at zero and black at full.
+pub fn solo_channel_uses_ink_coverage(metadata: &TiffMetadata, channel: usize) -> bool {
+    (metadata.color_model == ColorModel::Cmyk && channel < metadata.base_channel_count)
+        || (NORMALIZE_PHOTOSHOP_SPOT_POLARITY && is_photoshop_spot_channel(metadata, channel))
+}
+
 #[derive(Clone, Debug)]
 pub struct DecodedImage {
     pub metadata: TiffMetadata,
@@ -648,7 +711,11 @@ pub fn load_preview(path: &Path, max_dimension: u32) -> Result<PreviewFace, Stri
                     let source_base = (local_y * rw + local_x) * channel_count;
                     let destination = preview_y * width + preview_x;
                     for channel in 0..channel_count {
-                        channels[channel][destination] = samples[source_base + channel];
+                        channels[channel][destination] = working_sample_from_tiff(
+                            &info.metadata,
+                            channel,
+                            samples[source_base + channel],
+                        );
                     }
                     if !filled[destination] {
                         filled[destination] = true;
@@ -1554,5 +1621,72 @@ mod tests {
         let green = display[1].rgb.unwrap();
         assert!(purple[0] > 0.95 && purple[2] > 0.95 && purple[1] < 0.30);
         assert!(green[1] > 0.95 && green[0] < 0.05 && green[2] > 0.50);
+    }
+}
+
+#[cfg(test)]
+mod spot_polarity_tests {
+    use super::*;
+
+    fn metadata_with_spot() -> TiffMetadata {
+        let mut display = vec![None; 5];
+        display[4] = Some(PhotoshopChannelDisplay {
+            rgb: Some([0.9, 0.2, 0.1]),
+            solidity: 1.0,
+            kind: 2,
+        });
+        TiffMetadata {
+            width: 1,
+            height: 1,
+            bit_depth: 16,
+            samples_per_pixel: 5,
+            base_channel_count: 4,
+            color_model: ColorModel::Cmyk,
+            channel_names: vec![
+                "Cyan".to_owned(),
+                "Magenta".to_owned(),
+                "Yellow".to_owned(),
+                "Black".to_owned(),
+                "Spot Red".to_owned(),
+            ],
+            channel_display_info: display,
+            compression: None,
+            predictor: None,
+            orientation: None,
+            icc_profile: None,
+            photoshop_resources: None,
+            photoshop_image_source_data: None,
+        }
+    }
+
+    #[test]
+    fn spot_polarity_policy_can_be_enabled_or_disabled() {
+        let raw = 12_345u16;
+        assert_eq!(map_spot_polarity(false, true, raw), raw);
+        assert_eq!(map_spot_polarity(true, true, raw), u16::MAX - raw);
+        assert_eq!(map_spot_polarity(true, false, raw), raw);
+    }
+
+    #[test]
+    fn normalized_spot_round_trips_raw_tiff_samples() {
+        let metadata = metadata_with_spot();
+        for raw in [0u16, 1, 257, 12_345, 32_768, 65_534, u16::MAX] {
+            let working = working_sample_from_tiff(&metadata, 4, raw);
+            let restored = tiff_sample_from_working(&metadata, 4, working);
+            assert_eq!(restored, raw);
+        }
+    }
+
+    #[test]
+    fn equivalent_yellow_and_spot_ink_have_same_normalized_values() {
+        let metadata = metadata_with_spot();
+        for yellow in [0u16, 8_192, 16_384, 32_768, 49_152, u16::MAX] {
+            let spot_raw = u16::MAX - yellow;
+            let yellow_working = map_spot_polarity(true, false, yellow);
+            let spot_working = map_spot_polarity(true, true, spot_raw);
+            assert_eq!(yellow_working, spot_working);
+        }
+        assert!(is_photoshop_spot_channel(&metadata, 4));
+        assert!(!is_photoshop_spot_channel(&metadata, 2));
     }
 }
