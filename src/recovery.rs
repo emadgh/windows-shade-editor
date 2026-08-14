@@ -109,7 +109,16 @@ fn recovery_paths() -> [PathBuf; RECOVERY_STATE_COUNT] {
 }
 
 pub fn load() -> Result<Option<RecoveryFile>, String> {
-    load_from_paths(&recovery_paths())
+    let loaded = load_from_paths(&recovery_paths())?;
+    let Some(recovery) = loaded else {
+        return Ok(None);
+    };
+    if recovery.format_version == LEGACY_RECOVERY_FORMAT_VERSION {
+        let upgraded = stamped_recovery(&recovery)?;
+        write(&upgraded)?;
+        return Ok(Some(upgraded));
+    }
+    Ok(Some(recovery))
 }
 
 fn load_from_paths(paths: &[PathBuf]) -> Result<Option<RecoveryFile>, String> {
@@ -302,6 +311,17 @@ mod tests {
         let err = read_recovery(&paths[0]).unwrap_err();
         assert!(err.contains("checksum"), "unexpected error: {err}");
         let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn legacy_v1_can_be_upgraded_to_checksummed_v2() {
+        let mut recovery = RecoveryFile::new(ShadeProject::default(), vec![], None);
+        recovery.format_version = LEGACY_RECOVERY_FORMAT_VERSION;
+        recovery.checksum_sha256.clear();
+        let upgraded = stamped_recovery(&recovery).unwrap();
+        assert_eq!(upgraded.format_version, RECOVERY_FORMAT_VERSION);
+        assert!(!upgraded.checksum_sha256.is_empty());
+        verify_recovery_checksum(&upgraded).unwrap();
     }
 
     #[test]

@@ -167,7 +167,9 @@ pub fn inspect(path: &Path, default_dpi: f64) -> Result<TiffInspection, String> 
     );
     line!(
         "RowsPerStrip: {}",
-        rows_per_strip.map(|value| value.to_string()).unwrap_or_else(|| "N/A".into())
+        rows_per_strip
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "N/A".into())
     );
     line!(
         "Tile geometry: {}",
@@ -199,11 +201,17 @@ pub fn inspect(path: &Path, default_dpi: f64) -> Result<TiffInspection, String> 
     line!("InkSet: {}", ink_set_label(ink_set));
     line!(
         "NumberOfInks: {}",
-        number_of_inks.map(|value| value.to_string()).unwrap_or_else(|| "Not present".into())
+        number_of_inks
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "Not present".into())
     );
     line!(
         "InkNames: {}",
-        if ink_names.is_empty() { "Not present".to_owned() } else { ink_names.join(" | ") }
+        if ink_names.is_empty() {
+            "Not present".to_owned()
+        } else {
+            ink_names.join(" | ")
+        }
     );
     line!(
         "Photoshop Image Resources (34377): {}",
@@ -391,10 +399,15 @@ fn production_warnings(
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     if metadata.icc_profile.is_none() {
-        warnings.push("No embedded ICC profile; color interpretation depends on external assumptions.".to_owned());
+        warnings.push(
+            "No embedded ICC profile; color interpretation depends on external assumptions."
+                .to_owned(),
+        );
     }
     if !dpi.has_physical_resolution {
-        warnings.push("No physical DPI tags; physical print size depends on a fallback DPI.".to_owned());
+        warnings.push(
+            "No physical DPI tags; physical print size depends on a fallback DPI.".to_owned(),
+        );
     }
     if !stream.streamable {
         warnings.push("TIFF is not on Shade Editor's bounded streaming path; large exports may require compatibility decode.".to_owned());
@@ -406,17 +419,27 @@ fn production_warnings(
         warnings.push("Unknown ExtraSamples semantics detected.".to_owned());
     }
     if metadata.samples_per_pixel > metadata.base_channel_count && spot_names.is_empty() {
-        warnings.push("Extra channels exist but no Photoshop Spot DisplayInfo was detected.".to_owned());
+        warnings.push(
+            "Extra channels exist but no Photoshop Spot DisplayInfo was detected.".to_owned(),
+        );
     }
     if !spot_names.is_empty() && metadata.photoshop_resources.is_none() {
         warnings.push("Spot channels were inferred without Photoshop Image Resources; verify names/order in Photoshop and RIP.".to_owned());
     }
-    if photometric == Some(5) && metadata.base_channel_count == 4 && ink_set.is_some_and(|value| value != 1) {
-        warnings.push("Separated TIFF declares a non-CMYK InkSet; verify RIP interpretation.".to_owned());
+    if photometric == Some(5)
+        && metadata.base_channel_count == 4
+        && ink_set.is_some_and(|value| value != 1)
+    {
+        warnings.push(
+            "Separated TIFF declares a non-CMYK InkSet; verify RIP interpretation.".to_owned(),
+        );
     }
     if let Some(count) = number_of_inks {
         if !ink_names.is_empty() && count as usize != ink_names.len() {
-            warnings.push(format!("NumberOfInks={count} but InkNames contains {} names.", ink_names.len()));
+            warnings.push(format!(
+                "NumberOfInks={count} but InkNames contains {} names.",
+                ink_names.len()
+            ));
         }
     }
     warnings
@@ -442,7 +465,14 @@ fn tiff_container(path: &Path) -> Result<(&'static str, &'static str), String> {
         43 => "BigTIFF",
         other => return Err(format!("Unknown TIFF magic value {other}.")),
     };
-    Ok((container, if little { "Little-endian (II)" } else { "Big-endian (MM)" }))
+    Ok((
+        container,
+        if little {
+            "Little-endian (II)"
+        } else {
+            "Big-endian (MM)"
+        },
+    ))
 }
 
 fn photometric_label(value: Option<u16>) -> String {
@@ -595,6 +625,9 @@ mod tests {
 
     #[test]
     fn ink_names_split_nul_separated_values() {
-        assert_eq!(parse_ink_names("Cyan\0Spot Red\0".into()), vec!["Cyan", "Spot Red"]);
+        assert_eq!(
+            parse_ink_names("Cyan\0Spot Red\0".into()),
+            vec!["Cyan", "Spot Red"]
+        );
     }
 }

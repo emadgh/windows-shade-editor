@@ -178,6 +178,7 @@ enum JobResult {
         path: PathBuf,
         result: Result<(), String>,
     },
+    InspectTiff(Result<tiff_inspect::TiffInspection, String>),
     Export(SnapshotExportBatchResult),
 }
 
@@ -208,6 +209,13 @@ struct RenderResult {
 struct ErrorToast {
     message: String,
     created: Instant,
+}
+
+#[derive(Clone)]
+struct BackupRestoreCandidate {
+    primary_path: PathBuf,
+    backup_path: PathBuf,
+    primary_error: String,
 }
 
 struct ShadeApp {
@@ -252,6 +260,8 @@ struct ShadeApp {
     show_tiff_inspector: bool,
     tiff_inspection: Option<tiff_inspect::TiffInspection>,
     tiff_inspect_error: Option<String>,
+    opening_project_path: Option<PathBuf>,
+    backup_restore_candidate: Option<BackupRestoreCandidate>,
     remind_after_export: bool,
     show_snapshot_save_reminder: bool,
     log: app_log::AppLog,
@@ -358,6 +368,8 @@ impl ShadeApp {
             show_tiff_inspector: false,
             tiff_inspection: None,
             tiff_inspect_error: None,
+            opening_project_path: None,
+            backup_restore_candidate: None,
             remind_after_export: false,
             show_snapshot_save_reminder: false,
             log,
@@ -657,6 +669,8 @@ impl ShadeApp {
             return;
         }
         self.recovery_candidate = None;
+        self.backup_restore_candidate = None;
+        self.opening_project_path = Some(path.clone());
         let max_dimension = self.settings.max_preview_dimension;
         let default_dpi = self.settings.default_dpi;
         self.launch_job("Opening project", move |progress| {
@@ -1083,6 +1097,9 @@ impl ShadeApp {
     }
 
     fn inspect_tiff_dialog(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
         let mut dialog = rfd::FileDialog::new().add_filter("TIFF image", &["tif", "tiff"]);
         if let Some(parent) = self
             .faces
@@ -1094,17 +1111,62 @@ impl ShadeApp {
         let Some(path) = dialog.pick_file() else {
             return;
         };
-        match tiff_inspect::inspect(&path, self.settings.default_dpi) {
-            Ok(report) => {
-                self.tiff_inspection = Some(report);
-                self.tiff_inspect_error = None;
-            }
-            Err(err) => {
-                self.tiff_inspection = None;
-                self.tiff_inspect_error = Some(err);
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Inspecting TIFF", move |progress| {
+            Self::set_progress(
+                &progress,
+                Some(0.1),
+                "Inspecting TIFF",
+                "Reading bounded TIFF metadata",
+            );
+            let result = tiff_inspect::inspect(&path, default_dpi);
+            Self::set_progress(&progress, Some(1.0), "Inspecting TIFF", "Complete");
+            JobResult::InspectTiff(result)
+        });
+    }
+
+    fn ui_backup_restore_window(&mut self, ctx: &egui::Context) {
+        let Some(candidate) = self.backup_restore_candidate.clone() else {
+            return;
+        };
+        let mut restore = false;
+        let mut cancel = false;
+        egui::Window::new("Project backup available")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.strong("The selected .shade file could not be opened, but its .bak backup is valid.");
+                ui.label(format!("Primary: {}", candidate.primary_path.display()));
+                ui.label(format!("Backup: {}", candidate.backup_path.display()));
+                ui.colored_label(egui::Color32::LIGHT_RED, &candidate.primary_error);
+                ui.small("Restore keeps a copy of the failed primary as .corrupt before atomically replacing it with the validated backup.");
+                ui.horizontal(|ui| {
+                    restore = ui.button("Restore validated backup").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel {
+            self.backup_restore_candidate = None;
+        } else if restore {
+            let corrupt = append_path_suffix(&candidate.primary_path, ".corrupt");
+            let result = (|| -> Result<(), String> {
+                if candidate.primary_path.is_file() {
+                    safe_fs::atomic_copy(&candidate.primary_path, &corrupt)?;
+                }
+                safe_fs::atomic_copy(&candidate.backup_path, &candidate.primary_path)?;
+                ShadeProject::load(&candidate.primary_path)
+                    .map(|_| ())
+                    .map_err(|err| format!("Restored backup did not validate: {err}"))
+            })();
+            match result {
+                Ok(()) => {
+                    self.backup_restore_candidate = None;
+                    self.open_project_path(candidate.primary_path);
+                }
+                Err(err) => self.report_error(format!("Backup restore failed: {err}")),
             }
         }
-        self.show_tiff_inspector = true;
     }
 
     fn ui_tiff_inspector_window(&mut self, ctx: &egui::Context) {
@@ -1911,6 +1973,8 @@ impl ShadeApp {
             }
             JobResult::Open(result) => match result {
                 Ok(payload) => {
+                    self.opening_project_path = None;
+                    self.backup_restore_candidate = None;
                     self.project = payload.project;
                     self.bump_project_session();
                     self.snapshot_rename_id = None;
@@ -1947,7 +2011,20 @@ impl ShadeApp {
                         ));
                     }
                 }
-                Err(err) => self.report_error(err),
+                Err(err) => {
+                    let primary_path = self.opening_project_path.take();
+                    if let Some(primary_path) = primary_path {
+                        let backup_path = safe_fs::backup_path(&primary_path);
+                        if backup_path.is_file() && ShadeProject::load(&backup_path).is_ok() {
+                            self.backup_restore_candidate = Some(BackupRestoreCandidate {
+                                primary_path,
+                                backup_path,
+                                primary_error: err.clone(),
+                            });
+                        }
+                    }
+                    self.report_error(err);
+                }
             },
             JobResult::Recover(result) => match result {
                 Ok(payload) => {
@@ -2001,6 +2078,19 @@ impl ShadeApp {
                     self.report_error(err);
                 }
             },
+            JobResult::InspectTiff(result) => {
+                match result {
+                    Ok(report) => {
+                        self.tiff_inspection = Some(report);
+                        self.tiff_inspect_error = None;
+                    }
+                    Err(err) => {
+                        self.tiff_inspection = None;
+                        self.tiff_inspect_error = Some(err);
+                    }
+                }
+                self.show_tiff_inspector = true;
+            }
             JobResult::Export(payload) => {
                 let export_ok = payload.result.is_ok();
                 if !payload.marks.is_empty() {
@@ -5765,6 +5855,7 @@ impl eframe::App for ShadeApp {
         self.ui_export_all_window(ui.ctx());
         self.ui_export_queue_window(ui.ctx());
         self.ui_tiff_inspector_window(ui.ctx());
+        self.ui_backup_restore_window(ui.ctx());
         self.ui_recovery_window(ui.ctx());
         self.ui_snapshot_discard_confirmation(ui.ctx());
         self.ui_snapshot_save_reminder(ui.ctx());
@@ -5773,6 +5864,15 @@ impl eframe::App for ShadeApp {
 
         self.start_render_if_needed(ui.ctx());
     }
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|value| value.to_os_string())
+        .unwrap_or_default();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 fn project_name_for_path(current: &str, path: &Path) -> String {
