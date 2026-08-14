@@ -1,0 +1,50 @@
+name: Validate v0.17.2 New Project Guard
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - fix/new-project-save-confirmation
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Apply v0.17.2 migration
+        run: python tools/apply_v0172_new_project_guard.py
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check Windows target
+        run: cargo check --target x86_64-pc-windows-msvc
+
+      - name: Test Windows target
+        run: cargo test --target x86_64-pc-windows-msvc
+
+      - name: Remove temporary validation infrastructure
+        shell: pwsh
+        run: |
+          git rm tools/apply_v0172_new_project_guard.py
+          git rm .github/workflows/apply-v0172-new-project-guard.yml
+
+      - name: Commit validated source
+        shell: pwsh
+        run: |
+          git config user.name "Shade Editor CI"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git status --short
+          git commit -m "[skip ci] Guard New project against unsaved state loss"
+          git push origin HEAD:fix/new-project-save-confirmation
