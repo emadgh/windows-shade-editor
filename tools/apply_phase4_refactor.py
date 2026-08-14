@@ -361,6 +361,7 @@ t = once(
 
 # Feature entry labels now come from a single stable wiring module.
 t = t.replace('egui::Button::new("Inspect TIFF...")', 'egui::Button::new(app_features::TIFF_INSPECTOR_LABEL)')
+t = t.replace('ui.button("Inspect TIFF...")', 'ui.button(app_features::TIFF_INSPECTOR_LABEL)')
 t = t.replace('egui::Button::new("Export Queue")', 'egui::Button::new(app_features::EXPORT_QUEUE_LABEL)')
 t = t.replace('ui.button("Export Queue")', 'ui.button(app_features::EXPORT_QUEUE_LABEL)')
 # Preserve headings/window strings; replace only the explicit color-management opener if present.
