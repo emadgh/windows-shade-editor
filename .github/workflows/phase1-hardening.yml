@@ -19,6 +19,8 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
           components: rustfmt
+      - name: Patch Phase 1 migration matcher
+        run: python tools/phase1_script_fix.py
       - name: Apply Phase 1 migration
         run: python tools/apply_phase1_hardening.py
       - name: Format
@@ -31,6 +33,7 @@ jobs:
         shell: pwsh
         run: |
           git rm tools/apply_phase1_hardening.py
+          git rm tools/phase1_script_fix.py
           git rm .github/workflows/phase1-hardening.yml
       - name: Commit validated Phase 1 source
         shell: pwsh
