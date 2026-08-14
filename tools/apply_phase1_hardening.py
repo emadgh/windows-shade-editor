@@ -1,5 +1,4 @@
 from pathlib import Path
-import re
 
 
 def once(text, old, new, label):
@@ -7,6 +6,14 @@ def once(text, old, new, label):
     if count != 1:
         raise RuntimeError(f"{label}: expected 1, got {count}")
     return text.replace(old, new, 1)
+
+
+def first(text, old, new, label):
+    count = text.count(old)
+    if count < 1:
+        raise RuntimeError(f"{label}: expected at least 1, got 0")
+    return text.replace(old, new, 1)
+
 
 main = Path("src/main.rs")
 text = main.read_text(encoding="utf-8")
@@ -20,23 +27,20 @@ text = once(
 )
 text = once(text, "            export_queue: export_queue::ExportQueue::new(),", "            export_queue,", "queue init")
 
-# Convert all queue specs from heavyweight ShadeProject to compact recipe.
 text = once(text, "            project: self.project.clone(),", "            recipe: export_recipe::ExportRecipe::from_project(&self.project),", "current export recipe")
 text = once(text, "                project: project.clone(),", "                recipe: export_recipe::ExportRecipe::from_project(&project),", "export all recipe")
 text = once(text, "            project,\n            default_dpi:", "            recipe: export_recipe::ExportRecipe::from_project(&project),\n            default_dpi:", "single snapshot recipe")
 text = once(text, "                project,\n                default_dpi:", "                recipe: export_recipe::ExportRecipe::from_project(&project),\n                default_dpi:", "snapshot group recipe")
 
-# Export All token context: snapshot name and test code are distinct.
 text = once(
     text,
     "        let snapshot_code = self.project.effective_test_code_text();\n        let template = self.settings.export_all_template.clone();",
     "        let test_code = self.project.effective_test_code_text();\n        let snapshot_name = self.project.active_snapshot_name().unwrap_or(\"Working\").to_owned();\n        let template = self.settings.export_all_template.clone();",
     "export all token values",
 )
-text = once(text, "                snapshot_code: &snapshot_code,", "                snapshot_name: &snapshot_name,\n                test_code: &test_code,", "export all context")
+text = first(text, "                snapshot_code: &snapshot_code,", "                snapshot_name: &snapshot_name,\n                test_code: &test_code,", "export all context")
 text = once(text, "                label: format!(\"{face_name} / {snapshot_code}\"),", "                label: format!(\"{face_name} / {snapshot_name}\"),", "export all label")
 
-# Export All preview context.
 text = once(
     text,
     "        let snapshot_code = self.project.effective_test_code_text();\n        let first_source = self",
@@ -50,11 +54,9 @@ text = text.replace(
     1,
 )
 
-# Snapshot group context: snapshot name from the actual snapshot; effective test code separately.
 text = once(text, "            let snapshot_code = project.effective_test_code_text();", "            let test_code = project.effective_test_code_text();", "group test code")
-text = once(text, "                snapshot_code: &snapshot_code,", "                snapshot_name: &snapshot.name,\n                test_code: &test_code,", "group context")
+text = first(text, "                snapshot_code: &snapshot_code,", "                snapshot_name: &snapshot.name,\n                test_code: &test_code,", "group context")
 
-# Queue persistence error is visible in app log instead of disappearing.
 text = once(
     text,
     "    fn poll_export_queue(&mut self) {\n        let completions = self.export_queue.poll();",
@@ -62,7 +64,6 @@ text = once(
     "queue persistence logging",
 )
 
-# Explicitly describe processing action as stop-after-current, not immediate cancellation.
 text = text.replace(
     'if ui.small_button("Cancel").clicked() {\n                                                        cancel_id = Some(*id);\n                                                    }',
     'let button = if *status == export_queue::ExportQueueStatus::Processing {\n                                                        "Stop after current"\n                                                    } else {\n                                                        "Cancel"\n                                                    };\n                                                    if ui.small_button(button).clicked() {\n                                                        cancel_id = Some(*id);\n                                                    }',
@@ -76,7 +77,6 @@ text = text.replace(
 
 main.write_text(text, encoding="utf-8")
 
-# Add Gray transport parity to both streaming/fallback gates and encoder branches.
 export = Path("src/export.rs")
 e = export.read_text(encoding="utf-8")
 e = e.replace(
@@ -147,7 +147,6 @@ if e.count(needle) != 1:
     raise RuntimeError(f"Gray encoder insertion: expected 1, got {e.count(needle)}")
 e = e.replace(needle, insert, 1)
 
-# Add a focused unit test proving Gray adjustment transport is accepted by the common pipeline.
 test_marker = "    #[test]\n    fn spot_zero_working_coverage_exports_as_no_ink_with_photoshop_polarity() {"
 gray_test = '''    #[test]
     fn gray_adjustment_pipeline_preserves_single_channel_semantics() {
