@@ -1,46 +1,100 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+trait ContextKeyboardCompat {
+    fn wants_keyboard_input(&self) -> bool;
+}
+
+impl ContextKeyboardCompat for eframe::egui::Context {
+    fn wants_keyboard_input(&self) -> bool {
+        self.egui_wants_keyboard_input()
+    }
+}
+
+mod app_log;
+mod color_management;
+mod dpi;
 mod export;
+mod export_batch;
+mod history;
 mod model;
+mod palette;
+mod previous_shades;
+mod recovery;
 mod render;
+mod safe_fs;
 mod settings;
+mod thumbnail;
 mod tiff_io;
 mod update;
+mod validation;
+mod workflow;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
+use chrono::{Local, TimeZone};
+use color_management::{InstalledIccProfile, PreviewColorConfig, PreviewColorStatus};
 use eframe::egui;
-use model::{ChannelAdjustment, ShadeProject};
+use model::{
+    ChannelAdjustment, PreviewRenderingIntent, ShadeProject, TEST_CODE_ALL_CHANNELS,
+    TestCodePosition,
+};
+use palette::ChannelPalette;
 use settings::AppSettings;
 use tiff_io::PreviewFace;
 use update::{UpdateManager, UpdateStatus};
 
 const VIEWPORT_OVERSCROLL: f32 = 180.0;
+const ERROR_TOAST_LIFETIME: Duration = Duration::from_secs(8);
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
+const HISTORY_COMMIT_DELAY: Duration = Duration::from_millis(300);
+const PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT: usize = 64;
+const APP_WINDOW_TITLE: &str = concat!(
+    "Shade Editor v",
+    env!("CARGO_PKG_VERSION"),
+    " - (EmadGhasemi.ir)"
+);
 
 fn main() -> eframe::Result {
+    let startup_project = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("shade"))
+        });
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_title("Shade Editor")
-            .with_inner_size([1500.0, 900.0])
+            .with_title(APP_WINDOW_TITLE)
+            .with_inner_size([1550.0, 920.0])
             .with_min_inner_size([1100.0, 700.0]),
         ..Default::default()
     };
-
     eframe::run_native(
-        "Shade Editor",
+        APP_WINDOW_TITLE,
         native_options,
-        Box::new(|cc| Ok(Box::new(ShadeApp::new(cc)))),
+        Box::new(move |cc| {
+            let mut app = ShadeApp::new(cc);
+            if let Some(path) = startup_project.clone() {
+                app.show_previous_shades = false;
+                app.open_project_path(path);
+            } else {
+                app.show_previous_shades = true;
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolPanel {
     Levels,
-    Curves,
     Mixer,
+    Curves,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,10 +105,99 @@ enum AdjustmentScope {
 
 struct RuntimeFace {
     path: PathBuf,
-    preview: PreviewFace,
+    available: bool,
+    preview: Arc<PreviewFace>,
+    dpi: dpi::DpiInfo,
     adjusted: Vec<Vec<u16>>,
+    clipping: Vec<render::ChannelClippingStats>,
+    color_status: PreviewColorStatus,
     texture: Option<egui::TextureHandle>,
-    dirty: bool,
+    original_texture: Option<egui::TextureHandle>,
+    generation: u64,
+    rendered_generation: u64,
+}
+
+struct LoadedFace {
+    path: PathBuf,
+    available: bool,
+    preview: PreviewFace,
+    dpi: dpi::DpiInfo,
+}
+
+struct OpenPayload {
+    path: PathBuf,
+    project: ShadeProject,
+    faces: Vec<LoadedFace>,
+    errors: Vec<String>,
+}
+
+struct RecoveryPayload {
+    origin_path: Option<PathBuf>,
+    project: ShadeProject,
+    faces: Vec<LoadedFace>,
+    errors: Vec<String>,
+}
+
+#[derive(Clone)]
+struct JobProgress {
+    label: String,
+    detail: String,
+    fraction: Option<f32>,
+}
+
+struct JobHandle {
+    progress: Arc<Mutex<JobProgress>>,
+    rx: mpsc::Receiver<JobResult>,
+}
+
+enum JobResult {
+    AddFaces {
+        faces: Vec<LoadedFace>,
+        errors: Vec<String>,
+    },
+    RebuildPreviews(Result<Vec<LoadedFace>, String>),
+    RelinkFace {
+        index: usize,
+        result: Result<LoadedFace, String>,
+    },
+    RelinkFolder {
+        faces: Vec<(usize, LoadedFace)>,
+        errors: Vec<String>,
+    },
+    Open(Result<OpenPayload, String>),
+    Recover(Result<RecoveryPayload, String>),
+    Save {
+        path: PathBuf,
+        result: Result<(), String>,
+    },
+    Export(SnapshotExportBatchResult),
+}
+
+struct SnapshotExportMark {
+    snapshot_id: u64,
+    face_key: String,
+    folder: PathBuf,
+    exported_at_unix_ms: i64,
+}
+
+struct SnapshotExportBatchResult {
+    result: Result<String, String>,
+    marks: Vec<SnapshotExportMark>,
+}
+
+struct RenderResult {
+    face_index: usize,
+    generation: u64,
+    adjusted: Vec<Vec<u16>>,
+    clipping: Vec<render::ChannelClippingStats>,
+    color_status: PreviewColorStatus,
+    rgba: Vec<u8>,
+    original_rgba: Vec<u8>,
+}
+
+struct ErrorToast {
+    message: String,
+    created: Instant,
 }
 
 struct ShadeApp {
@@ -67,13 +210,59 @@ struct ShadeApp {
     tool: ToolPanel,
     adjustment_scope: AdjustmentScope,
     zoom: f32,
+    fit_requested: bool,
     viewport_recenter: bool,
     settings: AppSettings,
     updater: UpdateManager,
     show_settings: bool,
+    show_color_management: bool,
+    icc_profile_query: String,
+    icc_profiles: Vec<InstalledIccProfile>,
+    icc_profile_selected: Option<String>,
+    icc_profile_scan_done: bool,
+    icc_profile_scan_error: Option<String>,
+    icc_show_incompatible: bool,
     show_about: bool,
+    show_logs: bool,
+    show_previous_shades: bool,
+    previous_shades: previous_shades::PreviousShadesStore,
+    previous_shades_query: String,
+    previous_shades_sort: previous_shades::PreviousShadesSort,
+    previous_shades_selected: Option<String>,
+    previous_shade_preview: Option<previous_shades::ShadeInspection>,
+    previous_shade_preview_error: Option<String>,
+    previous_shade_texture: Option<egui::TextureHandle>,
+    previous_shade_list_textures: BTreeMap<String, egui::TextureHandle>,
+    previous_shade_list_texture_lru: VecDeque<String>,
+    show_export_all: bool,
+    export_all_folder: String,
+    remind_after_export: bool,
+    show_snapshot_save_reminder: bool,
+    log: app_log::AppLog,
+    log_cache: String,
+    last_update_failure: Option<String>,
+    toast: Option<ErrorToast>,
     status_message: String,
     project_dirty: bool,
+    snapshot_rename_id: Option<u64>,
+    snapshot_rename_buffer: String,
+    pending_snapshot_load: Option<u64>,
+    show_close_confirmation: bool,
+    close_after_save: bool,
+    allow_close_once: bool,
+    history: history::AdjustmentHistory,
+    history_clear_backup: Option<(Option<u64>, history::AdjustmentHistory)>,
+    history_pending_label: Option<String>,
+    history_pending_at: Option<Instant>,
+    recovery_candidate: Option<recovery::RecoveryFile>,
+    autosave_tx: mpsc::Sender<Result<PathBuf, String>>,
+    autosave_rx: mpsc::Receiver<Result<PathBuf, String>>,
+    autosave_busy: bool,
+    last_autosave: Instant,
+    job: Option<JobHandle>,
+    render_tx: mpsc::Sender<RenderResult>,
+    render_rx: mpsc::Receiver<RenderResult>,
+    render_busy: Option<(usize, u64)>,
 }
 
 impl ShadeApp {
@@ -84,138 +273,411 @@ impl ShadeApp {
         if settings.auto_update {
             updater.start_check(true);
         }
+        let (render_tx, render_rx) = mpsc::channel();
+        let (autosave_tx, autosave_rx) = mpsc::channel();
+        let mut project = ShadeProject::default();
+        project.channel_palette = settings.default_project_palette();
+        let log = app_log::AppLog::default();
+        log.info(&format!(
+            "Shade Editor {} started",
+            env!("CARGO_PKG_VERSION")
+        ));
+        let previous_shades = previous_shades::PreviousShadesStore::load().unwrap_or_else(|err| {
+            log.error(&err);
+            previous_shades::PreviousShadesStore::default()
+        });
+        let recovery_candidate = match recovery::load() {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                log.error(&err);
+                None
+            }
+        };
+        let mut history = history::AdjustmentHistory::default();
+        history.reset(&project.adjustments, "Start");
         Self {
-            project: ShadeProject::default(),
+            project,
             project_path: None,
             faces: Vec::new(),
             current_face: 0,
             selected_channel: 0,
             solo_channel: None,
             tool: ToolPanel::Levels,
-            adjustment_scope: AdjustmentScope::Selected,
+            adjustment_scope: AdjustmentScope::All,
             zoom: 1.0,
+            fit_requested: false,
             viewport_recenter: true,
             settings,
             updater,
             show_settings: false,
+            show_color_management: false,
+            icc_profile_query: String::new(),
+            icc_profiles: Vec::new(),
+            icc_profile_selected: None,
+            icc_profile_scan_done: false,
+            icc_profile_scan_error: None,
+            icc_show_incompatible: false,
             show_about: false,
+            show_logs: false,
+            show_previous_shades: false,
+            previous_shades,
+            previous_shades_query: String::new(),
+            previous_shades_sort: previous_shades::PreviousShadesSort::LastOpened,
+            previous_shades_selected: None,
+            previous_shade_preview: None,
+            previous_shade_preview_error: None,
+            previous_shade_texture: None,
+            previous_shade_list_textures: BTreeMap::new(),
+            previous_shade_list_texture_lru: VecDeque::new(),
+            show_export_all: false,
+            export_all_folder: String::new(),
+            remind_after_export: false,
+            show_snapshot_save_reminder: false,
+            log,
+            log_cache: String::new(),
+            last_update_failure: None,
+            toast: None,
             status_message: "Ready".to_owned(),
             project_dirty: false,
+            snapshot_rename_id: None,
+            snapshot_rename_buffer: String::new(),
+            pending_snapshot_load: None,
+            show_close_confirmation: false,
+            close_after_save: false,
+            allow_close_once: false,
+            history,
+            history_clear_backup: None,
+            history_pending_label: None,
+            history_pending_at: None,
+            recovery_candidate,
+            autosave_tx,
+            autosave_rx,
+            autosave_busy: false,
+            last_autosave: Instant::now(),
+            job: None,
+            render_tx,
+            render_rx,
+            render_busy: None,
         }
     }
 
+    fn report_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.log.error(&message);
+        self.status_message = "Error - see Logs".to_owned();
+        self.toast = Some(ErrorToast {
+            message,
+            created: Instant::now(),
+        });
+    }
+
+    fn report_info(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.log.info(&message);
+        self.status_message = message;
+    }
+
     fn new_project(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
         self.project = ShadeProject::default();
+        self.project.channel_palette = self.settings.default_project_palette();
         self.project_path = None;
         self.faces.clear();
         self.current_face = 0;
         self.selected_channel = 0;
         self.solo_channel = None;
-        self.adjustment_scope = AdjustmentScope::Selected;
+        self.adjustment_scope = AdjustmentScope::All;
         self.viewport_recenter = true;
-        self.status_message = "New shade project".to_owned();
+        self.fit_requested = true;
         self.project_dirty = false;
+        self.snapshot_rename_id = None;
+        self.snapshot_rename_buffer.clear();
+        self.pending_snapshot_load = None;
+        self.show_close_confirmation = false;
+        self.close_after_save = false;
+        self.show_color_management = false;
+        self.icc_profile_query.clear();
+        self.icc_profile_selected = None;
+        self.remind_after_export = false;
+        self.show_snapshot_save_reminder = false;
+        self.history.reset(&self.project.adjustments, "New project");
+        self.history_clear_backup = None;
+        self.history_pending_label = None;
+        self.history_pending_at = None;
+        self.report_info("New shade project");
+    }
+
+    fn make_runtime_face(item: LoadedFace) -> RuntimeFace {
+        RuntimeFace {
+            path: item.path,
+            available: item.available,
+            preview: Arc::new(item.preview),
+            dpi: item.dpi,
+            adjusted: Vec::new(),
+            clipping: Vec::new(),
+            color_status: PreviewColorStatus::Pending,
+            texture: None,
+            original_texture: None,
+            generation: 1,
+            rendered_generation: 0,
+        }
+    }
+
+    fn launch_job<F>(&mut self, label: &str, task: F)
+    where
+        F: FnOnce(Arc<Mutex<JobProgress>>) -> JobResult + Send + 'static,
+    {
+        if self.job.is_some() {
+            self.report_error("Another operation is already in progress.");
+            return;
+        }
+        let progress = Arc::new(Mutex::new(JobProgress {
+            label: label.to_owned(),
+            detail: String::new(),
+            fraction: None,
+        }));
+        let (tx, rx) = mpsc::channel();
+        let worker_progress = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let result = task(worker_progress);
+            let _ = tx.send(result);
+        });
+        self.job = Some(JobHandle { progress, rx });
+    }
+
+    fn set_progress(
+        progress: &Arc<Mutex<JobProgress>>,
+        fraction: Option<f32>,
+        label: &str,
+        detail: &str,
+    ) {
+        if let Ok(mut state) = progress.lock() {
+            state.fraction = fraction.map(|value| value.clamp(0.0, 1.0));
+            state.label = label.to_owned();
+            state.detail = detail.to_owned();
+        }
+    }
+
+    fn is_tiff_path(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
+    }
+
+    fn add_faces_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.job.is_some() {
+            return;
+        }
+        let paths = paths
+            .into_iter()
+            .filter(|path| Self::is_tiff_path(path))
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return;
+        }
+        let max_dimension = self.settings.max_preview_dimension;
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Opening TIFF", move |progress| {
+            let total = paths.len().max(1);
+            let mut faces = Vec::new();
+            let mut errors = Vec::new();
+            for (index, path) in paths.into_iter().enumerate() {
+                Self::set_progress(
+                    &progress,
+                    Some(index as f32 / total as f32),
+                    "Opening TIFF",
+                    &path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+                match tiff_io::load_preview(&path, max_dimension) {
+                    Ok(preview) => faces.push(LoadedFace {
+                        dpi: dpi::read_dpi(&path, default_dpi),
+                        path,
+                        available: true,
+                        preview,
+                    }),
+                    Err(err) => errors.push(format!("{}: {err}", path.display())),
+                }
+            }
+            Self::set_progress(&progress, Some(1.0), "Opening TIFF", "Complete");
+            JobResult::AddFaces { faces, errors }
+        });
     }
 
     fn add_faces_dialog(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
         let Some(paths) = rfd::FileDialog::new()
             .add_filter("TIFF images", &["tif", "tiff"])
             .pick_files()
-        else { return; };
+        else {
+            return;
+        };
+        self.add_faces_paths(paths);
+    }
 
-        let mut added = 0usize;
-        let mut last_error = None;
-        for path in paths {
-            match tiff_io::load_preview(&path, self.settings.max_preview_dimension) {
-                Ok(preview) => {
-                    self.project.ensure_channels(&preview.metadata.channel_names);
-                    let label = path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Face".to_owned());
-                    self.project.faces.push(model::FaceRef {
-                        path: path.to_string_lossy().into_owned(),
-                        label,
-                    });
-                    self.faces.push(RuntimeFace {
-                        path,
-                        preview,
-                        adjusted: Vec::new(),
-                        texture: None,
-                        dirty: true,
-                    });
-                    added += 1;
-                }
-                Err(err) => last_error = Some(err),
-            }
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        if self.job.is_some() {
+            return;
         }
+        let paths = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .filter(|path| Self::is_tiff_path(path))
+                .collect::<Vec<_>>()
+        });
+        if !paths.is_empty() {
+            self.add_faces_paths(paths);
+        }
+    }
 
-        if added > 0 {
-            self.current_face = self.faces.len().saturating_sub(added);
-            self.selected_channel = 0;
-            self.solo_channel = None;
-            self.viewport_recenter = true;
-            self.project_dirty = true;
-            self.status_message = format!("Added {added} face(s)");
-        }
-        if let Some(err) = last_error {
-            self.status_message = format!("Some TIFF files could not be loaded: {err}");
-        }
+    fn rebuild_previews(&mut self) {
+        workflow::rebuild_previews(self);
     }
 
     fn open_project_dialog(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Shade project", &["shade"])
             .pick_file()
-        else { return; };
-        self.open_project(&path);
+        else {
+            return;
+        };
+        self.open_project_path(path);
     }
 
-    fn open_project(&mut self, path: &Path) {
-        let project = match ShadeProject::load(path) {
-            Ok(project) => project,
-            Err(err) => {
-                self.status_message = err;
-                return;
-            }
-        };
-        let resolved = project.resolve_face_paths(path);
-        let mut runtime_faces = Vec::new();
-        let mut errors = Vec::new();
-        for source in &resolved {
-            match tiff_io::load_preview(source, self.settings.max_preview_dimension) {
-                Ok(preview) => runtime_faces.push(RuntimeFace {
-                    path: source.clone(),
-                    preview,
-                    adjusted: Vec::new(),
-                    texture: None,
-                    dirty: true,
-                }),
-                Err(err) => errors.push(format!("{}: {err}", source.display())),
-            }
+    fn open_project_path(&mut self, path: PathBuf) {
+        if self.job.is_some() {
+            return;
         }
+        self.recovery_candidate = None;
+        let max_dimension = self.settings.max_preview_dimension;
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Opening project", move |progress| {
+            let result = (|| -> Result<OpenPayload, String> {
+                Self::set_progress(&progress, None, "Opening project", "Reading .shade");
+                let mut project = ShadeProject::load(&path)?;
+                let resolved = project.resolve_face_paths(&path);
+                let total = resolved.len().max(1);
+                let mut faces = Vec::new();
+                let mut errors = Vec::new();
+                for (index, source) in resolved.into_iter().enumerate() {
+                    Self::set_progress(
+                        &progress,
+                        Some(index as f32 / total as f32),
+                        "Opening project",
+                        &format!("Loading Face {}/{}", index + 1, total),
+                    );
+                    let expected = project
+                        .file_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.faces.get(index))
+                        .cloned();
+                    match tiff_io::load_preview(&source, max_dimension) {
+                        Ok(preview) => {
+                            project.ensure_channels(&preview.metadata.channel_names);
+                            faces.push(LoadedFace {
+                                dpi: dpi::read_dpi(&source, default_dpi),
+                                path: source,
+                                available: true,
+                                preview,
+                            });
+                        }
+                        Err(err) => {
+                            errors.push(format!("{}: {err}", source.display()));
+                            faces.push(workflow::placeholder_loaded_face(
+                                source,
+                                expected.as_ref(),
+                                default_dpi,
+                            ));
+                        }
+                    }
+                }
+                Self::set_progress(&progress, Some(1.0), "Opening project", "Complete");
+                Ok(OpenPayload {
+                    path,
+                    project,
+                    faces,
+                    errors,
+                })
+            })();
+            JobResult::Open(result)
+        });
+    }
 
-        let mut project = project;
-        for face in &runtime_faces {
-            project.ensure_channels(&face.preview.metadata.channel_names);
+    fn begin_project_save(&mut self, path: PathBuf) -> bool {
+        if self.job.is_some() || self.faces.is_empty() {
+            return false;
         }
-        self.project = project;
-        self.project_path = Some(path.to_path_buf());
-        self.faces = runtime_faces;
-        self.current_face = 0;
-        self.selected_channel = 0;
-        self.solo_channel = None;
-        self.adjustment_scope = AdjustmentScope::Selected;
-        self.viewport_recenter = true;
-        self.project_dirty = false;
-        self.status_message = if errors.is_empty() {
-            format!("Opened {}", path.display())
+        self.flush_history_now();
+        self.sync_history_to_active_snapshot();
+        self.project.name = project_name_for_path(&self.project.name, &path);
+        let mut project = self.project.clone();
+        project.ensure_snapshot_histories();
+        project.file_metadata = Some(build_project_file_metadata(
+            &self.project,
+            &self.faces,
+            self.current_face,
+        ));
+        let thumbnail_face = self
+            .faces
+            .get(self.current_face)
+            .filter(|face| face.available)
+            .or_else(|| self.faces.iter().find(|face| face.available))
+            .map(|face| Arc::clone(&face.preview));
+        let face_paths = self
+            .faces
+            .iter()
+            .map(|face| face.path.clone())
+            .collect::<Vec<_>>();
+        let result_path = path.clone();
+        self.launch_job("Saving project", move |progress| {
+            Self::set_progress(
+                &progress,
+                Some(0.15),
+                "Saving project",
+                "Building project thumbnail",
+            );
+            let result = (|| -> Result<(), String> {
+                if let Some(face) = thumbnail_face.as_deref() {
+                    project.thumbnail = Some(thumbnail::build_project_thumbnail(face, &project)?);
+                }
+                Self::set_progress(
+                    &progress,
+                    Some(0.55),
+                    "Saving project",
+                    "Serializing project and metadata",
+                );
+                project.save(&path, &face_paths)
+            })();
+            Self::set_progress(&progress, Some(1.0), "Saving project", "Complete");
+            JobResult::Save {
+                path: result_path,
+                result,
+            }
+        });
+        true
+    }
+
+    fn save_project(&mut self, save_as: bool) -> bool {
+        if self.job.is_some() || self.faces.is_empty() {
+            return false;
+        }
+        let target = if !save_as {
+            self.project_path.clone()
         } else {
-            format!("Project opened with {} missing/unsupported face(s)", errors.len())
+            None
         };
-    }
-
-    fn save_project(&mut self, save_as: bool) {
-        let target = if !save_as { self.project_path.clone() } else { None };
         let target = match target {
             Some(path) => Some(path),
             None => {
@@ -228,56 +690,1052 @@ impl ShadeApp {
                 dialog.save_file()
             }
         };
-        let Some(path) = target else { return; };
-        let paths = self.faces.iter().map(|face| face.path.clone()).collect::<Vec<_>>();
-        match self.project.save(&path, &paths) {
-            Ok(()) => {
-                self.project_path = Some(path.clone());
-                self.project_dirty = false;
-                self.status_message = format!("Saved {}", path.display());
-            }
-            Err(err) => self.status_message = err,
+        let Some(path) = target else {
+            return false;
+        };
+        self.begin_project_save(path)
+    }
+
+    fn quick_save_target(&self) -> Option<PathBuf> {
+        if self.project_path.is_some() || self.faces.is_empty() {
+            return None;
         }
+        let face = self
+            .faces
+            .get(self.current_face)
+            .or_else(|| self.faces.first())?;
+        let parent = face.path.parent().unwrap_or_else(|| Path::new("."));
+        let mut stem = sanitize_filename(self.project.name.trim());
+        if stem.trim().is_empty()
+            || self
+                .project
+                .name
+                .trim()
+                .eq_ignore_ascii_case("Untitled Shade")
+        {
+            stem = face
+                .path
+                .file_stem()
+                .map(|value| sanitize_filename(&value.to_string_lossy()))
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "Shade Project".to_owned());
+        }
+        Some(unique_shade_path(parent, &stem))
+    }
+
+    fn quick_save_project(&mut self) -> bool {
+        let Some(path) = self.quick_save_target() else {
+            return false;
+        };
+        self.begin_project_save(path)
+    }
+
+    fn snapshot_project_needs_save_reminder(&self) -> bool {
+        self.project.active_snapshot_id.is_some()
+            && (self.project_dirty || self.project_path.is_none())
     }
 
     fn export_current_dialog(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        if !workflow::active_face_available(self) {
+            self.report_error(
+                "The active Face source TIFF is missing. Relink it before exporting.",
+            );
+            return;
+        }
         let Some(face) = self.faces.get(self.current_face) else {
-            self.status_message = "No active face to export".to_owned();
             return;
         };
-        let stem = face.path.file_stem().map(|value| value.to_string_lossy()).unwrap_or_default();
+        let stem = face
+            .path
+            .file_stem()
+            .map(|value| value.to_string_lossy())
+            .unwrap_or_default();
         let Some(destination) = rfd::FileDialog::new()
             .add_filter("TIFF image", &["tif", "tiff"])
             .set_file_name(format!("{stem}-shade.tif"))
             .save_file()
-        else { return; };
-        match export::export_face(&face.path, &destination, &self.project) {
-            Ok(()) => self.status_message = format!("Exported {}", destination.display()),
-            Err(err) => self.status_message = format!("Export failed: {err}"),
+        else {
+            return;
+        };
+        let source = face.path.clone();
+        let project = self.project.clone();
+        let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
+        let validate_after_export = self.settings.validate_after_export;
+        self.remind_after_export = self.snapshot_project_needs_save_reminder();
+        self.launch_job("Exporting TIFF", move |progress| {
+            let result = export::export_face_with_progress_options(
+                &source,
+                &destination,
+                &project,
+                default_dpi,
+                export::ExportOptions { force_lzw },
+                |fraction, detail| {
+                    let fraction = if validate_after_export {
+                        fraction * 0.88
+                    } else {
+                        fraction
+                    };
+                    Self::set_progress(&progress, Some(fraction), "Exporting TIFF", detail);
+                },
+            )
+            .and_then(|_| {
+                if validate_after_export {
+                    Self::set_progress(
+                        &progress,
+                        Some(0.92),
+                        "Validating exported TIFF",
+                        "Decoding strips and checking production metadata",
+                    );
+                    let verified = validation::validate_export_transport_with_options(
+                        &source,
+                        &destination,
+                        force_lzw,
+                    )?;
+                    Ok(format!("Exported {} · {verified}", destination.display()))
+                } else {
+                    Ok(format!("Exported {}", destination.display()))
+                }
+            });
+            JobResult::Export(SnapshotExportBatchResult {
+                result,
+                marks: Vec::new(),
+            })
+        });
+    }
+
+    fn validate_current_face_dialog(&mut self) {
+        if self.job.is_some() {
+            return;
         }
+        if !workflow::active_face_available(self) {
+            self.report_error(
+                "The active Face source TIFF is missing. Relink it before validation.",
+            );
+            return;
+        }
+        let Some(face) = self.faces.get(self.current_face) else {
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(parent) = face.path.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(folder) = dialog.pick_folder() else {
+            return;
+        };
+        let source = face.path.clone();
+        let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
+        self.remind_after_export = false;
+        self.launch_job("Validating TIFF", move |progress| {
+            let result = validation::validate_no_adjustment_roundtrip_with_options(
+                &source,
+                &folder,
+                default_dpi,
+                force_lzw,
+                |fraction, detail| {
+                    Self::set_progress(&progress, Some(fraction), "Validating TIFF", detail);
+                },
+            )
+            .map(|artifacts| {
+                let result = if artifacts.report.passed {
+                    "PASS"
+                } else {
+                    "FAIL"
+                };
+                format!(
+                    "TIFF round-trip {result} · report {}",
+                    artifacts.markdown_path.display()
+                )
+            });
+            JobResult::Export(SnapshotExportBatchResult {
+                result,
+                marks: Vec::new(),
+            })
+        });
     }
 
     fn export_all_dialog(&mut self) {
-        if self.faces.is_empty() {
-            self.status_message = "No faces to export".to_owned();
+        if self.job.is_some() || self.faces.is_empty() {
             return;
         }
-        let Some(folder) = rfd::FileDialog::new().pick_folder() else { return; };
-        let mut exported = 0usize;
-        for face in &self.faces {
-            let stem = face.path.file_stem().map(|value| value.to_string_lossy()).unwrap_or_default();
-            let destination = folder.join(format!("{stem}-shade.tif"));
-            if let Err(err) = export::export_face(&face.path, &destination, &self.project) {
-                self.status_message = format!("Export stopped at {}: {err}", face.path.display());
-                return;
-            }
-            exported += 1;
+        if self.faces.iter().any(|face| !face.available) {
+            self.report_error("Export all requires every Face source TIFF to be available. Relink missing Faces first.");
+            return;
         }
-        self.status_message = format!("Exported {exported} face(s) to {}", folder.display());
+        if self.export_all_folder.trim().is_empty() {
+            let initial = self
+                .project_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .or_else(|| {
+                    self.faces
+                        .get(self.current_face)
+                        .and_then(|face| face.path.parent())
+                })
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.export_all_folder = initial;
+        }
+        self.show_export_all = true;
+    }
+
+    fn start_export_all(&mut self) {
+        if self.job.is_some() || self.faces.is_empty() {
+            return;
+        }
+        let folder = PathBuf::from(self.export_all_folder.trim());
+        if self.export_all_folder.trim().is_empty() {
+            self.report_error("Choose an Export All folder first.");
+            return;
+        }
+        if let Err(err) = std::fs::create_dir_all(&folder) {
+            self.report_error(format!(
+                "Cannot create Export All folder {}: {err}",
+                folder.display()
+            ));
+            return;
+        }
+        if self.faces.iter().any(|face| !face.available) {
+            self.report_error("Export all requires every Face source TIFF to be available. Relink missing Faces first.");
+            return;
+        }
+
+        let sources = self
+            .faces
+            .iter()
+            .map(|face| face.path.clone())
+            .collect::<Vec<_>>();
+        let face_names = self
+            .project
+            .faces
+            .iter()
+            .map(|face| face.label.clone())
+            .collect::<Vec<_>>();
+        let shade_name = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map(|value| value.to_string_lossy().into_owned());
+        let project_name = self.project.name.clone();
+        let snapshot_code = self.project.effective_test_code_text();
+        let template = self.settings.export_all_template.clone();
+        let conflict_policy = self.settings.export_all_conflict_policy;
+        let open_after = self.settings.export_all_open_folder;
+        let mut project = self.project.clone();
+        project.test_code.enabled = self.settings.export_all_test_code;
+        let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
+        let validate_after_export = self.settings.validate_after_export;
+        self.remind_after_export = self.snapshot_project_needs_save_reminder();
+        self.show_export_all = false;
+        let _ = self.settings.save();
+
+        self.launch_job("Exporting faces", move |progress| {
+            let total = sources.len().max(1);
+            let result = (|| -> Result<String, String> {
+                let mut written = 0usize;
+                let mut skipped = 0usize;
+                for (index, source) in sources.iter().enumerate() {
+                    let face_name = face_names
+                        .get(index)
+                        .map(String::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .or_else(|| source.file_stem().and_then(|value| value.to_str()))
+                        .unwrap_or("face");
+                    let filename = export_batch::render_export_filename(
+                        &template,
+                        &export_batch::ExportNameContext {
+                            shade_name: shade_name.as_deref(),
+                            project_name: &project_name,
+                            snapshot_code: &snapshot_code,
+                            face_number: index + 1,
+                            face_name,
+                        },
+                    );
+                    let destination = match export_batch::resolve_destination(
+                        &folder,
+                        &filename,
+                        conflict_policy,
+                    ) {
+                        export_batch::DestinationDecision::Write(path) => path,
+                        export_batch::DestinationDecision::Skip(path) => {
+                            skipped += 1;
+                            Self::set_progress(
+                                &progress,
+                                Some((index + 1) as f32 / total as f32),
+                                "Exporting faces",
+                                &format!(
+                                    "Skipped existing {}",
+                                    path.file_name()
+                                        .map(|value| value.to_string_lossy())
+                                        .unwrap_or_default()
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    export::export_face_with_progress_options(
+                        source,
+                        &destination,
+                        &project,
+                        default_dpi,
+                        export::ExportOptions { force_lzw },
+                        |phase, detail| {
+                            let inner = if validate_after_export {
+                                phase * 0.88
+                            } else {
+                                phase
+                            };
+                            let overall = (index as f32 + inner) / total as f32;
+                            Self::set_progress(&progress, Some(overall), "Exporting faces", detail);
+                        },
+                    )?;
+                    if validate_after_export {
+                        let overall = (index as f32 + 0.92) / total as f32;
+                        Self::set_progress(
+                            &progress,
+                            Some(overall),
+                            "Validating exported TIFF",
+                            &destination.display().to_string(),
+                        );
+                        validation::validate_export_transport_with_options(
+                            source,
+                            &destination,
+                            force_lzw,
+                        )?;
+                    }
+                    written += 1;
+                }
+                Self::set_progress(&progress, Some(1.0), "Exporting faces", "Complete");
+                if open_after {
+                    let _ = open_folder(&folder);
+                }
+                Ok(if skipped > 0 {
+                    format!("Exported {written} face(s) · skipped {skipped} existing file(s)")
+                } else {
+                    format!("Exported {written} face(s)")
+                })
+            })();
+            JobResult::Export(SnapshotExportBatchResult {
+                result,
+                marks: Vec::new(),
+            })
+        });
+    }
+
+    fn ui_export_all_window(&mut self, ctx: &egui::Context) {
+        if !self.show_export_all {
+            return;
+        }
+        let mut open = self.show_export_all;
+        let folder = PathBuf::from(self.export_all_folder.trim());
+        let existing_tiffs = if folder.is_dir() {
+            export_batch::folder_tiff_count(&folder)
+        } else {
+            0
+        };
+        let shade_name = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map(|value| value.to_string_lossy().into_owned());
+        let snapshot_code = self.project.effective_test_code_text();
+        let face_name = self
+            .project
+            .faces
+            .first()
+            .map(|face| face.label.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("face");
+        let preview_name = export_batch::render_export_filename(
+            &self.settings.export_all_template,
+            &export_batch::ExportNameContext {
+                shade_name: shade_name.as_deref(),
+                project_name: &self.project.name,
+                snapshot_code: &snapshot_code,
+                face_number: 1,
+                face_name,
+            },
+        );
+        let mut browse = false;
+        let mut reveal = false;
+        let mut start = false;
+        let mut cancel = false;
+        let mut changed = false;
+        egui::Window::new("Export All Faces")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(500.0)
+            .min_width(460.0)
+            .max_width(560.0)
+            .show(ctx, |ui| {
+                ui.strong("Export folder");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.export_all_folder)
+                            .desired_width(300.0),
+                    );
+                    browse = ui.button("Browse...").clicked();
+                    reveal = ui
+                        .add_enabled(folder.is_dir(), egui::Button::new("Reveal folder"))
+                        .clicked();
+                });
+                if existing_tiffs > 0 {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!("Warning: this folder already contains {existing_tiffs} TIFF file(s). Mixing source/old exports can cause mistakes."),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.strong("File name template");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.settings.export_all_template)
+                            .desired_width(455.0),
+                    )
+                    .changed();
+                ui.small("Tokens: {shade-name|project-name}, {shade-name}, {project-name}, {snapshot-code}, {face-number}, {face-name}");
+                ui.small("Windows-reserved characters such as * are converted to '-' in the generated filename.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Preview:");
+                    ui.monospace(&preview_name);
+                });
+
+                ui.add_space(8.0);
+                ui.strong("If a file already exists");
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.export_all_conflict_policy,
+                            export_batch::ConflictPolicy::Overwrite,
+                            "Overwrite",
+                        )
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.export_all_conflict_policy,
+                            export_batch::ConflictPolicy::Skip,
+                            "Skip",
+                        )
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.export_all_conflict_policy,
+                            export_batch::ConflictPolicy::AutoNumber,
+                            "Auto-number",
+                        )
+                        .changed();
+                });
+                ui.small("Auto-number is the safe default and produces names such as '... (2).tif'.");
+
+                ui.add_space(8.0);
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.export_all_open_folder,
+                        "Open folder after export",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.export_all_test_code,
+                        "Write Test Code on every exported Face",
+                    )
+                    .changed();
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    start = ui
+                        .add_enabled(
+                            !self.export_all_folder.trim().is_empty()
+                                && self.job.is_none()
+                                && !self.faces.is_empty(),
+                            egui::Button::new("Export All"),
+                        )
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel {
+            open = false;
+        }
+        self.show_export_all = open;
+        if changed {
+            self.settings.sanitize();
+            if let Err(err) = self.settings.save() {
+                self.log.error(&err);
+            }
+        }
+        if browse {
+            let mut dialog = rfd::FileDialog::new();
+            if folder.is_dir() {
+                dialog = dialog.set_directory(&folder);
+            }
+            if let Some(selected) = dialog.pick_folder() {
+                self.export_all_folder = selected.to_string_lossy().into_owned();
+            }
+        }
+        if reveal && folder.is_dir() {
+            if let Err(err) = open_folder(&folder) {
+                self.report_error(err);
+            }
+        }
+        if start {
+            self.start_export_all();
+        }
+    }
+
+    fn export_snapshot_dialog(&mut self, snapshot_id: u64) {
+        if self.job.is_some() {
+            return;
+        }
+        if !workflow::active_face_available(self) {
+            self.report_error(
+                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",
+            );
+            return;
+        }
+        let Some(face) = self.faces.get(self.current_face) else {
+            return;
+        };
+        let Some(snapshot) = self
+            .project
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == snapshot_id)
+            .cloned()
+        else {
+            return;
+        };
+        let stem = face
+            .path
+            .file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "face".to_owned());
+        let suggested = format!(
+            "{}-{}.tif",
+            sanitize_filename(&stem),
+            sanitize_filename(&snapshot.name)
+        );
+        let Some(destination) = rfd::FileDialog::new()
+            .add_filter("TIFF image", &["tif", "tiff"])
+            .set_file_name(suggested)
+            .save_file()
+        else {
+            return;
+        };
+        let source = face.path.clone();
+        let face_key = source.to_string_lossy().into_owned();
+        let folder = destination
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let mut project = self.project.clone();
+        let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
+        project.adjustments = snapshot.adjustments.clone();
+        project.active_snapshot_id = Some(snapshot.id);
+        self.remind_after_export = self.snapshot_project_needs_save_reminder();
+        self.launch_job("Exporting snapshot", move |progress| {
+            let result = export::export_face_with_progress_options(
+                &source,
+                &destination,
+                &project,
+                default_dpi,
+                export::ExportOptions { force_lzw },
+                |fraction, detail| {
+                    Self::set_progress(&progress, Some(fraction), "Exporting snapshot", detail);
+                },
+            )
+            .map(|_| format!("Exported {}", destination.display()));
+            let marks = if result.is_ok() {
+                vec![SnapshotExportMark {
+                    snapshot_id,
+                    face_key,
+                    folder,
+                    exported_at_unix_ms: unix_ms_now(),
+                }]
+            } else {
+                Vec::new()
+            };
+            JobResult::Export(SnapshotExportBatchResult { result, marks })
+        });
+    }
+
+    fn export_snapshot_group_dialog(&mut self, snapshot_ids: Vec<u64>, label: String) {
+        if self.job.is_some() || snapshot_ids.is_empty() {
+            return;
+        }
+        if !workflow::active_face_available(self) {
+            self.report_error(
+                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",
+            );
+            return;
+        }
+        let Some(face) = self.faces.get(self.current_face) else {
+            return;
+        };
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let source = face.path.clone();
+        let face_key = source.to_string_lossy().into_owned();
+        let stem = source
+            .file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "face".to_owned());
+        let base_project = self.project.clone();
+        let default_dpi = self.settings.default_dpi;
+        let force_lzw = self.settings.lzw_compression;
+        let snapshots = snapshot_ids
+            .into_iter()
+            .filter_map(|id| {
+                self.project
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.id == id)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        if snapshots.is_empty() {
+            return;
+        }
+        self.remind_after_export = self.snapshot_project_needs_save_reminder();
+        self.launch_job("Exporting snapshots", move |progress| {
+            let total = snapshots.len().max(1);
+            let mut marks = Vec::new();
+            let result = (|| -> Result<String, String> {
+                for (index, snapshot) in snapshots.iter().enumerate() {
+                    let destination = folder.join(format!(
+                        "{}-{}.tif",
+                        sanitize_filename(&stem),
+                        sanitize_filename(&snapshot.name)
+                    ));
+                    let mut project = base_project.clone();
+                    project.adjustments = snapshot.adjustments.clone();
+                    project.active_snapshot_id = Some(snapshot.id);
+                    export::export_face_with_progress_options(
+                        &source,
+                        &destination,
+                        &project,
+                        default_dpi,
+                        export::ExportOptions { force_lzw },
+                        |inner, detail| {
+                            let overall = (index as f32 + inner) / total as f32;
+                            Self::set_progress(
+                                &progress,
+                                Some(overall),
+                                "Exporting snapshots",
+                                &format!("{} · {detail}", snapshot.name),
+                            );
+                        },
+                    )?;
+                    marks.push(SnapshotExportMark {
+                        snapshot_id: snapshot.id,
+                        face_key: face_key.clone(),
+                        folder: folder.clone(),
+                        exported_at_unix_ms: unix_ms_now(),
+                    });
+                }
+                Ok(format!(
+                    "Exported {} snapshot(s) ({label}) to {}",
+                    snapshots.len(),
+                    folder.display()
+                ))
+            })();
+            JobResult::Export(SnapshotExportBatchResult { result, marks })
+        });
+    }
+
+    fn ensure_project_palette_for_model(&mut self, color_model: tiff_io::ColorModel) -> bool {
+        if self.project.channel_palette.is_some() {
+            return false;
+        }
+        let palette = self
+            .settings
+            .default_project_palette()
+            .or_else(|| match color_model {
+                tiff_io::ColorModel::Rgb => Some(palette::builtin_rgb()),
+                tiff_io::ColorModel::Cmyk => Some(palette::builtin_cmyk()),
+                _ => None,
+            });
+        if let Some(palette) = palette {
+            self.project.channel_palette = Some(palette);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_project_palette(&mut self, palette: ChannelPalette) {
+        if self.project.channel_palette.as_ref() == Some(&palette) {
+            return;
+        }
+        let name = palette.name.clone();
+        self.project.channel_palette = Some(palette);
+        self.project_dirty = true;
+        self.report_info(format!("Channel palette: {name}"));
+    }
+
+    fn open_export_folder(&mut self, folder: &str) {
+        if let Err(err) = open_folder(Path::new(folder)) {
+            self.report_error(err);
+        }
+    }
+
+    fn poll_job(&mut self) {
+        let result = self.job.as_ref().and_then(|job| job.rx.try_recv().ok());
+        let Some(result) = result else {
+            return;
+        };
+        self.job = None;
+        match result {
+            JobResult::AddFaces { faces, errors } => {
+                let added = faces.len();
+                if let Some(first) = faces.first() {
+                    self.ensure_project_palette_for_model(first.preview.metadata.color_model);
+                }
+                for item in faces {
+                    self.project
+                        .ensure_channels(&item.preview.metadata.channel_names);
+                    let label = item
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Face".to_owned());
+                    self.project.faces.push(model::FaceRef {
+                        path: item.path.to_string_lossy().into_owned(),
+                        label,
+                    });
+                    self.faces.push(Self::make_runtime_face(item));
+                }
+                if added > 0 {
+                    self.current_face = self.faces.len().saturating_sub(added);
+                    self.selected_channel = 0;
+                    self.solo_channel = None;
+                    self.fit_requested = true;
+                    self.viewport_recenter = true;
+                    self.project_dirty = true;
+                    self.history
+                        .reset(&self.project.adjustments, "Faces changed");
+                    self.history_pending_label = None;
+                    self.history_pending_at = None;
+                    self.report_info(format!("Added {added} face(s)"));
+                }
+                if !errors.is_empty() {
+                    self.report_error(format!(
+                        "Some TIFF files could not be loaded: {}",
+                        errors.join(" | ")
+                    ));
+                }
+            }
+            JobResult::RebuildPreviews(result) => match result {
+                Ok(items) => {
+                    let old_generations = self
+                        .faces
+                        .iter()
+                        .map(|face| face.generation)
+                        .collect::<Vec<_>>();
+                    self.faces = items.into_iter().map(Self::make_runtime_face).collect();
+                    for (face, old_generation) in
+                        self.faces.iter_mut().zip(old_generations.into_iter())
+                    {
+                        face.generation = old_generation.wrapping_add(1).max(1);
+                    }
+                    self.current_face = self.current_face.min(self.faces.len().saturating_sub(1));
+                    if let Some(face) = self.faces.get(self.current_face) {
+                        let count = face.preview.metadata.channel_names.len();
+                        self.selected_channel = self.selected_channel.min(count.saturating_sub(1));
+                        if self.solo_channel.is_some_and(|channel| channel >= count) {
+                            self.solo_channel = None;
+                        }
+                    }
+                    self.render_busy = None;
+                    self.fit_requested = true;
+                    self.viewport_recenter = true;
+                    self.report_info(format!(
+                        "Rebuilt {} preview(s) at max dimension {}",
+                        self.faces.len(),
+                        self.settings.max_preview_dimension
+                    ));
+                }
+                Err(err) => self.report_error(format!("Preview rebuild failed: {err}")),
+            },
+            JobResult::RelinkFace { index, result } => {
+                workflow::apply_relinked_face(self, index, result);
+            }
+            JobResult::RelinkFolder { faces, errors } => {
+                workflow::apply_relinked_folder(self, faces, errors);
+            }
+            JobResult::Open(result) => match result {
+                Ok(payload) => {
+                    self.project = payload.project;
+                    self.snapshot_rename_id = None;
+                    self.snapshot_rename_buffer.clear();
+                    self.project_path = Some(payload.path.clone());
+                    self.faces = payload
+                        .faces
+                        .into_iter()
+                        .map(Self::make_runtime_face)
+                        .collect();
+                    self.current_face = 0;
+                    self.selected_channel = 0;
+                    self.solo_channel = None;
+                    if let Some(first) = self.faces.first() {
+                        let color_model = first.preview.metadata.color_model;
+                        self.ensure_project_palette_for_model(color_model);
+                    }
+                    self.adjustment_scope = AdjustmentScope::All;
+                    self.fit_requested = true;
+                    self.viewport_recenter = true;
+                    self.project_dirty = false;
+                    self.remind_after_export = false;
+                    self.show_snapshot_save_reminder = false;
+                    self.remember_previous_shade(&payload.path);
+                    self.load_history_for_active_snapshot("Open project");
+                    self.history_clear_backup = None;
+                    self.history_pending_label = None;
+                    self.history_pending_at = None;
+                    self.report_info(format!("Opened {}", payload.path.display()));
+                    if !payload.errors.is_empty() {
+                        self.report_error(format!(
+                            "Project opened with TIFF errors: {}",
+                            payload.errors.join(" | ")
+                        ));
+                    }
+                }
+                Err(err) => self.report_error(err),
+            },
+            JobResult::Recover(result) => match result {
+                Ok(payload) => {
+                    self.project = payload.project;
+                    self.project_path = payload.origin_path;
+                    self.faces = payload
+                        .faces
+                        .into_iter()
+                        .map(Self::make_runtime_face)
+                        .collect();
+                    self.current_face = 0;
+                    self.selected_channel = 0;
+                    self.solo_channel = None;
+                    self.adjustment_scope = AdjustmentScope::All;
+                    self.fit_requested = true;
+                    self.viewport_recenter = true;
+                    self.project_dirty = true;
+                    self.load_history_for_active_snapshot("Recovered project");
+                    self.history_clear_backup = None;
+                    self.history_pending_label = None;
+                    self.history_pending_at = None;
+                    self.last_autosave = Instant::now();
+                    self.report_info("Recovered autosaved project state");
+                    if !payload.errors.is_empty() {
+                        self.report_error(format!(
+                            "Recovery opened with TIFF errors: {}",
+                            payload.errors.join(" | ")
+                        ));
+                    }
+                }
+                Err(err) => self.report_error(format!("Recovery failed: {err}")),
+            },
+            JobResult::Save { path, result } => match result {
+                Ok(()) => {
+                    self.project.name = project_name_for_path(&self.project.name, &path);
+                    self.project_path = Some(path.clone());
+                    self.project_dirty = false;
+                    self.remind_after_export = false;
+                    self.show_snapshot_save_reminder = false;
+                    self.remember_previous_shade(&path);
+                    if let Err(err) = recovery::clear() {
+                        self.log.error(&err);
+                    }
+                    self.report_info(format!("Saved {}", path.display()));
+                }
+                Err(err) => {
+                    self.close_after_save = false;
+                    self.report_error(err);
+                }
+            },
+            JobResult::Export(payload) => {
+                let export_ok = payload.result.is_ok();
+                if !payload.marks.is_empty() {
+                    for mark in payload.marks {
+                        self.project.record_snapshot_export(
+                            mark.snapshot_id,
+                            mark.face_key,
+                            mark.folder.to_string_lossy().into_owned(),
+                            mark.exported_at_unix_ms,
+                        );
+                    }
+                    self.project_dirty = true;
+                }
+                match payload.result {
+                    Ok(message) => self.report_info(message),
+                    Err(err) => self.report_error(format!("Export failed: {err}")),
+                }
+                if export_ok && self.remind_after_export {
+                    self.show_snapshot_save_reminder = true;
+                }
+                self.remind_after_export = false;
+            }
+        }
+    }
+
+    fn mark_all_previews_dirty(&mut self) {
+        for face in &mut self.faces {
+            face.generation = face.generation.wrapping_add(1).max(1);
+        }
+        self.project_dirty = true;
+    }
+
+    fn mark_current_preview_dirty(&mut self) {
+        if let Some(face) = self.faces.get_mut(self.current_face) {
+            face.generation = face.generation.wrapping_add(1).max(1);
+        }
+    }
+
+    /// Re-render textures for display-only color settings. The caller decides
+    /// whether the project should be marked dirty; TIFF source/export data is never changed.
+    fn invalidate_display_previews(&mut self) {
+        for face in &mut self.faces {
+            face.generation = face.generation.wrapping_add(1).max(1);
+            face.color_status = PreviewColorStatus::Pending;
+        }
+        self.render_busy = None;
+    }
+
+    fn poll_render(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.render_rx.try_recv() {
+            if self.render_busy == Some((result.face_index, result.generation)) {
+                self.render_busy = None;
+            }
+            let Some(face) = self.faces.get_mut(result.face_index) else {
+                continue;
+            };
+            if face.generation != result.generation {
+                continue;
+            }
+            face.adjusted = result.adjusted;
+            face.clipping = result.clipping;
+            face.color_status = result.color_status;
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [face.preview.width, face.preview.height],
+                &result.rgba,
+            );
+            let options = egui::TextureOptions::LINEAR;
+            if let Some(texture) = &mut face.texture {
+                texture.set(image, options);
+            } else {
+                face.texture = Some(ctx.load_texture(
+                    format!("face-preview-{}", result.face_index),
+                    image,
+                    options,
+                ));
+            }
+            let original_image = egui::ColorImage::from_rgba_unmultiplied(
+                [face.preview.width, face.preview.height],
+                &result.original_rgba,
+            );
+            if let Some(texture) = &mut face.original_texture {
+                texture.set(original_image, options);
+            } else {
+                face.original_texture = Some(ctx.load_texture(
+                    format!("face-original-preview-{}", result.face_index),
+                    original_image,
+                    options,
+                ));
+            }
+            face.rendered_generation = result.generation;
+        }
+    }
+
+    fn start_render_if_needed(&mut self, ctx: &egui::Context) {
+        if self.render_busy.is_some() || ctx.input(|input| input.pointer.any_down()) {
+            return;
+        }
+        let Some(face) = self.faces.get(self.current_face) else {
+            return;
+        };
+        if !face.available {
+            return;
+        }
+        if face.rendered_generation == face.generation {
+            return;
+        }
+        let face_index = self.current_face;
+        let generation = face.generation;
+        let preview = Arc::clone(&face.preview);
+        let project = self.project.clone();
+        let solo_channel = self.solo_channel;
+        let color_config = PreviewColorConfig {
+            enabled: self.project.preview_color.enabled,
+            intent: self.project.preview_color.rendering_intent,
+            black_point_compensation: self.project.preview_color.black_point_compensation,
+            assigned_profile_path: self
+                .project
+                .preview_color
+                .assigned_profile_path
+                .as_ref()
+                .map(PathBuf::from),
+        };
+        let tx = self.render_tx.clone();
+        self.render_busy = Some((face_index, generation));
+        std::thread::spawn(move || {
+            let (adjusted, clipping) = render::adjusted_planes_with_stats(&preview, &project);
+            let color =
+                color_management::PreviewColorTransform::new(&preview.metadata, color_config);
+            let rgba =
+                render::rgba_from_planes_with_color(&preview, &adjusted, solo_channel, &color);
+            let original_rgba = render::rgba_from_planes_with_color(
+                &preview,
+                &preview.channels,
+                solo_channel,
+                &color,
+            );
+            let color_status = color.status().clone();
+            let _ = tx.send(RenderResult {
+                face_index,
+                generation,
+                adjusted,
+                clipping,
+                color_status,
+                rgba,
+                original_rgba,
+            });
+        });
+    }
+
+    fn select_channel(&mut self, channel: usize, isolate: bool) {
+        let previous_solo = self.solo_channel;
+        if isolate {
+            let (selected, solo) =
+                channel_click_state(self.selected_channel, self.solo_channel, channel);
+            self.selected_channel = selected;
+            self.solo_channel = solo;
+        } else {
+            self.selected_channel = channel;
+            self.solo_channel = None;
+        }
+        if self.solo_channel != previous_solo {
+            self.mark_current_preview_dirty();
+        }
+    }
+
+    fn show_composite(&mut self) {
+        if self.solo_channel.is_some() {
+            self.solo_channel = None;
+            self.mark_current_preview_dirty();
+        }
     }
 
     fn remove_current_face(&mut self) {
-        if self.current_face >= self.faces.len() { return; }
+        if self.job.is_some() || self.current_face >= self.faces.len() {
+            return;
+        }
         self.faces.remove(self.current_face);
         if self.current_face < self.project.faces.len() {
             self.project.faces.remove(self.current_face);
@@ -285,276 +1743,1246 @@ impl ShadeApp {
         self.current_face = self.current_face.min(self.faces.len().saturating_sub(1));
         self.selected_channel = 0;
         self.solo_channel = None;
+        self.fit_requested = true;
         self.viewport_recenter = true;
         self.project_dirty = true;
-        self.status_message = "Face removed from project (source TIFF was not deleted)".to_owned();
+        self.report_info("Face removed from project (source TIFF was not deleted)");
     }
 
-    fn mark_all_previews_dirty(&mut self) {
-        for face in &mut self.faces { face.dirty = true; }
-        self.project_dirty = true;
-    }
-
-    fn ensure_current_texture(&mut self, ctx: &egui::Context) {
-        let Some(face) = self.faces.get_mut(self.current_face) else { return; };
-        if !face.dirty && face.texture.is_some() { return; }
-        face.adjusted = render::adjusted_planes(&face.preview, &self.project);
-        let rgba = render::rgba_from_planes(&face.preview, &face.adjusted, self.solo_channel);
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [face.preview.width, face.preview.height],
-            &rgba,
-        );
-        let options = egui::TextureOptions::LINEAR;
-        if let Some(texture) = &mut face.texture {
-            texture.set(image, options);
-        } else {
-            let id = format!("face-preview-{}", self.current_face);
-            face.texture = Some(ctx.load_texture(id, image, options));
-        }
-        face.dirty = false;
-    }
-
-    fn select_channel(&mut self, channel: usize, isolate: bool) {
-        self.selected_channel = channel;
-        let next_solo = if isolate { Some(channel) } else { None };
-        if self.solo_channel != next_solo {
-            self.solo_channel = next_solo;
-            if let Some(face) = self.faces.get_mut(self.current_face) { face.dirty = true; }
+    fn remember_previous_shade(&mut self, path: &Path) {
+        self.previous_shade_list_textures.clear();
+        self.previous_shades.record_open(path, &self.project.name);
+        if let Err(err) = self.previous_shades.save() {
+            self.log.error(&err);
         }
     }
 
-    fn show_composite(&mut self) {
-        if self.solo_channel.is_some() {
-            self.solo_channel = None;
-            if let Some(face) = self.faces.get_mut(self.current_face) { face.dirty = true; }
+    fn load_previous_shade_preview(&mut self, ctx: &egui::Context, path: &str) {
+        self.previous_shades_selected = Some(path.to_owned());
+        self.previous_shade_texture = None;
+        self.previous_shade_preview = None;
+        self.previous_shade_preview_error = None;
+        match previous_shades::inspect(Path::new(path)) {
+            Ok(mut preview) => {
+                if let Some(thumbnail) = preview.thumbnail.take() {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [thumbnail.width, thumbnail.height],
+                        &thumbnail.rgba,
+                    );
+                    self.previous_shade_texture = Some(ctx.load_texture(
+                        format!("previous-shade-thumbnail:{path}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                self.previous_shade_preview = Some(preview);
+            }
+            Err(err) => self.previous_shade_preview_error = Some(err),
         }
     }
 
     fn save_settings_quietly(&mut self) {
-        if let Err(err) = self.settings.save() { self.status_message = err; }
+        if let Err(err) = self.settings.save() {
+            self.report_error(err);
+        }
+    }
+
+    fn bundled_shell_script(file_name: &str) -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let root = exe.parent()?;
+        for folder in ["shell", "Shell"] {
+            let candidate = root.join(folder).join(file_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn launch_shell_script(&mut self, file_name: &str, action: &str) {
+        let Some(script) = Self::bundled_shell_script(file_name) else {
+            self.report_error("Shell integration package was not found next to ShadeEditor.exe. Install the Shell package separately.");
+            return;
+        };
+        match std::process::Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script)
+            .spawn()
+        {
+            Ok(_) => self.report_info(format!(
+                "Shell integration {action} started - approve the Windows administrator prompt."
+            )),
+            Err(err) => {
+                self.report_error(format!("Cannot start Shell integration {action}: {err}"))
+            }
+        }
+    }
+
+    fn sync_update_state(&mut self) {
+        match self.updater.status() {
+            UpdateStatus::Failed(message) => {
+                if self.last_update_failure.as_deref() != Some(message.as_str()) {
+                    self.last_update_failure = Some(message.clone());
+                    self.report_error(format!("Update: {message}"));
+                }
+            }
+            _ => self.last_update_failure = None,
+        }
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.created.elapsed() > ERROR_TOAST_LIFETIME)
+        {
+            self.toast = None;
+            if self.status_message == "Error - see Logs" {
+                self.status_message = "Ready".to_owned();
+            }
+        }
     }
 
     fn ui_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("New").clicked() { self.new_project(); }
-            if ui.button("Open .shade").clicked() { self.open_project_dialog(); }
-            if ui.button("Add TIFF faces").clicked() { self.add_faces_dialog(); }
-            ui.separator();
-            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Save")).clicked() { self.save_project(false); }
-            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Save As")).clicked() { self.save_project(true); }
-            ui.separator();
-            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Export face")).clicked() { self.export_current_dialog(); }
-            if ui.add_enabled(!self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
-            ui.separator();
-            if ui.button("Settings").clicked() { self.show_settings = true; }
-            if ui.button("About").clicked() { self.show_about = true; }
+        let mut dismiss_error = false;
+        ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                let enabled = self.job.is_none();
+                if ui.add_enabled(enabled, egui::Button::new("New")).clicked() { self.new_project(); }
+                if ui.add_enabled(enabled, egui::Button::new("Open .shade")).clicked() { self.open_project_dialog(); }
+                if ui.button("Project View").clicked() { self.show_previous_shades = true; }
+                if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces")).clicked() { self.add_faces_dialog(); }
+                ui.separator();
+                if self.project_path.is_none() && ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Quick Save")).on_hover_text("Create the first .shade project beside the source TIFF files without opening a Save dialog").clicked() { self.quick_save_project(); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() { self.save_project(false); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save As")).clicked() { self.save_project(true); }
+                ui.separator();
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export face")).clicked() { self.export_current_dialog(); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Validate face")).on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.").clicked() { self.validate_current_face_dialog(); }
+                ui.separator();
+                if ui.button("Settings").clicked() { self.show_settings = true; }
+                if ui.button("About").clicked() { self.show_about = true; }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.ui_operation_progress(ui);
+                if ui.small_button("Logs").clicked() { self.log_cache = self.log.read(); self.show_logs = true; }
+                self.ui_update_compact(ui);
+                if let Some(toast) = &self.toast {
+                    ui.horizontal(|ui| {
+                        dismiss_error = ui.small_button("x").on_hover_text("Dismiss error").clicked();
+                        let full = toast.message.clone();
+                        let mut compact = full.chars().take(56).collect::<String>();
+                        if full.chars().count() > 56 { compact.push('…'); }
+                        ui.label(egui::RichText::new(compact).color(egui::Color32::LIGHT_RED).small()).on_hover_text(full);
+                    });
+                }
+            });
+        });
+        if dismiss_error {
+            self.toast = None;
+            if self.status_message == "Error - see Logs" {
+                self.status_message = "Ready".to_owned();
+            }
+        }
+    }
+
+    fn ui_operation_progress(&self, ui: &mut egui::Ui) {
+        if let Some(job) = &self.job {
+            if let Ok(progress) = job.progress.lock() {
+                let value = progress.fraction.unwrap_or(0.5);
+                let full_text = if progress.detail.trim().is_empty() {
+                    progress.label.clone()
+                } else {
+                    format!("{} - {}", progress.label, progress.detail)
+                };
+                let mut compact = full_text.chars().take(64).collect::<String>();
+                if full_text.chars().count() > 64 {
+                    compact.push('…');
+                }
+                ui.add(
+                    egui::ProgressBar::new(value)
+                        .desired_width(380.0)
+                        .text(compact)
+                        .animate(progress.fraction.is_none()),
+                )
+                .on_hover_text(full_text);
+                return;
+            }
+        }
+        if self.render_busy.is_some() {
+            ui.add(
+                egui::ProgressBar::new(0.45)
+                    .desired_width(300.0)
+                    .text("Rendering preview")
+                    .animate(true),
+            );
+        }
+    }
+
+    fn ui_update_compact(&mut self, ui: &mut egui::Ui) {
+        match self.updater.status() {
+            UpdateStatus::Idle => {
+                if ui.small_button("Check update").clicked() {
+                    self.updater.start_check(false);
+                }
+            }
+            UpdateStatus::Checking => {
+                ui.add(
+                    egui::ProgressBar::new(0.5)
+                        .desired_width(190.0)
+                        .text("Checking update")
+                        .animate(true),
+                );
+            }
+            UpdateStatus::UpToDate => {
+                if ui
+                    .small_button("Update OK")
+                    .on_hover_text("Check again")
+                    .clicked()
+                {
+                    self.updater.start_check(false);
+                }
+            }
+            UpdateStatus::Available(info) => {
+                if ui
+                    .small_button(format!("Download {}", info.version))
+                    .on_hover_text(info.release_url)
+                    .clicked()
+                {
+                    self.updater.start_download();
+                }
+            }
+            UpdateStatus::Downloading {
+                info,
+                downloaded,
+                total,
+            } => {
+                let fraction = total
+                    .filter(|total| *total > 0)
+                    .map(|total| downloaded as f32 / total as f32)
+                    .unwrap_or(0.5);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(220.0)
+                        .text(format!("Updating {}", info.version))
+                        .animate(total.is_none()),
+                );
+            }
+            UpdateStatus::Ready(info, _) => {
+                if ui
+                    .small_button(format!("Restart {}", info.version))
+                    .clicked()
+                {
+                    match self.updater.apply_ready() {
+                        Ok(true) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                        Ok(false) => {}
+                        Err(err) => self.report_error(err),
+                    }
+                }
+            }
+            UpdateStatus::Failed(_) => {
+                if ui.small_button("Retry update").clicked() {
+                    self.updater.start_check(false);
+                }
+            }
+        }
+    }
+
+    fn apply_snapshot_now(&mut self, id: u64) {
+        self.flush_history_now();
+        self.sync_history_to_active_snapshot();
+        if self.project.apply_snapshot(id) {
+            if let Some(snapshot) = self
+                .project
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == id)
+            {
+                self.snapshot_rename_id = Some(id);
+                self.snapshot_rename_buffer = snapshot.name.clone();
+            }
+            self.mark_all_previews_dirty();
+            let history_label = self
+                .project
+                .active_snapshot_name()
+                .map(|name| format!("Snapshot - {name}"))
+                .unwrap_or_else(|| "Snapshot".to_owned());
+            self.load_history_for_active_snapshot(&history_label);
+            self.history_clear_backup = None;
+            self.history_pending_label = None;
+            self.history_pending_at = None;
+            self.report_info("Snapshot loaded");
+        }
+    }
+
+    fn request_snapshot_load(&mut self, id: u64) {
+        if self.project.active_snapshot_id == Some(id) {
+            return;
+        }
+        let active_snapshot_dirty =
+            self.project.active_snapshot_id.is_some() && !self.project.active_snapshot_matches();
+        if active_snapshot_dirty {
+            self.pending_snapshot_load = Some(id);
+        } else {
+            self.apply_snapshot_now(id);
+        }
+    }
+
+    fn ui_snapshot_discard_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(target_id) = self.pending_snapshot_load else {
+            return;
+        };
+        let current_name = self
+            .project
+            .active_snapshot_name()
+            .unwrap_or("Current snapshot")
+            .to_owned();
+        let target_name = self
+            .project
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == target_id)
+            .map(|snapshot| snapshot.name.clone())
+            .unwrap_or_else(|| "selected snapshot".to_owned());
+        let mut stay = false;
+        let mut discard = false;
+        egui::Window::new("Snapshot changes not updated")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{current_name} has adjustment changes that have not been written back with Update."
+                ));
+                ui.label(format!("Switch to {target_name}?"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    stay = ui.button("Stay editing").clicked();
+                    discard = ui.button("Discard changes and switch").clicked();
+                });
+            });
+        if stay {
+            self.pending_snapshot_load = None;
+        } else if discard {
+            self.pending_snapshot_load = None;
+            self.apply_snapshot_now(target_id);
+        }
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.allow_close_once {
+            self.allow_close_once = false;
+            return;
+        }
+        if self.project_dirty {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_close_confirmation = true;
+        }
+    }
+
+    fn ui_close_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.show_close_confirmation {
+            return;
+        }
+        let mut save_and_exit = false;
+        let mut discard_and_exit = false;
+        let mut stay = false;
+        egui::Window::new("Unsaved project changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("This .shade project has changes that have not been saved.");
+                if self.job.is_some() {
+                    ui.small("Wait for the current operation to finish before saving.");
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    save_and_exit = ui
+                        .add_enabled(
+                            self.job.is_none() && !self.faces.is_empty(),
+                            egui::Button::new("Save and exit"),
+                        )
+                        .clicked();
+                    discard_and_exit = ui.button("Discard and exit").clicked();
+                    stay = ui.button("Stay").clicked();
+                });
+            });
+
+        if stay {
+            self.show_close_confirmation = false;
+        } else if discard_and_exit {
+            self.show_close_confirmation = false;
+            if let Err(err) = recovery::clear() {
+                self.log.error(&err);
+            }
+            self.allow_close_once = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if save_and_exit && self.save_project(false) {
+            self.show_close_confirmation = false;
+            self.close_after_save = true;
+        }
+    }
+
+    fn sync_history_to_active_snapshot(&mut self) -> bool {
+        let Some(active_id) = self.project.active_snapshot_id else {
+            return false;
+        };
+        let persisted = self.history.to_persisted();
+        let Some(snapshot) = self
+            .project
+            .snapshots
+            .iter_mut()
+            .find(|snapshot| snapshot.id == active_id)
+        else {
+            return false;
+        };
+        if snapshot.history == persisted {
+            return false;
+        }
+        snapshot.history = persisted;
+        self.project_dirty = true;
+        true
+    }
+
+    fn load_history_for_active_snapshot(&mut self, fallback_label: &str) {
+        let persisted = self.project.active_snapshot_id.and_then(|active_id| {
+            self.project
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == active_id)
+                .map(|snapshot| snapshot.history.clone())
+        });
+        self.history = if let Some(persisted) = persisted {
+            history::AdjustmentHistory::from_persisted(
+                &persisted,
+                &self.project.adjustments,
+                fallback_label,
+            )
+        } else {
+            let mut history = history::AdjustmentHistory::default();
+            history.reset(&self.project.adjustments, fallback_label);
+            history
+        };
+        self.history_pending_label = None;
+        self.history_pending_at = None;
+    }
+
+    fn flush_history_now(&mut self) {
+        if let Some(label) = self.history_pending_label.take() {
+            self.history_pending_at = None;
+            if self.history.record(&self.project.adjustments, label) {
+                self.history_clear_backup = None;
+            }
+        }
+        self.sync_history_to_active_snapshot();
+    }
+
+    fn queue_adjustment_history(&mut self, before: &BTreeMap<String, ChannelAdjustment>) {
+        if *before == self.project.adjustments {
+            return;
+        }
+        self.history_pending_label =
+            Some(history::describe_change(before, &self.project.adjustments));
+        self.history_pending_at = Some(Instant::now());
+    }
+
+    fn commit_pending_history(&mut self, ctx: &egui::Context, force: bool) {
+        let Some(label) = self.history_pending_label.clone() else {
+            return;
+        };
+        let ready = force
+            || (self
+                .history_pending_at
+                .is_some_and(|at| at.elapsed() >= HISTORY_COMMIT_DELAY)
+                && !ctx.input(|input| input.pointer.any_down()));
+        if !ready {
+            return;
+        }
+        if self.history.record(&self.project.adjustments, label) {
+            self.history_clear_backup = None;
+            self.sync_history_to_active_snapshot();
+        }
+        self.history_pending_label = None;
+        self.history_pending_at = None;
+    }
+
+    fn apply_history_adjustments(
+        &mut self,
+        adjustments: BTreeMap<String, ChannelAdjustment>,
+        message: &str,
+    ) {
+        self.project.adjustments = adjustments;
+        self.history_pending_label = None;
+        self.history_pending_at = None;
+        self.history_clear_backup = None;
+        self.mark_all_previews_dirty();
+        self.sync_history_to_active_snapshot();
+        self.report_info(message);
+    }
+
+    fn undo_adjustment(&mut self, _ctx: &egui::Context) {
+        self.flush_history_now();
+        if let Some(adjustments) = self.history.undo() {
+            self.apply_history_adjustments(adjustments, "Undo adjustment");
+        }
+    }
+
+    fn redo_adjustment(&mut self, _ctx: &egui::Context) {
+        self.flush_history_now();
+        if let Some(adjustments) = self.history.redo() {
+            self.apply_history_adjustments(adjustments, "Redo adjustment");
+        }
+    }
+
+    fn handle_history_shortcuts(&mut self, ctx: &egui::Context) {
+        let (undo, redo) = ctx.input(|input| {
+            let z = input.key_pressed(egui::Key::Z);
+            (
+                z && input.modifiers.ctrl && input.modifiers.alt && !input.modifiers.shift,
+                z && input.modifiers.ctrl && input.modifiers.shift && !input.modifiers.alt,
+            )
+        });
+        if undo {
+            self.undo_adjustment(ctx);
+        } else if redo {
+            self.redo_adjustment(ctx);
+        }
+    }
+
+    fn ui_history(&mut self, ui: &mut egui::Ui) {
+        let scope = self.project.active_snapshot_id;
+        let can_undo_clear = self
+            .history_clear_backup
+            .as_ref()
+            .is_some_and(|(backup_scope, _)| *backup_scope == scope);
+        let mut clear = false;
+        let mut undo_clear = false;
+        ui.horizontal(|ui| {
+            ui.strong("History");
+            if ui
+                .add_enabled(self.history.can_undo(), egui::Button::new("Undo").small())
+                .on_hover_text("Ctrl+Alt+Z")
+                .clicked()
+            {
+                self.undo_adjustment(ui.ctx());
+            }
+            if ui
+                .add_enabled(self.history.can_redo(), egui::Button::new("Redo").small())
+                .on_hover_text("Ctrl+Shift+Z")
+                .clicked()
+            {
+                self.redo_adjustment(ui.ctx());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if can_undo_clear {
+                    undo_clear = ui.small_button("Undo clear").clicked();
+                }
+                clear = ui
+                    .add_enabled(
+                        self.history.len() > 1,
+                        egui::Button::new("Clear history").small(),
+                    )
+                    .clicked();
+            });
+        });
+        if let Some(name) = self.project.active_snapshot_name() {
+            ui.small(format!(
+                "Snapshot: {name} · up to 50 adjustment states are saved in this .shade file."
+            ));
+        } else {
+            ui.small("Working adjustment history. Create/select a Snapshot to keep an independent saved history.");
+        }
+
+        if clear {
+            self.flush_history_now();
+            self.history_clear_backup = Some((scope, self.history.clone()));
+            self.history
+                .reset(&self.project.adjustments, "Current state");
+            self.sync_history_to_active_snapshot();
+            self.report_info("History cleared - Undo clear is available once");
+        } else if undo_clear {
+            if let Some((backup_scope, backup)) = self.history_clear_backup.take() {
+                if backup_scope == scope {
+                    self.history = backup;
+                    self.sync_history_to_active_snapshot();
+                    self.report_info("Cleared history restored");
+                }
+            }
+        }
+
+        let rows = self
+            .history
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, entry.label.clone()))
+            .collect::<Vec<_>>();
+        let cursor = self.history.cursor();
+        let mut requested = None;
+        egui::ScrollArea::vertical()
+            .id_salt("adjustment-history")
+            .max_height(210.0)
+            .show(ui, |ui| {
+                for (index, label) in rows {
+                    if clickable_row(ui, index == cursor, &label, None, None, 28.0).clicked() {
+                        requested = Some(index);
+                    }
+                }
+            });
+        if let Some(index) = requested {
+            self.flush_history_now();
+            if let Some(adjustments) = self.history.jump(index) {
+                self.apply_history_adjustments(adjustments, "History state selected");
+            }
+        }
+    }
+
+    fn poll_autosave(&mut self) {
+        while let Ok(result) = self.autosave_rx.try_recv() {
+            self.autosave_busy = false;
+            match result {
+                Ok(path) => self
+                    .log
+                    .info(&format!("Recovery autosaved: {}", path.display())),
+                Err(err) => self.log.error(&format!("Recovery autosave failed: {err}")),
+            }
+        }
+    }
+
+    fn maybe_autosave(&mut self) {
+        if !self.project_dirty
+            || self.autosave_busy
+            || self.job.is_some()
+            || self.faces.is_empty()
+            || self.last_autosave.elapsed() < AUTOSAVE_INTERVAL
+        {
+            return;
+        }
+        let recovery_file = recovery::RecoveryFile::new(
+            self.project.clone(),
+            self.faces.iter().map(|face| face.path.clone()).collect(),
+            self.project_path.clone(),
+        );
+        let tx = self.autosave_tx.clone();
+        self.autosave_busy = true;
+        self.last_autosave = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(recovery::write(&recovery_file));
         });
     }
 
-    fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
-        match self.updater.status() {
-            UpdateStatus::Idle | UpdateStatus::UpToDate => {}
-            UpdateStatus::Checking => { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking for updates…"); }); }
-            UpdateStatus::Available(info) => {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Shade Editor {} is available.", info.version));
-                    if ui.button("Download").clicked() { self.updater.start_download(); }
-                    ui.hyperlink_to("Release", info.release_url);
-                });
-            }
-            UpdateStatus::Downloading(info) => { ui.horizontal(|ui| { ui.spinner(); ui.label(format!("Downloading Shade Editor {}…", info.version)); }); }
-            UpdateStatus::Ready(info, _) => {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Shade Editor {} is ready to install.", info.version));
-                    if ui.button("Restart and update").clicked() {
-                        match self.updater.apply_ready() {
-                            Ok(true) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
-                            Ok(false) => {}
-                            Err(err) => self.status_message = err,
+    fn recover_project(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(candidate) = self.recovery_candidate.take() else {
+            return;
+        };
+        let max_dimension = self.settings.max_preview_dimension;
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Recovering project", move |progress| {
+            let result = (|| -> Result<RecoveryPayload, String> {
+                let paths = candidate.resolved_face_paths();
+                let origin_path = candidate.origin_path();
+                let mut project = candidate.project;
+                let total = paths.len().max(1);
+                let mut faces = Vec::new();
+                let mut errors = Vec::new();
+                for (index, source) in paths.into_iter().enumerate() {
+                    Self::set_progress(
+                        &progress,
+                        Some(index as f32 / total as f32),
+                        "Recovering project",
+                        &source
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    );
+                    let expected = project
+                        .file_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.faces.get(index))
+                        .cloned();
+                    match tiff_io::load_preview(&source, max_dimension) {
+                        Ok(preview) => {
+                            project.ensure_channels(&preview.metadata.channel_names);
+                            faces.push(LoadedFace {
+                                dpi: dpi::read_dpi(&source, default_dpi),
+                                path: source,
+                                available: true,
+                                preview,
+                            });
+                        }
+                        Err(err) => {
+                            errors.push(format!("{}: {err}", source.display()));
+                            faces.push(workflow::placeholder_loaded_face(
+                                source,
+                                expected.as_ref(),
+                                default_dpi,
+                            ));
                         }
                     }
-                });
-            }
-            UpdateStatus::Failed(message) => {
+                }
+                Ok(RecoveryPayload {
+                    origin_path,
+                    project,
+                    faces,
+                    errors,
+                })
+            })();
+            Self::set_progress(&progress, Some(1.0), "Recovering project", "Complete");
+            JobResult::Recover(result)
+        });
+    }
+
+    fn ui_recovery_window(&mut self, ctx: &egui::Context) {
+        let Some(candidate) = self.recovery_candidate.as_ref() else {
+            return;
+        };
+        let saved = Local
+            .timestamp_millis_opt(candidate.saved_at_unix_ms)
+            .single()
+            .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "unknown time".to_owned());
+        let origin = candidate
+            .origin_project_path
+            .as_deref()
+            .unwrap_or("Unsaved project")
+            .to_owned();
+        let mut recover_now = false;
+        let mut discard = false;
+        egui::Window::new("Recovery available")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.strong("An autosaved Shade Editor recovery state was found.");
+                ui.label(format!("Saved: {saved}"));
+                ui.label(format!("Project: {origin}"));
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label(format!("Update check failed: {message}"));
-                    if ui.button("Retry").clicked() { self.updater.start_check(false); }
+                    recover_now = ui.button("Recover").clicked();
+                    discard = ui.button("Discard recovery").clicked();
                 });
+            });
+        if recover_now {
+            self.recover_project();
+        } else if discard {
+            if let Err(err) = recovery::clear() {
+                self.report_error(err);
             }
+            self.recovery_candidate = None;
         }
     }
 
     fn ui_faces(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Faces");
-        if self.faces.is_empty() {
-            ui.label("Add TIFF files to create a shade project.");
-            return;
-        }
-        let mut requested_face = None;
-        for (index, face) in self.faces.iter().enumerate() {
-            let label = self.project.faces.get(index)
-                .map(|item| item.label.as_str())
-                .unwrap_or_else(|| face.path.file_name().and_then(|name| name.to_str()).unwrap_or("Face"));
-            if ui.selectable_label(self.current_face == index, label).clicked() { requested_face = Some(index); }
-        }
-        if let Some(index) = requested_face {
-            self.current_face = index;
-            self.selected_channel = 0;
-            self.solo_channel = None;
-            self.viewport_recenter = true;
-            if let Some(face) = self.faces.get_mut(index) { face.dirty = true; }
-        }
-        ui.separator();
-        if ui.button("Remove active face").clicked() { self.remove_current_face(); }
-        ui.separator();
-        self.ui_snapshots(ui);
+        workflow::ui_faces(self, ui);
     }
-
     fn ui_snapshots(&mut self, ui: &mut egui::Ui) {
+        let face_key = self
+            .faces
+            .get(self.current_face)
+            .map(|face| face.path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let rows = self
+            .project
+            .snapshots
+            .iter()
+            .map(|snapshot| {
+                let export = self
+                    .project
+                    .snapshot_export_for_face(snapshot.id, &face_key)
+                    .map(|record| (record.folder.clone(), record.exported_at_unix_ms));
+                (
+                    snapshot.id,
+                    snapshot.name.clone(),
+                    snapshot.created_at_unix_ms,
+                    export,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let all_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        let all_latest_folder = rows
+            .iter()
+            .filter_map(|row| row.3.as_ref())
+            .max_by_key(|(_, exported_at)| *exported_at)
+            .map(|(folder, _)| folder.clone());
+        let all_exported = !rows.is_empty() && rows.iter().all(|row| row.3.is_some());
+
+        let mut new_snapshot = false;
+        let mut export_all = false;
+        let mut open_all_folder = false;
         ui.horizontal(|ui| {
             ui.heading("Snapshots");
-            if ui.small_button("+ New").clicked() {
-                let id = self.project.create_snapshot();
-                self.project_dirty = true;
-                self.status_message = format!("Created snapshot #{id}");
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if all_exported {
+                    open_all_folder = ui
+                        .add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))
+                        .on_hover_text("Open the latest export folder for these snapshots")
+                        .clicked();
+                }
+                export_all = ui
+                    .add_enabled(
+                        self.job.is_none() && !all_ids.is_empty() && !self.faces.is_empty(),
+                        VectorIconButton::export().min_size(egui::vec2(20.0, 20.0)),
+                    )
+                    .on_hover_text("Export all snapshots for the active Face")
+                    .clicked();
+                new_snapshot = ui.small_button("+ New").clicked();
+            });
         });
-        ui.small("Snapshots store adjustment settings only.");
+        ui.small(
+            "Saved adjustment test states. Export always remains available after a successful run.",
+        );
+        ui.add_space(4.0);
 
-        if self.project.snapshots.is_empty() {
-            ui.label("No saved tests yet.");
-            return;
+        if new_snapshot {
+            self.flush_history_now();
+            self.sync_history_to_active_snapshot();
+            let id = self.project.create_snapshot();
+            if let Some(snapshot) = self
+                .project
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == id)
+            {
+                self.snapshot_rename_id = Some(id);
+                self.snapshot_rename_buffer = snapshot.name.clone();
+            }
+            self.load_history_for_active_snapshot("Snapshot created");
+            self.history_clear_backup = None;
+            self.project_dirty = true;
+        }
+        if export_all {
+            self.export_snapshot_group_dialog(all_ids.clone(), "all snapshots".to_owned());
+        }
+        if open_all_folder {
+            if let Some(folder) = all_latest_folder.as_deref() {
+                self.open_export_folder(folder);
+            }
         }
 
         let active_id = self.project.active_snapshot_id;
-        let mut requested_load = None;
-        for snapshot in &self.project.snapshots {
-            let selected = active_id == Some(snapshot.id);
-            let label = if selected && !self.project.active_snapshot_matches() {
-                format!("{}  *", snapshot.name)
-            } else {
-                snapshot.name.clone()
-            };
-            if ui.selectable_label(selected, label).clicked() {
-                requested_load = Some(snapshot.id);
+        let active_dirty = active_id.is_some() && !self.project.active_snapshot_matches();
+        let mut groups: Vec<(String, Vec<(u64, String, i64, Option<(String, i64)>)>)> = Vec::new();
+        for row in rows {
+            let day = snapshot_day_time(row.2).0;
+            if groups.last().map(|group| group.0.as_str()) != Some(day.as_str()) {
+                groups.push((day, Vec::new()));
             }
+            groups.last_mut().unwrap().1.push(row);
+        }
+
+        let mut requested_load = None;
+        let mut requested_export = None;
+        let mut requested_group_export: Option<(Vec<u64>, String)> = None;
+        let mut requested_folder: Option<String> = None;
+
+        for (day, day_rows) in groups {
+            ui.add_space(2.0);
+            let day_ids = day_rows.iter().map(|row| row.0).collect::<Vec<_>>();
+            let day_exported = !day_rows.is_empty() && day_rows.iter().all(|row| row.3.is_some());
+            let day_latest_folder = day_rows
+                .iter()
+                .filter_map(|row| row.3.as_ref())
+                .max_by_key(|(_, exported_at)| *exported_at)
+                .map(|(folder, _)| folder.clone());
+            ui.horizontal(|ui| {
+                ui.strong(&day);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if day_exported
+                        && ui
+                            .add(VectorIconButton::check().min_size(egui::vec2(20.0, 20.0)))
+                            .on_hover_text("Open the latest export folder for this day")
+                            .clicked()
+                    {
+                        requested_folder = day_latest_folder.clone();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.job.is_none() && !day_ids.is_empty() && !self.faces.is_empty(),
+                            VectorIconButton::export().min_size(egui::vec2(20.0, 20.0)),
+                        )
+                        .on_hover_text("Export all snapshots from this day for the active Face")
+                        .clicked()
+                    {
+                        requested_group_export = Some((day_ids.clone(), day.clone()));
+                    }
+                });
+            });
+
+            for (id, name, created_at, export_record) in day_rows {
+                let (_, time) = snapshot_day_time(created_at);
+                let selected = active_id == Some(id);
+                let display_name = if selected && active_dirty {
+                    format!("{name}  *")
+                } else {
+                    name
+                };
+                let (row_response, export_clicked, folder_clicked) = snapshot_row_with_actions(
+                    ui,
+                    selected,
+                    selected && active_dirty,
+                    &display_name,
+                    &time,
+                    export_record.is_some(),
+                    self.job.is_none() && !self.faces.is_empty(),
+                );
+                if export_clicked {
+                    requested_export = Some(id);
+                } else if folder_clicked {
+                    requested_folder = export_record.as_ref().map(|record| record.0.clone());
+                } else if row_response.clicked() {
+                    requested_load = Some(id);
+                }
+            }
+            ui.add_space(4.0);
         }
 
         if let Some(id) = requested_load {
-            if self.project.apply_snapshot(id) {
-                self.mark_all_previews_dirty();
-                self.status_message = "Snapshot loaded".to_owned();
-            }
+            self.request_snapshot_load(id);
+        }
+        if let Some(id) = requested_export {
+            self.export_snapshot_dialog(id);
+        }
+        if let Some((ids, label)) = requested_group_export {
+            self.export_snapshot_group_dialog(ids, label);
+        }
+        if let Some(folder) = requested_folder {
+            self.open_export_folder(&folder);
         }
 
-        let Some(active_id) = self.project.active_snapshot_id else { return; };
-        ui.separator();
+        let Some(active_id) = self.project.active_snapshot_id else {
+            return;
+        };
+        let Some(active_name) = self
+            .project
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == active_id)
+            .map(|snapshot| snapshot.name.clone())
+        else {
+            return;
+        };
+        if self.snapshot_rename_id != Some(active_id) {
+            self.snapshot_rename_id = Some(active_id);
+            self.snapshot_rename_buffer = active_name.clone();
+        }
+
+        ui.add_space(6.0);
         ui.label("Snapshot name");
-        let mut renamed = false;
-        if let Some(snapshot) = self.project.snapshots.iter_mut().find(|snapshot| snapshot.id == active_id) {
-            renamed = ui.text_edit_singleline(&mut snapshot.name).changed();
-        }
-        if renamed { self.project_dirty = true; }
-
-        if !self.project.active_snapshot_matches() {
-            ui.small("Current adjustments differ from this snapshot.");
+        let rename_response = ui.add(
+            egui::TextEdit::singleline(&mut self.snapshot_rename_buffer)
+                .desired_width(f32::INFINITY),
+        );
+        let enter =
+            rename_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if (rename_response.lost_focus() || enter)
+            && self.snapshot_rename_buffer.trim() != active_name
+        {
+            let candidate = self.snapshot_rename_buffer.clone();
+            match self.project.rename_snapshot(active_id, &candidate) {
+                Ok(true) => {
+                    self.snapshot_rename_buffer = candidate.trim().to_owned();
+                    self.project_dirty = true;
+                    self.report_info("Snapshot renamed");
+                }
+                Ok(false) => {}
+                Err(err) => self.report_error(err),
+            }
         }
 
         let mut update = false;
         let mut delete = false;
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             update = ui.button("Update").clicked();
             delete = ui.button("Delete").clicked();
         });
-        if update && self.project.update_snapshot(active_id) {
-            self.project_dirty = true;
-            self.status_message = "Snapshot updated from current adjustments".to_owned();
+        if update {
+            workflow::update_active_snapshot(self);
         }
         if delete && self.project.delete_snapshot(active_id) {
+            self.snapshot_rename_id = None;
+            self.snapshot_rename_buffer.clear();
+            self.history
+                .reset(&self.project.adjustments, "Snapshot deleted");
+            self.history_clear_backup = None;
             self.project_dirty = true;
-            self.status_message = "Snapshot deleted".to_owned();
+            self.report_info("Snapshot deleted");
+        }
+    }
+    fn ui_test_code(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Test code");
+        let channel_names = self
+            .faces
+            .get(self.current_face)
+            .filter(|face| face.available)
+            .map(|face| face.preview.metadata.channel_names.clone())
+            .unwrap_or_default();
+        let palette = self.project.channel_palette.clone();
+        let fallback = self
+            .project
+            .active_snapshot_name()
+            .unwrap_or("Test")
+            .to_owned();
+        let mut changed = ui
+            .checkbox(&mut self.project.test_code.enabled, "Write code on export")
+            .changed();
+        ui.add_enabled_ui(self.project.test_code.enabled, |ui| {
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.project.test_code.text)
+                        .hint_text(format!("Empty uses {fallback}")),
+                )
+                .changed();
+            if !channel_names.is_empty() {
+                let selected_display = if self.project.test_code.channel == TEST_CODE_ALL_CHANNELS {
+                    "All channels".to_owned()
+                } else {
+                    let selected_index = channel_names
+                        .iter()
+                        .position(|name| name == &self.project.test_code.channel)
+                        .unwrap_or(0);
+                    channel_display_name(
+                        palette.as_ref(),
+                        &channel_names[selected_index],
+                        selected_index,
+                    )
+                    .to_owned()
+                };
+                egui::ComboBox::from_label("Ink / channel")
+                    .selected_text(selected_display)
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.project.test_code.channel,
+                                TEST_CODE_ALL_CHANNELS.to_owned(),
+                                "All channels",
+                            )
+                            .changed();
+                        ui.separator();
+                        for (index, name) in channel_names.iter().enumerate() {
+                            let display = channel_display_name(palette.as_ref(), name, index);
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.project.test_code.channel,
+                                    name.clone(),
+                                    display,
+                                )
+                                .changed();
+                        }
+                    });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Font");
+                ui.strong("Tahoma");
+            });
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.project.test_code.font_size_pt, 6.0..=72.0)
+                        .text("Size (pt)"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.project.test_code.margin_cm, 0.0..=5.0)
+                        .text("Edge margin (cm)"),
+                )
+                .changed();
+            egui::ComboBox::from_label("Position")
+                .selected_text(match self.project.test_code.position {
+                    TestCodePosition::TopLeft => "Top left",
+                    TestCodePosition::TopRight => "Top right",
+                    TestCodePosition::BottomLeft => "Bottom left",
+                    TestCodePosition::BottomRight => "Bottom right",
+                })
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.project.test_code.position,
+                            TestCodePosition::TopLeft,
+                            "Top left",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.project.test_code.position,
+                            TestCodePosition::TopRight,
+                            "Top right",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.project.test_code.position,
+                            TestCodePosition::BottomLeft,
+                            "Bottom left",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.project.test_code.position,
+                            TestCodePosition::BottomRight,
+                            "Bottom right",
+                        )
+                        .changed();
+                });
+            ui.small("Default: top-left, 1 cm margin. Point size is converted using the TIFF DPI.");
+        });
+        if changed {
+            self.project_dirty = true;
         }
     }
 
-    fn ui_channels_and_tools(&mut self, ui: &mut egui::Ui) {
+    fn ui_channels_histogram(&mut self, ui: &mut egui::Ui) {
         let Some(face) = self.faces.get(self.current_face) else {
             ui.heading("Channels");
             ui.label("No active face");
             return;
         };
+        if !face.available {
+            ui.heading("Channels");
+            ui.label("Source TIFF missing. Relink this Face to inspect channels and histograms.");
+            return;
+        }
         let channel_names = face.preview.metadata.channel_names.clone();
         let original_histograms = face.preview.histograms.clone();
-        let adjusted_histograms = face.adjusted.iter().map(|values| render::histogram(values)).collect::<Vec<_>>();
+        let adjusted_histograms = face
+            .adjusted
+            .iter()
+            .map(|values| render::histogram(values))
+            .collect::<Vec<_>>();
+        let clipping = face.clipping.clone();
         let base_count = face.preview.metadata.base_channel_count;
         let color_model = face.preview.metadata.color_model;
-        if channel_names.is_empty() { return; }
+        let photoshop_display = face.preview.metadata.channel_display_info.clone();
+        if channel_names.is_empty() {
+            return;
+        }
         self.selected_channel = self.selected_channel.min(channel_names.len() - 1);
+        let mut active_palette = self.project.channel_palette.clone();
+        let palette_library = self.settings.palette_library();
 
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("Tools sidebar");
-            let label = if self.settings.sidebar_two_columns { "1 column" } else { "2 columns" };
-            if ui.small_button(label).clicked() {
-                self.settings.sidebar_two_columns = !self.settings.sidebar_two_columns;
-                self.save_settings_quietly();
+        ui.horizontal(|ui| {
+            ui.heading("Channels");
+            let selected = active_palette
+                .as_ref()
+                .map(|palette| palette.name.as_str())
+                .unwrap_or("TIFF channel names");
+            let mut requested_palette = None;
+            egui::ComboBox::from_id_salt("project-channel-palette")
+                .selected_text(selected)
+                .width(155.0)
+                .show_ui(ui, |ui| {
+                    for palette in &palette_library {
+                        if ui
+                            .selectable_label(
+                                active_palette
+                                    .as_ref()
+                                    .is_some_and(|current| current.id == palette.id),
+                                &palette.name,
+                            )
+                            .clicked()
+                        {
+                            requested_palette = Some(palette.clone());
+                        }
+                    }
+                });
+            if let Some(palette) = requested_palette {
+                active_palette = Some(palette.clone());
+                self.select_project_palette(palette);
             }
         });
-        ui.separator();
-
-        if self.settings.sidebar_two_columns {
-            ui.columns(2, |columns| {
-                self.ui_channels_histogram_column(
-                    &mut columns[0],
-                    &channel_names,
-                    &original_histograms,
-                    &adjusted_histograms,
-                    base_count,
-                    color_model,
-                );
-                columns[1].separator();
-                self.ui_adjustments_test_column(&mut columns[1], &channel_names);
-            });
-        } else {
-            self.ui_channels_histogram_column(
-                ui,
-                &channel_names,
-                &original_histograms,
-                &adjusted_histograms,
-                base_count,
-                color_model,
-            );
-            ui.separator();
-            self.ui_adjustments_test_column(ui, &channel_names);
+        if clickable_row(
+            ui,
+            self.solo_channel.is_none(),
+            "Composite",
+            None,
+            None,
+            32.0,
+        )
+        .clicked()
+        {
+            self.show_composite();
         }
-    }
-
-    fn ui_channels_histogram_column(
-        &mut self,
-        ui: &mut egui::Ui,
-        channel_names: &[String],
-        original_histograms: &[[u32; 256]],
-        adjusted_histograms: &[[u32; 256]],
-        base_count: usize,
-        color_model: tiff_io::ColorModel,
-    ) {
-        ui.heading("Channels");
-        ui.horizontal(|ui| {
-            if ui.selectable_label(self.solo_channel.is_none(), "Composite").clicked() { self.show_composite(); }
-            ui.label(format!("{} + {} extra", color_model.title(), channel_names.len().saturating_sub(base_count)));
-        });
+        ui.small(format!(
+            "{} + {} extra",
+            color_model.title(),
+            channel_names.len().saturating_sub(base_count)
+        ));
+        ui.add_space(3.0);
         for (index, name) in channel_names.iter().enumerate() {
-            let suffix = if index >= base_count { "  • extra/spot" } else { "" };
-            if ui.selectable_label(self.selected_channel == index, format!("{name}{suffix}")).clicked() {
+            let display_info = photoshop_display.get(index).and_then(|value| *value);
+            let suffix = if index >= base_count {
+                match display_info {
+                    Some(info) if info.is_spot() => "  spot",
+                    Some(_) => "  alpha",
+                    None => "  extra",
+                }
+            } else {
+                ""
+            };
+            let accent = channel_color_with_photoshop(
+                active_palette.as_ref(),
+                &photoshop_display,
+                name,
+                index,
+            );
+            let is_solo = self.solo_channel == Some(index);
+            let display_name = channel_display_name(active_palette.as_ref(), name, index);
+            let label = format!("{display_name}{suffix}");
+            let mut hover = match display_info {
+                Some(info) if info.is_spot() => format!(
+                    "Photoshop Spot Channel · Solidity {:.0}% · click to select; click again to toggle solo preview.",
+                    info.solidity * 100.0
+                ),
+                Some(_) => "Photoshop Alpha/auxiliary channel · click to select; click again to toggle solo preview.".to_owned(),
+                None => "Extra TIFF channel (Spot/Alpha type not declared) · click to select; click again to toggle solo preview.".to_owned(),
+            };
+            let warning = if self.settings.show_clipping_warnings {
+                clipping
+                    .get(index)
+                    .copied()
+                    .and_then(clipping_warning_color)
+            } else {
+                None
+            };
+            if self.settings.show_clipping_warnings {
+                if let Some(stats) = clipping.get(index).copied() {
+                    hover.push_str(&format!("\n{}", clipping_tooltip(stats)));
+                }
+            }
+            let response = clickable_channel_row(
+                ui,
+                self.selected_channel == index,
+                is_solo,
+                &label,
+                accent,
+                warning,
+                32.0,
+            )
+            .on_hover_text(hover);
+            if response.clicked() {
                 self.select_channel(index, true);
             }
         }
-        if self.solo_channel.is_some() && ui.small_button("Return to composite (keep channel selected)").clicked() {
+        if self.solo_channel.is_some() && ui.small_button("Return to composite").clicked() {
             self.show_composite();
         }
 
         ui.separator();
         ui.horizontal(|ui| {
             ui.strong("Histogram");
-            let label = if self.settings.show_all_histograms { "All channels" } else { "Selected only" };
+            let label = if self.settings.show_all_histograms {
+                "All channels"
+            } else {
+                "Selected"
+            };
             if ui.small_button(label).clicked() {
                 self.settings.show_all_histograms = !self.settings.show_all_histograms;
                 self.save_settings_quietly();
@@ -562,63 +2990,238 @@ impl ShadeApp {
         });
         if self.settings.show_all_histograms {
             for (index, name) in channel_names.iter().enumerate() {
-                ui.label(name);
-                draw_histogram(ui, original_histograms.get(index), adjusted_histograms.get(index));
+                let accent = self.settings.colorize_histograms.then(|| {
+                    channel_color_with_photoshop(
+                        active_palette.as_ref(),
+                        &photoshop_display,
+                        name,
+                        index,
+                    )
+                });
+                let display = channel_display_name(active_palette.as_ref(), name, index);
+                ui.colored_label(accent.unwrap_or(ui.visuals().text_color()), display);
+                draw_histogram(
+                    ui,
+                    original_histograms.get(index),
+                    adjusted_histograms.get(index),
+                    accent,
+                );
             }
         } else {
-            let index = self.selected_channel.min(channel_names.len().saturating_sub(1));
-            ui.strong(format!("Histogram — {}", channel_names[index]));
-            draw_histogram(ui, original_histograms.get(index), adjusted_histograms.get(index));
+            let index = self.selected_channel;
+            let accent = self.settings.colorize_histograms.then(|| {
+                channel_color_with_photoshop(
+                    active_palette.as_ref(),
+                    &photoshop_display,
+                    &channel_names[index],
+                    index,
+                )
+            });
+            let display =
+                channel_display_name(active_palette.as_ref(), &channel_names[index], index);
+            ui.strong(format!("Histogram - {display}"));
+            draw_histogram(
+                ui,
+                original_histograms.get(index),
+                adjusted_histograms.get(index),
+                accent,
+            );
         }
     }
-
-    fn ui_adjustments_test_column(&mut self, ui: &mut egui::Ui, channel_names: &[String]) {
-        if channel_names.is_empty() { return; }
+    fn ui_adjustments(&mut self, ui: &mut egui::Ui) {
+        let adjustments_before = self.project.adjustments.clone();
+        let Some(face) = self.faces.get(self.current_face) else {
+            ui.heading("Adjustments");
+            ui.label("No active face");
+            return;
+        };
+        if !face.available {
+            ui.heading("Adjustments");
+            ui.label("Source TIFF missing. Relink this Face before editing its channels.");
+            return;
+        }
+        let channel_names = face.preview.metadata.channel_names.clone();
+        if channel_names.is_empty() {
+            return;
+        }
         self.selected_channel = self.selected_channel.min(channel_names.len() - 1);
         let output_name = channel_names[self.selected_channel].clone();
+        let palette = self.project.channel_palette.clone();
+        let output_display =
+            channel_display_name(palette.as_ref(), &output_name, self.selected_channel);
+        let all_original_histograms = face.preview.histograms.clone();
+        let all_adjusted_histograms = face
+            .adjusted
+            .iter()
+            .map(|values| render::histogram(values))
+            .collect::<Vec<_>>();
+        let active_original_histogram = all_original_histograms.get(self.selected_channel).copied();
+        let active_adjusted_histogram = all_adjusted_histograms.get(self.selected_channel).copied();
+        let active_clipping = face.clipping.get(self.selected_channel).copied();
+        let control_accent = self
+            .settings
+            .colorize_adjustments
+            .then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));
+        let panel_accent = (self.adjustment_scope == AdjustmentScope::Selected)
+            .then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));
+        let modified_count = channel_names
+            .iter()
+            .filter(|name| {
+                self.project
+                    .adjustments
+                    .get(*name)
+                    .is_some_and(adjustment_is_modified)
+            })
+            .count();
+        let output_modified = self
+            .project
+            .adjustments
+            .get(&output_name)
+            .is_some_and(adjustment_is_modified);
 
+        ui.horizontal(|ui| {
+            ui.heading("Adjustments");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let layout_label = if self.settings.adjustment_tabs {
+                    "Tabs"
+                } else {
+                    "Stacked"
+                };
+                if ui.small_button(layout_label).clicked() {
+                    self.settings.adjustment_tabs = !self.settings.adjustment_tabs;
+                    self.save_settings_quietly();
+                }
+            });
+        });
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Adjustments");
-            ui.selectable_value(&mut self.adjustment_scope, AdjustmentScope::Selected, &output_name);
-            ui.selectable_value(&mut self.adjustment_scope, AdjustmentScope::All, "All channels");
-            let layout_label = if self.settings.adjustment_tabs { "Tabs" } else { "Stacked" };
-            if ui.small_button(layout_label).clicked() {
-                self.settings.adjustment_tabs = !self.settings.adjustment_tabs;
-                self.save_settings_quietly();
+            let mut all_channels = self.adjustment_scope == AdjustmentScope::All;
+            if ui.checkbox(&mut all_channels, "All channels").changed() {
+                self.adjustment_scope = if all_channels {
+                    AdjustmentScope::All
+                } else {
+                    AdjustmentScope::Selected
+                };
+            }
+            let selected = self.adjustment_scope == AdjustmentScope::Selected;
+            let channel_button_label = if output_modified {
+                format!("{output_display}  •")
+            } else {
+                output_display.to_owned()
+            };
+            let channel_button_text = if selected && control_accent.is_some() {
+                egui::WidgetText::from(
+                    egui::RichText::new(channel_button_label).color(egui::Color32::WHITE),
+                )
+            } else {
+                egui::WidgetText::from(channel_button_label)
+            };
+            let response = with_accent(ui, control_accent, |ui| {
+                ui.add(egui::Button::new(channel_button_text).selected(selected))
+            });
+            if response.clicked() {
+                self.adjustment_scope = AdjustmentScope::Selected;
+            }
+            if modified_count > 0 {
+                ui.small(format!("Modified {modified_count}/{}", channel_names.len()));
             }
         });
-
-        if ui.button("Reset all adjustments").clicked() {
-            self.project.reset_adjustments(channel_names);
-            self.mark_all_previews_dirty();
-            self.status_message = "All adjustments reset to defaults".to_owned();
+        if self.settings.show_clipping_warnings {
+            if let Some(stats) = active_clipping {
+                clipping_summary_ui(ui, stats);
+            }
         }
 
-        let changed = match self.adjustment_scope {
-            AdjustmentScope::Selected => self.ui_selected_adjustment(ui, &output_name, channel_names),
-            AdjustmentScope::All => self.ui_all_adjustments(ui, &output_name, channel_names),
-        };
-        if changed { self.mark_all_previews_dirty(); }
-
-        ui.separator();
-        self.ui_test_code(ui, channel_names);
-    }
-
-    fn ui_test_code(&mut self, ui: &mut egui::Ui, channel_names: &[String]) {
-        ui.collapsing("Test code", |ui| {
-            let mut test_changed = ui.checkbox(&mut self.project.test_code.enabled, "Write test code on export").changed();
-            test_changed |= ui.text_edit_singleline(&mut self.project.test_code.text).changed();
-            egui::ComboBox::from_label("Channel")
-                .selected_text(&self.project.test_code.channel)
-                .show_ui(ui, |ui| {
-                    for name in channel_names {
-                        test_changed |= ui.selectable_value(&mut self.project.test_code.channel, name.clone(), name).changed();
-                    }
-                });
-            test_changed |= ui.add(egui::Slider::new(&mut self.project.test_code.scale, 1..=8).text("Text scale")).changed();
-            test_changed |= ui.add(egui::Slider::new(&mut self.project.test_code.margin_px, 0..=500).text("Margin px")).changed();
-            if test_changed { self.project_dirty = true; }
-        });
+        let mut frame = egui::Frame::new().inner_margin(8).corner_radius(6);
+        if let Some(color) = panel_accent {
+            frame = frame.stroke(egui::Stroke::new(1.5, color.gamma_multiply(0.72)));
+        } else {
+            frame = frame.stroke(ui.visuals().widgets.noninteractive.bg_stroke);
+        }
+        let changed = frame
+            .show(ui, |ui| {
+                if let Some(color) = panel_accent {
+                    ui.visuals_mut().widgets.noninteractive.bg_stroke.color =
+                        color.gamma_multiply(0.52);
+                }
+                let mut header_changed = false;
+                let reset_all = ui
+                    .horizontal(|ui| {
+                        match self.adjustment_scope {
+                            AdjustmentScope::Selected => {
+                                if let Some(color) = panel_accent {
+                                    ui.colored_label(color, format!("Editing: {output_display}"));
+                                } else {
+                                    ui.strong(format!("Editing: {output_display}"));
+                                }
+                                let enabled = &mut self
+                                    .project
+                                    .adjustments
+                                    .entry(output_name.clone())
+                                    .or_default()
+                                    .enabled;
+                                header_changed |= ui.checkbox(enabled, "Enabled").changed();
+                            }
+                            AdjustmentScope::All => {
+                                ui.strong("Editing: All channels");
+                                let mut all_enabled = channel_names.iter().all(|name| {
+                                    self.project
+                                        .adjustments
+                                        .get(name)
+                                        .map(|adjustment| adjustment.enabled)
+                                        .unwrap_or(true)
+                                });
+                                if ui.checkbox(&mut all_enabled, "Enabled").changed() {
+                                    for name in &channel_names {
+                                        self.project
+                                            .adjustments
+                                            .entry(name.clone())
+                                            .or_default()
+                                            .enabled = all_enabled;
+                                    }
+                                    header_changed = true;
+                                }
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.small_button("Reset all").clicked()
+                        })
+                        .inner
+                    })
+                    .inner;
+                if reset_all {
+                    self.project.reset_adjustments(&channel_names);
+                    self.mark_all_previews_dirty();
+                    self.report_info("All adjustments reset to defaults");
+                }
+                let body_changed = match self.adjustment_scope {
+                    AdjustmentScope::Selected => self.ui_selected_adjustment(
+                        ui,
+                        &output_name,
+                        &channel_names,
+                        active_original_histogram.as_ref(),
+                        active_adjusted_histogram.as_ref(),
+                        control_accent,
+                        palette.as_ref(),
+                    ),
+                    AdjustmentScope::All => self.ui_all_adjustments(
+                        ui,
+                        &output_name,
+                        &channel_names,
+                        &all_original_histograms,
+                        &all_adjusted_histograms,
+                        control_accent,
+                        palette.as_ref(),
+                    ),
+                };
+                header_changed || body_changed
+            })
+            .inner;
+        if changed {
+            self.mark_all_previews_dirty();
+        }
+        if self.project.adjustments != adjustments_before {
+            self.queue_adjustment_history(&adjustments_before);
+        }
     }
 
     fn ui_selected_adjustment(
@@ -626,37 +3229,95 @@ impl ShadeApp {
         ui: &mut egui::Ui,
         output_name: &str,
         channel_names: &[String],
+        histogram_before: Option<&[u32; 256]>,
+        histogram_after: Option<&[u32; 256]>,
+        accent: Option<egui::Color32>,
+        palette: Option<&ChannelPalette>,
     ) -> bool {
         let mut changed = false;
-        let adjustment = self.project.adjustments.entry(output_name.to_owned()).or_default();
-        changed |= ui.checkbox(&mut adjustment.enabled, "Enable adjustment for this channel").changed();
+        let compact_curve_controls = self.settings.compact_curve_controls;
+        let adjustment = self
+            .project
+            .adjustments
+            .entry(output_name.to_owned())
+            .or_default();
         ui.add_enabled_ui(adjustment.enabled, |ui| {
             if self.settings.adjustment_tabs {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
-                    ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
-                    ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
-                });
+                let reset_tool = adjustment_tab_bar(ui, &mut self.tool);
+                if reset_tool {
+                    match self.tool {
+                        ToolPanel::Levels => adjustment.levels = model::Levels::default(),
+                        ToolPanel::Curves => adjustment.curve = model::Curve::default(),
+                        ToolPanel::Mixer => reset_mixer_row(adjustment, output_name, channel_names),
+                    }
+                    changed = true;
+                }
                 changed |= match self.tool {
-                    ToolPanel::Levels => levels_ui(ui, adjustment),
-                    ToolPanel::Curves => curves_ui(ui, adjustment),
-                    ToolPanel::Mixer => mixer_ui(ui, adjustment, output_name, channel_names),
+                    ToolPanel::Levels => levels_ui(ui, adjustment, accent),
+                    ToolPanel::Curves => curves_ui(
+                        ui,
+                        adjustment,
+                        histogram_before.filter(|_| self.settings.show_curve_histogram),
+                        histogram_after.filter(|_| self.settings.show_curve_histogram),
+                        accent,
+                        compact_curve_controls,
+                        false,
+                    ),
+                    ToolPanel::Mixer => {
+                        mixer_ui(ui, adjustment, output_name, channel_names, accent, palette)
+                    }
                 };
             } else {
-                ui.group(|ui| {
-                    ui.strong("Levels");
-                    changed |= levels_ui(ui, adjustment);
-                });
-                ui.add_space(6.0);
-                ui.group(|ui| {
-                    ui.strong("Curve");
-                    changed |= curves_ui(ui, adjustment);
-                });
-                ui.add_space(6.0);
-                ui.group(|ui| {
-                    ui.strong("Channel Mixer");
-                    changed |= mixer_ui(ui, adjustment, output_name, channel_names);
-                });
+                let (body_changed, reset) = adjustment_foldout(
+                    ui,
+                    format!("selected-levels-{output_name}"),
+                    "Levels",
+                    true,
+                    |ui| levels_ui(ui, adjustment, accent),
+                );
+                changed |= body_changed.unwrap_or(false);
+                if reset {
+                    adjustment.levels = model::Levels::default();
+                    changed = true;
+                }
+
+                ui.add_space(4.0);
+                let (body_changed, reset) = adjustment_foldout(
+                    ui,
+                    format!("selected-mixer-{output_name}"),
+                    "Channel Mixer",
+                    true,
+                    |ui| mixer_ui(ui, adjustment, output_name, channel_names, accent, palette),
+                );
+                changed |= body_changed.unwrap_or(false);
+                if reset {
+                    reset_mixer_row(adjustment, output_name, channel_names);
+                    changed = true;
+                }
+
+                ui.add_space(4.0);
+                let (body_changed, reset) = adjustment_foldout(
+                    ui,
+                    format!("selected-curve-{output_name}"),
+                    "Curve",
+                    true,
+                    |ui| {
+                        curves_ui(
+                            ui,
+                            adjustment,
+                            histogram_before.filter(|_| self.settings.show_curve_histogram),
+                            histogram_after.filter(|_| self.settings.show_curve_histogram),
+                            accent,
+                            compact_curve_controls,
+                            false,
+                        )
+                    },
+                );
+                changed |= body_changed.unwrap_or(false);
+                if reset {
+                    adjustment.curve = model::Curve::default();
+                    changed = true;
+                }
             }
         });
         changed
@@ -667,105 +3328,303 @@ impl ShadeApp {
         ui: &mut egui::Ui,
         template_name: &str,
         channel_names: &[String],
+        histograms_before: &[[u32; 256]],
+        histograms_after: &[[u32; 256]],
+        accent: Option<egui::Color32>,
+        palette: Option<&ChannelPalette>,
     ) -> bool {
         let mut changed = false;
-        let enabled_count = channel_names.iter()
-            .filter(|name| self.project.adjustments.get(*name).map(|adjustment| adjustment.enabled).unwrap_or(true))
-            .count();
-        let mut all_enabled = enabled_count == channel_names.len();
-        if ui.checkbox(&mut all_enabled, "Enable adjustments on all channels").changed() {
-            for name in channel_names {
-                self.project.adjustments.entry(name.clone()).or_default().enabled = all_enabled;
-            }
-            changed = true;
-        }
-        ui.small(format!("{enabled_count}/{} channels currently enabled", channel_names.len()));
-        ui.small("Levels and Curve changes are broadcast to every channel. Mixer rows remain independent per output.");
+        let compact_curve_controls = self.settings.compact_curve_controls;
+        ui.small(
+            "Levels broadcasts to every channel. Mixer output rows remain independent. Curve keeps one Broadcast control plus independent per-channel foldouts.",
+        );
 
         if self.settings.adjustment_tabs {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tool, ToolPanel::Levels, "Levels");
-                ui.selectable_value(&mut self.tool, ToolPanel::Curves, "Curve");
-                ui.selectable_value(&mut self.tool, ToolPanel::Mixer, "Mixer");
-            });
+            let reset_tool = adjustment_tab_bar(ui, &mut self.tool);
+            if reset_tool {
+                match self.tool {
+                    ToolPanel::Levels => {
+                        reset_all_levels(&mut self.project.adjustments, channel_names)
+                    }
+                    ToolPanel::Curves => {
+                        reset_all_curves(&mut self.project.adjustments, channel_names)
+                    }
+                    ToolPanel::Mixer => {
+                        reset_all_mixers(&mut self.project.adjustments, channel_names)
+                    }
+                }
+                changed = true;
+            }
             changed |= match self.tool {
-                ToolPanel::Levels => broadcast_levels_ui(ui, &mut self.project.adjustments, template_name, channel_names),
-                ToolPanel::Curves => broadcast_curves_ui(ui, &mut self.project.adjustments, template_name, channel_names),
-                ToolPanel::Mixer => all_mixers_ui(ui, &mut self.project.adjustments, channel_names),
+                ToolPanel::Levels => broadcast_levels_ui(
+                    ui,
+                    &mut self.project.adjustments,
+                    template_name,
+                    channel_names,
+                    accent,
+                ),
+                ToolPanel::Curves => all_curves_ui(
+                    ui,
+                    &mut self.project.adjustments,
+                    template_name,
+                    channel_names,
+                    histograms_before,
+                    histograms_after,
+                    self.settings.colorize_adjustments,
+                    self.settings.show_curve_histogram,
+                    compact_curve_controls,
+                    palette,
+                ),
+                ToolPanel::Mixer => all_mixers_ui(
+                    ui,
+                    &mut self.project.adjustments,
+                    channel_names,
+                    self.settings.colorize_adjustments,
+                    palette,
+                ),
             };
         } else {
-            ui.group(|ui| {
-                ui.strong("Levels — all channels");
-                changed |= broadcast_levels_ui(ui, &mut self.project.adjustments, template_name, channel_names);
-            });
-            ui.add_space(6.0);
-            ui.group(|ui| {
-                ui.strong("Curve — all channels");
-                changed |= broadcast_curves_ui(ui, &mut self.project.adjustments, template_name, channel_names);
-            });
-            ui.add_space(6.0);
-            ui.group(|ui| {
-                ui.strong("Channel Mixer — all output rows");
-                changed |= all_mixers_ui(ui, &mut self.project.adjustments, channel_names);
-            });
+            let (body_changed, reset) = adjustment_foldout(
+                ui,
+                "all-levels-section",
+                "Levels - all channels",
+                true,
+                |ui| {
+                    broadcast_levels_ui(
+                        ui,
+                        &mut self.project.adjustments,
+                        template_name,
+                        channel_names,
+                        accent,
+                    )
+                },
+            );
+            changed |= body_changed.unwrap_or(false);
+            if reset {
+                reset_all_levels(&mut self.project.adjustments, channel_names);
+                changed = true;
+            }
+
+            ui.add_space(4.0);
+            let (body_changed, reset) = adjustment_foldout(
+                ui,
+                "all-mixers-section",
+                "Channel Mixer - all output rows",
+                true,
+                |ui| {
+                    all_mixers_ui(
+                        ui,
+                        &mut self.project.adjustments,
+                        channel_names,
+                        self.settings.colorize_adjustments,
+                        palette,
+                    )
+                },
+            );
+            changed |= body_changed.unwrap_or(false);
+            if reset {
+                reset_all_mixers(&mut self.project.adjustments, channel_names);
+                changed = true;
+            }
+
+            ui.add_space(4.0);
+            let (body_changed, reset) = adjustment_foldout(
+                ui,
+                "all-curves-section",
+                "Curve - broadcast + per channel",
+                true,
+                |ui| {
+                    all_curves_ui(
+                        ui,
+                        &mut self.project.adjustments,
+                        template_name,
+                        channel_names,
+                        histograms_before,
+                        histograms_after,
+                        self.settings.colorize_adjustments,
+                        self.settings.show_curve_histogram,
+                        compact_curve_controls,
+                        palette,
+                    )
+                },
+            );
+            changed |= body_changed.unwrap_or(false);
+            if reset {
+                reset_all_curves(&mut self.project.adjustments, channel_names);
+                changed = true;
+            }
         }
         changed
     }
 
+    fn ui_tools(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Tools");
+            let layout = if self.settings.sidebar_two_columns {
+                "2 columns"
+            } else {
+                "1 column"
+            };
+            if ui.small_button(layout).clicked() {
+                self.settings.sidebar_two_columns = !self.settings.sidebar_two_columns;
+                self.save_settings_quietly();
+            }
+        });
+        ui.separator();
+        if self.settings.sidebar_two_columns {
+            ui.columns(2, |columns| {
+                egui::ScrollArea::vertical()
+                    .id_salt("channels-column")
+                    .show(&mut columns[0], |ui| {
+                        self.ui_channels_histogram(ui);
+                        ui.separator();
+                        self.ui_history(ui);
+                    });
+                egui::ScrollArea::vertical()
+                    .id_salt("adjustments-column")
+                    .show(&mut columns[1], |ui| self.ui_adjustments(ui));
+            });
+        } else {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.ui_channels_histogram(ui);
+                ui.separator();
+                self.ui_history(ui);
+                ui.separator();
+                self.ui_adjustments(ui);
+            });
+        }
+    }
+
     fn ui_viewport(&mut self, ui: &mut egui::Ui) {
+        if workflow::ui_missing_viewport(self, ui) {
+            return;
+        }
+
         let Some(face) = self.faces.get(self.current_face) else {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
                     ui.heading("Shade Editor");
                     ui.label("Open a .shade project or add TIFF faces.");
-                    if ui.button("Add TIFF faces").clicked() { self.add_faces_dialog(); }
+                    if ui.button("Add TIFF faces").clicked() {
+                        self.add_faces_dialog();
+                    }
                 });
             });
             return;
         };
-        let title = self.project.faces.get(self.current_face)
-            .map(|item| item.label.clone())
+
+        let file_name = face
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| face.path.display().to_string());
-        let meta = &face.preview.metadata;
+        let meta = face.preview.metadata.clone();
+        let dpi_info = face.dpi;
+        let color_status = face.color_status.clone();
+        let texture = face.texture.clone();
+        let original_texture = face.original_texture.clone();
+        let (width_cm, height_cm) = physical_dimensions_cm(meta.width, meta.height, dpi_info);
         ui.horizontal_wrapped(|ui| {
-            ui.strong(title);
+            ui.strong(file_name);
             ui.separator();
-            ui.label(format!("{} × {} px", meta.width, meta.height));
             ui.label(format!("{}-bit", meta.bit_depth));
+            ui.label(format!(
+                "{} x {} cm",
+                format_cm_value(width_cm),
+                format_cm_value(height_cm)
+            ));
+            ui.label(format!("{} x {} px", meta.width, meta.height));
+            if dpi_info.has_physical_resolution {
+                ui.label(format!("{:.0} x {:.0} DPI", dpi_info.dpi_x, dpi_info.dpi_y));
+            } else {
+                ui.label(format!(
+                    "{:.0} x {:.0} DPI (default)",
+                    dpi_info.dpi_x, dpi_info.dpi_y
+                ));
+            }
             ui.label(meta.color_model.title());
             ui.label(format!("{} channels", meta.samples_per_pixel));
-            if meta.samples_per_pixel > meta.base_channel_count {
-                ui.label(format!("{} extra/spot", meta.samples_per_pixel - meta.base_channel_count));
+            let profile_text = if color_status.is_problem() {
+                egui::RichText::new(color_status.button_label()).color(egui::Color32::YELLOW)
+            } else if color_status.is_managed() {
+                egui::RichText::new(color_status.button_label()).color(egui::Color32::LIGHT_GREEN)
+            } else {
+                egui::RichText::new(color_status.button_label())
+            };
+            let icc_response = ui.small_button(profile_text);
+            let open_color_management = icc_response.clicked();
+            icc_response.on_hover_text(format!(
+                "{}
+Click to manage the preview profile.",
+                color_status.detail()
+            ));
+            if open_color_management {
+                self.show_color_management = true;
+                self.icc_profile_selected =
+                    self.project.preview_color.assigned_profile_path.clone();
             }
         });
         ui.separator();
 
-        let texture = self.faces.get(self.current_face).and_then(|face| face.texture.clone());
-        let zoom = self.zoom;
+        let Some(texture) = texture else {
+            ui.centered_and_justified(|ui| {
+                ui.spinner();
+            });
+            return;
+        };
+
+        let visible = ui.available_size().max(egui::vec2(1.0, 1.0));
+        if self.fit_requested {
+            let natural = texture.size_vec2();
+            if natural.x > 0.0 && natural.y > 0.0 {
+                self.zoom = ((visible.x - 30.0).max(1.0) / natural.x)
+                    .min((visible.y - 30.0).max(1.0) / natural.y)
+                    .clamp(0.05, 8.0);
+            }
+            self.fit_requested = false;
+            self.viewport_recenter = true;
+        }
+
+        let image_size = texture.size_vec2() * self.zoom;
         let recenter = self.viewport_recenter;
-        egui::ScrollArea::both()
-            .id_salt("image-viewport-scroll")
+        let output = egui::ScrollArea::both()
+            .id_salt("image-viewport")
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show_viewport(ui, |ui, viewport| {
-                let Some(texture) = texture.as_ref() else { return; };
-                let image_size = texture.size_vec2() * zoom;
-                let viewport_size = viewport.size();
                 let canvas_size = egui::vec2(
                     (image_size.x + VIEWPORT_OVERSCROLL * 2.0)
-                        .max(viewport_size.x + VIEWPORT_OVERSCROLL * 2.0),
+                        .max(viewport.width() + VIEWPORT_OVERSCROLL * 2.0),
                     (image_size.y + VIEWPORT_OVERSCROLL * 2.0)
-                        .max(viewport_size.y + VIEWPORT_OVERSCROLL * 2.0),
+                        .max(viewport.height() + VIEWPORT_OVERSCROLL * 2.0),
                 );
                 let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
                 let image_rect = egui::Rect::from_center_size(canvas_rect.center(), image_size);
+                let show_before = ui.input(|input| input.pointer.secondary_down())
+                    && ui.rect_contains_pointer(image_rect);
+                let display_texture = if show_before {
+                    original_texture.as_ref().unwrap_or(&texture)
+                } else {
+                    &texture
+                };
                 ui.put(
                     image_rect,
-                    egui::Image::from_texture(texture).fit_to_exact_size(image_size),
+                    egui::Image::from_texture(display_texture).fit_to_exact_size(image_size),
                 );
+                if show_before {
+                    ui.painter().text(
+                        image_rect.left_top() + egui::vec2(10.0, 10.0),
+                        egui::Align2::LEFT_TOP,
+                        "BEFORE",
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::WHITE,
+                    );
+                }
                 if recenter {
                     ui.scroll_to_rect(image_rect, Some(egui::Align::Center));
                 }
             });
+        let _ = output;
         if recenter {
             self.viewport_recenter = false;
         }
@@ -773,146 +3632,2002 @@ impl ShadeApp {
 
     fn ui_status(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let dirty = if self.project_dirty { " • modified" } else { "" };
+            let dirty = if self.project_dirty {
+                " * modified"
+            } else {
+                ""
+            };
             ui.label(format!("{}{}", self.status_message, dirty));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Slider::new(&mut self.zoom, 0.1..=4.0).logarithmic(true).text("Zoom")).changed() {
+                if ui.button("Fit").clicked() {
+                    self.fit_requested = true;
+                }
+                let zoom = ui.add(
+                    egui::Slider::new(&mut self.zoom, 0.05..=8.0)
+                        .logarithmic(true)
+                        .text("Zoom"),
+                );
+                if zoom.changed() {
                     self.viewport_recenter = true;
                 }
-                if let Some(path) = &self.project_path { ui.label(path.display().to_string()); }
+                if let Some(path) = &self.project_path {
+                    ui.label(path.display().to_string());
+                }
             });
         });
     }
 
+    fn ensure_previous_shade_list_texture(
+        &mut self,
+        ctx: &egui::Context,
+        entry: &previous_shades::PreviousShadeEntry,
+    ) {
+        let key = entry.path.clone();
+        if self.previous_shade_list_textures.contains_key(&key) {
+            self.previous_shade_list_texture_lru
+                .retain(|item| item != &key);
+            self.previous_shade_list_texture_lru.push_back(key);
+            return;
+        }
+        let Ok(Some(thumbnail)) = previous_shades::decode_cached_thumbnail(entry) else {
+            return;
+        };
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [thumbnail.width, thumbnail.height],
+            &thumbnail.rgba,
+        );
+        let texture = ctx.load_texture(
+            format!("previous-shade-list:{}", entry.path),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.previous_shade_list_textures
+            .insert(key.clone(), texture);
+        self.previous_shade_list_texture_lru
+            .retain(|item| item != &key);
+        self.previous_shade_list_texture_lru.push_back(key);
+        while self.previous_shade_list_texture_lru.len() > PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT {
+            if let Some(oldest) = self.previous_shade_list_texture_lru.pop_front() {
+                self.previous_shade_list_textures.remove(&oldest);
+            }
+        }
+    }
+
+    fn ui_previous_shades_window(&mut self, ctx: &egui::Context) {
+        if !self.show_previous_shades {
+            return;
+        }
+        let mut open = self.show_previous_shades;
+        let query_before = self.previous_shades_query.clone();
+        let mut requested_open: Option<String> = None;
+        let mut requested_select: Option<String> = None;
+        let mut requested_reveal: Option<String> = None;
+        let mut requested_remove: Option<String> = None;
+        let mut requested_relink: Option<String> = None;
+
+        egui::Window::new("Project View")
+            .open(&mut open)
+            .default_width(1040.0)
+            .default_height(680.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Project View");
+                    ui.separator();
+                    ui.label(format!("{} project(s)", self.previous_shades.entries().len()));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Search");
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut self.previous_shades_query)
+                            .hint_text("Project, path, Snapshot name / ID / Test Code")
+                            .desired_width(390.0),
+                    );
+                    if !search.has_focus() && !ctx.wants_keyboard_input() {
+                        let typed = ctx.input(|input| {
+                            input
+                                .events
+                                .iter()
+                                .filter_map(|event| match event {
+                                    egui::Event::Text(text) if !text.chars().all(char::is_control) => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<String>()
+                        });
+                        if !typed.is_empty() {
+                            self.previous_shades_query.push_str(&typed);
+                            search.request_focus();
+                        }
+                    }
+                    ui.label("Sort");
+                    egui::ComboBox::from_id_salt("previous-shades-sort")
+                        .selected_text(self.previous_shades_sort.label())
+                        .show_ui(ui, |ui| {
+                            for sort in [
+                                previous_shades::PreviousShadesSort::LastOpened,
+                                previous_shades::PreviousShadesSort::ProjectName,
+                                previous_shades::PreviousShadesSort::SavedAt,
+                                previous_shades::PreviousShadesSort::Path,
+                            ] {
+                                ui.selectable_value(&mut self.previous_shades_sort, sort, sort.label());
+                            }
+                        });
+                });
+
+                let query = self.previous_shades_query.trim().to_lowercase();
+                let entries = self.previous_shades.entries();
+                let mut indices = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.matches_query(&query))
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                match self.previous_shades_sort {
+                    previous_shades::PreviousShadesSort::LastOpened => indices.sort_by(|a, b| {
+                        entries[*b].last_opened_unix_ms.cmp(&entries[*a].last_opened_unix_ms)
+                    }),
+                    previous_shades::PreviousShadesSort::ProjectName => indices.sort_by(|a, b| {
+                        entries[*a].display_name().to_lowercase().cmp(&entries[*b].display_name().to_lowercase())
+                    }),
+                    previous_shades::PreviousShadesSort::SavedAt => indices.sort_by(|a, b| {
+                        entries[*b].saved_at_unix_ms.cmp(&entries[*a].saved_at_unix_ms)
+                    }),
+                    previous_shades::PreviousShadesSort::Path => indices.sort_by(|a, b| {
+                        entries[*a].path.to_lowercase().cmp(&entries[*b].path.to_lowercase())
+                    }),
+                }
+                let paths = indices
+                    .iter()
+                    .map(|index| entries[*index].path.clone())
+                    .collect::<Vec<_>>();
+
+                if query_before != self.previous_shades_query {
+                    requested_select = paths.first().cloned();
+                }
+                let current_path = requested_select
+                    .as_deref()
+                    .or(self.previous_shades_selected.as_deref());
+                let current_position = current_path.and_then(|path| paths.iter().position(|item| item == path));
+                let (up, down, enter) = ctx.input(|input| {
+                    (
+                        input.key_pressed(egui::Key::ArrowUp),
+                        input.key_pressed(egui::Key::ArrowDown),
+                        input.key_pressed(egui::Key::Enter),
+                    )
+                });
+                if !paths.is_empty() && (up || down) {
+                    let next = match (current_position, up, down) {
+                        (Some(position), true, _) => position.saturating_sub(1),
+                        (Some(position), _, true) => (position + 1).min(paths.len() - 1),
+                        (None, _, true) => 0,
+                        (None, true, _) => paths.len() - 1,
+                        _ => 0,
+                    };
+                    requested_select = paths.get(next).cloned();
+                }
+                if enter {
+                    requested_open = requested_select
+                        .clone()
+                        .or_else(|| self.previous_shades_selected.clone())
+                        .filter(|path| Path::new(path).is_file());
+                }
+
+                ui.separator();
+
+                let selected_path = requested_select
+                    .clone()
+                    .or_else(|| self.previous_shades_selected.clone());
+                let cached_selected = selected_path.as_deref().and_then(|path| {
+                    self.previous_shades
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.path == path)
+                        .cloned()
+                });
+
+                egui::Panel::right("project-view-preview-pane")
+                    .resizable(true)
+                    .default_size(420.0)
+                    .size_range(320.0..=580.0)
+                    .show(ui, |preview_ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("project-view-preview-scroll")
+                            .auto_shrink([false, false])
+                            .show(preview_ui, |preview_ui| {
+                        preview_ui.strong("Preview");
+                        preview_ui.add_space(4.0);
+                        let Some(path) = selected_path.as_deref() else {
+                            preview_ui.label("Select a project to inspect its thumbnail, Snapshots and metadata.");
+                            return;
+                        };
+
+                        let exists = Path::new(path).is_file();
+                        preview_ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled(exists, egui::Button::new("Open")).clicked() {
+                                requested_open = Some(path.to_owned());
+                            }
+                            if ui.add_enabled(exists, egui::Button::new("Reveal in Explorer")).clicked() {
+                                requested_reveal = Some(path.to_owned());
+                            }
+                            if !exists && ui.button("Relink missing...").clicked() {
+                                requested_relink = Some(path.to_owned());
+                            }
+                            if ui.button("Remove from history").clicked() {
+                                requested_remove = Some(path.to_owned());
+                            }
+                        });
+                        preview_ui.separator();
+
+                        if let Some(error) = self.previous_shade_preview_error.as_ref() {
+                            preview_ui.colored_label(egui::Color32::YELLOW, error);
+                            if let Some(entry) = cached_selected.as_ref() {
+                                preview_ui.label(format!(
+                                    "Cached: {} face(s) · {}",
+                                    entry.face_count,
+                                    entry.active_face_display()
+                                ));
+                                if let Some(snapshot) = entry.latest_snapshot() {
+                                    preview_ui.label(format!(
+                                        "Latest Snapshot: {} · #{}",
+                                        snapshot.name, snapshot.id
+                                    ));
+                                }
+                            }
+                            preview_ui.small(path);
+                            return;
+                        }
+
+                        let Some(preview) = self.previous_shade_preview.as_ref() else {
+                            preview_ui.label("Loading project inspection...");
+                            return;
+                        };
+
+                        preview_ui.heading(&preview.project_name);
+                        if let Some(texture) = self.previous_shade_texture.as_ref() {
+                            let natural = texture.size_vec2();
+                            if natural.x > 0.0 && natural.y > 0.0 {
+                                let max_size = egui::vec2(
+                                    preview_ui.available_width().min(350.0),
+                                    350.0,
+                                );
+                                let scale = (max_size.x / natural.x)
+                                    .min(max_size.y / natural.y)
+                                    .min(1.0);
+                                preview_ui.add(
+                                    egui::Image::from_texture(texture)
+                                        .fit_to_exact_size(natural * scale),
+                                );
+                            }
+                        } else if let Some(error) = preview.thumbnail_error.as_ref() {
+                            preview_ui.small(format!("Thumbnail unavailable: {error}"));
+                        } else {
+                            preview_ui.small("No embedded thumbnail in this .shade file.");
+                        }
+
+                        preview_ui.add_space(6.0);
+                        egui::Grid::new("project-view-preview-meta")
+                            .num_columns(4)
+                            .striped(true)
+                            .spacing([12.0, 5.0])
+                            .show(preview_ui, |ui| {
+                                ui.strong("Saved");
+                                ui.label(format_previous_shade_time(preview.saved_at_unix_ms));
+                                ui.strong("File modified");
+                                ui.label(
+                                    preview
+                                        .file_modified_unix_ms
+                                        .map(format_previous_shade_time)
+                                        .unwrap_or_else(|| "-".to_owned()),
+                                );
+                                ui.end_row();
+                                ui.strong("Faces");
+                                ui.label(preview.face_count.to_string());
+                                ui.strong("Active Face");
+                                ui.label(preview.active_face_index.saturating_add(1).to_string());
+                                ui.end_row();
+                                ui.strong("Snapshots");
+                                ui.label(preview.snapshot_count.to_string());
+                                ui.strong("Active snapshot");
+                                ui.label(preview.active_snapshot_name.as_deref().unwrap_or("-"));
+                                ui.end_row();
+                                ui.strong("Test code");
+                                ui.label(if preview.test_code_enabled { "Enabled" } else { "Off" });
+                                ui.strong("Source bytes");
+                                ui.label(format_byte_count(preview.total_source_bytes));
+                                ui.end_row();
+                            });
+
+                        if let Some(face) = preview.active_face.as_ref() {
+                            preview_ui.separator();
+                            preview_ui
+                                .strong(format!(
+                                    "TIFF details · Face {} of {}",
+                                    preview
+                                        .active_face_index
+                                        .saturating_add(1)
+                                        .min(preview.face_count.max(1)),
+                                    preview.face_count,
+                                ))
+                                .on_hover_text(&face.source_file_name);
+                            egui::Grid::new("project-view-active-face-meta")
+                                .num_columns(4)
+                                .striped(true)
+                                .spacing([12.0, 5.0])
+                                .show(preview_ui, |ui| {
+                                    ui.strong("Face");
+                                    ui.label(
+                                        preview
+                                            .active_face_index
+                                            .saturating_add(1)
+                                            .min(preview.face_count.max(1))
+                                            .to_string(),
+                                    );
+                                    ui.strong("Dimensions");
+                                    ui.label(format!("{} x {} px", face.width, face.height));
+                                    ui.end_row();
+                                    ui.strong("Bit depth");
+                                    ui.label(format!("{}-bit", face.bit_depth));
+                                    ui.strong("Color model");
+                                    ui.label(&face.color_model);
+                                    ui.end_row();
+                                    ui.strong("DPI");
+                                    ui.label(format!("{:.0} x {:.0}", face.dpi_x, face.dpi_y));
+                                    ui.strong("Channels");
+                                    ui.label(face.channel_count.to_string());
+                                    ui.end_row();
+                                    ui.strong("File size");
+                                    ui.label(format_byte_count(face.file_size_bytes));
+                                    ui.strong("Channel names");
+                                    ui.label(if face.channel_names.is_empty() {
+                                        "-".to_owned()
+                                    } else {
+                                        face.channel_names.join(", ")
+                                    });
+                                    ui.end_row();
+                                });
+                        }
+
+                        preview_ui.separator();
+                        preview_ui.strong(format!("Snapshots · {}", preview.snapshots.len()));
+                        if preview.snapshots.is_empty() {
+                            preview_ui.small("No saved Snapshots in this project.");
+                        } else {
+                            let mut snapshots = preview.snapshots.iter().collect::<Vec<_>>();
+                            snapshots.sort_by(|left, right| {
+                                (right.created_at_unix_ms, right.id)
+                                    .cmp(&(left.created_at_unix_ms, left.id))
+                            });
+                            egui::Grid::new("project-view-snapshots-grid")
+                                .num_columns(2)
+                                .striped(true)
+                                .spacing([14.0, 4.0])
+                                .show(preview_ui, |ui| {
+                                    for pair in snapshots.chunks(2) {
+                                        for snapshot in pair {
+                                            let active = preview.active_snapshot_name.as_deref()
+                                                == Some(snapshot.name.as_str());
+                                            let label = if active {
+                                                format!("#{}  {} · active", snapshot.id, snapshot.name)
+                                            } else {
+                                                format!("#{}  {}", snapshot.id, snapshot.name)
+                                            };
+                                            let response = if active {
+                                                ui.strong(label)
+                                            } else {
+                                                ui.label(label)
+                                            };
+                                            if !snapshot.code.trim().is_empty()
+                                                && !snapshot
+                                                    .code
+                                                    .eq_ignore_ascii_case(&snapshot.name)
+                                            {
+                                                response.on_hover_text(format!(
+                                                    "Code: {}", snapshot.code
+                                                ));
+                                            }
+                                        }
+                                        if pair.len() == 1 {
+                                            ui.label("");
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                        preview_ui.separator();
+                        preview_ui.small(preview.path.display().to_string());
+                            });
+                    });
+
+                ui.strong(format!("Projects · {}", paths.len()));
+                ui.add_space(4.0);
+                if paths.is_empty() {
+                    ui.label("No matching .shade projects.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("project-view-list")
+                        .auto_shrink([false, false])
+                        .show_rows(ui, 88.0, indices.len(), |ui, range| {
+                            for row in range {
+                                let entry = self.previous_shades.entries()[indices[row]].clone();
+                                self.ensure_previous_shade_list_texture(ctx, &entry);
+                                let display_name = entry.display_name();
+                                let label = if entry.is_missing() {
+                                    format!("[missing] {display_name}")
+                                } else {
+                                    display_name
+                                };
+                                let source_bytes = if entry.total_source_bytes > 0 {
+                                    format_byte_count(entry.total_source_bytes)
+                                } else {
+                                    "-".to_owned()
+                                };
+                                let pixel_size = entry
+                                    .active_face_pixel_size()
+                                    .map(|(width, height)| format!("{width} x {height} px"))
+                                    .unwrap_or_else(|| "-".to_owned());
+                                let metadata = format!(
+                                    "{} face(s) · {} · {}",
+                                    entry.face_count, source_bytes, pixel_size,
+                                );
+                                let recent_names = entry
+                                    .recent_snapshots(8)
+                                    .into_iter()
+                                    .map(|snapshot| snapshot.name.trim())
+                                    .filter(|name| !name.is_empty())
+                                    .collect::<Vec<_>>();
+                                let snapshot_line_1 = if recent_names.is_empty() {
+                                    "No Snapshots".to_owned()
+                                } else {
+                                    format!(
+                                        "Snapshots: {}",
+                                        recent_names[..recent_names.len().min(4)].join(" · ")
+                                    )
+                                };
+                                let snapshot_line_2 = if recent_names.len() > 4 {
+                                    recent_names[4..].join(" · ")
+                                } else {
+                                    String::new()
+                                };
+                                let selected = requested_select
+                                    .as_deref()
+                                    .or(self.previous_shades_selected.as_deref())
+                                    == Some(entry.path.as_str());
+                                let thumbnail = self.previous_shade_list_textures.get(&entry.path);
+                                let response = previous_shade_history_row(
+                                    ui,
+                                    selected,
+                                    &label,
+                                    &metadata,
+                                    &snapshot_line_1,
+                                    &snapshot_line_2,
+                                    thumbnail,
+                                )
+                                .on_hover_text(&entry.path);
+                                if response.clicked() {
+                                    requested_select = Some(entry.path.clone());
+                                }
+                                if response.double_clicked() && !entry.is_missing() {
+                                    requested_open = Some(entry.path.clone());
+                                }
+                            }
+                        });
+                }
+            });
+
+        self.show_previous_shades = open;
+        if let Some(path) = requested_select {
+            if self.previous_shades_selected.as_deref() != Some(path.as_str()) {
+                self.load_previous_shade_preview(ctx, &path);
+            }
+        }
+        if let Some(path) = requested_reveal {
+            if let Err(err) = reveal_in_explorer(Path::new(&path)) {
+                self.report_error(err);
+            }
+        }
+        if let Some(old_path) = requested_relink {
+            if let Some(new_path) = rfd::FileDialog::new()
+                .add_filter("Shade projects", &["shade"])
+                .pick_file()
+            {
+                match self.previous_shades.relink_path(&old_path, &new_path) {
+                    Ok(new_display) => {
+                        if let Err(err) = self.previous_shades.save() {
+                            self.log.error(&err);
+                        }
+                        self.previous_shade_list_textures.remove(&old_path);
+                        self.previous_shade_list_texture_lru
+                            .retain(|item| item != &old_path);
+                        self.load_previous_shade_preview(ctx, &new_display);
+                    }
+                    Err(err) => self.report_error(err),
+                }
+            }
+        }
+        if let Some(path) = requested_remove {
+            if self.previous_shades.remove_path(&path) {
+                if let Err(err) = self.previous_shades.save() {
+                    self.log.error(&err);
+                }
+                self.previous_shade_list_textures.remove(&path);
+                self.previous_shade_list_texture_lru
+                    .retain(|item| item != &path);
+                if self.previous_shades_selected.as_deref() == Some(path.as_str()) {
+                    self.previous_shades_selected = None;
+                    self.previous_shade_preview = None;
+                    self.previous_shade_preview_error = None;
+                    self.previous_shade_texture = None;
+                }
+            }
+        }
+        if let Some(path) = requested_open {
+            self.show_previous_shades = false;
+            self.open_project_path(PathBuf::from(path));
+        }
+    }
+
+    fn ui_snapshot_save_reminder(&mut self, ctx: &egui::Context) {
+        if !self.show_snapshot_save_reminder {
+            return;
+        }
+        let unsaved_project = self.project_path.is_none();
+        let quick_target = self.quick_save_target();
+        let mut quick_save = false;
+        let mut save = false;
+        let mut save_as = false;
+        let mut later = false;
+        egui::Window::new("Save Snapshot/Test project state")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            if unsaved_project {
+                ui.strong("The TIFF export is saved, but this Snapshot/Test state is not stored in a .shade project yet.");
+                ui.label("This project has never been saved. Quick Save will create the project beside the source TIFF files so the exported test can be reproduced later.");
+                if let Some(path) = quick_target.as_ref() {
+                    ui.small(format!("Quick Save target: {}", path.display()));
+                }
+            } else {
+                ui.strong("The TIFF export is saved, but the Snapshot/Test state has unsaved project changes.");
+                ui.label("Save the .shade project now to keep the test state that produced this TIFF.");
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if unsaved_project {
+                    quick_save = ui
+                        .add_enabled(self.job.is_none() && quick_target.is_some(), egui::Button::new("Quick Save project"))
+                        .clicked();
+                    save_as = ui
+                        .add_enabled(self.job.is_none() && !self.faces.is_empty(), egui::Button::new("Save As..."))
+                        .clicked();
+                } else {
+                    save = ui
+                        .add_enabled(self.job.is_none(), egui::Button::new("Save project"))
+                        .clicked();
+                }
+                later = ui.button("Later").clicked();
+            });
+        });
+        if quick_save && self.quick_save_project() {
+            self.show_snapshot_save_reminder = false;
+        } else if save && self.save_project(false) {
+            self.show_snapshot_save_reminder = false;
+        } else if save_as && self.save_project(true) {
+            self.show_snapshot_save_reminder = false;
+        } else if later {
+            self.show_snapshot_save_reminder = false;
+        }
+    }
+
+    fn refresh_icc_profile_catalog(&mut self) {
+        self.icc_profile_scan_done = true;
+        match color_management::installed_profiles() {
+            Ok(profiles) => {
+                self.icc_profiles = profiles;
+                self.icc_profile_scan_error = None;
+            }
+            Err(err) => {
+                self.icc_profiles.clear();
+                self.icc_profile_scan_error = Some(err);
+            }
+        }
+    }
+
+    fn ui_color_management_window(&mut self, ctx: &egui::Context) {
+        if !self.show_color_management {
+            return;
+        }
+        if !self.icc_profile_scan_done {
+            self.refresh_icc_profile_catalog();
+        }
+
+        let Some(active_face) = self.faces.get(self.current_face) else {
+            self.show_color_management = false;
+            return;
+        };
+        let active_model = active_face.preview.metadata.color_model;
+        let embedded_name =
+            color_management::embedded_profile_description(&active_face.preview.metadata)
+                .unwrap_or_else(|| "No embedded ICC".to_owned());
+        let profiles = self.icc_profiles.clone();
+        let scan_error = self.icc_profile_scan_error.clone();
+        let current_status = active_face.color_status.clone();
+
+        let original_query = self.icc_profile_query.clone();
+        let mut query = original_query.clone();
+        let mut selected = self
+            .icc_profile_selected
+            .clone()
+            .or_else(|| self.project.preview_color.assigned_profile_path.clone());
+        let mut enabled = self.project.preview_color.enabled;
+        let mut intent = self.project.preview_color.rendering_intent;
+        let mut bpc = self.project.preview_color.black_point_compensation;
+        let mut show_incompatible = self.icc_show_incompatible;
+        let mut requested_profile: Option<Option<PathBuf>> = None;
+        let mut browse_requested = false;
+        let mut refresh_requested = false;
+        let mut open = self.show_color_management;
+
+        egui::Window::new("Color Management / Preview Profile")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([760.0, 650.0])
+            .show(ctx, |ui| {
+                ui.heading("Preview profile assignment");
+                ui.small("This changes only Shade Editor's preview. The source TIFF, exported samples, embedded ICC tag and Photoshop resources are never rewritten by profile assignment.");
+                ui.add_space(5.0);
+                egui::Grid::new("preview-profile-current")
+                    .num_columns(2)
+                    .striped(true)
+                    .spacing([14.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.strong("Active preview");
+                        ui.label(current_status.button_label())
+                            .on_hover_text(current_status.detail());
+                        ui.end_row();
+                        ui.strong("TIFF base model");
+                        ui.label(active_model.title());
+                        ui.end_row();
+                        ui.strong("Embedded profile");
+                        ui.label(&embedded_name);
+                        ui.end_row();
+                        ui.strong("Assigned profile");
+                        ui.label(
+                            self.project
+                                .preview_color
+                                .assigned_profile_path
+                                .as_deref()
+                                .unwrap_or("Embedded profile"),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Use embedded profile").clicked() {
+                        requested_profile = Some(None);
+                    }
+                    if ui.button("Browse ICC / ICM...").clicked() {
+                        browse_requested = true;
+                    }
+                    if ui.button("Refresh system profiles").clicked() {
+                        refresh_requested = true;
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut enabled, "Enable color-managed preview");
+                    ui.checkbox(&mut bpc, "Black point compensation");
+                });
+                egui::ComboBox::from_label("Rendering intent")
+                    .selected_text(intent.label())
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            PreviewRenderingIntent::Perceptual,
+                            PreviewRenderingIntent::RelativeColorimetric,
+                            PreviewRenderingIntent::Saturation,
+                            PreviewRenderingIntent::AbsoluteColorimetric,
+                        ] {
+                            ui.selectable_value(&mut intent, value, value.label());
+                        }
+                    });
+                ui.small("Black point compensation is optional and is most useful with relative-colorimetric transforms. The preview destination remains sRGB; no monitor or printer/RIP proof profile is applied here.");
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Search");
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("Profile name, filename, RGB/CMYK/Gray, path")
+                            .desired_width(430.0),
+                    );
+                    if !search.has_focus() && !ctx.wants_keyboard_input() {
+                        let typed = ctx.input(|input| {
+                            input
+                                .events
+                                .iter()
+                                .filter_map(|event| match event {
+                                    egui::Event::Text(text) if !text.chars().all(char::is_control) => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<String>()
+                        });
+                        if !typed.is_empty() {
+                            query.push_str(&typed);
+                            search.request_focus();
+                        }
+                    }
+                    ui.checkbox(&mut show_incompatible, "Show incompatible");
+                });
+
+                let visible = profiles
+                    .iter()
+                    .filter(|profile| profile.matches_query(&query))
+                    .filter(|profile| show_incompatible || profile.compatible_with(active_model))
+                    .collect::<Vec<_>>();
+                let compatible_paths = visible
+                    .iter()
+                    .filter(|profile| profile.compatible_with(active_model))
+                    .map(|profile| profile.path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                if query != original_query {
+                    selected = compatible_paths.first().cloned();
+                }
+                let current_position = selected
+                    .as_deref()
+                    .and_then(|path| compatible_paths.iter().position(|item| item == path));
+                let (up, down, enter) = ctx.input(|input| {
+                    (
+                        input.key_pressed(egui::Key::ArrowUp),
+                        input.key_pressed(egui::Key::ArrowDown),
+                        input.key_pressed(egui::Key::Enter),
+                    )
+                });
+                if !compatible_paths.is_empty() && (up || down) {
+                    let next = match (current_position, up, down) {
+                        (Some(position), true, _) => position.saturating_sub(1),
+                        (Some(position), _, true) => (position + 1).min(compatible_paths.len() - 1),
+                        (None, _, true) => 0,
+                        (None, true, _) => compatible_paths.len() - 1,
+                        _ => 0,
+                    };
+                    selected = compatible_paths.get(next).cloned();
+                }
+                if enter {
+                    if let Some(path) = selected.as_ref() {
+                        requested_profile = Some(Some(PathBuf::from(path)));
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.strong(format!(
+                    "System profiles · {} compatible / {} loaded",
+                    profiles
+                        .iter()
+                        .filter(|profile| profile.compatible_with(active_model))
+                        .count(),
+                    profiles.len()
+                ));
+                if let Some(error) = scan_error.as_ref() {
+                    ui.colored_label(egui::Color32::YELLOW, error);
+                }
+                if visible.is_empty() {
+                    ui.label("No matching assignable profiles.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("icc-profile-list")
+                        .auto_shrink([false, false])
+                        .max_height(330.0)
+                        .show(ui, |ui| {
+                            for profile in visible {
+                                let path_text = profile.path.to_string_lossy().into_owned();
+                                let compatible = profile.compatible_with(active_model);
+                                let label = format!(
+                                    "{}  ·  {}  ·  {}",
+                                    profile.description,
+                                    profile.color_space_label(),
+                                    profile.filename()
+                                );
+                                let response = ui
+                                    .add_enabled(
+                                        compatible,
+                                        egui::Button::new(label)
+                                            .selected(selected.as_deref() == Some(path_text.as_str())),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{}\nClass: {}{}",
+                                        profile.path.display(),
+                                        profile.device_class_label(),
+                                        if compatible {
+                                            ""
+                                        } else {
+                                            "\nIncompatible with the active TIFF base color model."
+                                        }
+                                    ));
+                                if response.clicked() {
+                                    selected = Some(path_text.clone());
+                                }
+                                if response.double_clicked() && compatible {
+                                    requested_profile = Some(Some(profile.path.clone()));
+                                }
+                            }
+                        });
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let can_assign = selected.as_deref().is_some_and(|path| {
+                        profiles.iter().any(|profile| {
+                            profile.path.to_string_lossy() == path
+                                && profile.compatible_with(active_model)
+                        })
+                    });
+                    if ui
+                        .add_enabled(can_assign, egui::Button::new("Assign selected profile"))
+                        .clicked()
+                    {
+                        requested_profile = selected
+                            .as_ref()
+                            .map(|path| Some(PathBuf::from(path)));
+                    }
+                    ui.small("Up/Down changes selection; Enter assigns it.");
+                });
+            });
+
+        self.show_color_management = open;
+        self.icc_profile_query = query;
+        self.icc_profile_selected = selected;
+        self.icc_show_incompatible = show_incompatible;
+
+        if refresh_requested {
+            self.icc_profile_scan_done = false;
+            self.refresh_icc_profile_catalog();
+        }
+
+        if browse_requested {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("ICC color profiles", &["icc", "icm"])
+                .pick_file()
+            {
+                requested_profile = Some(Some(path));
+            }
+        }
+
+        let mut changed = false;
+        if self.project.preview_color.enabled != enabled {
+            self.project.preview_color.enabled = enabled;
+            changed = true;
+        }
+        if self.project.preview_color.rendering_intent != intent {
+            self.project.preview_color.rendering_intent = intent;
+            changed = true;
+        }
+        if self.project.preview_color.black_point_compensation != bpc {
+            self.project.preview_color.black_point_compensation = bpc;
+            changed = true;
+        }
+
+        if let Some(requested) = requested_profile {
+            match requested {
+                None => {
+                    if self.project.preview_color.assigned_profile_path.is_some() {
+                        self.project.preview_color.assigned_profile_path = None;
+                        self.icc_profile_selected = None;
+                        changed = true;
+                    }
+                }
+                Some(path) => match color_management::inspect_profile(&path) {
+                    Ok(profile) if profile.compatible_with(active_model) => {
+                        let path_text = path.to_string_lossy().into_owned();
+                        if self.project.preview_color.assigned_profile_path.as_deref()
+                            != Some(path_text.as_str())
+                        {
+                            self.project.preview_color.assigned_profile_path =
+                                Some(path_text.clone());
+                            self.icc_profile_selected = Some(path_text);
+                            changed = true;
+                        }
+                    }
+                    Ok(profile) => self.report_error(format!(
+                        "Cannot assign '{}': profile color space {} does not match active TIFF {}.",
+                        profile.description,
+                        profile.color_space_label(),
+                        active_model.title(),
+                    )),
+                    Err(err) => self.report_error(err),
+                },
+            }
+        }
+
+        if changed {
+            self.project_dirty = true;
+            self.invalidate_display_previews();
+        }
+    }
+
     fn ui_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_settings { return; }
+        if !self.show_settings {
+            return;
+        }
         let mut open = self.show_settings;
+        let mut rebuild_previews_requested = false;
         egui::Window::new("Settings")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
+            .default_size([640.0, 760.0])
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Application");
                 let mut changed = false;
-                changed |= ui.checkbox(&mut self.settings.auto_update, "Automatically check and download updates").changed();
-                let dark_changed = ui.checkbox(&mut self.settings.dark_mode, "Dark mode").changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.auto_update,
+                        "Automatically check and download updates",
+                    )
+                    .changed();
+                let dark_changed = ui
+                    .checkbox(&mut self.settings.dark_mode, "Dark mode")
+                    .changed();
                 changed |= dark_changed;
-                changed |= ui.add(
-                    egui::Slider::new(&mut self.settings.max_preview_dimension, 600..=4000)
-                        .text("Preview max dimension"),
-                ).changed();
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.settings.max_preview_dimension, 600..=4000)
+                                .text("Preview max dimension"),
+                        )
+                        .changed();
+                    if ui
+                        .add_enabled(
+                            !self.faces.is_empty() && self.job.is_none(),
+                            egui::Button::new("Rebuild previews"),
+                        )
+                        .on_hover_text("Reload all current TIFF Faces using this preview size")
+                        .clicked()
+                    {
+                        rebuild_previews_requested = true;
+                    }
+                });
+                ui.small("The max dimension is used when TIFF previews are loaded. Use Rebuild previews to apply a changed value to Faces already open in this project.");
                 ui.separator();
-                ui.heading("Editor layout");
-                changed |= ui.checkbox(&mut self.settings.show_all_histograms, "Show a histogram for every channel").changed();
-                changed |= ui.checkbox(&mut self.settings.adjustment_tabs, "Use tabs for Levels / Curve / Mixer").changed();
-                changed |= ui.checkbox(&mut self.settings.sidebar_two_columns, "Use two-column tools sidebar").changed();
-                if dark_changed { apply_theme(ctx, self.settings.dark_mode); }
-                if changed {
-                    if let Err(err) = self.settings.save() { self.status_message = err; }
+                ui.heading("Preview diagnostics");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.show_clipping_warnings,
+                        "Show per-channel clipping warnings",
+                    )
+                    .changed();
+                ui.small("Clipping percentages are estimates from the loaded preview samples. Yellow starts at 0.10%; red at 1.00%. Full-resolution export data is not sampled or modified for these warnings.");
+                ui.small("ICC profile assignment is project-owned. Click the profile name beside the active Face metadata to open Color Management.");
+                ui.separator();
+                ui.heading("Export & storage");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.lzw_compression,
+                        "Use LZW compression for exported TIFF files",
+                    )
+                    .changed();
+                ui.small("LZW is enabled by default. Disable it only when you specifically need to preserve a supported source compression mode.");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.validate_after_export,
+                        "Validate TIFF after normal Export face / Export all",
+                    )
+                    .changed();
+                ui.small("When enabled, Shade Editor immediately re-decodes every exported TIFF and verifies channel layout/names, ICC/Photoshop resources, compression/predictor policy and complete strip decoding.");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.export_all_test_code,
+                        "Write Test Code during Export all",
+                    )
+                    .changed();
+                ui.small("Off by default: Export all writes clean Face TIFFs without Test Code. Enable this only when every Face in Export all should receive the current Test Code configuration.");
+                let old_default_dpi = self.settings.default_dpi;
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.default_dpi, 72.0..=1200.0)
+                            .text("Default DPI")
+                            .suffix(" dpi"),
+                    )
+                    .changed();
+                ui.small("Used when a TIFF has no valid physical DPI. Default: 220. Exported TIFFs receive this DPI when the source does not provide one.");
+                let dpi_changed = (old_default_dpi - self.settings.default_dpi).abs() > f64::EPSILON;
+                if dpi_changed {
+                    for face in &mut self.faces {
+                        if face.dpi.used_default {
+                            face.dpi = dpi::DpiInfo::with_default(self.settings.default_dpi);
+                        }
+                    }
                 }
                 ui.separator();
-                ui.label("Automatic updates can be disabled here. Manual update checking remains available in About.");
+                ui.heading("Windows Explorer integration");
+                let shell_installer = Self::bundled_shell_script("Install-ShadeEditorShell.ps1");
+                let shell_uninstaller = Self::bundled_shell_script("Uninstall-ShadeEditorShell.ps1");
+                if let Some(installer) = shell_installer {
+                    ui.small(format!("Bundled Shell package: {}", installer.parent().unwrap_or_else(|| Path::new(".")).display()));
+                    ui.horizontal(|ui| {
+                        if ui.button("Install Shell integration").clicked() { self.launch_shell_script("Install-ShadeEditorShell.ps1", "installation"); }
+                        if shell_uninstaller.is_some() && ui.button("Uninstall Shell integration").clicked() { self.launch_shell_script("Uninstall-ShadeEditorShell.ps1", "removal"); }
+                    });
+                    ui.small("The installer may request administrator permission because Explorer COM/property handlers are registered machine-wide.");
+                } else {
+                    ui.colored_label(egui::Color32::YELLOW, "Bundled shell folder not found next to ShadeEditor.exe.");
+                    ui.small("Install the Shell package separately, or place the shell folder from the build package next to ShadeEditor.exe.");
+                }
+                ui.separator();
+                ui.heading("Editor layout");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.sidebar_two_columns,
+                        "Use two-column tools sidebar",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.show_all_histograms,
+                        "Show a histogram for every channel",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.adjustment_tabs,
+                        "Use tabs for Levels / Mixer / Curve",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.compact_curve_controls,
+                        "Compact Curve editor (hide Input / Output fields)",
+                    )
+                    .changed();
+                ui.small("When enabled, Curve keeps only the draggable graph and hides the selected-point label, Input / Output fields, and helper text.");
+                ui.separator();
+                ui.heading("Color guides");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.colorize_histograms,
+                        "Colorize histograms by channel",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.colorize_adjustments,
+                        "Colorize Levels / Mixer / Curve by channel",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.show_curve_histogram,
+                        "Show active histogram behind Curve",
+                    )
+                    .changed();
+                ui.separator();
+                ui.heading("Channel palettes");
+                ui.small("Palettes change only UI channel names/colors. TIFF channel names and separation order stay untouched. The active project palette is saved inside the .shade file.");
+                let palette_library = self.settings.palette_library();
+                let default_palette_name = if self.settings.default_palette_id == palette::AUTO_PALETTE_ID {
+                    "Automatic - CMYK/RGB from first Face".to_owned()
+                } else {
+                    palette_library
+                        .iter()
+                        .find(|palette| palette.id == self.settings.default_palette_id)
+                        .map(|palette| palette.name.clone())
+                        .unwrap_or_else(|| "Automatic - CMYK/RGB from first Face".to_owned())
+                };
+                egui::ComboBox::from_label("Default palette for new projects")
+                    .selected_text(default_palette_name)
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.settings.default_palette_id,
+                                palette::AUTO_PALETTE_ID.to_owned(),
+                                "Automatic - CMYK/RGB from first Face",
+                            )
+                            .changed();
+                        for palette in &palette_library {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.settings.default_palette_id,
+                                    palette.id.clone(),
+                                    &palette.name,
+                                )
+                                .changed();
+                        }
+                    });
+
+                ui.label("Built-in palettes (read-only)");
+                for builtin in palette::builtin_palettes() {
+                    egui::CollapsingHeader::new(&builtin.name)
+                        .id_salt(format!("builtin-palette-{}", builtin.id))
+                        .show(ui, |ui| {
+                            for entry in &builtin.channels {
+                                palette_entry_readonly(ui, entry);
+                            }
+                        });
+                }
+
+                let mut delete_palette = None;
+                let mut add_channel_to = None;
+                let mut remove_channel = None;
+                for custom in &mut self.settings.custom_palettes {
+                    let custom_id = custom.id.clone();
+                    egui::CollapsingHeader::new(format!("Custom - {}", custom.name))
+                        .id_salt(format!("custom-palette-{custom_id}"))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Palette name");
+                                changed |= ui.text_edit_singleline(&mut custom.name).changed();
+                                if ui.small_button("Delete palette").clicked() {
+                                    delete_palette = Some(custom_id.clone());
+                                }
+                            });
+                            ui.add_space(3.0);
+                            for (index, entry) in custom.channels.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{}", index + 1));
+                                    changed |= ui
+                                        .add(egui::TextEdit::singleline(&mut entry.name).desired_width(130.0))
+                                        .changed();
+                                    changed |= ui.color_edit_button_srgb(&mut entry.color).changed();
+                                    if ui.small_button("-").on_hover_text("Remove channel slot").clicked() {
+                                        remove_channel = Some((custom_id.clone(), index));
+                                    }
+                                });
+                            }
+                            if ui.small_button("+ Channel slot").clicked() {
+                                add_channel_to = Some(custom_id.clone());
+                            }
+                        });
+                }
+                if let Some((id, index)) = remove_channel {
+                    if let Some(custom) = self.settings.custom_palettes.iter_mut().find(|item| item.id == id) {
+                        if index < custom.channels.len() {
+                            custom.channels.remove(index);
+                            changed = true;
+                        }
+                    }
+                }
+                if let Some(id) = add_channel_to {
+                    if let Some(custom) = self.settings.custom_palettes.iter_mut().find(|item| item.id == id) {
+                        let number = custom.channels.len() + 1;
+                        let color = palette::fallback_channel_color("Spot", number - 1);
+                        custom.channels.push(palette::ChannelPaletteEntry {
+                            name: format!("Ink {number}"),
+                            color,
+                        });
+                        changed = true;
+                    }
+                }
+                if let Some(id) = delete_palette {
+                    changed |= self.settings.delete_custom_palette(&id);
+                }
+                if ui.button("+ New custom palette").clicked() {
+                    self.settings.create_custom_palette();
+                    changed = true;
+                }
+                if dark_changed {
+                    apply_theme(ctx, self.settings.dark_mode);
+                }
+                if changed {
+                    if let Err(err) = self.settings.save() {
+                        self.report_error(err);
+                    }
+                }
+                });
             });
         self.show_settings = open;
+        if rebuild_previews_requested {
+            self.rebuild_previews();
+        }
     }
 
     fn ui_about_window(&mut self, ctx: &egui::Context) {
-        if !self.show_about { return; }
+        if !self.show_about {
+            return;
+        }
         let mut open = self.show_about;
         egui::Window::new("About Shade Editor")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
+            .default_width(520.0)
             .show(ctx, |ui| {
                 ui.heading("Shade Editor");
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.label("Native multi-channel TIFF shade editor for digital ceramic printing.");
                 ui.separator();
-                ui.label("Copyright © 2026 Emad Ghasemi");
+                ui.label("Copyright (c) 2026 Emad Ghasemi");
                 ui.label("MIT License");
-                ui.hyperlink_to("GitHub repository", "https://github.com/emadgh/windows-shade-editor");
+                ui.hyperlink_to(
+                    "GitHub repository",
+                    "https://github.com/emadgh/windows-shade-editor",
+                );
+                ui.hyperlink_to("EmadGhasemi.ir", "https://emadghasemi.ir");
                 ui.separator();
-                match self.updater.status() {
-                    UpdateStatus::Checking => { ui.spinner(); ui.label("Checking for updates…"); }
-                    UpdateStatus::UpToDate => { ui.label("You are using the latest version."); }
-                    UpdateStatus::Available(info) => {
-                        ui.label(format!("Version {} is available.", info.version));
-                        if ui.button("Download update").clicked() { self.updater.start_download(); }
-                    }
-                    UpdateStatus::Downloading(info) => { ui.label(format!("Downloading {}…", info.version)); }
-                    UpdateStatus::Ready(info, _) => { ui.label(format!("Version {} is downloaded and ready to install.", info.version)); }
-                    UpdateStatus::Failed(message) => { ui.label(format!("Update check failed: {message}")); }
-                    UpdateStatus::Idle => {}
-                }
-                if ui.button("Check for updates").clicked() { self.updater.start_check(false); }
+                ui.label("Update controls are located on the right side of the main toolbar.");
+                ui.separator();
+                ui.strong("Shortcuts");
+                egui::Grid::new("about-shortcuts")
+                    .num_columns(2)
+                    .spacing([18.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("File");
+                        ui.label("Ctrl+N  New   |   Ctrl+S  Save   |   Ctrl+Shift+S  Save As");
+                        ui.end_row();
+                        ui.strong("Export");
+                        ui.label("Ctrl+E  Export Face   |   Ctrl+Shift+E  Export All");
+                        ui.end_row();
+                        ui.strong("View / Settings");
+                        ui.label("F  Fit image   |   G  Settings");
+                        ui.end_row();
+                        ui.strong("Channels");
+                        ui.label("1-9  Select channel   |   S  Solo channel");
+                        ui.end_row();
+                        ui.strong("Snapshot");
+                        ui.label("Ctrl+Enter  Update active Snapshot");
+                        ui.end_row();
+                        ui.strong("Curve");
+                        ui.label("Arrow keys  Nudge point   |   Shift+Arrow  Larger step");
+                        ui.end_row();
+                        ui.strong("History");
+                        ui.label("Ctrl+Alt+Z  Undo   |   Ctrl+Shift+Z  Redo");
+                        ui.end_row();
+                    });
             });
         self.show_about = open;
+    }
+
+    fn ui_logs_window(&mut self, ctx: &egui::Context) {
+        if !self.show_logs {
+            return;
+        }
+        let mut open = self.show_logs;
+        egui::Window::new("Application log")
+            .open(&mut open)
+            .default_size([780.0, 480.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        self.log_cache = self.log.read();
+                    }
+                    if ui.button("Clear").clicked() {
+                        match self.log.clear() {
+                            Ok(()) => self.log_cache.clear(),
+                            Err(err) => self.report_error(err),
+                        }
+                    }
+                    ui.label(self.log.path().display().to_string());
+                });
+                ui.separator();
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.log_cache)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(22),
+                        );
+                    });
+            });
+        self.show_logs = open;
     }
 }
 
 impl eframe::App for ShadeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
-        self.ensure_current_texture(ui.ctx());
-
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            self.ui_toolbar(ui);
-            self.ui_update_banner(ui);
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        self.poll_job();
+        self.poll_render(ui.ctx());
+        self.sync_update_state();
+        self.poll_autosave();
+        self.handle_dropped_files(ui.ctx());
+        workflow::handle_shortcuts(self, ui.ctx());
+        if !self.show_previous_shades {
+            self.handle_history_shortcuts(ui.ctx());
+        }
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("shade-editor-curve-graph-focused"), false);
         });
+        self.maybe_autosave();
+        self.handle_close_request(ui.ctx());
+        if self.close_after_save && self.job.is_none() && !self.project_dirty {
+            self.close_after_save = false;
+            self.allow_close_once = true;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        egui::Panel::top("toolbar").show(ui, |ui| self.ui_toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.ui_status(ui));
         egui::Panel::left("faces")
-            .default_size(240.0)
-            .resizable(true)
-            .show(ui, |ui| self.ui_faces(ui));
-
-        let tools_default_size = if self.settings.sidebar_two_columns { 720.0 } else { 380.0 };
-        let tools_min_size = if self.settings.sidebar_two_columns { 600.0 } else { 300.0 };
-        egui::Panel::right("tools")
-            .default_size(tools_default_size)
-            .min_size(tools_min_size)
+            .default_size(270.0)
             .resizable(true)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.ui_channels_and_tools(ui));
+                egui::ScrollArea::vertical().show(ui, |ui| self.ui_faces(ui))
             });
+        let tools_width = if self.settings.sidebar_two_columns {
+            760.0
+        } else {
+            400.0
+        };
+        egui::Panel::right("tools")
+            .default_size(tools_width)
+            .min_size(if self.settings.sidebar_two_columns {
+                560.0
+            } else {
+                300.0
+            })
+            .resizable(true)
+            .show(ui, |ui| self.ui_tools(ui));
         egui::CentralPanel::default().show(ui, |ui| self.ui_viewport(ui));
 
         self.ui_settings_window(ui.ctx());
+        self.ui_color_management_window(ui.ctx());
         self.ui_about_window(ui.ctx());
+        self.ui_logs_window(ui.ctx());
+        self.ui_previous_shades_window(ui.ctx());
+        self.ui_export_all_window(ui.ctx());
+        self.ui_recovery_window(ui.ctx());
+        self.ui_snapshot_discard_confirmation(ui.ctx());
+        self.ui_snapshot_save_reminder(ui.ctx());
+        self.ui_close_confirmation(ui.ctx());
+        self.commit_pending_history(ui.ctx(), false);
+
+        self.start_render_if_needed(ui.ctx());
     }
 }
 
-fn levels_ui(ui: &mut egui::Ui, adjustment: &mut ChannelAdjustment) -> bool {
-    let levels = &mut adjustment.levels;
-    let mut changed = false;
-    changed |= ui.add(egui::Slider::new(&mut levels.input_black, 0.0..=0.98).text("Input black")).changed();
-    changed |= ui.add(egui::Slider::new(&mut levels.gamma, 0.1..=4.0).logarithmic(true).text("Gamma")).changed();
-    changed |= ui.add(egui::Slider::new(&mut levels.input_white, 0.02..=1.0).text("Input white")).changed();
-    changed |= ui.add(egui::Slider::new(&mut levels.output_black, 0.0..=1.0).text("Output black")).changed();
-    changed |= ui.add(egui::Slider::new(&mut levels.output_white, 0.0..=1.0).text("Output white")).changed();
-    if levels.input_white <= levels.input_black {
-        levels.input_white = (levels.input_black + 0.01).min(1.0);
-        changed = true;
+fn project_name_for_path(current: &str, path: &Path) -> String {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("Untitled Shade") {
+        return trimmed.to_owned();
     }
-    if levels.output_white < levels.output_black {
-        levels.output_white = levels.output_black;
-        changed = true;
-    }
-    if ui.small_button("Reset Levels").clicked() {
-        adjustment.levels = model::Levels::default();
-        changed = true;
-    }
-    changed
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Shade Project".to_owned())
 }
 
-fn curves_ui(ui: &mut egui::Ui, adjustment: &mut ChannelAdjustment) -> bool {
-    draw_curve(ui, adjustment.curve);
-    let mut changed = false;
-    changed |= ui.add(egui::Slider::new(&mut adjustment.curve.black, 0.0..=1.0).text("Black output")).changed();
-    changed |= ui.add(egui::Slider::new(&mut adjustment.curve.midpoint, 0.0..=1.0).text("Mid output")).changed();
-    changed |= ui.add(egui::Slider::new(&mut adjustment.curve.white, 0.0..=1.0).text("White output")).changed();
-    if ui.small_button("Reset Curve").clicked() {
-        adjustment.curve = model::Curve::default();
-        changed = true;
+fn previous_shade_history_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    label: &str,
+    metadata: &str,
+    detail_primary: &str,
+    detail_secondary: &str,
+    thumbnail: Option<&egui::TextureHandle>,
+) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let height = 84.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill.gamma_multiply(0.72)
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 5.0, fill);
     }
-    changed
+
+    let thumb_rect = egui::Rect::from_min_size(
+        rect.left_top() + egui::vec2(7.0, 14.0),
+        egui::vec2(56.0, 56.0),
+    );
+    if let Some(texture) = thumbnail {
+        let natural = texture.size_vec2();
+        let scale = if natural.x > 0.0 && natural.y > 0.0 {
+            (thumb_rect.width() / natural.x)
+                .min(thumb_rect.height() / natural.y)
+                .min(1.0)
+        } else {
+            1.0
+        };
+        let image_rect = egui::Rect::from_center_size(thumb_rect.center(), natural * scale);
+        ui.painter()
+            .rect_filled(thumb_rect, 4.0, ui.visuals().extreme_bg_color);
+        ui.painter().image(
+            texture.id(),
+            image_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        ui.painter().rect_stroke(
+            thumb_rect,
+            4.0,
+            visuals.widgets.noninteractive.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            thumb_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "—",
+            egui::FontId::proportional(16.0),
+            visuals.weak_text_color(),
+        );
+    }
+
+    let text_left = thumb_rect.right() + 9.0;
+    ui.painter().text(
+        egui::pos2(text_left, rect.top() + 14.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.5),
+        if selected {
+            visuals.selection.stroke.color
+        } else {
+            visuals.text_color()
+        },
+    );
+    ui.painter().text(
+        egui::pos2(text_left, rect.top() + 34.0),
+        egui::Align2::LEFT_CENTER,
+        metadata,
+        egui::FontId::proportional(12.0),
+        visuals.weak_text_color(),
+    );
+    ui.painter().text(
+        egui::pos2(text_left, rect.top() + 54.0),
+        egui::Align2::LEFT_CENTER,
+        detail_primary,
+        egui::FontId::proportional(11.5),
+        visuals.weak_text_color(),
+    );
+    if !detail_secondary.is_empty() {
+        ui.painter().text(
+            egui::pos2(text_left, rect.top() + 72.0),
+            egui::Align2::LEFT_CENTER,
+            detail_secondary,
+            egui::FontId::proportional(11.5),
+            visuals.weak_text_color(),
+        );
+    }
+    response
+}
+
+fn adjustment_tab_bar(ui: &mut egui::Ui, tool: &mut ToolPanel) -> bool {
+    ui.add_space(7.0);
+    let mut reset = false;
+    ui.horizontal(|ui| {
+        let spacing = ui.spacing().item_spacing.x;
+        let reset_width = 54.0;
+        let available = ui.available_width();
+        let tab_width = ((available - reset_width - spacing * 3.0) / 3.0).clamp(54.0, 76.0);
+        if ui
+            .add_sized(
+                [tab_width, 30.0],
+                egui::Button::new("Levels").selected(*tool == ToolPanel::Levels),
+            )
+            .clicked()
+        {
+            *tool = ToolPanel::Levels;
+        }
+        if ui
+            .add_sized(
+                [tab_width, 30.0],
+                egui::Button::new("Mixer").selected(*tool == ToolPanel::Mixer),
+            )
+            .clicked()
+        {
+            *tool = ToolPanel::Mixer;
+        }
+        if ui
+            .add_sized(
+                [tab_width, 30.0],
+                egui::Button::new("Curve").selected(*tool == ToolPanel::Curves),
+            )
+            .clicked()
+        {
+            *tool = ToolPanel::Curves;
+        }
+        reset = ui
+            .add_sized([reset_width, 30.0], egui::Button::new("Reset"))
+            .clicked();
+    });
+    ui.add_space(7.0);
+    reset
+}
+
+fn unique_shade_path(directory: &Path, stem: &str) -> PathBuf {
+    let candidate = directory.join(format!("{stem}.shade"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    for number in 2u32.. {
+        let candidate = directory.join(format!("{stem}-{number}.shade"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn format_previous_shade_time(unix_ms: i64) -> String {
+    if unix_ms <= 0 {
+        return "-".to_owned();
+    }
+    Local
+        .timestamp_millis_opt(unix_ms)
+        .single()
+        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let value = bytes as f64;
+    if value >= GB {
+        format!("{:.2} GB", value / GB)
+    } else if value >= MB {
+        format!("{:.1} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn adjustment_foldout<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    title: impl Into<egui::WidgetText>,
+    default_open: bool,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> (Option<R>, bool) {
+    let id = ui.make_persistent_id(id_salt);
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    let title = title.into();
+    let mut reset = false;
+    let header = ui.horizontal(|ui| {
+        state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+        let title_response = ui.add(egui::Label::new(title).sense(egui::Sense::click()));
+        if title_response.clicked() {
+            state.toggle(ui);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            reset = ui.small_button("Reset").clicked();
+        });
+    });
+    let body = state.show_body_indented(&header.response, ui, body);
+    (body.map(|response| response.inner), reset)
+}
+
+fn reset_mixer_row(
+    adjustment: &mut ChannelAdjustment,
+    output_name: &str,
+    channel_names: &[String],
+) {
+    adjustment.mixer.coefficients.clear();
+    for name in channel_names {
+        adjustment
+            .mixer
+            .coefficients
+            .insert(name.clone(), if name == output_name { 1.0 } else { 0.0 });
+    }
+    adjustment.mixer.constant = 0.0;
+}
+
+fn reset_all_levels(
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    channel_names: &[String],
+) {
+    for name in channel_names {
+        adjustments.entry(name.clone()).or_default().levels = model::Levels::default();
+    }
+}
+
+fn reset_all_curves(
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    channel_names: &[String],
+) {
+    for name in channel_names {
+        adjustments.entry(name.clone()).or_default().curve = model::Curve::default();
+    }
+}
+
+fn reset_all_mixers(
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    channel_names: &[String],
+) {
+    for output_name in channel_names {
+        let adjustment = adjustments.entry(output_name.clone()).or_default();
+        reset_mixer_row(adjustment, output_name, channel_names);
+    }
+}
+
+fn levels_ui(
+    ui: &mut egui::Ui,
+    adjustment: &mut ChannelAdjustment,
+    accent: Option<egui::Color32>,
+) -> bool {
+    with_accent(ui, accent, |ui| {
+        let levels = &mut adjustment.levels;
+        let mut changed = false;
+        changed |= ui
+            .add(egui::Slider::new(&mut levels.input_black, 0.0..=0.98).text("Input black"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut levels.gamma, 0.1..=4.0)
+                    .logarithmic(true)
+                    .text("Gamma (relative)"),
+            )
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut levels.input_white, 0.02..=1.0).text("Input white"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut levels.output_black, 0.0..=1.0).text("Output black"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut levels.output_white, 0.0..=1.0).text("Output white"))
+            .changed();
+        if levels.input_white <= levels.input_black {
+            levels.input_white = (levels.input_black + 0.01).min(1.0);
+            changed = true;
+        }
+        ui.small(format!(
+            "Gamma midpoint output: {:.3}",
+            model::levels_gamma_mid_output(*levels)
+        ));
+        changed
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CurvePointKind {
+    Black,
+    Midpoint,
+    White,
+}
+
+impl CurvePointKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Black => "Black point",
+            Self::Midpoint => "Midpoint",
+            Self::White => "White point",
+        }
+    }
+}
+
+fn curve_point_xy(curve: model::Curve, point: CurvePointKind) -> (f32, f32) {
+    match point {
+        CurvePointKind::Black => (curve.input_black, curve.black),
+        CurvePointKind::Midpoint => (curve.midpoint_input, curve.midpoint),
+        CurvePointKind::White => (curve.input_white, curve.white),
+    }
+}
+
+fn set_curve_point(curve: &mut model::Curve, point: CurvePointKind, input: f32, output: f32) {
+    let gap = 1.0 / 255.0;
+    let output = output.clamp(0.0, 1.0);
+    match point {
+        CurvePointKind::Black => {
+            let max_input = if curve.midpoint_enabled {
+                (curve.midpoint_input - gap).max(0.0)
+            } else {
+                (curve.input_white - gap).max(0.0)
+            };
+            curve.input_black = input.clamp(0.0, max_input);
+            curve.black = output;
+        }
+        CurvePointKind::Midpoint => {
+            curve.midpoint_input = input.clamp(
+                (curve.input_black + gap).min(1.0),
+                (curve.input_white - gap).max(0.0),
+            );
+            curve.midpoint = output;
+        }
+        CurvePointKind::White => {
+            let min_input = if curve.midpoint_enabled {
+                (curve.midpoint_input + gap).min(1.0)
+            } else {
+                (curve.input_black + gap).min(1.0)
+            };
+            curve.input_white = input.clamp(min_input, 1.0);
+            curve.white = output;
+        }
+    }
+}
+
+fn curve_point_screen(rect: egui::Rect, input: f32, output: f32) -> egui::Pos2 {
+    egui::pos2(
+        egui::lerp(rect.x_range(), input.clamp(0.0, 1.0)),
+        egui::lerp(rect.bottom()..=rect.top(), output.clamp(0.0, 1.0)),
+    )
+}
+
+fn curve_editor_graph(
+    ui: &mut egui::Ui,
+    curve: &mut model::Curve,
+    histogram_before: Option<&[u32; 256]>,
+    histogram_after: Option<&[u32; 256]>,
+    accent: Option<egui::Color32>,
+    neutral_histogram: bool,
+) -> (bool, CurvePointKind) {
+    let desired = egui::vec2(ui.available_width().min(340.0).max(150.0), 210.0);
+    let (rect, graph_response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let graph_id = ui.make_persistent_id("three-point-curve-editor");
+    let selection_id = graph_id.with("selected-point");
+    let mut selected = ui
+        .data(|data| data.get_temp::<CurvePointKind>(selection_id))
+        .unwrap_or(CurvePointKind::Black);
+    if !curve.midpoint_enabled && selected == CurvePointKind::Midpoint {
+        selected = CurvePointKind::Black;
+    }
+    let mut changed = false;
+    if graph_response.clicked() {
+        graph_response.request_focus();
+    }
+    let mut midpoint_removed_this_frame = false;
+    let points = [
+        CurvePointKind::Black,
+        CurvePointKind::Midpoint,
+        CurvePointKind::White,
+    ];
+
+    for point in points {
+        if point == CurvePointKind::Midpoint && !curve.midpoint_enabled {
+            continue;
+        }
+        let (input, output) = curve_point_xy(*curve, point);
+        let center = curve_point_screen(rect, input, output);
+        let hit_rect = egui::Rect::from_center_size(center, egui::vec2(22.0, 22.0));
+        let response = ui.interact(
+            hit_rect,
+            graph_id.with(point),
+            egui::Sense::click_and_drag(),
+        );
+        if point == CurvePointKind::Midpoint && response.double_clicked() {
+            curve.midpoint_enabled = false;
+            midpoint_removed_this_frame = true;
+            selected = CurvePointKind::Black;
+            ui.data_mut(|data| data.insert_temp(selection_id, selected));
+            changed = true;
+            continue;
+        }
+        if response.clicked() || response.drag_started() {
+            selected = point;
+            ui.data_mut(|data| data.insert_temp(selection_id, point));
+            graph_response.request_focus();
+        }
+        if response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let output = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
+                set_curve_point(curve, point, input, output);
+                selected = point;
+                ui.data_mut(|data| data.insert_temp(selection_id, point));
+                changed = true;
+            }
+        }
+    }
+
+    if !curve.midpoint_enabled && !midpoint_removed_this_frame && graph_response.double_clicked() {
+        if let Some(pointer) = graph_response.interact_pointer_pos() {
+            let input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let gap = 1.0 / 255.0;
+            if input > curve.input_black + gap && input < curve.input_white - gap {
+                let output = model::curve_linear_output(input, *curve);
+                let line_point = curve_point_screen(rect, input, output);
+                if pointer.distance(line_point) <= 16.0 {
+                    curve.midpoint_enabled = true;
+                    curve.midpoint_input = input;
+                    curve.midpoint = output;
+                    selected = CurvePointKind::Midpoint;
+                    ui.data_mut(|data| data.insert_temp(selection_id, selected));
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if graph_response.has_focus() {
+        let (left, right, up, down, shift) = ui.input(|input| {
+            (
+                input.key_pressed(egui::Key::ArrowLeft),
+                input.key_pressed(egui::Key::ArrowRight),
+                input.key_pressed(egui::Key::ArrowUp),
+                input.key_pressed(egui::Key::ArrowDown),
+                input.modifiers.shift,
+            )
+        });
+        if left || right || up || down {
+            let step = if shift { 10.0 / 255.0 } else { 1.0 / 255.0 };
+            let (mut input_value, mut output_value) = curve_point_xy(*curve, selected);
+            if left {
+                input_value -= step;
+            }
+            if right {
+                input_value += step;
+            }
+            if up {
+                output_value += step;
+            }
+            if down {
+                output_value -= step;
+            }
+            set_curve_point(curve, selected, input_value, output_value);
+            changed = true;
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect_stroke(
+        rect,
+        2.0,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    if histogram_before.is_some() || histogram_after.is_some() {
+        let max_value = histogram_before
+            .into_iter()
+            .chain(histogram_after)
+            .flat_map(|bins| bins.iter())
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1) as f32;
+        let before_color = ui.visuals().weak_text_color().gamma_multiply(0.20);
+        let after_base = if neutral_histogram {
+            ui.visuals().weak_text_color()
+        } else {
+            accent.unwrap_or(ui.visuals().selection.stroke.color)
+        };
+        let after_color = after_base.gamma_multiply(0.48);
+        for (bins, color) in [
+            (histogram_before, before_color),
+            (histogram_after, after_color),
+        ] {
+            if let Some(bins) = bins {
+                for (index, value) in bins.iter().enumerate() {
+                    let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
+                    let h = *value as f32 / max_value * rect.height();
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, rect.bottom()),
+                            egui::pos2(x, rect.bottom() - h),
+                        ],
+                        egui::Stroke::new(1.0, color),
+                    );
+                }
+            }
+        }
+    }
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), rect.bottom()),
+            egui::pos2(rect.right(), rect.top()),
+        ],
+        egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+    );
+    let curve_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
+    let mut last = None;
+    for step in 0..=128 {
+        let x = step as f32 / 128.0;
+        let y = model::apply_curve(x, *curve);
+        let point = curve_point_screen(rect, x, y);
+        if let Some(previous) = last {
+            painter.line_segment([previous, point], egui::Stroke::new(2.0, curve_color));
+        }
+        last = Some(point);
+    }
+    for point in points {
+        if point == CurvePointKind::Midpoint && !curve.midpoint_enabled {
+            continue;
+        }
+        let (input, output) = curve_point_xy(*curve, point);
+        let center = curve_point_screen(rect, input, output);
+        let is_selected = point == selected;
+        let radius = if is_selected { 6.5 } else { 5.0 };
+        let fill = if is_selected {
+            curve_color
+        } else {
+            ui.visuals().extreme_bg_color
+        };
+        painter.circle_filled(center, radius, fill);
+        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, curve_color));
+    }
+    if graph_response.has_focus() {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("shade-editor-curve-graph-focused"), true);
+        });
+    }
+    (changed, selected)
+}
+
+fn curve_point_fields(
+    ui: &mut egui::Ui,
+    curve: &mut model::Curve,
+    selected: CurvePointKind,
+) -> bool {
+    let (input, output) = curve_point_xy(*curve, selected);
+    let mut input_value = (input * 255.0).round() as i32;
+    let mut output_value = (output * 255.0).round() as i32;
+    ui.small(selected.label());
+    let mut input_changed = false;
+    let mut output_changed = false;
+    ui.columns(2, |columns| {
+        columns[0].label("Input");
+        input_changed = columns[0]
+            .add(
+                egui::DragValue::new(&mut input_value)
+                    .range(0..=255)
+                    .speed(1),
+            )
+            .changed();
+        columns[1].label("Output");
+        output_changed = columns[1]
+            .add(
+                egui::DragValue::new(&mut output_value)
+                    .range(0..=255)
+                    .speed(1),
+            )
+            .changed();
+    });
+    if input_changed || output_changed {
+        set_curve_point(
+            curve,
+            selected,
+            input_value as f32 / 255.0,
+            output_value as f32 / 255.0,
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn curves_ui(
+    ui: &mut egui::Ui,
+    adjustment: &mut ChannelAdjustment,
+    histogram_before: Option<&[u32; 256]>,
+    histogram_after: Option<&[u32; 256]>,
+    accent: Option<egui::Color32>,
+    compact_controls: bool,
+    neutral_histogram: bool,
+) -> bool {
+    with_accent(ui, accent, |ui| {
+        let (graph_changed, selected) = curve_editor_graph(
+            ui,
+            &mut adjustment.curve,
+            histogram_before,
+            histogram_after,
+            accent,
+            neutral_histogram,
+        );
+        if histogram_before.is_some() && histogram_after.is_some() {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().weak_text_color(), "Before");
+                let after_color = if neutral_histogram {
+                    ui.visuals().weak_text_color()
+                } else {
+                    accent.unwrap_or(ui.visuals().selection.stroke.color)
+                };
+                ui.colored_label(after_color, "After");
+            });
+        }
+        let mut changed = graph_changed;
+        if !compact_controls {
+            ui.add_space(6.0);
+            changed |= curve_point_fields(ui, &mut adjustment.curve, selected);
+            ui.add_space(4.0);
+            ui.small("Double-click the Curve line to add the midpoint; double-click the midpoint to remove it. Drag active points directly. Input / Output use Photoshop-style 0-255 values.");
+        }
+        changed
+    })
 }
 
 fn mixer_ui(
@@ -920,34 +5635,63 @@ fn mixer_ui(
     adjustment: &mut ChannelAdjustment,
     output_name: &str,
     channel_names: &[String],
+    accent: Option<egui::Color32>,
+    palette: Option<&ChannelPalette>,
 ) -> bool {
-    ui.label(format!("Output: {output_name}"));
-    let mut changed = false;
-    for name in channel_names {
-        let default = if name == output_name { 1.0 } else { 0.0 };
-        let coefficient = adjustment.mixer.coefficients.entry(name.clone()).or_insert(default);
-        changed |= ui.add(egui::Slider::new(coefficient, -2.0..=2.0).text(name)).changed();
-    }
-    changed |= ui.add(egui::Slider::new(&mut adjustment.mixer.constant, -1.0..=1.0).text("Constant")).changed();
-    if ui.small_button("Reset Mixer").clicked() {
-        adjustment.mixer.coefficients.clear();
-        for name in channel_names {
-            adjustment.mixer.coefficients.insert(name.clone(), if name == output_name { 1.0 } else { 0.0 });
+    with_accent(ui, accent, |ui| {
+        let output_index = channel_names
+            .iter()
+            .position(|name| name == output_name)
+            .unwrap_or(0);
+        let output_display = channel_display_name(palette, output_name, output_index);
+        if let Some(color) = accent {
+            ui.colored_label(color, format!("Output: {output_display}"));
+        } else {
+            ui.label(format!("Output: {output_display}"));
         }
-        adjustment.mixer.constant = 0.0;
-        changed = true;
-    }
-    changed
+        let mut changed = false;
+        for (index, name) in channel_names.iter().enumerate() {
+            let default = if name == output_name { 1.0 } else { 0.0 };
+            let coefficient = adjustment
+                .mixer
+                .coefficients
+                .entry(name.clone())
+                .or_insert(default);
+            let row_accent = accent.map(|_| channel_color(palette, name, index));
+            changed |= with_accent(ui, row_accent, |ui| {
+                let mut slider = egui::Slider::new(coefficient, -2.0..=2.0)
+                    .text(channel_display_name(palette, name, index))
+                    .trailing_fill(true);
+                if let Some(color) = row_accent {
+                    slider = slider.text_color(color);
+                }
+                ui.add(slider).changed()
+            });
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        let mut constant_slider = egui::Slider::new(&mut adjustment.mixer.constant, -1.0..=1.0)
+            .text("Constant")
+            .trailing_fill(true);
+        if let Some(color) = accent {
+            constant_slider = constant_slider.text_color(color);
+        }
+        changed |= ui.add(constant_slider).changed();
+        changed
+    })
 }
-
 fn broadcast_levels_ui(
     ui: &mut egui::Ui,
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
     template_name: &str,
     channel_names: &[String],
+    accent: Option<egui::Color32>,
 ) -> bool {
     let mut draft = adjustments.get(template_name).cloned().unwrap_or_default();
-    if !levels_ui(ui, &mut draft) { return false; }
+    if !levels_ui(ui, &mut draft, accent) {
+        return false;
+    }
     for name in channel_names {
         adjustments.entry(name.clone()).or_default().levels = draft.levels;
     }
@@ -959,92 +5703,861 @@ fn broadcast_curves_ui(
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
     template_name: &str,
     channel_names: &[String],
+    histogram_before: Option<&[u32; 256]>,
+    histogram_after: Option<&[u32; 256]>,
+    accent: Option<egui::Color32>,
+    compact_controls: bool,
 ) -> bool {
     let mut draft = adjustments.get(template_name).cloned().unwrap_or_default();
-    if !curves_ui(ui, &mut draft) { return false; }
+    if !curves_ui(
+        ui,
+        &mut draft,
+        histogram_before,
+        histogram_after,
+        accent,
+        compact_controls,
+        true,
+    ) {
+        return false;
+    }
     for name in channel_names {
         adjustments.entry(name.clone()).or_default().curve = draft.curve;
     }
     true
 }
 
+fn all_curves_ui(
+    ui: &mut egui::Ui,
+    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    template_name: &str,
+    channel_names: &[String],
+    histograms_before: &[[u32; 256]],
+    histograms_after: &[[u32; 256]],
+    colorize: bool,
+    show_histogram: bool,
+    compact_controls: bool,
+    palette: Option<&ChannelPalette>,
+) -> bool {
+    let mut changed = false;
+    let template_index = channel_names
+        .iter()
+        .position(|name| name == template_name)
+        .unwrap_or(0);
+    let broadcast_accent = colorize.then(|| channel_color(palette, template_name, template_index));
+    let broadcast_histogram_before = show_histogram
+        .then(|| histograms_before.get(template_index))
+        .flatten();
+    let broadcast_histogram_after = show_histogram
+        .then(|| histograms_after.get(template_index))
+        .flatten();
+
+    egui::Frame::new()
+        .inner_margin(6)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(5)
+        .show(ui, |ui| {
+            ui.strong("Broadcast to all");
+            ui.small("Changes here are copied to every channel Curve.");
+            changed |= broadcast_curves_ui(
+                ui,
+                adjustments,
+                template_name,
+                channel_names,
+                broadcast_histogram_before,
+                broadcast_histogram_after,
+                broadcast_accent,
+                compact_controls,
+            );
+        });
+
+    ui.add_space(7.0);
+    ui.strong("Per-channel Curves");
+    ui.small("Open any channel to refine it after using Broadcast.");
+    for (index, name) in channel_names.iter().enumerate() {
+        let accent = colorize.then(|| channel_color(palette, name, index));
+        let title = if let Some(color) = accent {
+            egui::RichText::new(format!("●  {}", channel_display_name(palette, name, index)))
+                .color(color)
+        } else {
+            egui::RichText::new(channel_display_name(palette, name, index))
+        };
+        egui::CollapsingHeader::new(title)
+            .id_salt(format!("all-channel-curve-{index}-{name}"))
+            .default_open(false)
+            .show(ui, |ui| {
+                let histogram_before = if show_histogram {
+                    histograms_before.get(index)
+                } else {
+                    None
+                };
+                let histogram_after = if show_histogram {
+                    histograms_after.get(index)
+                } else {
+                    None
+                };
+                let adjustment = adjustments.entry(name.clone()).or_default();
+                changed |= curves_ui(
+                    ui,
+                    adjustment,
+                    histogram_before,
+                    histogram_after,
+                    accent,
+                    compact_controls,
+                    false,
+                );
+            });
+    }
+    changed
+}
+
 fn all_mixers_ui(
     ui: &mut egui::Ui,
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
     channel_names: &[String],
+    colorize: bool,
+    palette: Option<&ChannelPalette>,
 ) -> bool {
     let mut changed = false;
-    for output_name in channel_names {
-        ui.collapsing(format!("Output — {output_name}"), |ui| {
+    for (index, output_name) in channel_names.iter().enumerate() {
+        let display = channel_display_name(palette, output_name, index);
+        ui.collapsing(format!("Output - {display}"), |ui| {
             let adjustment = adjustments.entry(output_name.clone()).or_default();
-            changed |= mixer_ui(ui, adjustment, output_name, channel_names);
+            let accent = colorize.then(|| channel_color(palette, output_name, index));
+            changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);
         });
     }
     changed
 }
 
-fn draw_histogram(ui: &mut egui::Ui, original: Option<&[u32; 256]>, adjusted: Option<&[u32; 256]>) {
+fn with_accent<R>(
+    ui: &mut egui::Ui,
+    accent: Option<egui::Color32>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.scope(|ui| {
+        if let Some(color) = accent {
+            let visuals = ui.visuals_mut();
+            visuals.selection.bg_fill = color;
+            visuals.selection.stroke.color = color;
+            visuals.widgets.active.bg_fill = color.gamma_multiply(0.45);
+            visuals.widgets.hovered.bg_fill = color.gamma_multiply(0.28);
+        }
+        add(ui)
+    })
+    .inner
+}
+
+fn channel_click_state(
+    selected_channel: usize,
+    solo_channel: Option<usize>,
+    clicked_channel: usize,
+) -> (usize, Option<usize>) {
+    if selected_channel != clicked_channel {
+        // First click on another channel selects it for editing and returns to composite.
+        (clicked_channel, None)
+    } else if solo_channel == Some(clicked_channel) {
+        // Second click while solo is active returns to the composite preview.
+        (selected_channel, None)
+    } else {
+        // Clicking the already-selected channel toggles its monochrome solo preview on.
+        (selected_channel, Some(clicked_channel))
+    }
+}
+
+#[cfg(test)]
+mod channel_interaction_tests {
+    use super::channel_click_state;
+
+    #[test]
+    fn first_click_selects_without_solo_then_active_click_toggles_solo() {
+        assert_eq!(channel_click_state(0, None, 2), (2, None));
+        assert_eq!(channel_click_state(2, None, 2), (2, Some(2)));
+        assert_eq!(channel_click_state(2, Some(2), 2), (2, None));
+    }
+
+    #[test]
+    fn selecting_another_channel_exits_previous_solo() {
+        assert_eq!(channel_click_state(2, Some(2), 4), (4, None));
+    }
+}
+
+fn channel_display_name<'a>(
+    palette: Option<&'a ChannelPalette>,
+    actual_name: &'a str,
+    index: usize,
+) -> &'a str {
+    palette
+        .map(|palette| palette.display_name(actual_name, index))
+        .unwrap_or(actual_name)
+}
+
+fn channel_color(palette: Option<&ChannelPalette>, name: &str, index: usize) -> egui::Color32 {
+    let [r, g, b] = palette
+        .map(|palette| palette.color(name, index))
+        .unwrap_or_else(|| palette::fallback_channel_color(name, index));
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn channel_color_with_photoshop(
+    palette: Option<&ChannelPalette>,
+    photoshop_display: &[Option<tiff_io::PhotoshopChannelDisplay>],
+    name: &str,
+    index: usize,
+) -> egui::Color32 {
+    // Explicit project palette entries always win. For channels beyond the
+    // configured palette, use the TIFF's Photoshop Spot display color before
+    // falling back to the deterministic generic palette.
+    if palette
+        .and_then(|palette| palette.channels.get(index))
+        .is_some()
+    {
+        return channel_color(palette, name, index);
+    }
+    if let Some(info) = photoshop_display.get(index).and_then(|value| *value) {
+        if info.is_spot() {
+            if let Some([r, g, b]) = info.rgb {
+                return egui::Color32::from_rgb(
+                    (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                );
+            }
+        }
+    }
+    channel_color(palette, name, index)
+}
+
+fn palette_entry_readonly(ui: &mut egui::Ui, entry: &palette::ChannelPaletteEntry) {
+    let [r, g, b] = entry.color;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+        ui.label(&entry.name);
+    });
+}
+
+#[derive(Clone, Copy)]
+enum VectorIconKind {
+    Export,
+    Check,
+}
+
+struct VectorIconButton {
+    icon: VectorIconKind,
+    min_size: egui::Vec2,
+    frame: bool,
+    sense: egui::Sense,
+}
+
+impl VectorIconButton {
+    fn export() -> Self {
+        Self {
+            icon: VectorIconKind::Export,
+            min_size: egui::vec2(20.0, 20.0),
+            frame: true,
+            sense: egui::Sense::click(),
+        }
+    }
+
+    fn check() -> Self {
+        Self {
+            icon: VectorIconKind::Check,
+            min_size: egui::vec2(20.0, 20.0),
+            frame: true,
+            sense: egui::Sense::click(),
+        }
+    }
+
+    fn min_size(mut self, size: egui::Vec2) -> Self {
+        self.min_size = size;
+        self
+    }
+
+    fn frame(mut self, frame: bool) -> Self {
+        self.frame = frame;
+        self
+    }
+
+    fn sense(mut self, sense: egui::Sense) -> Self {
+        self.sense = sense;
+        self
+    }
+}
+
+impl egui::Widget for VectorIconButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(self.min_size, self.sense);
+        let enabled = ui.is_enabled();
+        let visuals = ui.style().interact(&response);
+
+        if self.frame {
+            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+            ui.painter()
+                .rect_stroke(rect, 4.0, visuals.bg_stroke, egui::StrokeKind::Inside);
+        } else if enabled && response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+        }
+
+        let color = if enabled {
+            visuals.fg_stroke.color
+        } else {
+            ui.visuals().weak_text_color().gamma_multiply(0.45)
+        };
+        paint_vector_icon(ui.painter(), rect, self.icon, color);
+        response
+    }
+}
+
+fn paint_vector_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: VectorIconKind,
+    color: egui::Color32,
+) {
+    let icon_rect = rect.shrink(5.0);
+    match icon {
+        VectorIconKind::Export => {
+            let stroke = egui::Stroke::new(1.8, color);
+            let x = icon_rect.center().x;
+            let top = icon_rect.top() + 0.5;
+            let shaft_bottom = icon_rect.center().y + 1.5;
+            painter.line_segment([egui::pos2(x, shaft_bottom), egui::pos2(x, top)], stroke);
+            painter.line_segment([egui::pos2(x, top), egui::pos2(x - 3.2, top + 3.2)], stroke);
+            painter.line_segment([egui::pos2(x, top), egui::pos2(x + 3.2, top + 3.2)], stroke);
+            let bottom = icon_rect.bottom() - 0.5;
+            let side_top = bottom - 4.0;
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.left() + 0.5, side_top),
+                    egui::pos2(icon_rect.left() + 0.5, bottom),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.left() + 0.5, bottom),
+                    egui::pos2(icon_rect.right() - 0.5, bottom),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.right() - 0.5, bottom),
+                    egui::pos2(icon_rect.right() - 0.5, side_top),
+                ],
+                stroke,
+            );
+        }
+        VectorIconKind::Check => {
+            let stroke = egui::Stroke::new(2.0, color);
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.left() + 1.0, icon_rect.center().y),
+                    egui::pos2(icon_rect.center().x - 1.0, icon_rect.bottom() - 1.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(icon_rect.center().x - 1.0, icon_rect.bottom() - 1.5),
+                    egui::pos2(icon_rect.right() - 0.5, icon_rect.top() + 1.0),
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
+fn clickable_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    left: &str,
+    trailing: Option<&str>,
+    accent: Option<egui::Color32>,
+    height: f32,
+) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill.gamma_multiply(0.72)
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    let left_color = accent.unwrap_or_else(|| {
+        if selected {
+            visuals.selection.stroke.color
+        } else {
+            visuals.text_color()
+        }
+    });
+    ui.painter().text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        left,
+        egui::FontId::proportional(14.0),
+        left_color,
+    );
+    if let Some(trailing) = trailing {
+        ui.painter().text(
+            rect.right_center() - egui::vec2(8.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            trailing,
+            egui::FontId::proportional(12.5),
+            visuals.weak_text_color(),
+        );
+    }
+    response
+}
+
+fn clipping_warning_color(stats: render::ChannelClippingStats) -> Option<egui::Color32> {
+    let max = stats.max_percent();
+    if max >= 1.0 {
+        Some(egui::Color32::RED)
+    } else if max >= 0.10 {
+        Some(egui::Color32::YELLOW)
+    } else {
+        None
+    }
+}
+
+fn clipping_tooltip(stats: render::ChannelClippingStats) -> String {
+    format!(
+        "Preview clipping estimate · Levels: black ~{:.2}%, white ~{:.2}% · Curve: black ~{:.2}%, white ~{:.2}% · {} sampled pixels",
+        stats.levels_black_percent(),
+        stats.levels_white_percent(),
+        stats.curve_black_percent(),
+        stats.curve_white_percent(),
+        stats.sample_count,
+    )
+}
+
+fn clipping_summary_ui(ui: &mut egui::Ui, stats: render::ChannelClippingStats) {
+    let warning = clipping_warning_color(stats);
+    egui::Frame::new()
+        .inner_margin(6)
+        .corner_radius(4)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(color) = warning {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.0, color);
+                }
+                ui.strong("Clipping estimate");
+                ui.label(format!(
+                    "Levels  Black ~{:.2}%  White ~{:.2}%",
+                    stats.levels_black_percent(),
+                    stats.levels_white_percent(),
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "Curve  Black ~{:.2}%  White ~{:.2}%",
+                    stats.curve_black_percent(),
+                    stats.curve_white_percent(),
+                ));
+            });
+            ui.small(format!(
+                "Preview estimate from {} sampled pixels · yellow ≥0.10% · red ≥1.00%",
+                stats.sample_count,
+            ));
+        });
+    ui.add_space(5.0);
+}
+
+fn clickable_channel_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    solo: bool,
+    label: &str,
+    accent: egui::Color32,
+    warning: Option<egui::Color32>,
+    height: f32,
+) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill.gamma_multiply(0.72)
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+
+    let indicator = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 14.0, rect.center().y),
+        egui::vec2(11.0, 11.0),
+    );
+    if solo {
+        ui.painter().rect_filled(indicator, 1.5, accent);
+    } else {
+        ui.painter().rect_stroke(
+            indicator,
+            1.5,
+            egui::Stroke::new(1.5, accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 28.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        accent,
+    );
+    if let Some(color) = warning {
+        ui.painter()
+            .circle_filled(egui::pos2(rect.right() - 10.0, rect.center().y), 4.5, color);
+    }
+    response
+}
+
+fn snapshot_row_with_actions(
+    ui: &mut egui::Ui,
+    selected: bool,
+    dirty: bool,
+    left: &str,
+    time: &str,
+    exported: bool,
+    export_enabled: bool,
+) -> (egui::Response, bool, bool) {
+    let width = ui.available_width().max(1.0);
+    let height = 38.0;
+    let (rect, row_response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if dirty {
+        visuals.selection.bg_fill.gamma_multiply(1.12)
+    } else if selected {
+        visuals.selection.bg_fill.gamma_multiply(0.72)
+    } else if row_response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    if dirty {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            4.0,
+            egui::Stroke::new(1.5, visuals.selection.stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 3.0, rect.bottom())),
+            2.0,
+            visuals.selection.stroke.color,
+        );
+    }
+
+    let action_width = 26.0;
+    let action_gap = 2.0;
+    let right_padding = 4.0;
+    let export_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.right() - right_padding - action_width * 0.5,
+            rect.center().y,
+        ),
+        egui::vec2(action_width, 24.0),
+    );
+    let check_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            export_rect.left() - action_gap - action_width * 0.5,
+            rect.center().y,
+        ),
+        egui::vec2(action_width, 24.0),
+    );
+    let time_right = if exported {
+        check_rect.left() - 7.0
+    } else {
+        export_rect.left() - 7.0
+    };
+
+    ui.painter().text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        left,
+        egui::FontId::proportional(if dirty { 15.0 } else { 14.0 }),
+        if selected {
+            visuals.selection.stroke.color
+        } else {
+            visuals.text_color()
+        },
+    );
+    ui.painter().text(
+        egui::pos2(time_right, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        time,
+        egui::FontId::proportional(12.0),
+        visuals.weak_text_color(),
+    );
+
+    let export_clicked = ui
+        .put(
+            export_rect,
+            VectorIconButton::export()
+                .frame(false)
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_text("Export this snapshot for the active Face")
+        .clicked()
+        && export_enabled;
+    let folder_clicked = if exported {
+        ui.put(
+            check_rect,
+            VectorIconButton::check()
+                .frame(false)
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_text("Open export folder")
+        .clicked()
+    } else {
+        false
+    };
+    (row_response, export_clicked, folder_clicked)
+}
+
+fn snapshot_day_time(created_at_unix_ms: i64) -> (String, String) {
+    if created_at_unix_ms <= 0 {
+        return ("Earlier snapshots".to_owned(), "-".to_owned());
+    }
+    match Local.timestamp_millis_opt(created_at_unix_ms).single() {
+        Some(value) => (
+            value.format("%Y-%m-%d").to_string(),
+            value.format("%H:%M").to_string(),
+        ),
+        None => ("Earlier snapshots".to_owned(), "-".to_owned()),
+    }
+}
+
+fn draw_histogram(
+    ui: &mut egui::Ui,
+    original: Option<&[u32; 256]>,
+    adjusted: Option<&[u32; 256]>,
+    accent: Option<egui::Color32>,
+) {
     let desired = egui::vec2(ui.available_width().max(80.0), 105.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_stroke(rect, 2.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Inside);
-
-    let max_value = original.into_iter().flat_map(|bins| bins.iter())
+    painter.rect_stroke(
+        rect,
+        2.0,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let max_value = original
+        .into_iter()
+        .flat_map(|bins| bins.iter())
         .chain(adjusted.into_iter().flat_map(|bins| bins.iter()))
-        .copied().max().unwrap_or(1).max(1) as f32;
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32;
     let original_color = ui.visuals().weak_text_color();
-    let adjusted_color = ui.visuals().selection.stroke.color;
+    let adjusted_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
     for index in 0..256 {
         let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
         if let Some(bins) = original {
             let h = bins[index] as f32 / max_value * rect.height();
             painter.line_segment(
-                [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
+                [
+                    egui::pos2(x, rect.bottom()),
+                    egui::pos2(x, rect.bottom() - h),
+                ],
                 egui::Stroke::new(1.0, original_color),
             );
         }
         if let Some(bins) = adjusted {
             let h = bins[index] as f32 / max_value * rect.height();
             painter.line_segment(
-                [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
+                [
+                    egui::pos2(x, rect.bottom()),
+                    egui::pos2(x, rect.bottom() - h),
+                ],
                 egui::Stroke::new(1.0, adjusted_color),
             );
         }
     }
 }
 
-fn draw_curve(ui: &mut egui::Ui, curve: model::Curve) {
-    let desired = egui::vec2(ui.available_width().min(300.0).max(120.0), 150.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_stroke(rect, 2.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Inside);
-    painter.line_segment(
-        [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.top())],
-        egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
-    );
-    let mut last = None;
-    for step in 0..=64 {
-        let x = step as f32 / 64.0;
-        let y = model::apply_curve(x, curve);
-        let point = egui::pos2(
-            egui::lerp(rect.x_range(), x),
-            egui::lerp(rect.bottom()..=rect.top(), y),
-        );
-        if let Some(previous) = last {
-            painter.line_segment([previous, point], ui.visuals().selection.stroke);
-        }
-        last = Some(point);
+fn apply_theme(ctx: &egui::Context, dark: bool) {
+    if dark {
+        ctx.set_visuals(egui::Visuals::dark());
+    } else {
+        ctx.set_visuals(egui::Visuals::light());
     }
 }
 
-fn apply_theme(ctx: &egui::Context, dark: bool) {
-    if dark { ctx.set_visuals(egui::Visuals::dark()); } else { ctx.set_visuals(egui::Visuals::light()); }
+fn physical_dimensions_cm(width_px: u32, height_px: u32, dpi: dpi::DpiInfo) -> (f64, f64) {
+    let dpi_x = dpi.dpi_x.max(1.0);
+    let dpi_y = dpi.dpi_y.max(1.0);
+    (
+        width_px as f64 / dpi_x * 2.54,
+        height_px as f64 / dpi_y * 2.54,
+    )
+}
+
+fn format_cm_value(value: f64) -> String {
+    let rounded = value.round();
+    if (value - rounded).abs() < 0.05 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn face_identity_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn duplicate_face_counts(faces: &[RuntimeFace]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for face in faces {
+        *counts.entry(face_identity_key(&face.path)).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn build_project_file_metadata(
+    project: &ShadeProject,
+    faces: &[RuntimeFace],
+    active_face_index: usize,
+) -> model::ProjectFileMetadata {
+    let mut total_source_bytes = 0u64;
+    let mut entries = Vec::with_capacity(faces.len());
+    for (index, face) in faces.iter().enumerate() {
+        let fs_metadata = std::fs::metadata(&face.path).ok();
+        let file_size_bytes = fs_metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
+        total_source_bytes = total_source_bytes.saturating_add(file_size_bytes);
+        let modified_at_unix_ms = fs_metadata
+            .as_ref()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(system_time_unix_ms);
+        let tiff = &face.preview.metadata;
+        let label = project
+            .faces
+            .get(index)
+            .map(|face| face.label.clone())
+            .unwrap_or_else(|| {
+                face.path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("Face {}", index + 1))
+            });
+        entries.push(model::FaceFileMetadata {
+            label,
+            source_file_name: face
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            width: tiff.width,
+            height: tiff.height,
+            bit_depth: tiff.bit_depth,
+            color_model: tiff.color_model.title().to_owned(),
+            channel_count: tiff.samples_per_pixel,
+            base_channel_count: tiff.base_channel_count,
+            channel_names: tiff.channel_names.clone(),
+            dpi_x: face.dpi.dpi_x,
+            dpi_y: face.dpi.dpi_y,
+            dpi_from_source: face.dpi.has_physical_resolution,
+            resolution_unit: face.dpi.unit,
+            file_size_bytes,
+            modified_at_unix_ms,
+        });
+    }
+    model::ProjectFileMetadata {
+        saved_at_unix_ms: unix_ms_now(),
+        face_count: entries.len(),
+        active_face_index: active_face_index.min(entries.len().saturating_sub(1)),
+        total_source_bytes,
+        faces: entries,
+    }
+}
+
+fn system_time_unix_ms(value: std::time::SystemTime) -> Option<i64> {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+}
+
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn adjustment_is_modified(adjustment: &ChannelAdjustment) -> bool {
+    let default = ChannelAdjustment::default();
+    adjustment.levels != default.levels
+        || adjustment.mixer != default.mixer
+        || adjustment.curve != default.curve
+}
+
+fn reveal_in_explorer(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        if path.is_file() {
+            std::process::Command::new("explorer.exe")
+                .arg("/select,")
+                .arg(path)
+                .spawn()
+                .map_err(|err| format!("Cannot reveal {} in Explorer: {err}", path.display()))?;
+            return Ok(());
+        }
+    }
+    let folder = path.parent().unwrap_or(path);
+    open_folder(folder)
+}
+
+fn open_folder(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("Cannot open export folder {}: {err}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err("Opening export folders is only available in the Windows build.".to_owned())
+    }
 }
 
 fn sanitize_filename(value: &str) -> String {
     let filtered = value
         .chars()
-        .map(|ch| if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') { '_' } else { ch })
+        .map(|ch| {
+            if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                ch
+            }
+        })
         .collect::<String>();
-    if filtered.trim().is_empty() { "shade-project".to_owned() } else { filtered }
+    if filtered.trim().is_empty() {
+        "shade-project".to_owned()
+    } else {
+        filtered
+    }
 }

@@ -1,132 +1,103 @@
 # Shade Editor architecture
 
-This document is the hand-off map for future developers and AI agents.
+This document is the current hand-off map for developers and AI agents.
 
-## Design constraints
+## Hard invariants
 
-1. The application is a native Windows desktop program. Do not introduce WebView, Electron, Tauri web front-ends, or browser-hosted UI.
-2. Source TIFF Face files are immutable inputs. `.shade` stores recipes and references; exporting creates new TIFF files.
-3. Never hard-code color adjustments to exactly four channels. The base workflow is CMYK plus zero or more additional/spot channels.
-4. Channel names are stable project keys where possible. Any future channel-ID migration must be schema-versioned.
-5. UI code must not become the TIFF parser or color engine. Keep IO/model/render/export modules independently testable.
-6. Do not claim Photoshop/RIP compatibility without round-trip tests using real production files.
+1. The application is a native Windows desktop program. Do not introduce WebView, Electron, Tauri web front-ends or browser-hosted UI.
+2. Source TIFF Face files are immutable inputs. `.shade` stores recipes/references; export creates/replaces output TIFFs only through the export backend.
+3. Never hard-code production adjustment logic to exactly four channels. RGB/CMYK base channels may be followed by zero or more additional/Spot channels.
+4. Real TIFF channel names/order remain authoritative. Palette aliases are UI-only.
+5. UI code must not become the TIFF parser, export engine or ICC engine. Keep IO/model/render/export/color-management code independently testable.
+6. Preview ICC assignment must never leak into `export.rs`. Export preserves the source embedded ICC payload and operates on adjustment output samples, not screen RGB.
+7. Do not claim Photoshop/RIP compatibility without round-trip testing on real production files.
 
-## Modules
+## Active source layout
 
-### `model.rs`
-Owns the `.shade` project schema and adjustment domain model.
+Legacy version-suffixed implementations were removed. Active modules have canonical names:
 
-- `ShadeProject`: project root and schema version.
-- `FaceRef`: source-file reference and display label.
-- `ChannelAdjustment`: per-output-channel settings.
-- `Levels`: black/gamma/white input and output mapping.
-- `Curve`: compact v1 curve representation.
-- `MixerRow`: N-input coefficient row plus constant for one output channel.
-- `TestCodeConfig`: export raster settings.
+- `main.rs` — egui UI and application orchestration.
+- `model.rs` — schema-v9 `.shade` model, Snapshots, adjustments, Test Code and project preview-color settings.
+- `color_management.rs` — embedded/assigned ICC preview transforms and installed Windows profile discovery.
+- `tiff_io.rs` — TIFF decode, channel discovery, Photoshop resources, Spot polarity and metadata.
+- `render.rs` — preview adjustment pipeline, clipping estimates and RGB/Spot composition.
+- `export.rs` — full-resolution production TIFF renderer/writer.
+- `validation.rs` — production round-trip comparison.
+- `settings.rs` — application-only preferences such as layout, diagnostics, palettes and export defaults.
+- `previous_shades.rs` — Project View cache/search/inspection.
+- `recovery.rs` — rotating recovery states.
+- `update.rs` — isolated self-update subsystem.
+- `workflow.rs` — missing-Face/relink UI helpers.
 
-`ShadeProject::ensure_channels` is the central invariant builder. Every discovered channel receives an adjustment and an identity mixer row.
+`lib.rs` exposes the production backend required by TIFF conformance tests. `Cargo.toml` explicitly builds `src/main.rs` as `ShadeEditor`.
 
-Schema v9 is the current clean-break project format. Future schema changes should increment `SHADE_SCHEMA_VERSION`; add migration only when backward compatibility is explicitly required.
+## `.shade` model
 
-### `tiff_io.rs`
-Owns TIFF decoding and source metadata discovery.
+Schema v9 remains the clean-break format. New fields that are safe to default can be added with `#[serde(default)]` without forcing a schema bump; incompatible semantic changes still require incrementing `SHADE_SCHEMA_VERSION`.
 
-Current responsibilities:
+`ShadeProject::preview_color` is project-wide and contains:
 
-- decode 8/16-bit TIFF samples;
-- normalize samples to internal `u16`;
-- account for planar configuration;
-- discover CMYK base channels and extra channels;
-- retain ICC tag 34675;
-- retain Photoshop Image Resources tag 34377;
-- parse Photoshop channel-name resources 1006/1045;
-- build downsampled preview planes and histograms.
+- enabled/disabled color-managed preview;
+- optional assigned ICC/ICM path (`None` means the TIFF embedded profile);
+- rendering intent;
+- optional black-point compensation.
 
-Normal chunky strip TIFFs are decoded strip-by-strip for preview. Planar/tiled inputs retain the full-decode compatibility path. Keep the public `PreviewFace` boundary so UI code remains independent from decoding strategy.
+These values are not part of Snapshot adjustment history because they describe the project viewing environment rather than a shade recipe. They are saved in `.shade` so reopening the project reproduces the preview setup when the referenced profile is available.
 
-### `render.rs`
-Pure preview processing.
+## Adjustment/render data flow
 
-Pipeline:
-
-1. normalize each source channel;
-2. Levels;
-3. Curve;
-4. N×N mixer;
-5. convert adjusted planes to preview RGBA or isolated-channel grayscale.
-
-The base RGB/CMYK composite conversion remains an engineering approximation, but Photoshop DisplayInfo 1077 Spot colors and Solidity are honored when present. Full ICC color-managed proofing should still live behind this module rather than leaking conversion into UI code.
-
-### `export.rs`
-Full-resolution destructive renderer for newly-created output files only.
-
-It applies the same adjustment order as `render.rs`, can rasterize test code into a selected separation, and writes CMYK plus TIFF ExtraSamples. ICC and Photoshop resource payloads are copied from the source when present.
-
-Current hardening:
-
-- chunky strip inputs stream through preview and export;
-- output preserves approved resolution/orientation/ICC/Photoshop metadata and source lossless compression/predictor intent;
-- output is committed with same-directory atomic replacement;
-- Photoshop DisplayInfo 1077 is parsed for Spot display semantics.
-
-Remaining production validation:
-
-- reopen representative no-adjustment exports in Photoshop and the actual RIP to confirm Spot semantics/order;
-- maintain regression fixtures or metadata baselines for each production TIFF family;
-- treat the preview as engineering simulation, not a press proof.
-
-### `settings.rs`
-Persists app-level preferences under `%LOCALAPPDATA%\ShadeEditor\settings.json`.
-
-`auto_update` defaults to `true`. Keep manual update checking available even when automatic updates are disabled.
-
-### `update.rs`
-Self-update subsystem modeled after GahYar but isolated from the UI.
-
-- checks GitHub `releases/latest` for `emadgh/windows-shade-editor`;
-- compares version tags with the Cargo package version;
-- downloads the `ShadeEditor.exe` release asset with WinHTTP;
-- validates basic Windows executable shape;
-- stages it in the temp directory;
-- replaces/relaunches through a short PowerShell helper after the current process exits.
-
-The updater must never replace the running executable while a project is still open. Auto-update downloads in the background, but install is an explicit **Restart and update** action.
-
-Tagged Releases publish `ShadeEditor.exe.sha256`; the updater requires and verifies that SHA-256 digest before staging the executable. A future code-signing step can add publisher/authenticode verification on top.
-
-### `main.rs`
-Application orchestration and egui UI.
-
-Major surfaces:
-
-- toolbar: project/open/save/export/settings/about;
-- left panel: Faces;
-- center: active Face viewport;
-- right panel: Channels, histogram, Levels/Curve/Mixer, Test Code;
-- Settings window: automatic update and preview preferences;
-- About window: app/version/repository/update status.
-
-Keep expensive processing out of paint callbacks as the project grows. `RuntimeFace::dirty` is the current invalidation mechanism.
-
-## Data flow
+Production adjustment order:
 
 ```text
-TIFF source
-  -> tiff_io::decode/load_preview
-  -> RuntimeFace preview planes
-  -> render::adjusted_planes
-  -> viewport/histogram
-
-.shade
-  <-> model::ShadeProject
-
-TIFF source + ShadeProject
-  -> export::export_face
-  -> adjusted TIFF output
+TIFF source samples
+  -> Levels
+  -> N×N Channel Mixer
+  -> Curve
+  -> export sample
 ```
 
-## Release flow
+Preview reuses the adjusted downsampled planes, then performs display conversion:
 
-`.github/workflows/build-windows.yml` checks, tests and builds the x64 MSVC target. On a `v*` tag it publishes `ShadeEditor.exe` as a GitHub Release asset. The updater expects that exact asset name.
+```text
+adjusted base RGB/CMYK/Gray
+  -> embedded ICC or assigned preview ICC
+  -> LittleCMS intent (+ optional BPC)
+  -> sRGB
+  -> declared Photoshop Spot DisplayInfo composite
+  -> egui texture
+```
 
-When changing executable names, repository names or release naming, update both the workflow and `src/update.rs` in the same change.
+Solo-channel view intentionally remains an engineering separation view, not a colorimetric composite.
+
+Assigned ICC is an **input/source-profile override for preview**. It is not a proofing profile. A true printer/RIP soft proof would require LittleCMS proofing transforms and a separate proof-device profile and is currently out of scope.
+
+## ICC profile catalog
+
+`color_management::installed_profiles()` scans the standard Windows color-profile directory (`%WINDIR%\System32\spool\drivers\color`) for `.icc`/`.icm`, opens each valid profile with LittleCMS and records its description, base color space and device class. UI assignment is allowed only when the profile color space matches the active TIFF base model. Browse permits valid compatible profiles outside the system directory.
+
+The Color Management window follows Project View's search/navigation behavior: typing focuses/updates search, Up/Down changes the compatible selection and Enter assigns it.
+
+## TIFF / Spot rules
+
+`tiff_io.rs` retains ICC tag 34675, Photoshop Image Resources 34377 and ImageSourceData 37724. Photoshop DisplayInfo resource 1077 drives declared Spot display color/Solidity. Known Alpha channels are not composite printing inks.
+
+Photoshop Spot samples are normalized internally to ink-coverage polarity and converted back for export. Do not change this contract without fixtures and production validation.
+
+## DPI
+
+`dpi.rs` owns physical-resolution parsing and fallback. `AppSettings::default_dpi` defaults to 220 DPI. `DpiInfo::used_default` distinguishes source DPI from fallback. Do not introduce a 72-DPI fallback in UI, Test Code or export.
+
+## Channel palettes
+
+`palette.rs` owns built-in palettes; `settings.rs` owns custom palette library/default choice; `ShadeProject::channel_palette` stores the project snapshot. Palette names/colors are presentation only. TIFF names/order, adjustment keys, mixer keys, Test Code channel IDs and export metadata always use real source channel names.
+
+## Production export boundary
+
+`export.rs` applies full-resolution adjustments and Test Code, preserves approved metadata, uses bounded streaming/spooling paths, selects/preserves BigTIFF when required and commits output atomically. Preview ICC settings are forbidden inputs to this module.
+
+## Remaining production validation
+
+- Reopen identity exports in Photoshop and the production RIP and confirm Spot type/order/name, DisplayInfo, ICC, DPI and press interpretation.
+- Keep regression fixtures/baselines for each production TIFF family.
+- Validate large BigTIFF and tiled/planar production artwork.
+- Validate Windows Shell install/upgrade/removal on clean workstations.
