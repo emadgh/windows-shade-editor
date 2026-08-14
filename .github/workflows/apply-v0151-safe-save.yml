@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - scripts/apply_v0151_safe_save.py
+      - .github/workflows/apply-v0151-safe-save.yml
   workflow_dispatch:
 
 permissions:
