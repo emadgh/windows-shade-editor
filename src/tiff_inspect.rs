@@ -11,6 +11,9 @@ use crate::tiff_io::{self, ChunkStorage};
 
 const MAX_INSPECTED_IFDS: usize = 1024;
 const MAX_PHOTOSHOP_RESOURCE_ENTRIES: usize = 512;
+const TIFF_TAG_INK_SET: Tag = Tag::Unknown(332);
+const TIFF_TAG_INK_NAMES: Tag = Tag::Unknown(333);
+const TIFF_TAG_NUMBER_OF_INKS: Tag = Tag::Unknown(334);
 
 #[derive(Clone, Debug)]
 pub struct TiffInspection {
@@ -37,10 +40,10 @@ pub fn inspect(path: &Path, default_dpi: f64) -> Result<TiffInspection, String> 
     let rows_per_strip = tag_u64(&mut decoder, Tag::RowsPerStrip);
     let tile_width = tag_u64(&mut decoder, Tag::TileWidth);
     let tile_length = tag_u64(&mut decoder, Tag::TileLength);
-    let ink_set = tag_u16(&mut decoder, Tag::InkSet);
-    let number_of_inks = tag_u64(&mut decoder, Tag::NumberOfInks);
+    let ink_set = tag_u16(&mut decoder, TIFF_TAG_INK_SET);
+    let number_of_inks = tag_u64(&mut decoder, TIFF_TAG_NUMBER_OF_INKS);
     let ink_names = decoder
-        .get_tag_ascii_string(Tag::InkNames)
+        .get_tag_ascii_string(TIFF_TAG_INK_NAMES)
         .ok()
         .map(parse_ink_names)
         .unwrap_or_default();
