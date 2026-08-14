@@ -1,3 +1,11 @@
+# Shade Editor 0.13.1
+
+- Index Snapshot names, Snapshot IDs and effective Test Code values in the persistent Previous Shades cache.
+- Previous Shades search can now find projects by a specific Snapshot/Test code without reopening `.shade` files during search.
+- Existing Previous Shades history is migrated once when cached Snapshot metadata is missing and the `.shade` file is available.
+- Opening, Save and Quick Save refresh the cached Snapshot/Test index immediately so renamed/new tests become searchable at once.
+- Search results show the matching Snapshot name/code when a Snapshot term produced the match.
+
 # Shade Editor 0.13.0
 
 - Add TIFF drag-and-drop directly into the Faces list.

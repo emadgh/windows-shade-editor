@@ -9,6 +9,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{FaceFileMetadata, ProjectThumbnail, ShadeProject};
 
+const SNAPSHOT_CACHE_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CachedSnapshot {
+    pub id: u64,
+    pub name: String,
+    /// Effective code rendered by Test Code for this snapshot. When the project
+    /// does not override Test Code text, this is the snapshot name itself.
+    pub code: String,
+    pub created_at_unix_ms: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PreviousShadeEntry {
@@ -17,6 +30,11 @@ pub struct PreviousShadeEntry {
     pub last_opened_unix_ms: i64,
     pub saved_at_unix_ms: i64,
     pub open_count: u64,
+    /// Versioned local index so old Previous Shades JSON can be upgraded once
+    /// without rereading every .shade file on each application start.
+    pub snapshot_cache_version: u32,
+    pub snapshots: Vec<CachedSnapshot>,
+    pub test_code_text: String,
 }
 
 impl Default for PreviousShadeEntry {
@@ -27,6 +45,9 @@ impl Default for PreviousShadeEntry {
             last_opened_unix_ms: 0,
             saved_at_unix_ms: 0,
             open_count: 0,
+            snapshot_cache_version: 0,
+            snapshots: Vec::new(),
+            test_code_text: String::new(),
         }
     }
 }
@@ -81,6 +102,60 @@ pub struct ShadeInspection {
     pub file_modified_unix_ms: Option<i64>,
 }
 
+impl PreviousShadeEntry {
+    fn refresh_from_project(&mut self, project: &ShadeProject) {
+        self.project_name = project.name.trim().to_owned();
+        self.test_code_text = project.test_code.text.trim().to_owned();
+        let explicit_code = self.test_code_text.as_str();
+        self.snapshots = project
+            .snapshots
+            .iter()
+            .map(|snapshot| {
+                let name = snapshot.name.trim().to_owned();
+                CachedSnapshot {
+                    id: snapshot.id,
+                    code: if explicit_code.is_empty() {
+                        name.clone()
+                    } else {
+                        explicit_code.to_owned()
+                    },
+                    name,
+                    created_at_unix_ms: snapshot.created_at_unix_ms,
+                }
+            })
+            .collect();
+        self.snapshot_cache_version = SNAPSHOT_CACHE_VERSION;
+    }
+
+    pub fn matches_query(&self, query_lower: &str) -> bool {
+        let query = query_lower.trim();
+        if query.is_empty() {
+            return true;
+        }
+        contains_case_insensitive(&self.project_name, query)
+            || contains_case_insensitive(&self.path, query)
+            || self.test_code_matches(query)
+            || self.matching_snapshot(query).is_some()
+    }
+
+    pub fn matching_snapshot(&self, query_lower: &str) -> Option<&CachedSnapshot> {
+        let query = query_lower.trim();
+        if query.is_empty() {
+            return None;
+        }
+        self.snapshots.iter().find(|snapshot| {
+            contains_case_insensitive(&snapshot.name, query)
+                || contains_case_insensitive(&snapshot.code, query)
+                || snapshot_id_matches(snapshot.id, query)
+        })
+    }
+
+    pub fn test_code_matches(&self, query_lower: &str) -> bool {
+        !self.test_code_text.trim().is_empty()
+            && contains_case_insensitive(&self.test_code_text, query_lower.trim())
+    }
+}
+
 impl PreviousShadesStore {
     pub fn load() -> Result<Self, String> {
         let path = history_path();
@@ -90,6 +165,12 @@ impl PreviousShadesStore {
         let mut store: Self = serde_json::from_str(&text)
             .map_err(|err| format!("Cannot parse Previous Shades history: {err}"))?;
         store.sanitize();
+        // Cache migration is intentionally one-shot. Existing history entries
+        // created before snapshot indexing are hydrated from the .shade file
+        // only when the file is currently available.
+        if store.refresh_stale_snapshot_cache() {
+            let _ = store.save();
+        }
         Ok(store)
     }
 
@@ -112,11 +193,13 @@ impl PreviousShadesStore {
         let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let display = normalized.to_string_lossy().into_owned();
         let now = unix_ms_now();
-        let saved_at = ShadeProject::load(path)
-            .ok()
+        let loaded_project = ShadeProject::load(path).ok();
+        let saved_at = loaded_project
+            .as_ref()
             .and_then(|project| {
                 project
                     .file_metadata
+                    .as_ref()
                     .map(|metadata| metadata.saved_at_unix_ms)
             })
             .unwrap_or_else(|| {
@@ -126,25 +209,67 @@ impl PreviousShadesStore {
                     .and_then(system_time_to_unix_ms)
                     .unwrap_or(0)
             });
+        let cached_name = loaded_project
+            .as_ref()
+            .map(|project| project.name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| project_name.trim())
+            .to_owned();
+
         if let Some(entry) = self
             .entries
             .iter_mut()
             .find(|entry| same_path(&entry.path, &display))
         {
             entry.path = display;
-            entry.project_name = project_name.trim().to_owned();
+            entry.project_name = cached_name;
             entry.last_opened_unix_ms = now;
             entry.saved_at_unix_ms = saved_at;
             entry.open_count = entry.open_count.saturating_add(1).max(1);
+            if let Some(project) = loaded_project.as_ref() {
+                // This path is used after Open, Save and Quick Save, so every
+                // successful project save immediately refreshes its snapshot
+                // names/codes in the persistent Previous Shades cache.
+                entry.refresh_from_project(project);
+            }
         } else {
-            self.entries.push(PreviousShadeEntry {
+            let mut entry = PreviousShadeEntry {
                 path: display,
-                project_name: project_name.trim().to_owned(),
+                project_name: cached_name,
                 last_opened_unix_ms: now,
                 saved_at_unix_ms: saved_at,
                 open_count: 1,
-            });
+                ..PreviousShadeEntry::default()
+            };
+            if let Some(project) = loaded_project.as_ref() {
+                entry.refresh_from_project(project);
+            }
+            self.entries.push(entry);
         }
+    }
+
+    fn refresh_stale_snapshot_cache(&mut self) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if entry.snapshot_cache_version >= SNAPSHOT_CACHE_VERSION {
+                continue;
+            }
+            let path = Path::new(&entry.path);
+            let Ok(project) = ShadeProject::load(path) else {
+                continue;
+            };
+            entry.refresh_from_project(&project);
+            if let Some(saved_at) = project
+                .file_metadata
+                .as_ref()
+                .map(|metadata| metadata.saved_at_unix_ms)
+                .filter(|saved_at| *saved_at > 0)
+            {
+                entry.saved_at_unix_ms = saved_at;
+            }
+            changed = true;
+        }
+        changed
     }
 
     fn sanitize(&mut self) {
@@ -152,6 +277,11 @@ impl PreviousShadesStore {
         for mut entry in self.entries.drain(..) {
             entry.path = entry.path.trim().to_owned();
             entry.project_name = entry.project_name.trim().to_owned();
+            entry.test_code_text = entry.test_code_text.trim().to_owned();
+            for snapshot in &mut entry.snapshots {
+                snapshot.name = snapshot.name.trim().to_owned();
+                snapshot.code = snapshot.code.trim().to_owned();
+            }
             if entry.path.is_empty() {
                 continue;
             }
@@ -164,6 +294,13 @@ impl PreviousShadesStore {
                     existing.project_name = entry.project_name;
                     existing.last_opened_unix_ms = entry.last_opened_unix_ms;
                     existing.saved_at_unix_ms = entry.saved_at_unix_ms;
+                    existing.snapshot_cache_version = entry.snapshot_cache_version;
+                    existing.snapshots = entry.snapshots.clone();
+                    existing.test_code_text = entry.test_code_text.clone();
+                } else if entry.snapshot_cache_version > existing.snapshot_cache_version {
+                    existing.snapshot_cache_version = entry.snapshot_cache_version;
+                    existing.snapshots = entry.snapshots.clone();
+                    existing.test_code_text = entry.test_code_text.clone();
                 }
                 existing.open_count = existing.open_count.max(entry.open_count).max(1);
             } else {
@@ -284,6 +421,15 @@ fn system_time_to_unix_ms(value: SystemTime) -> Option<i64> {
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
 }
 
+fn contains_case_insensitive(value: &str, query_lower: &str) -> bool {
+    !query_lower.is_empty() && value.to_lowercase().contains(query_lower)
+}
+
+fn snapshot_id_matches(id: u64, query: &str) -> bool {
+    let normalized = query.trim().strip_prefix('#').unwrap_or(query.trim());
+    normalized.parse::<u64>().ok() == Some(id)
+}
+
 fn same_path(left: &str, right: &str) -> bool {
     #[cfg(windows)]
     {
@@ -307,6 +453,44 @@ mod tests {
         assert_eq!(store.entries().len(), 1);
         assert_eq!(store.entries()[0].project_name, "Second");
         assert_eq!(store.entries()[0].open_count, 2);
+    }
+
+    #[test]
+    fn snapshot_cache_searches_name_code_and_id_and_refreshes_after_save() {
+        let root =
+            std::env::temp_dir().join(format!("shade-editor-previous-shades-{}", unix_ms_now()));
+        fs::create_dir_all(&root).unwrap();
+        let shade_path = root.join("cache-test.shade");
+
+        let mut project = ShadeProject::default();
+        project.name = "Floor Tile 24".to_owned();
+        let snapshot_id = project.create_snapshot();
+        project.rename_snapshot(snapshot_id, "Kiln-A-042").unwrap();
+        project.test_code.text = "TC-042".to_owned();
+        project.save(&shade_path, &[]).unwrap();
+
+        let mut store = PreviousShadesStore::default();
+        store.record_open(&shade_path, "fallback");
+        let entry = &store.entries()[0];
+        assert_eq!(entry.snapshot_cache_version, SNAPSHOT_CACHE_VERSION);
+        assert_eq!(entry.snapshots.len(), 1);
+        assert_eq!(entry.snapshots[0].name, "Kiln-A-042");
+        assert_eq!(entry.snapshots[0].code, "TC-042");
+        assert!(entry.matches_query("kiln-a-042"));
+        assert!(entry.matches_query("tc-042"));
+        assert!(entry.matches_query(&format!("#{snapshot_id}")));
+
+        project.rename_snapshot(snapshot_id, "Kiln-A-043").unwrap();
+        project.test_code.text = "TC-043".to_owned();
+        project.save(&shade_path, &[]).unwrap();
+        store.record_open(&shade_path, &project.name);
+        let entry = &store.entries()[0];
+        assert!(!entry.matches_query("kiln-a-042"));
+        assert!(!entry.matches_query("tc-042"));
+        assert!(entry.matches_query("kiln-a-043"));
+        assert!(entry.matches_query("tc-043"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

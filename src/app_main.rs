@@ -3153,7 +3153,7 @@ impl ShadeApp {
         ui.horizontal(|ui| {
             let search = ui.add(
                 egui::TextEdit::singleline(&mut self.previous_shades_query)
-                    .hint_text("Search project name or path...")
+                    .hint_text("Search project, path, snapshot name or test code...")
                     .desired_width(320.0),
             );
             if !search.has_focus() {
@@ -3203,16 +3203,13 @@ impl ShadeApp {
             ui.add_enabled(false, egui::Button::new("Load all shades from system"))
                 .on_hover_text("Reserved for the Everything Search integration. History already uses the same importable entry model.");
         });
-        ui.small("All .shade projects opened or saved by Shade Editor are retained here. Missing paths stay in history so moved/offline projects are visible.");
+        ui.small("All .shade projects opened or saved by Shade Editor are retained here. Search uses the local cache for project/path plus Snapshot names, Snapshot IDs and effective Test Code values; missing paths stay visible.");
         ui.separator();
 
         let query = self.previous_shades_query.trim().to_lowercase();
         let mut rows = self.previous_shades.entries().to_vec();
         if !query.is_empty() {
-            rows.retain(|entry| {
-                entry.project_name.to_lowercase().contains(&query)
-                    || entry.path.to_lowercase().contains(&query)
-            });
+            rows.retain(|entry| entry.matches_query(&query));
         }
         match self.previous_shades_sort {
             previous_shades::PreviousShadesSort::LastOpened => {
@@ -3260,9 +3257,30 @@ impl ShadeApp {
                             format!("[missing] {display_name}")
                         };
                         let opened = format_previous_shade_time(entry.last_opened_unix_ms);
+                        let match_detail = if query.is_empty() {
+                            None
+                        } else {
+                            entry
+                                .matching_snapshot(&query)
+                                .map(|snapshot| {
+                                    if snapshot.code.trim().is_empty()
+                                        || snapshot.code.eq_ignore_ascii_case(&snapshot.name)
+                                    {
+                                        format!("Snapshot: {} · #{}", snapshot.name, snapshot.id)
+                                    } else {
+                                        format!("Snapshot: {} · code {}", snapshot.name, snapshot.code)
+                                    }
+                                })
+                                .or_else(|| {
+                                    entry.test_code_matches(&query).then(|| {
+                                        format!("Test code: {}", entry.test_code_text)
+                                    })
+                                })
+                        };
+                        let detail = match_detail.as_deref().unwrap_or(&opened);
                         let selected = self.previous_shades_selected.as_deref()
                             == Some(entry.path.as_str());
-                        if clickable_row(ui, selected, &label, Some(&opened), None, 38.0)
+                        if clickable_row(ui, selected, &label, Some(detail), None, 38.0)
                             .on_hover_text(&entry.path)
                             .clicked()
                         {
