@@ -1,12 +1,22 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 use lcms2::{
     ColorSpaceSignature, Flags, InfoType, Intent, Locale, PixelFormat, Profile,
     ProfileClassSignature, Transform,
 };
+use sha2::{Digest, Sha256};
 
-use crate::model::{PreviewRenderingIntent, ShadeProject};
+#[cfg(windows)]
+use windows_sys::Win32::UI::ColorSystem::{
+    ENUM_TYPE_VERSION, ENUMTYPEW, EnumColorProfilesW,
+};
+
+use crate::model::{IccProfileIdentity, PreviewRenderingIntent, ShadeProject};
+use crate::settings::AppSettings;
 use crate::tiff_io::{ColorModel, TiffMetadata};
 
 #[derive(Clone, Debug)]
@@ -15,6 +25,7 @@ pub struct InstalledIccProfile {
     pub description: String,
     color_space: ColorSpaceSignature,
     device_class: ProfileClassSignature,
+    identity: IccProfileIdentity,
 }
 
 impl InstalledIccProfile {
@@ -41,6 +52,19 @@ impl InstalledIccProfile {
         self.device_class == ProfileClassSignature::OutputClass
     }
 
+    pub fn is_display_profile(&self) -> bool {
+        self.device_class == ProfileClassSignature::DisplayClass
+            && self.color_space == ColorSpaceSignature::RgbData
+    }
+
+    pub fn identity(&self) -> &IccProfileIdentity {
+        &self.identity
+    }
+
+    pub fn matches_identity(&self, identity: &IccProfileIdentity) -> bool {
+        !identity.sha256.is_empty() && self.identity.sha256.eq_ignore_ascii_case(&identity.sha256)
+    }
+
     pub fn matches_query(&self, query: &str) -> bool {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
@@ -60,12 +84,19 @@ pub struct PreviewColorConfig {
     pub intent: PreviewRenderingIntent,
     pub black_point_compensation: bool,
     pub assigned_profile_path: Option<PathBuf>,
+    pub assigned_profile_identity: Option<IccProfileIdentity>,
     pub soft_proof_enabled: bool,
     pub proof_profile_path: Option<PathBuf>,
+    pub proof_profile_identity: Option<IccProfileIdentity>,
     pub proofing_intent: PreviewRenderingIntent,
+    pub monitor_profile_path: Option<PathBuf>,
+    pub monitor_profile_identity: Option<IccProfileIdentity>,
+    pub gamut_warning: bool,
 }
 
 impl PreviewColorConfig {
+    /// Portable/project thumbnail configuration. Monitor ICC and gamut alarm are
+    /// workstation UI concerns and are intentionally excluded from stored thumbnails.
     pub fn from_project(project: &ShadeProject) -> Self {
         Self {
             enabled: project.preview_color.enabled,
@@ -76,14 +107,27 @@ impl PreviewColorConfig {
                 .assigned_profile_path
                 .as_ref()
                 .map(PathBuf::from),
+            assigned_profile_identity: project.preview_color.assigned_profile_identity.clone(),
             soft_proof_enabled: project.preview_color.soft_proof_enabled,
             proof_profile_path: project
                 .preview_color
                 .proof_profile_path
                 .as_ref()
                 .map(PathBuf::from),
+            proof_profile_identity: project.preview_color.proof_profile_identity.clone(),
             proofing_intent: project.preview_color.proofing_intent,
+            monitor_profile_path: None,
+            monitor_profile_identity: None,
+            gamut_warning: false,
         }
+    }
+
+    pub fn for_viewport(project: &ShadeProject, settings: &AppSettings) -> Self {
+        let mut config = Self::from_project(project);
+        config.monitor_profile_path = settings.monitor_profile_path.as_ref().map(PathBuf::from);
+        config.monitor_profile_identity = settings.monitor_profile_identity.clone();
+        config.gamut_warning = settings.gamut_warning;
+        config
     }
 }
 
@@ -105,6 +149,8 @@ pub enum PreviewColorStatus {
         black_point_compensation: bool,
         proof_description: Option<String>,
         proofing_intent: Option<PreviewRenderingIntent>,
+        monitor_description: Option<String>,
+        gamut_warning: bool,
     },
     Fallback {
         reason: String,
@@ -147,6 +193,8 @@ impl PreviewColorStatus {
                 black_point_compensation,
                 proof_description,
                 proofing_intent,
+                monitor_description,
+                gamut_warning,
             } => {
                 let source = match source {
                     PreviewProfileSource::Embedded => "embedded TIFF profile".to_owned(),
@@ -159,11 +207,20 @@ impl PreviewColorStatus {
                 } else {
                     ""
                 };
+                let monitor = monitor_description
+                    .as_deref()
+                    .map(|value| format!("monitor '{}'", value))
+                    .unwrap_or_else(|| "sRGB display fallback".to_owned());
+                let gamut = if *gamut_warning {
+                    " · gamut warning on"
+                } else {
+                    ""
+                };
                 if let (Some(proof), Some(proof_intent)) =
                     (proof_description.as_ref(), proofing_intent.as_ref())
                 {
                     format!(
-                        "{} ({source}) → printer/RIP soft proof '{}' → sRGB display · source {} intent · proof {} intent{bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
+                        "{} ({source}) → printer/RIP soft proof '{}' → {monitor} · source {} intent · proof {} intent{bpc}{gamut}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
                         description,
                         proof,
                         intent.label(),
@@ -171,7 +228,7 @@ impl PreviewColorStatus {
                     )
                 } else {
                     format!(
-                        "{} ({source}) → sRGB preview · {} intent{bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
+                        "{} ({source}) → {monitor} · {} intent{bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
                         description,
                         intent.label(),
                     )
@@ -208,7 +265,7 @@ enum BaseTransform {
     Gray(Transform<[u16; 1], [u8; 3]>),
 }
 
-/// Preview-only ICC transform. Assigned source profiles and proof profiles are
+/// Preview-only ICC transform. Assigned source, proof and monitor profiles are
 /// never written to TIFF or consumed by production export.
 pub struct PreviewColorTransform {
     transform: Option<BaseTransform>,
@@ -240,6 +297,13 @@ impl PreviewColorTransform {
         let (source, source_kind, requested_label) =
             if let Some(path) = config.assigned_profile_path.as_ref() {
                 let requested_label = Some(profile_path_label(path));
+                if let Err(err) = verify_profile_identity(
+                    path,
+                    config.assigned_profile_identity.as_ref(),
+                    "assigned source",
+                ) {
+                    return Self::fallback(err, requested_label);
+                }
                 match Profile::new_file(path) {
                     Ok(profile) => (
                         profile,
@@ -284,7 +348,42 @@ impl PreviewColorTransform {
         }
 
         let description = profile_description(&source);
-        let destination = Profile::new_srgb();
+        let (destination, monitor_description) = if let Some(path) = config.monitor_profile_path.as_ref() {
+            if let Err(err) = verify_profile_identity(
+                path,
+                config.monitor_profile_identity.as_ref(),
+                "monitor/display",
+            ) {
+                return Self::fallback(err, Some(profile_path_label(path)));
+            }
+            let monitor = match Profile::new_file(path) {
+                Ok(profile) => profile,
+                Err(err) => {
+                    return Self::fallback(
+                        format!("cannot open monitor profile {}: {err}", path.display()),
+                        Some(profile_path_label(path)),
+                    );
+                }
+            };
+            if monitor.device_class() != ProfileClassSignature::DisplayClass
+                || monitor.color_space() != ColorSpaceSignature::RgbData
+            {
+                return Self::fallback(
+                    format!(
+                        "monitor profile '{}' must be an RGB Display-class profile, found {} / {}",
+                        profile_description(&monitor),
+                        profile_class_label(monitor.device_class()),
+                        color_space_label(monitor.color_space()),
+                    ),
+                    Some(profile_path_label(path)),
+                );
+            }
+            let label = profile_description(&monitor);
+            (monitor, Some(label))
+        } else {
+            (Profile::new_srgb(), None)
+        };
+
         let intent = to_lcms_intent(config.intent);
         let bpc = config.black_point_compensation;
 
@@ -295,6 +394,13 @@ impl PreviewColorTransform {
                     Some("Soft proof".to_owned()),
                 );
             };
+            if let Err(err) = verify_profile_identity(
+                path,
+                config.proof_profile_identity.as_ref(),
+                "printer/RIP proof",
+            ) {
+                return Self::fallback(err, Some(profile_path_label(path)));
+            }
             let proof = match Profile::new_file(path) {
                 Ok(profile) => profile,
                 Err(err) => {
@@ -320,11 +426,14 @@ impl PreviewColorTransform {
         };
 
         let proofing_intent = to_lcms_intent(config.proofing_intent);
-        let proof_flags = if bpc {
-            Flags::SOFT_PROOFING | Flags::BLACKPOINT_COMPENSATION
-        } else {
-            Flags::SOFT_PROOFING
-        };
+        let mut proof_flags = Flags::SOFT_PROOFING;
+        if bpc {
+            proof_flags = proof_flags | Flags::BLACKPOINT_COMPENSATION;
+        }
+        let gamut_warning = config.gamut_warning && proof.is_some();
+        if gamut_warning {
+            proof_flags = proof_flags | Flags::GAMUT_CHECK;
+        }
 
         macro_rules! make_transform {
             ($input:expr, $variant:ident) => {{
@@ -372,6 +481,8 @@ impl PreviewColorTransform {
                     black_point_compensation: bpc,
                     proof_description: proof.as_ref().map(|(_, label)| label.clone()),
                     proofing_intent: proof.as_ref().map(|_| config.proofing_intent),
+                    monitor_description,
+                    gamut_warning,
                 },
             },
             Err(err) => Self::fallback(
@@ -456,43 +567,202 @@ pub fn embedded_profile_description(metadata: &TiffMetadata) -> Option<String> {
         .map(|profile| profile_description(&profile))
 }
 
-pub fn inspect_profile(path: &Path) -> Result<InstalledIccProfile, String> {
-    let profile = Profile::new_file(path)
-        .map_err(|err| format!("Cannot open ICC profile {}: {err}", path.display()))?;
-    Ok(InstalledIccProfile {
-        path: path.to_path_buf(),
-        description: profile_description(&profile),
-        color_space: profile.color_space(),
-        device_class: profile.device_class(),
-    })
+#[derive(Clone)]
+struct CachedProfileInspection {
+    size: u64,
+    modified_ns: Option<u128>,
+    profile: InstalledIccProfile,
 }
 
-/// Enumerate installed profile files from the Windows color directory.
-pub fn installed_profiles() -> Result<Vec<InstalledIccProfile>, String> {
-    let windows = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let directory = windows
-        .join("System32")
-        .join("spool")
-        .join("drivers")
-        .join("color");
-    let entries = fs::read_dir(&directory).map_err(|err| {
-        format!(
-            "Cannot read Windows color profile directory {}: {err}",
-            directory.display()
-        )
-    })?;
-    let mut profiles = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || !is_profile_path(&path) {
-            continue;
-        }
-        if let Ok(profile) = inspect_profile(&path) {
-            profiles.push(profile);
+static PROFILE_INSPECTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedProfileInspection>>> =
+    OnceLock::new();
+
+fn profile_cache() -> &'static Mutex<HashMap<PathBuf, CachedProfileInspection>> {
+    PROFILE_INSPECTION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn inspect_profile(path: &Path) -> Result<InstalledIccProfile, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("Cannot inspect ICC profile {}: {err}", path.display()))?;
+    let size = metadata.len();
+    let modified_ns = metadata.modified().ok().and_then(|time| {
+        time.duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_nanos())
+    });
+    let cache_key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Ok(cache) = profile_cache().lock() {
+        if let Some(cached) = cache.get(&cache_key) {
+            if cached.size == size && cached.modified_ns == modified_ns {
+                return Ok(cached.profile.clone());
+            }
         }
     }
+
+    let profile = Profile::new_file(path)
+        .map_err(|err| format!("Cannot open ICC profile {}: {err}", path.display()))?;
+    let description = profile_description(&profile);
+    let bytes = fs::read(path)
+        .map_err(|err| format!("Cannot hash ICC profile {}: {err}", path.display()))?;
+    let identity = IccProfileIdentity {
+        description: description.clone(),
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    let inspected = InstalledIccProfile {
+        path: path.to_path_buf(),
+        description,
+        color_space: profile.color_space(),
+        device_class: profile.device_class(),
+        identity,
+    };
+    if let Ok(mut cache) = profile_cache().lock() {
+        cache.insert(
+            cache_key,
+            CachedProfileInspection {
+                size,
+                modified_ns,
+                profile: inspected.clone(),
+            },
+        );
+    }
+    Ok(inspected)
+}
+
+pub fn profile_identity(path: &Path) -> Result<IccProfileIdentity, String> {
+    inspect_profile(path).map(|profile| profile.identity)
+}
+
+fn verify_profile_identity(
+    path: &Path,
+    expected: Option<&IccProfileIdentity>,
+    role: &str,
+) -> Result<(), String> {
+    let Some(expected) = expected.filter(|identity| !identity.sha256.trim().is_empty()) else {
+        return Ok(());
+    };
+    let actual = profile_identity(path)?;
+    if !actual.sha256.eq_ignore_ascii_case(&expected.sha256) {
+        return Err(format!(
+            "{role} ICC at {} no longer matches the profile stored with this configuration (expected '{}'). Relink the profile before previewing.",
+            path.display(),
+            expected.description
+        ));
+    }
+    Ok(())
+}
+
+pub fn resolve_external_profile_path(
+    stored_path: Option<&str>,
+    identity: Option<&IccProfileIdentity>,
+    profiles: &[InstalledIccProfile],
+) -> Option<PathBuf> {
+    if let Some(path) = stored_path.map(PathBuf::from) {
+        if path.is_file() {
+            if identity.is_none()
+                || inspect_profile(&path)
+                    .ok()
+                    .zip(identity)
+                    .is_some_and(|(profile, expected)| profile.matches_identity(expected))
+            {
+                return Some(path);
+            }
+        }
+    }
+    let identity = identity?;
+    profiles
+        .iter()
+        .find(|profile| profile.matches_identity(identity))
+        .map(|profile| profile.path.clone())
+}
+
+pub fn relink_project_profiles(
+    project: &mut ShadeProject,
+    profiles: &[InstalledIccProfile],
+) -> bool {
+    let mut changed = false;
+    changed |= relink_path(
+        &mut project.preview_color.assigned_profile_path,
+        project.preview_color.assigned_profile_identity.as_ref(),
+        profiles,
+    );
+    changed |= relink_path(
+        &mut project.preview_color.proof_profile_path,
+        project.preview_color.proof_profile_identity.as_ref(),
+        profiles,
+    );
+    changed
+}
+
+pub fn relink_monitor_profile(settings: &mut AppSettings, profiles: &[InstalledIccProfile]) -> bool {
+    relink_path(
+        &mut settings.monitor_profile_path,
+        settings.monitor_profile_identity.as_ref(),
+        profiles,
+    )
+}
+
+fn relink_path(
+    stored_path: &mut Option<String>,
+    identity: Option<&IccProfileIdentity>,
+    profiles: &[InstalledIccProfile],
+) -> bool {
+    let resolved = resolve_external_profile_path(stored_path.as_deref(), identity, profiles);
+    let Some(resolved) = resolved else {
+        return false;
+    };
+    let text = resolved.to_string_lossy().into_owned();
+    if stored_path.as_deref() == Some(text.as_str()) {
+        false
+    } else {
+        *stored_path = Some(text);
+        true
+    }
+}
+
+pub fn installed_profiles() -> Result<Vec<InstalledIccProfile>, String> {
+    let directory = color_directory();
+    let mut paths = Vec::new();
+
+    #[cfg(windows)]
+    {
+        if let Ok(names) = registered_profile_names() {
+            for name in names {
+                let path = PathBuf::from(name);
+                paths.push(if path.is_absolute() {
+                    path
+                } else {
+                    directory.join(path)
+                });
+            }
+        }
+    }
+
+    // Filesystem scan remains a fallback/supplement because vendor installers
+    // sometimes place usable ICCs in the color directory without a device association.
+    if let Ok(entries) = fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && is_profile_path(&path) {
+                paths.push(path);
+            }
+        }
+    } else if paths.is_empty() {
+        return Err(format!(
+            "Cannot enumerate Windows color profiles from {}",
+            directory.display()
+        ));
+    }
+
+    paths.sort_by_key(|path| path.to_string_lossy().to_lowercase());
+    paths.dedup_by(|left, right| {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    });
+
+    let mut profiles = paths
+        .into_iter()
+        .filter_map(|path| inspect_profile(&path).ok())
+        .collect::<Vec<_>>();
     profiles.sort_by(|left, right| {
         left.description
             .to_lowercase()
@@ -503,8 +773,77 @@ pub fn installed_profiles() -> Result<Vec<InstalledIccProfile>, String> {
                     .cmp(&right.filename().to_lowercase())
             })
     });
-    profiles.dedup_by(|left, right| left.path == right.path);
+    profiles.dedup_by(|left, right| left.identity.sha256 == right.identity.sha256);
     Ok(profiles)
+}
+
+fn color_directory() -> PathBuf {
+    let windows = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    windows
+        .join("System32")
+        .join("spool")
+        .join("drivers")
+        .join("color")
+}
+
+#[cfg(windows)]
+fn registered_profile_names() -> Result<Vec<String>, String> {
+    let mut record = ENUMTYPEW::default();
+    record.dwSize = std::mem::size_of::<ENUMTYPEW>() as u32;
+    record.dwVersion = ENUM_TYPE_VERSION;
+    record.dwFields = 0;
+
+    let mut bytes_needed = 0u32;
+    let mut profile_count = 0u32;
+    unsafe {
+        let _ = EnumColorProfilesW(
+            std::ptr::null(),
+            &record,
+            std::ptr::null_mut(),
+            &mut bytes_needed,
+            &mut profile_count,
+        );
+    }
+    if bytes_needed == 0 {
+        return Err("Windows profile enumeration returned an empty buffer size.".to_owned());
+    }
+
+    let mut buffer = vec![0u8; bytes_needed as usize];
+    let ok = unsafe {
+        EnumColorProfilesW(
+            std::ptr::null(),
+            &record,
+            buffer.as_mut_ptr(),
+            &mut bytes_needed,
+            &mut profile_count,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "EnumColorProfilesW failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let units = buffer
+        .chunks_exact(2)
+        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    let mut names = Vec::with_capacity(profile_count as usize);
+    let mut start = 0usize;
+    for index in 0..units.len() {
+        if units[index] != 0 {
+            continue;
+        }
+        if index == start {
+            break;
+        }
+        names.push(String::from_utf16_lossy(&units[start..index]));
+        start = index + 1;
+    }
+    Ok(names)
 }
 
 pub fn is_profile_path(path: &Path) -> bool {
@@ -575,18 +914,23 @@ fn to_lcms_intent(intent: PreviewRenderingIntent) -> Intent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tiff_io::TiffMetadata;
 
-    fn rgb_metadata(icc_profile: Option<Vec<u8>>) -> TiffMetadata {
+    fn metadata(model: ColorModel, icc_profile: Option<Vec<u8>>) -> TiffMetadata {
+        let base = match model {
+            ColorModel::Rgb => 3,
+            ColorModel::Cmyk => 4,
+            ColorModel::Gray => 1,
+            ColorModel::Other => 1,
+        };
         TiffMetadata {
             width: 1,
             height: 1,
             bit_depth: 16,
-            samples_per_pixel: 3,
-            base_channel_count: 3,
-            color_model: ColorModel::Rgb,
-            channel_names: vec!["Red".into(), "Green".into(), "Blue".into()],
-            channel_display_info: vec![None; 3],
+            samples_per_pixel: base,
+            base_channel_count: base,
+            color_model: model,
+            channel_names: (0..base).map(|index| format!("C{index}")).collect(),
+            channel_display_info: vec![None; base],
             compression: None,
             predictor: None,
             orientation: None,
@@ -602,31 +946,109 @@ mod tests {
             intent: PreviewRenderingIntent::Perceptual,
             black_point_compensation: false,
             assigned_profile_path: None,
+            assigned_profile_identity: None,
             soft_proof_enabled: false,
             proof_profile_path: None,
+            proof_profile_identity: None,
             proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
+            monitor_profile_path: None,
+            monitor_profile_identity: None,
+            gamut_warning: false,
         }
+    }
+
+    fn temp_profile(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "shade-color-{label}-{}-{}.icc",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut profile = Profile::new_srgb();
+        profile.save_profile_to_file(&path).unwrap();
+        path
     }
 
     #[test]
     fn no_profile_is_reported_without_modifying_data() {
-        let transform = PreviewColorTransform::new(&rgb_metadata(None), config());
+        let transform = PreviewColorTransform::new(&metadata(ColorModel::Rgb, None), config());
         assert!(matches!(
             transform.status(),
             PreviewColorStatus::NoEmbeddedProfile
         ));
-        assert!(
-            transform
-                .base_rgb8(&[vec![0], vec![0], vec![0]], 1)
-                .is_none()
-        );
     }
 
     #[test]
     fn disabled_preview_is_explicit() {
         let mut cfg = config();
         cfg.enabled = false;
-        let transform = PreviewColorTransform::new(&rgb_metadata(None), cfg);
+        let transform = PreviewColorTransform::new(&metadata(ColorModel::Rgb, None), cfg);
         assert!(matches!(transform.status(), PreviewColorStatus::Disabled));
+    }
+
+    #[test]
+    fn missing_external_profile_is_a_fallback_not_silent_reassignment() {
+        let mut cfg = config();
+        cfg.assigned_profile_path = Some(PathBuf::from(r"Z:\missing\profile.icc"));
+        let transform = PreviewColorTransform::new(&metadata(ColorModel::Rgb, None), cfg);
+        assert!(matches!(transform.status(), PreviewColorStatus::Fallback { .. }));
+    }
+
+    #[test]
+    fn corrupt_external_profile_is_rejected() {
+        let path = std::env::temp_dir().join(format!("shade-corrupt-{}.icc", std::process::id()));
+        fs::write(&path, b"not an ICC").unwrap();
+        assert!(inspect_profile(&path).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn wrong_source_color_space_is_rejected() {
+        let path = temp_profile("wrong-space");
+        let inspected = inspect_profile(&path).unwrap();
+        let mut cfg = config();
+        cfg.assigned_profile_path = Some(path.clone());
+        cfg.assigned_profile_identity = Some(inspected.identity().clone());
+        let transform = PreviewColorTransform::new(&metadata(ColorModel::Cmyk, None), cfg);
+        assert!(matches!(transform.status(), PreviewColorStatus::Fallback { .. }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn wrong_proof_device_class_is_rejected() {
+        let path = temp_profile("wrong-class");
+        let inspected = inspect_profile(&path).unwrap();
+        assert!(inspected.is_display_profile());
+        assert!(!inspected.is_output_profile());
+        let mut source_profile = Profile::new_srgb();
+        let mut bytes = Vec::new();
+        source_profile.write_icc(&mut bytes).unwrap();
+        let mut cfg = config();
+        cfg.soft_proof_enabled = true;
+        cfg.proof_profile_path = Some(path.clone());
+        cfg.proof_profile_identity = Some(inspected.identity().clone());
+        let transform = PreviewColorTransform::new(&metadata(ColorModel::Rgb, Some(bytes)), cfg);
+        assert!(matches!(transform.status(), PreviewColorStatus::Fallback { .. }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identity_relinks_moved_profile_without_embedding_it() {
+        let original = temp_profile("identity-a");
+        let moved = original.with_file_name(format!("shade-color-moved-{}.icc", std::process::id()));
+        fs::copy(&original, &moved).unwrap();
+        let expected = inspect_profile(&original).unwrap().identity().clone();
+        let moved_profile = inspect_profile(&moved).unwrap();
+        fs::remove_file(&original).unwrap();
+        let resolved = resolve_external_profile_path(
+            original.to_str(),
+            Some(&expected),
+            &[moved_profile],
+        )
+        .unwrap();
+        assert_eq!(resolved, moved);
+        let _ = fs::remove_file(resolved);
     }
 }
