@@ -47,7 +47,7 @@ text = once(
     "        let test_code = self.project.effective_test_code_text();\n        let snapshot_name = self.project.active_snapshot_name().unwrap_or(\"Working\").to_owned();\n        let first_source = self",
     "export preview token values",
 )
-text = once(text, "            snapshot_code: &snapshot_code,", "            snapshot_name: &snapshot_name,\n            test_code: &test_code,", "export preview context")
+text = first(text, "            snapshot_code: &snapshot_code,", "            snapshot_name: &snapshot_name,\n            test_code: &test_code,", "export preview context")
 text = text.replace(
     'ui.small("Tokens: {project}, {face}, {snapshot}, {source}, {date}. Legacy tokens remain supported.");',
     'ui.small("Tokens: {project}, {face}, {snapshot}, {testcode}, {source}, {date}. Legacy {snapshot-code} remains Test Code compatible.");',

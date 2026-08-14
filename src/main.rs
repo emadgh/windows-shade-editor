@@ -16,6 +16,7 @@ mod dpi;
 mod export;
 mod export_batch;
 mod export_queue;
+mod export_recipe;
 mod history;
 mod model;
 mod palette;
@@ -311,6 +312,10 @@ impl ShadeApp {
         };
         let mut history = history::AdjustmentHistory::default();
         history.reset(&project.adjustments, "Start");
+        let export_queue = export_queue::ExportQueue::load_persistent().unwrap_or_else(|err| {
+            log.error(&err);
+            export_queue::ExportQueue::new()
+        });
         Self {
             project,
             project_path: None,
@@ -348,7 +353,7 @@ impl ShadeApp {
             show_export_all: false,
             export_all_folder: String::new(),
             show_export_queue: false,
-            export_queue: export_queue::ExportQueue::new(),
+            export_queue,
             export_queue_open_folder_after: None,
             show_tiff_inspector: false,
             tiff_inspection: None,
@@ -888,7 +893,7 @@ impl ShadeApp {
             label: format!("{face_name} / {state_name}"),
             source,
             destination,
-            project: self.project.clone(),
+            recipe: export_recipe::ExportRecipe::from_project(&self.project),
             default_dpi: self.settings.default_dpi,
             force_lzw: self.settings.lzw_compression,
             validate_after_export: self.settings.validate_after_export,
@@ -903,6 +908,9 @@ impl ShadeApp {
 
     fn poll_export_queue(&mut self) {
         let completions = self.export_queue.poll();
+        if let Some(err) = self.export_queue.take_persistence_error() {
+            self.log.error(&format!("Export Queue persistence: {err}"));
+        }
         if completions.is_empty() {
             return;
         }
@@ -991,7 +999,7 @@ impl ShadeApp {
                         cancel_waiting = ui.button("Cancel waiting").clicked();
                     });
                 });
-                ui.small("Processing items finish their current atomic TIFF write safely. Cancel on a Processing item stops the queue after that file is safely committed.");
+                ui.small("Waiting items can be cancelled immediately. Processing items use Stop after current: the current atomic TIFF finishes safely, then remaining waiting items are cancelled.");
                 ui.separator();
 
                 if rows.is_empty() {
@@ -1011,7 +1019,12 @@ impl ShadeApp {
                                             match status {
                                                 export_queue::ExportQueueStatus::Waiting
                                                 | export_queue::ExportQueueStatus::Processing => {
-                                                    if ui.small_button("Cancel").clicked() {
+                                                    let button = if *status == export_queue::ExportQueueStatus::Processing {
+                                                        "Stop after current"
+                                                    } else {
+                                                        "Cancel"
+                                                    };
+                                                    if ui.small_button(button).clicked() {
                                                         cancel_id = Some(*id);
                                                     }
                                                 }
@@ -1282,7 +1295,12 @@ impl ShadeApp {
             .and_then(|path| path.file_stem())
             .map(|value| value.to_string_lossy().into_owned());
         let project_name = self.project.name.clone();
-        let snapshot_code = self.project.effective_test_code_text();
+        let test_code = self.project.effective_test_code_text();
+        let snapshot_name = self
+            .project
+            .active_snapshot_name()
+            .unwrap_or("Working")
+            .to_owned();
         let template = self.settings.export_all_template.clone();
         let folder_template = self.settings.export_folder_template.clone();
         let conflict_policy = self.settings.export_all_conflict_policy;
@@ -1308,7 +1326,8 @@ impl ShadeApp {
             let context = export_batch::ExportNameContext {
                 shade_name: shade_name.as_deref(),
                 project_name: &project_name,
-                snapshot_code: &snapshot_code,
+                snapshot_name: &snapshot_name,
+                test_code: &test_code,
                 face_number: index + 1,
                 face_name,
                 source_name,
@@ -1337,10 +1356,10 @@ impl ShadeApp {
                 }
             };
             if !self.enqueue_export(export_queue::ExportQueueSpec {
-                label: format!("{face_name} / {snapshot_code}"),
+                label: format!("{face_name} / {snapshot_name}"),
                 source: source.clone(),
                 destination,
-                project: project.clone(),
+                recipe: export_recipe::ExportRecipe::from_project(&project),
                 default_dpi: self.settings.default_dpi,
                 force_lzw: self.settings.lzw_compression,
                 validate_after_export: self.settings.validate_after_export,
@@ -1388,7 +1407,12 @@ impl ShadeApp {
             .as_ref()
             .and_then(|path| path.file_stem())
             .map(|value| value.to_string_lossy().into_owned());
-        let snapshot_code = self.project.effective_test_code_text();
+        let test_code = self.project.effective_test_code_text();
+        let snapshot_name = self
+            .project
+            .active_snapshot_name()
+            .unwrap_or("Working")
+            .to_owned();
         let first_source = self
             .faces
             .first()
@@ -1410,7 +1434,8 @@ impl ShadeApp {
         let preview_context = export_batch::ExportNameContext {
             shade_name: shade_name.as_deref(),
             project_name: &self.project.name,
-            snapshot_code: &snapshot_code,
+            snapshot_name: &snapshot_name,
+            test_code: &test_code,
             face_number: 1,
             face_name,
             source_name: &source_name,
@@ -1464,7 +1489,7 @@ impl ShadeApp {
                             .desired_width(500.0),
                     )
                     .changed();
-                ui.small("Tokens: {project}, {face}, {snapshot}, {source}, {date}. Legacy tokens remain supported.");
+                ui.small("Tokens: {project}, {face}, {snapshot}, {testcode}, {source}, {date}. Legacy {snapshot-code} remains Test Code compatible.");
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Preview:");
                     ui.monospace(&preview_name);
@@ -1620,7 +1645,7 @@ impl ShadeApp {
             label: format!("Face {} / {}", self.current_face + 1, snapshot.name),
             source,
             destination,
-            project,
+            recipe: export_recipe::ExportRecipe::from_project(&project),
             default_dpi: self.settings.default_dpi,
             force_lzw: self.settings.lzw_compression,
             validate_after_export: self.settings.validate_after_export,
@@ -1696,11 +1721,12 @@ impl ShadeApp {
             let mut project = self.project.clone();
             project.adjustments = snapshot.adjustments.clone();
             project.active_snapshot_id = Some(snapshot.id);
-            let snapshot_code = project.effective_test_code_text();
+            let test_code = project.effective_test_code_text();
             let context = export_batch::ExportNameContext {
                 shade_name: shade_name.as_deref(),
                 project_name: &project_name,
-                snapshot_code: &snapshot_code,
+                snapshot_name: &snapshot.name,
+                test_code: &test_code,
                 face_number: self.current_face + 1,
                 face_name: &face_name,
                 source_name: &source_name,
@@ -1736,7 +1762,7 @@ impl ShadeApp {
                 label: format!("{face_name} / {}", snapshot.name),
                 source: source.clone(),
                 destination,
-                project,
+                recipe: export_recipe::ExportRecipe::from_project(&project),
                 default_dpi: self.settings.default_dpi,
                 force_lzw: self.settings.lzw_compression,
                 validate_after_export: self.settings.validate_after_export,

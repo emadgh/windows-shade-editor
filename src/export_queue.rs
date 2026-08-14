@@ -92,8 +92,12 @@ impl SourceFingerprint {
 }
 
 fn sampled_sha256(path: &Path, size: u64) -> Result<String, String> {
-    let mut file = File::open(path)
-        .map_err(|err| format!("Cannot open source TIFF {} for fingerprint: {err}", path.display()))?;
+    let mut file = File::open(path).map_err(|err| {
+        format!(
+            "Cannot open source TIFF {} for fingerprint: {err}",
+            path.display()
+        )
+    })?;
     let mut hasher = Sha256::new();
     hasher.update(size.to_le_bytes());
 
@@ -425,7 +429,8 @@ impl ExportQueue {
             ExportQueueStatus::Processing => {
                 self.stop_after_current = true;
                 item.detail =
-                    "Stop after current requested · current atomic export will finish safely".to_owned();
+                    "Stop after current requested · current atomic export will finish safely"
+                        .to_owned();
                 true
             }
             _ => false,
@@ -838,9 +843,7 @@ mod tests {
             face_key: "face".into(),
             folder: folder.clone(),
         });
-        queue
-            .enqueue_for_project(queued, vec![source], 55)
-            .unwrap();
+        queue.enqueue_for_project(queued, vec![source], 55).unwrap();
         queue.items[0].status = ExportQueueStatus::Processing;
         queue.persist();
         drop(queue);

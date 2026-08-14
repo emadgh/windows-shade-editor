@@ -229,10 +229,7 @@ mod tests {
 
     #[test]
     fn compact_snapshot_and_testcode_tokens_are_distinct() {
-        let name = render_export_filename(
-            "{project}_{snapshot}_{testcode}_{date}",
-            &context(),
-        );
+        let name = render_export_filename("{project}_{snapshot}_{testcode}_{date}", &context());
         assert_eq!(name, "Project A_Test 7_T-42_2026-08-14.tif");
     }
 

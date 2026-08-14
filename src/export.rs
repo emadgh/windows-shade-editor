@@ -127,10 +127,10 @@ where
     }
     if !matches!(
         decoded.metadata.color_model,
-        ColorModel::Rgb | ColorModel::Cmyk
+        ColorModel::Rgb | ColorModel::Cmyk | ColorModel::Gray
     ) {
         return Err(format!(
-            "Export currently supports RGB and CMYK Photoshop TIFF; this file is {}.",
+            "Export currently supports RGB, CMYK and Gray TIFF; this file is {}.",
             decoded.metadata.color_model.title()
         ));
     }
@@ -261,9 +261,12 @@ where
     F: FnMut(f32, &str),
 {
     let metadata = &stream.metadata;
-    if !matches!(metadata.color_model, ColorModel::Rgb | ColorModel::Cmyk) {
+    if !matches!(
+        metadata.color_model,
+        ColorModel::Rgb | ColorModel::Cmyk | ColorModel::Gray
+    ) {
         return Err(format!(
-            "Export currently supports RGB and CMYK Photoshop TIFF; this file is {}.",
+            "Export currently supports RGB, CMYK and Gray TIFF; this file is {}.",
             metadata.color_model.title()
         ));
     }
@@ -896,6 +899,34 @@ where
                 .write_data(data)
                 .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
         }
+        (ColorModel::Gray, 8, OutputPixels::U8(data)) => {
+            let mut image = encoder
+                .new_image::<colortype::Gray8>(metadata.width, metadata.height)
+                .map_err(|err| format!("Cannot create Gray 8-bit TIFF image: {err}"))?;
+            configure_extras_and_metadata(&mut image, channels, 1, metadata, dpi_info)?;
+            if let Some(rows) = rows_per_strip {
+                image
+                    .rows_per_strip(rows)
+                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
+            }
+            image
+                .write_data(data)
+                .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
+        }
+        (ColorModel::Gray, 16, OutputPixels::U16(data)) => {
+            let mut image = encoder
+                .new_image::<colortype::Gray16>(metadata.width, metadata.height)
+                .map_err(|err| format!("Cannot create Gray 16-bit TIFF image: {err}"))?;
+            configure_extras_and_metadata(&mut image, channels, 1, metadata, dpi_info)?;
+            if let Some(rows) = rows_per_strip {
+                image
+                    .rows_per_strip(rows)
+                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
+            }
+            image
+                .write_data(data)
+                .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
+        }
         (_, depth, _) => {
             return Err(format!(
                 "Unsupported export bit depth/color model: {depth}-bit."
@@ -1309,6 +1340,25 @@ mod streaming_tests {
 
         let legacy = apply_curve(leveled_a, a.curve) * 0.5 + leveled_b * 0.5;
         assert!((actual - legacy).abs() > 0.20);
+    }
+
+    #[test]
+    fn gray_adjustment_pipeline_preserves_single_channel_semantics() {
+        let names = vec!["Gray".to_owned()];
+        let mut metadata = test_metadata(&names, 1, vec![None]);
+        metadata.color_model = ColorModel::Gray;
+        let mut project = ShadeProject::default();
+        project.ensure_channels(&names);
+        project
+            .adjustments
+            .get_mut("Gray")
+            .unwrap()
+            .levels
+            .output_white = 0.5;
+        let input = [32_768u16];
+        let output = adjusted_strip(&input, &metadata, &project);
+        assert_eq!(output.len(), 1);
+        assert!(output[0] < input[0]);
     }
 
     #[test]
