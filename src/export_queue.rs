@@ -1,10 +1,13 @@
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
 use crate::export;
+use crate::export_batch::{self, ConflictPolicy, DestinationDecision};
 use crate::model::ShadeProject;
+use crate::path_safety;
 use crate::validation;
-use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportQueueStatus {
@@ -47,7 +50,15 @@ pub struct ExportQueueSpec {
     pub default_dpi: f64,
     pub force_lzw: bool,
     pub validate_after_export: bool,
+    pub conflict_policy: ConflictPolicy,
     pub mark: Option<ExportQueueMark>,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedExportSpec {
+    export: ExportQueueSpec,
+    protected_sources: Vec<PathBuf>,
+    project_session_id: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -60,12 +71,13 @@ pub struct ExportQueueItem {
     pub progress: f32,
     pub detail: String,
     pub error: Option<String>,
-    spec: ExportQueueSpec,
+    spec: QueuedExportSpec,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExportQueueCompletion {
     pub id: u64,
+    pub project_session_id: u64,
     pub result: Result<String, String>,
     pub mark: Option<ExportQueueMark>,
 }
@@ -78,6 +90,7 @@ enum ExportQueueEvent {
     },
     Finished {
         id: u64,
+        project_session_id: u64,
         result: Result<String, String>,
         mark: Option<ExportQueueMark>,
     },
@@ -111,7 +124,28 @@ impl ExportQueue {
         }
     }
 
+    /// Test/helper enqueue without project isolation. Production UI should use
+    /// `enqueue_for_project` so source TIFFs and project ownership are protected.
     pub fn enqueue(&mut self, spec: ExportQueueSpec) -> u64 {
+        self.enqueue_for_project(spec, Vec::new(), 0)
+            .expect("unprotected queue enqueue must not fail")
+    }
+
+    pub fn enqueue_for_project(
+        &mut self,
+        spec: ExportQueueSpec,
+        protected_sources: Vec<PathBuf>,
+        project_session_id: u64,
+    ) -> Result<u64, String> {
+        validate_destination(&spec.destination, &protected_sources)?;
+        let key = path_safety::path_key(&spec.destination);
+        if self.reserved_destination_keys().contains(&key) {
+            return Err(format!(
+                "Export destination is already reserved by another queued job: {}",
+                spec.destination.display()
+            ));
+        }
+
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.items.push(ExportQueueItem {
@@ -123,9 +157,13 @@ impl ExportQueue {
             progress: 0.0,
             detail: String::new(),
             error: None,
-            spec,
+            spec: QueuedExportSpec {
+                export: spec,
+                protected_sources,
+                project_session_id,
+            },
         });
-        id
+        Ok(id)
     }
 
     pub fn items(&self) -> &[ExportQueueItem] {
@@ -146,6 +184,19 @@ impl ExportQueue {
 
     pub fn has_pending(&self) -> bool {
         self.pending_count() > 0
+    }
+
+    pub fn reserved_destination_keys(&self) -> BTreeSet<String> {
+        self.items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    ExportQueueStatus::Waiting | ExportQueueStatus::Processing
+                )
+            })
+            .map(|item| path_safety::path_key(&item.destination))
+            .collect()
     }
 
     pub fn active_summary(&self) -> Option<(f32, String)> {
@@ -180,6 +231,7 @@ impl ExportQueue {
     }
 
     pub fn retry(&mut self, id: u64) -> bool {
+        let reserved = self.reserved_destination_keys();
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
@@ -187,6 +239,10 @@ impl ExportQueue {
             item.status,
             ExportQueueStatus::Failed | ExportQueueStatus::Cancelled
         ) {
+            return false;
+        }
+        if reserved.contains(&path_safety::path_key(&item.destination)) {
+            item.error = Some("Destination is reserved by another queued export.".to_owned());
             return false;
         }
         item.status = ExportQueueStatus::Waiting;
@@ -223,7 +279,12 @@ impl ExportQueue {
                         item.detail = detail;
                     }
                 }
-                ExportQueueEvent::Finished { id, result, mark } => {
+                ExportQueueEvent::Finished {
+                    id,
+                    project_session_id,
+                    result,
+                    mark,
+                } => {
                     self.active_id = None;
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
                         item.progress = 1.0;
@@ -240,7 +301,12 @@ impl ExportQueue {
                             }
                         }
                     }
-                    completions.push(ExportQueueCompletion { id, result, mark });
+                    completions.push(ExportQueueCompletion {
+                        id,
+                        project_session_id,
+                        result,
+                        mark,
+                    });
                     if self.stop_after_current {
                         self.stop_after_current = false;
                         self.cancel_all_waiting();
@@ -263,14 +329,112 @@ impl ExportQueue {
         else {
             return;
         };
+
+        let mut queued = self.items[index].spec.clone();
         let id = self.items[index].id;
-        let spec = self.items[index].spec.clone();
+        let session_id = queued.project_session_id;
+
+        if let Err(err) = validate_destination(
+            &queued.export.destination,
+            &queued.protected_sources,
+        ) {
+            self.items[index].status = ExportQueueStatus::Processing;
+            self.active_id = Some(id);
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                let _ = tx.send(ExportQueueEvent::Finished {
+                    id,
+                    project_session_id: session_id,
+                    result: Err(err),
+                    mark: None,
+                });
+            });
+            return;
+        }
+
+        // A file may appear after enqueue. Honor the original conflict policy
+        // immediately before processing while respecting every other queued reservation.
+        if queued.export.destination.exists() {
+            match queued.export.conflict_policy {
+                ConflictPolicy::Overwrite => {}
+                ConflictPolicy::Skip => {
+                    self.items[index].status = ExportQueueStatus::Processing;
+                    self.active_id = Some(id);
+                    let tx = self.tx.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(ExportQueueEvent::Finished {
+                            id,
+                            project_session_id: session_id,
+                            result: Ok("Skipped · destination already exists".to_owned()),
+                            mark: None,
+                        });
+                    });
+                    return;
+                }
+                ConflictPolicy::AutoNumber => {
+                    let folder = queued
+                        .export
+                        .destination
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."));
+                    let filename = queued
+                        .export
+                        .destination
+                        .file_name()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "shade-export.tif".to_owned());
+                    let mut reserved = self
+                        .items
+                        .iter()
+                        .enumerate()
+                        .filter(|(other_index, item)| {
+                            *other_index != index
+                                && matches!(
+                                    item.status,
+                                    ExportQueueStatus::Waiting | ExportQueueStatus::Processing
+                                )
+                        })
+                        .map(|(_, item)| path_safety::path_key(&item.destination))
+                        .collect::<BTreeSet<_>>();
+                    if let DestinationDecision::Write(path) = export_batch::resolve_destination_reserved(
+                        folder,
+                        &filename,
+                        ConflictPolicy::AutoNumber,
+                        &mut reserved,
+                    ) {
+                        queued.export.destination = path.clone();
+                        self.items[index].destination = path;
+                        self.items[index].spec = queued.clone();
+                    }
+                }
+            }
+        }
+
+        if let Err(err) = validate_destination(
+            &queued.export.destination,
+            &queued.protected_sources,
+        ) {
+            self.items[index].status = ExportQueueStatus::Processing;
+            self.active_id = Some(id);
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                let _ = tx.send(ExportQueueEvent::Finished {
+                    id,
+                    project_session_id: session_id,
+                    result: Err(err),
+                    mark: None,
+                });
+            });
+            return;
+        }
+
         self.items[index].status = ExportQueueStatus::Processing;
         self.items[index].progress = 0.0;
         self.items[index].detail = "Starting".to_owned();
         self.items[index].error = None;
         self.active_id = Some(id);
 
+        let spec = queued.export;
         let tx = self.tx.clone();
         thread::spawn(move || {
             let validate_after_export = spec.validate_after_export;
@@ -314,31 +478,73 @@ impl ExportQueue {
             });
 
             let mark = result.as_ref().ok().and(spec.mark);
-            let _ = tx.send(ExportQueueEvent::Finished { id, result, mark });
+            let _ = tx.send(ExportQueueEvent::Finished {
+                id,
+                project_session_id: session_id,
+                result,
+                mark,
+            });
         });
     }
+}
+
+fn validate_destination(destination: &Path, sources: &[PathBuf]) -> Result<(), String> {
+    if let Some(source) = path_safety::conflicts_with_any_source(destination, sources) {
+        return Err(format!(
+            "Refusing export: destination resolves to a source TIFF. Source: {} · Destination: {}",
+            source.display(),
+            destination.display()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn waiting_item_can_be_cancelled_and_retried_without_io() {
-        let mut queue = ExportQueue::new();
-        let id = queue.enqueue(ExportQueueSpec {
+    fn spec(destination: &str) -> ExportQueueSpec {
+        ExportQueueSpec {
             label: "test".to_owned(),
             source: PathBuf::from("missing.tif"),
-            destination: PathBuf::from("out.tif"),
+            destination: PathBuf::from(destination),
             project: ShadeProject::default(),
             default_dpi: 220.0,
             force_lzw: true,
             validate_after_export: false,
+            conflict_policy: ConflictPolicy::AutoNumber,
             mark: None,
-        });
+        }
+    }
+
+    #[test]
+    fn waiting_item_can_be_cancelled_and_retried_without_io() {
+        let mut queue = ExportQueue::new();
+        let id = queue.enqueue(spec("out.tif"));
         assert!(queue.cancel(id));
         assert_eq!(queue.items()[0].status, ExportQueueStatus::Cancelled);
         assert!(queue.retry(id));
         assert_eq!(queue.items()[0].status, ExportQueueStatus::Waiting);
+    }
+
+    #[test]
+    fn queued_destination_cannot_target_a_protected_source() {
+        let mut queue = ExportQueue::new();
+        let err = queue
+            .enqueue_for_project(spec("source.tif"), vec![PathBuf::from("source.tif")], 7)
+            .unwrap_err();
+        assert!(err.contains("source TIFF"));
+    }
+
+    #[test]
+    fn pending_destinations_are_globally_reserved() {
+        let mut queue = ExportQueue::new();
+        queue
+            .enqueue_for_project(spec("same.tif"), vec![], 1)
+            .unwrap();
+        let err = queue
+            .enqueue_for_project(spec("same.tif"), vec![], 1)
+            .unwrap_err();
+        assert!(err.contains("already reserved"));
     }
 }
