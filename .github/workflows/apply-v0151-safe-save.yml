@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - scripts/apply_v0151_safe_save.py
+      - scripts/run_v0151_safe_save.py
       - .github/workflows/apply-v0151-safe-save.yml
   workflow_dispatch:
 
@@ -21,7 +22,7 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - name: Apply source migration
-        run: python -X utf8 scripts/apply_v0151_safe_save.py
+        run: python -X utf8 scripts/run_v0151_safe_save.py
       - name: Format
         run: cargo fmt --all
       - name: Verify diff
@@ -35,7 +36,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock src/app_main.rs src/model_v6.rs src/recovery.rs src/safe_fs.rs
+          git add Cargo.toml Cargo.lock src/app_main.rs src/lib.rs src/model_v6.rs src/recovery.rs src/safe_fs.rs
           if (git diff --cached --quiet) { exit 0 }
           git commit -m "Harden project saves and recovery integrity"
           git push origin HEAD:main
