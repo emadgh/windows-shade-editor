@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::export_batch::{ConflictPolicy, DEFAULT_EXPORT_TEMPLATE};
 use crate::palette::{
     AUTO_PALETTE_ID, ChannelPalette, ChannelPaletteEntry, builtin_palettes, is_builtin_id,
 };
@@ -25,6 +26,9 @@ pub struct AppSettings {
     pub compact_curve_controls: bool,
     pub validate_after_export: bool,
     pub export_all_test_code: bool,
+    pub export_all_template: String,
+    pub export_all_conflict_policy: ConflictPolicy,
+    pub export_all_open_folder: bool,
     pub lzw_compression: bool,
     pub default_dpi: f64,
     pub default_palette_id: String,
@@ -46,6 +50,9 @@ impl Default for AppSettings {
             compact_curve_controls: false,
             validate_after_export: false,
             export_all_test_code: false,
+            export_all_template: DEFAULT_EXPORT_TEMPLATE.to_owned(),
+            export_all_conflict_policy: ConflictPolicy::AutoNumber,
+            export_all_open_folder: false,
             lzw_compression: true,
             default_dpi: DEFAULT_DPI,
             default_palette_id: AUTO_PALETTE_ID.to_owned(),
@@ -81,6 +88,9 @@ impl AppSettings {
             self.default_dpi = DEFAULT_DPI;
         }
         self.default_dpi = self.default_dpi.clamp(36.0, 2400.0);
+        if self.export_all_template.trim().is_empty() {
+            self.export_all_template = DEFAULT_EXPORT_TEMPLATE.to_owned();
+        }
 
         let mut used_ids = HashSet::new();
         self.custom_palettes.retain_mut(|palette| {
@@ -212,6 +222,17 @@ mod tests {
     #[test]
     fn export_all_test_code_defaults_off() {
         assert!(!AppSettings::default().export_all_test_code);
+    }
+
+    #[test]
+    fn export_all_defaults_are_safe() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.export_all_template, DEFAULT_EXPORT_TEMPLATE);
+        assert_eq!(
+            settings.export_all_conflict_policy,
+            ConflictPolicy::AutoNumber
+        );
+        assert!(!settings.export_all_open_folder);
     }
 
     #[test]

@@ -16,6 +16,8 @@ mod app_log;
 mod dpi;
 #[path = "export_v6.rs"]
 mod export;
+#[path = "export_batch.rs"]
+mod export_batch;
 #[path = "history.rs"]
 mod history;
 #[path = "model_v6.rs"]
@@ -41,7 +43,7 @@ mod validation;
 #[path = "workflow_v0103.rs"]
 mod workflow_v0103;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -58,6 +60,7 @@ const VIEWPORT_OVERSCROLL: f32 = 180.0;
 const ERROR_TOAST_LIFETIME: Duration = Duration::from_secs(8);
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
 const HISTORY_COMMIT_DELAY: Duration = Duration::from_millis(300);
+const PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT: usize = 64;
 
 fn main() -> eframe::Result {
     let startup_project = std::env::args_os()
@@ -82,7 +85,10 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let mut app = ShadeApp::new(cc);
             if let Some(path) = startup_project.clone() {
+                app.show_previous_shades = false;
                 app.open_project_path(path);
+            } else {
+                app.show_previous_shades = true;
             }
             Ok(Box::new(app))
         }),
@@ -221,6 +227,9 @@ struct ShadeApp {
     previous_shade_preview_error: Option<String>,
     previous_shade_texture: Option<egui::TextureHandle>,
     previous_shade_list_textures: BTreeMap<String, egui::TextureHandle>,
+    previous_shade_list_texture_lru: VecDeque<String>,
+    show_export_all: bool,
+    export_all_folder: String,
     remind_after_export: bool,
     show_snapshot_save_reminder: bool,
     log: app_log::AppLog,
@@ -305,6 +314,9 @@ impl ShadeApp {
             previous_shade_preview_error: None,
             previous_shade_texture: None,
             previous_shade_list_textures: BTreeMap::new(),
+            previous_shade_list_texture_lru: VecDeque::new(),
+            show_export_all: false,
+            export_all_folder: String::new(),
             remind_after_export: false,
             show_snapshot_save_reminder: false,
             log,
@@ -834,42 +846,131 @@ impl ShadeApp {
             self.report_error("Export all requires every Face source TIFF to be available. Relink missing Faces first.");
             return;
         }
-        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+        if self.export_all_folder.trim().is_empty() {
+            let initial = self
+                .project_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .or_else(|| {
+                    self.faces
+                        .get(self.current_face)
+                        .and_then(|face| face.path.parent())
+                })
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.export_all_folder = initial;
+        }
+        self.show_export_all = true;
+    }
+
+    fn start_export_all(&mut self) {
+        if self.job.is_some() || self.faces.is_empty() {
             return;
-        };
+        }
+        let folder = PathBuf::from(self.export_all_folder.trim());
+        if self.export_all_folder.trim().is_empty() {
+            self.report_error("Choose an Export All folder first.");
+            return;
+        }
+        if let Err(err) = std::fs::create_dir_all(&folder) {
+            self.report_error(format!(
+                "Cannot create Export All folder {}: {err}",
+                folder.display()
+            ));
+            return;
+        }
+        if self.faces.iter().any(|face| !face.available) {
+            self.report_error("Export all requires every Face source TIFF to be available. Relink missing Faces first.");
+            return;
+        }
+
         let sources = self
             .faces
             .iter()
             .map(|face| face.path.clone())
             .collect::<Vec<_>>();
+        let face_names = self
+            .project
+            .faces
+            .iter()
+            .map(|face| face.label.clone())
+            .collect::<Vec<_>>();
+        let shade_name = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map(|value| value.to_string_lossy().into_owned());
+        let project_name = self.project.name.clone();
+        let snapshot_code = self.project.effective_test_code_text();
+        let template = self.settings.export_all_template.clone();
+        let conflict_policy = self.settings.export_all_conflict_policy;
+        let open_after = self.settings.export_all_open_folder;
         let mut project = self.project.clone();
         project.test_code.enabled = self.settings.export_all_test_code;
         let default_dpi = self.settings.default_dpi;
         let force_lzw = self.settings.lzw_compression;
         let validate_after_export = self.settings.validate_after_export;
         self.remind_after_export = self.snapshot_project_needs_save_reminder();
+        self.show_export_all = false;
+        let _ = self.settings.save();
+
         self.launch_job("Exporting faces", move |progress| {
             let total = sources.len().max(1);
             let result = (|| -> Result<String, String> {
+                let mut written = 0usize;
+                let mut skipped = 0usize;
                 for (index, source) in sources.iter().enumerate() {
-                    let stem = source
-                        .file_stem()
-                        .map(|value| value.to_string_lossy())
-                        .unwrap_or_default();
-                    let destination = folder.join(format!("{stem}-shade.tif"));
+                    let face_name = face_names
+                        .get(index)
+                        .map(String::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .or_else(|| source.file_stem().and_then(|value| value.to_str()))
+                        .unwrap_or("face");
+                    let filename = export_batch::render_export_filename(
+                        &template,
+                        &export_batch::ExportNameContext {
+                            shade_name: shade_name.as_deref(),
+                            project_name: &project_name,
+                            snapshot_code: &snapshot_code,
+                            face_number: index + 1,
+                            face_name,
+                        },
+                    );
+                    let destination = match export_batch::resolve_destination(
+                        &folder,
+                        &filename,
+                        conflict_policy,
+                    ) {
+                        export_batch::DestinationDecision::Write(path) => path,
+                        export_batch::DestinationDecision::Skip(path) => {
+                            skipped += 1;
+                            Self::set_progress(
+                                &progress,
+                                Some((index + 1) as f32 / total as f32),
+                                "Exporting faces",
+                                &format!(
+                                    "Skipped existing {}",
+                                    path.file_name()
+                                        .map(|value| value.to_string_lossy())
+                                        .unwrap_or_default()
+                                ),
+                            );
+                            continue;
+                        }
+                    };
                     export::export_face_with_progress_options(
                         source,
                         &destination,
                         &project,
                         default_dpi,
                         export::ExportOptions { force_lzw },
-                        |inner, detail| {
-                            let phase = if validate_after_export {
-                                inner * 0.88
+                        |phase, detail| {
+                            let inner = if validate_after_export {
+                                phase * 0.88
                             } else {
-                                inner
+                                phase
                             };
-                            let overall = (index as f32 + phase) / total as f32;
+                            let overall = (index as f32 + inner) / total as f32;
                             Self::set_progress(&progress, Some(overall), "Exporting faces", detail);
                         },
                     )?;
@@ -887,29 +988,181 @@ impl ShadeApp {
                             force_lzw,
                         )?;
                     }
+                    written += 1;
                 }
-                let code_note = if project.test_code.enabled {
-                    " with Test Code"
-                } else {
-                    " without Test Code"
-                };
-                if validate_after_export {
-                    Ok(format!(
-                        "Exported and verified {total} face(s){code_note} to {}",
-                        folder.display()
-                    ))
-                } else {
-                    Ok(format!(
-                        "Exported {total} face(s){code_note} to {}",
-                        folder.display()
-                    ))
+                Self::set_progress(&progress, Some(1.0), "Exporting faces", "Complete");
+                if open_after {
+                    let _ = open_folder(&folder);
                 }
+                Ok(if skipped > 0 {
+                    format!("Exported {written} face(s) · skipped {skipped} existing file(s)")
+                } else {
+                    format!("Exported {written} face(s)")
+                })
             })();
             JobResult::Export(SnapshotExportBatchResult {
                 result,
                 marks: Vec::new(),
             })
         });
+    }
+
+    fn ui_export_all_window(&mut self, ctx: &egui::Context) {
+        if !self.show_export_all {
+            return;
+        }
+        let mut open = self.show_export_all;
+        let folder = PathBuf::from(self.export_all_folder.trim());
+        let existing_tiffs = if folder.is_dir() {
+            export_batch::folder_tiff_count(&folder)
+        } else {
+            0
+        };
+        let shade_name = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map(|value| value.to_string_lossy().into_owned());
+        let snapshot_code = self.project.effective_test_code_text();
+        let face_name = self
+            .project
+            .faces
+            .first()
+            .map(|face| face.label.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("face");
+        let preview_name = export_batch::render_export_filename(
+            &self.settings.export_all_template,
+            &export_batch::ExportNameContext {
+                shade_name: shade_name.as_deref(),
+                project_name: &self.project.name,
+                snapshot_code: &snapshot_code,
+                face_number: 1,
+                face_name,
+            },
+        );
+        let mut browse = false;
+        let mut reveal = false;
+        let mut start = false;
+        let mut cancel = false;
+        let mut changed = false;
+        egui::Window::new("Export All Faces")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.strong("Export folder");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.export_all_folder)
+                            .desired_width(f32::INFINITY),
+                    );
+                    browse = ui.button("Browse...").clicked();
+                });
+                if existing_tiffs > 0 {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!("Warning: this folder already contains {existing_tiffs} TIFF file(s). Mixing source/old exports can cause mistakes."),
+                    );
+                    reveal = ui.button("Reveal folder").clicked();
+                }
+
+                ui.add_space(8.0);
+                ui.strong("File name template");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.settings.export_all_template)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed();
+                ui.small("Tokens: {shade-name|project-name}, {shade-name}, {project-name}, {snapshot-code}, {face-number}, {face-name}");
+                ui.small("Windows-reserved characters such as * are converted to '-' in the generated filename.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Preview:");
+                    ui.monospace(&preview_name);
+                });
+
+                ui.add_space(8.0);
+                ui.strong("If a file already exists");
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.export_all_conflict_policy,
+                            export_batch::ConflictPolicy::Overwrite,
+                            "Overwrite",
+                        )
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.export_all_conflict_policy,
+                            export_batch::ConflictPolicy::Skip,
+                            "Skip",
+                        )
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.export_all_conflict_policy,
+                            export_batch::ConflictPolicy::AutoNumber,
+                            "Auto-number",
+                        )
+                        .changed();
+                });
+                ui.small("Auto-number is the safe default and produces names such as '... (2).tif'.");
+
+                ui.add_space(8.0);
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.export_all_open_folder,
+                        "Open folder after export",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.export_all_test_code,
+                        "Write Test Code on every exported Face",
+                    )
+                    .changed();
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    start = ui
+                        .add_enabled(
+                            !self.export_all_folder.trim().is_empty()
+                                && self.job.is_none()
+                                && !self.faces.is_empty(),
+                            egui::Button::new("Export All"),
+                        )
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel {
+            open = false;
+        }
+        self.show_export_all = open;
+        if changed {
+            self.settings.sanitize();
+            if let Err(err) = self.settings.save() {
+                self.log.error(&err);
+            }
+        }
+        if browse {
+            let mut dialog = rfd::FileDialog::new();
+            if folder.is_dir() {
+                dialog = dialog.set_directory(&folder);
+            }
+            if let Some(selected) = dialog.pick_folder() {
+                self.export_all_folder = selected.to_string_lossy().into_owned();
+            }
+        }
+        if reveal && folder.is_dir() {
+            if let Err(err) = open_folder(&folder) {
+                self.report_error(err);
+            }
+        }
+        if start {
+            self.start_export_all();
+        }
     }
 
     fn export_snapshot_dialog(&mut self, snapshot_id: u64) {
@@ -2620,9 +2873,26 @@ impl ShadeApp {
             .then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));
         let panel_accent = (self.adjustment_scope == AdjustmentScope::Selected)
             .then(|| channel_color(palette.as_ref(), &output_name, self.selected_channel));
+        let modified_count = channel_names
+            .iter()
+            .filter(|name| {
+                self.project
+                    .adjustments
+                    .get(*name)
+                    .is_some_and(adjustment_is_modified)
+            })
+            .count();
+        let output_modified = self
+            .project
+            .adjustments
+            .get(&output_name)
+            .is_some_and(adjustment_is_modified);
 
         ui.horizontal_wrapped(|ui| {
             ui.heading("Adjustments");
+            if modified_count > 0 {
+                ui.small(format!("{modified_count}/{} modified", channel_names.len()));
+            }
             let mut all_channels = self.adjustment_scope == AdjustmentScope::All;
             if ui.checkbox(&mut all_channels, "All channels").changed() {
                 self.adjustment_scope = if all_channels {
@@ -2632,8 +2902,13 @@ impl ShadeApp {
                 };
             }
             let selected = self.adjustment_scope == AdjustmentScope::Selected;
+            let channel_button_label = if output_modified {
+                format!("{output_display}  •")
+            } else {
+                output_display.to_owned()
+            };
             let response = with_accent(ui, control_accent, |ui| {
-                ui.add(egui::Button::new(output_display).selected(selected))
+                ui.add(egui::Button::new(channel_button_label).selected(selected))
             });
             if response.clicked() {
                 self.adjustment_scope = AdjustmentScope::Selected;
@@ -3145,360 +3420,359 @@ impl ShadeApp {
         });
     }
 
+    fn ensure_previous_shade_list_texture(
+        &mut self,
+        ctx: &egui::Context,
+        entry: &previous_shades::PreviousShadeEntry,
+    ) {
+        let key = entry.path.clone();
+        if self.previous_shade_list_textures.contains_key(&key) {
+            self.previous_shade_list_texture_lru
+                .retain(|item| item != &key);
+            self.previous_shade_list_texture_lru.push_back(key);
+            return;
+        }
+        let Ok(Some(thumbnail)) = previous_shades::decode_cached_thumbnail(entry) else {
+            return;
+        };
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [thumbnail.width, thumbnail.height],
+            &thumbnail.rgba,
+        );
+        let texture = ctx.load_texture(
+            format!("previous-shade-list:{}", entry.path),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.previous_shade_list_textures
+            .insert(key.clone(), texture);
+        self.previous_shade_list_texture_lru
+            .retain(|item| item != &key);
+        self.previous_shade_list_texture_lru.push_back(key);
+        while self.previous_shade_list_texture_lru.len() > PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT {
+            if let Some(oldest) = self.previous_shade_list_texture_lru.pop_front() {
+                self.previous_shade_list_textures.remove(&oldest);
+            }
+        }
+    }
+
     fn ui_previous_shades_window(&mut self, ctx: &egui::Context) {
         if !self.show_previous_shades {
             return;
         }
         let mut open = self.show_previous_shades;
-        let mut requested_select: Option<String> = None;
+        let query_before = self.previous_shades_query.clone();
         let mut requested_open: Option<String> = None;
-        let mut requested_folder: Option<PathBuf> = None;
-        let mut clear_selection = false;
-        egui::Window::new("Previous shades")
+        let mut requested_select: Option<String> = None;
+        let mut requested_reveal: Option<String> = None;
+        let mut requested_remove: Option<String> = None;
+        let mut requested_relink: Option<String> = None;
+
+        egui::Window::new("Previous Shades")
             .open(&mut open)
+            .default_width(1040.0)
+            .default_height(680.0)
             .resizable(true)
-            .default_size([1060.0, 680.0])
             .show(ctx, |ui| {
-                let query_before = self.previous_shades_query.clone();
                 ui.horizontal(|ui| {
+                    ui.heading("Project Browser");
+                    ui.separator();
+                    ui.label(format!("{} project(s)", self.previous_shades.entries().len()));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Search");
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut self.previous_shades_query)
-                            .hint_text("Search project, path, snapshot name or test code...")
-                            .desired_width(360.0),
+                            .hint_text("Project, path, Snapshot name / ID / Test Code")
+                            .desired_width(390.0),
                     );
-                    if !search.has_focus() {
-                        let typed = ui.input(|input| {
-                            if input.modifiers.ctrl || input.modifiers.alt || input.modifiers.command {
-                                String::new()
-                            } else {
-                                input
-                                    .events
-                                    .iter()
-                                    .filter_map(|event| match event {
-                                        egui::Event::Text(text) => Some(text.as_str()),
-                                        _ => None,
-                                    })
-                                    .collect::<String>()
-                            }
+                    if !search.has_focus() && !ctx.wants_keyboard_input() {
+                        let typed = ctx.input(|input| {
+                            input
+                                .events
+                                .iter()
+                                .filter_map(|event| match event {
+                                    egui::Event::Text(text) if !text.chars().all(char::is_control) => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<String>()
                         });
                         if !typed.is_empty() {
                             self.previous_shades_query.push_str(&typed);
                             search.request_focus();
                         }
                     }
+                    ui.label("Sort");
                     egui::ComboBox::from_id_salt("previous-shades-sort")
                         .selected_text(self.previous_shades_sort.label())
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.previous_shades_sort,
+                            for sort in [
                                 previous_shades::PreviousShadesSort::LastOpened,
-                                "Last opened",
-                            );
-                            ui.selectable_value(
-                                &mut self.previous_shades_sort,
                                 previous_shades::PreviousShadesSort::ProjectName,
-                                "Project name",
-                            );
-                            ui.selectable_value(
-                                &mut self.previous_shades_sort,
                                 previous_shades::PreviousShadesSort::SavedAt,
-                                "Saved time",
-                            );
-                            ui.selectable_value(
-                                &mut self.previous_shades_sort,
                                 previous_shades::PreviousShadesSort::Path,
-                                "Path",
-                            );
+                            ] {
+                                ui.selectable_value(&mut self.previous_shades_sort, sort, sort.label());
+                            }
                         });
-                    ui.add_enabled(false, egui::Button::new("Load all shades from system"))
-                        .on_hover_text("Reserved for the Everything Search integration. History already uses the same importable entry model.");
                 });
-                ui.small("Type to search. Up/Down moves through results even while Search has focus; Enter opens the selected project.");
-                ui.separator();
 
-                let query_changed = self.previous_shades_query != query_before;
                 let query = self.previous_shades_query.trim().to_lowercase();
-                let mut rows = self.previous_shades.entries().to_vec();
-                if !query.is_empty() {
-                    rows.retain(|entry| entry.matches_query(&query));
-                }
+                let entries = self.previous_shades.entries();
+                let mut indices = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.matches_query(&query))
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
                 match self.previous_shades_sort {
-                    previous_shades::PreviousShadesSort::LastOpened => {
-                        rows.sort_by(|a, b| b.last_opened_unix_ms.cmp(&a.last_opened_unix_ms));
-                    }
-                    previous_shades::PreviousShadesSort::ProjectName => {
-                        rows.sort_by(|a, b| {
-                            a.display_name()
-                                .to_lowercase()
-                                .cmp(&b.display_name().to_lowercase())
-                                .then_with(|| b.last_opened_unix_ms.cmp(&a.last_opened_unix_ms))
-                        });
-                    }
-                    previous_shades::PreviousShadesSort::SavedAt => {
-                        rows.sort_by(|a, b| b.saved_at_unix_ms.cmp(&a.saved_at_unix_ms));
-                    }
-                    previous_shades::PreviousShadesSort::Path => {
-                        rows.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
-                    }
+                    previous_shades::PreviousShadesSort::LastOpened => indices.sort_by(|a, b| {
+                        entries[*b].last_opened_unix_ms.cmp(&entries[*a].last_opened_unix_ms)
+                    }),
+                    previous_shades::PreviousShadesSort::ProjectName => indices.sort_by(|a, b| {
+                        entries[*a].display_name().to_lowercase().cmp(&entries[*b].display_name().to_lowercase())
+                    }),
+                    previous_shades::PreviousShadesSort::SavedAt => indices.sort_by(|a, b| {
+                        entries[*b].saved_at_unix_ms.cmp(&entries[*a].saved_at_unix_ms)
+                    }),
+                    previous_shades::PreviousShadesSort::Path => indices.sort_by(|a, b| {
+                        entries[*a].path.to_lowercase().cmp(&entries[*b].path.to_lowercase())
+                    }),
                 }
+                let paths = indices
+                    .iter()
+                    .map(|index| entries[*index].path.clone())
+                    .collect::<Vec<_>>();
 
-                for entry in &rows {
-                    if self.previous_shade_list_textures.contains_key(&entry.path) {
-                        continue;
-                    }
-                    if let Ok(Some(thumbnail)) = previous_shades::decode_cached_thumbnail(entry) {
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [thumbnail.width, thumbnail.height],
-                            &thumbnail.rgba,
-                        );
-                        let texture = ctx.load_texture(
-                            format!("previous-shade-list:{}", entry.path),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        self.previous_shade_list_textures
-                            .insert(entry.path.clone(), texture);
-                    }
+                if query_before != self.previous_shades_query {
+                    requested_select = paths.first().cloned();
                 }
-
-                let selection_visible = self.previous_shades_selected.as_deref().is_some_and(|path| {
-                    rows.iter().any(|entry| entry.path == path)
-                });
-                if query_changed || !selection_visible {
-                    requested_select = rows.first().map(|entry| entry.path.clone());
-                    if rows.is_empty() {
-                        clear_selection = true;
-                    }
-                }
-
-                let (up, down, enter) = ui.input(|input| {
+                let current_path = requested_select
+                    .as_deref()
+                    .or(self.previous_shades_selected.as_deref());
+                let current_position = current_path.and_then(|path| paths.iter().position(|item| item == path));
+                let (up, down, enter) = ctx.input(|input| {
                     (
                         input.key_pressed(egui::Key::ArrowUp),
                         input.key_pressed(egui::Key::ArrowDown),
                         input.key_pressed(egui::Key::Enter),
                     )
                 });
-                if !rows.is_empty() && (up || down) {
-                    let effective = requested_select
-                        .as_deref()
-                        .or(self.previous_shades_selected.as_deref());
-                    let current = effective
-                        .and_then(|path| rows.iter().position(|entry| entry.path == path))
-                        .unwrap_or(0);
-                    let next = if down {
-                        (current + 1).min(rows.len() - 1)
-                    } else {
-                        current.saturating_sub(1)
+                if !paths.is_empty() && (up || down) {
+                    let next = match (current_position, up, down) {
+                        (Some(position), true, _) => position.saturating_sub(1),
+                        (Some(position), _, true) => (position + 1).min(paths.len() - 1),
+                        (None, _, true) => 0,
+                        (None, true, _) => paths.len() - 1,
+                        _ => 0,
                     };
-                    requested_select = Some(rows[next].path.clone());
+                    requested_select = paths.get(next).cloned();
                 }
                 if enter {
-                    if let Some(path) = requested_select
-                        .as_deref()
-                        .or(self.previous_shades_selected.as_deref())
-                    {
-                        if Path::new(path).is_file() {
-                            requested_open = Some(path.to_owned());
-                        }
-                    }
+                    requested_open = requested_select
+                        .clone()
+                        .or_else(|| self.previous_shades_selected.clone())
+                        .filter(|path| Path::new(path).is_file());
                 }
 
+                ui.separator();
                 ui.columns(2, |columns| {
-                    columns[0].strong(format!("History · {}", rows.len()));
-                    columns[0].add_space(4.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("previous-shades-history")
-                        .show(&mut columns[0], |ui| {
-                            for entry in &rows {
-                                let display_name = entry.display_name();
-                                let label = if Path::new(&entry.path).is_file() {
-                                    display_name
-                                } else {
-                                    format!("[missing] {display_name}")
-                                };
-                                let opened = format_previous_shade_time(entry.last_opened_unix_ms);
-                                let match_detail = if query.is_empty() {
-                                    None
-                                } else {
-                                    entry
-                                        .matching_snapshot(&query)
+                    columns[0].set_min_width(520.0);
+                    if paths.is_empty() {
+                        columns[0].label("No matching .shade projects.");
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("previous-shades-list")
+                            .auto_shrink([false, false])
+                            .show_rows(&mut columns[0], 72.0, indices.len(), |ui, range| {
+                                for row in range {
+                                    let entry = self.previous_shades.entries()[indices[row]].clone();
+                                    self.ensure_previous_shade_list_texture(ctx, &entry);
+                                    let label = entry.display_name();
+                                    let source_bytes = if entry.total_source_bytes > 0 {
+                                        format_byte_count(entry.total_source_bytes)
+                                    } else {
+                                        "-".to_owned()
+                                    };
+                                    let metadata = format!(
+                                        "{} face(s) · {} · {}",
+                                        entry.face_count,
+                                        source_bytes,
+                                        entry.active_face_display(),
+                                    );
+                                    let latest = entry
+                                        .latest_snapshot()
                                         .map(|snapshot| {
-                                            if snapshot.code.trim().is_empty()
-                                                || snapshot.code.eq_ignore_ascii_case(&snapshot.name)
-                                            {
-                                                format!("Snapshot: {} · #{}", snapshot.name, snapshot.id)
+                                            let code = snapshot.code.trim();
+                                            if code.is_empty() || code == snapshot.name.trim() {
+                                                format!("Latest: {}", snapshot.name)
                                             } else {
-                                                format!("Snapshot: {} · code {}", snapshot.name, snapshot.code)
+                                                format!("Latest: {} · {}", snapshot.name, code)
                                             }
                                         })
-                                        .or_else(|| {
-                                            entry.test_code_matches(&query).then(|| {
-                                                format!("Test code: {}", entry.test_code_text)
-                                            })
-                                        })
-                                };
-                                let detail = match_detail.as_deref().unwrap_or(&opened);
-                                let source_bytes = if entry.total_source_bytes > 0 {
-                                    format_byte_count(entry.total_source_bytes)
-                                } else {
-                                    "-".to_owned()
-                                };
-                                let metadata = format!("{} face(s) · {source_bytes}", entry.face_count);
-                                let selected = requested_select.as_deref()
-                                    .or(self.previous_shades_selected.as_deref())
-                                    == Some(entry.path.as_str());
-                                let thumbnail = self.previous_shade_list_textures.get(&entry.path);
-                                let response = previous_shade_history_row(
-                                    ui,
-                                    selected,
-                                    &label,
-                                    &metadata,
-                                    detail,
-                                    thumbnail,
-                                )
-                                .on_hover_text(&entry.path);
-                                if response.clicked() {
-                                    requested_select = Some(entry.path.clone());
+                                        .unwrap_or_else(|| "No Snapshots".to_owned());
+                                    let detail = if entry.is_missing() {
+                                        format!("{latest} · MISSING")
+                                    } else {
+                                        latest
+                                    };
+                                    let selected = requested_select
+                                        .as_deref()
+                                        .or(self.previous_shades_selected.as_deref())
+                                        == Some(entry.path.as_str());
+                                    let thumbnail = self.previous_shade_list_textures.get(&entry.path);
+                                    let response = previous_shade_history_row(
+                                        ui,
+                                        selected,
+                                        &label,
+                                        &metadata,
+                                        &detail,
+                                        thumbnail,
+                                    );
+                                    if response.clicked() {
+                                        requested_select = Some(entry.path.clone());
+                                    }
+                                    if response.double_clicked() && !entry.is_missing() {
+                                        requested_open = Some(entry.path.clone());
+                                    }
                                 }
-                                if response.double_clicked() && Path::new(&entry.path).is_file() {
-                                    requested_open = Some(entry.path.clone());
-                                }
+                            });
+                    }
+
+                    let selected_path = requested_select
+                        .as_deref()
+                        .or(self.previous_shades_selected.as_deref());
+                    if let Some(path) = selected_path {
+                        let cached = self
+                            .previous_shades
+                            .entries()
+                            .iter()
+                            .find(|entry| entry.path == path)
+                            .cloned();
+                        columns[1].horizontal_wrapped(|ui| {
+                            let exists = Path::new(path).is_file();
+                            if ui.add_enabled(exists, egui::Button::new("Open")).clicked() {
+                                requested_open = Some(path.to_owned());
+                            }
+                            if ui.add_enabled(exists, egui::Button::new("Reveal in Explorer")).clicked() {
+                                requested_reveal = Some(path.to_owned());
+                            }
+                            if !exists && ui.button("Relink missing...").clicked() {
+                                requested_relink = Some(path.to_owned());
+                            }
+                            if ui.button("Remove from history").clicked() {
+                                requested_remove = Some(path.to_owned());
                             }
                         });
-
-                    columns[1].strong("Preview");
-                    columns[1].add_space(4.0);
-                    if let Some(err) = self.previous_shade_preview_error.as_ref() {
-                        columns[1].colored_label(egui::Color32::LIGHT_RED, err);
-                        if let Some(path) = self.previous_shades_selected.as_deref() {
-                            columns[1].label(path);
-                        }
-                    } else if let Some(preview) = self.previous_shade_preview.as_ref() {
-                        columns[1].heading(&preview.project_name);
-                        if let Some(texture) = self.previous_shade_texture.as_ref() {
-                            let natural = texture.size_vec2();
-                            if natural.x > 0.0 && natural.y > 0.0 {
-                                let max_size = egui::vec2(columns[1].available_width().min(440.0), 280.0);
-                                let scale = (max_size.x / natural.x)
-                                    .min(max_size.y / natural.y)
-                                    .min(1.0);
-                                columns[1].add(
-                                    egui::Image::from_texture(texture)
-                                        .fit_to_exact_size(natural * scale),
-                                );
-                            }
-                        } else if let Some(err) = preview.thumbnail_error.as_ref() {
-                            columns[1].small(format!("Thumbnail unavailable: {err}"));
-                        } else {
-                            columns[1].small("No embedded thumbnail in this .shade file.");
-                        }
-                        columns[1].add_space(6.0);
-                        egui::Grid::new("previous-shade-preview-meta")
-                            .num_columns(2)
-                            .striped(true)
-                            .spacing([12.0, 5.0])
-                            .show(&mut columns[1], |ui| {
-                                ui.strong("Saved");
-                                ui.label(format_previous_shade_time(preview.saved_at_unix_ms));
-                                ui.end_row();
-                                ui.strong("File modified");
-                                ui.label(preview.file_modified_unix_ms.map(format_previous_shade_time).unwrap_or_else(|| "-".to_owned()));
-                                ui.end_row();
-                                ui.strong("Faces");
-                                ui.label(preview.face_count.to_string());
-                                ui.end_row();
-                                ui.strong("Snapshots");
-                                ui.label(preview.snapshot_count.to_string());
-                                ui.end_row();
-                                ui.strong("Active snapshot");
-                                ui.label(preview.active_snapshot_name.as_deref().unwrap_or("-"));
-                                ui.end_row();
-                                ui.strong("Test code");
-                                ui.label(if preview.test_code_enabled { "Enabled" } else { "Off" });
-                                ui.end_row();
-                                ui.strong("Source bytes");
-                                ui.label(format_byte_count(preview.total_source_bytes));
-                                ui.end_row();
-                            });
-
                         columns[1].separator();
-                        columns[1].strong(format!("Snapshots · {}", preview.snapshots.len()));
-                        if preview.snapshots.is_empty() {
-                            columns[1].small("No saved Snapshots in this project.");
-                        } else {
+                        if let Some(texture) = self.previous_shade_texture.as_ref() {
+                            let available = columns[1].available_width().min(420.0);
+                            let size = texture.size_vec2();
+                            let scale = (available / size.x.max(1.0)).min(1.0);
+                            columns[1].image((texture.id(), size * scale));
+                        }
+                        if let Some(preview) = self.previous_shade_preview.as_ref() {
+                            columns[1].heading(&preview.project_name);
+                            egui::Grid::new("previous-shade-metadata")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(&mut columns[1], |ui| {
+                                    ui.strong("Saved");
+                                    ui.label(format_previous_shade_time(preview.saved_at_unix_ms));
+                                    ui.end_row();
+                                    ui.strong("Faces");
+                                    ui.label(preview.face_count.to_string());
+                                    ui.end_row();
+                                    ui.strong("Active Face");
+                                    ui.label(format!("{}", preview.active_face_index.saturating_add(1)));
+                                    ui.end_row();
+                                    ui.strong("Source bytes");
+                                    ui.label(format_byte_count(preview.total_source_bytes));
+                                    ui.end_row();
+                                });
+                            columns[1].separator();
+                            columns[1].strong(format!("Snapshots · {}", preview.snapshots.len()));
                             egui::ScrollArea::vertical()
                                 .id_salt("previous-shade-snapshots")
-                                .max_height(170.0)
+                                .max_height(220.0)
                                 .show(&mut columns[1], |ui| {
                                     for snapshot in &preview.snapshots {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.strong(format!("#{}", snapshot.id));
-                                            ui.label(&snapshot.name);
-                                        });
-                                        if !snapshot.code.trim().is_empty()
-                                            && !snapshot.code.eq_ignore_ascii_case(&snapshot.name)
-                                        {
-                                            ui.small(format!("Code: {}", snapshot.code));
+                                        let active = preview.active_snapshot_name.as_deref() == Some(snapshot.name.as_str());
+                                        let suffix = if snapshot.code.trim().is_empty() || snapshot.code == snapshot.name {
+                                            format!("#{}", snapshot.id)
+                                        } else {
+                                            format!("#{} · {}", snapshot.id, snapshot.code)
+                                        };
+                                        if active {
+                                            ui.strong(format!("{} · {} · active", snapshot.name, suffix));
+                                        } else {
+                                            ui.label(format!("{} · {}", snapshot.name, suffix));
                                         }
                                     }
                                 });
+                        } else if let Some(error) = self.previous_shade_preview_error.as_ref() {
+                            columns[1].colored_label(egui::Color32::YELLOW, error);
+                            if let Some(entry) = cached.as_ref() {
+                                columns[1].label(format!("Cached: {} face(s) · {}", entry.face_count, entry.active_face_display()));
+                                if let Some(snapshot) = entry.latest_snapshot() {
+                                    columns[1].label(format!("Latest Snapshot: {} · #{}", snapshot.name, snapshot.id));
+                                }
+                            }
+                        } else {
+                            columns[1].label("Select a project to inspect its thumbnail, Snapshots and metadata.");
                         }
-
-                        if let Some(face) = preview.active_face.as_ref() {
-                            columns[1].separator();
-                            columns[1].strong(format!(
-                                "Face {} of {} · {}",
-                                preview.active_face_index.saturating_add(1).min(preview.face_count.max(1)),
-                                preview.face_count,
-                                face.label
-                            ));
-                            columns[1].label(format!("{} · {} x {} px · {}-bit · {}", face.source_file_name, face.width, face.height, face.bit_depth, face.color_model));
-                            columns[1].label(format!("{:.0} x {:.0} DPI · {} channels · {}", face.dpi_x, face.dpi_y, face.channel_count, format_byte_count(face.file_size_bytes)));
-                            if !face.channel_names.is_empty() {
-                                columns[1].small(format!("Channels: {}", face.channel_names.join(", ")));
-                            }
-                        }
-                        columns[1].separator();
-                        columns[1].small(preview.path.display().to_string());
-                        columns[1].horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    self.job.is_none() && preview.path.is_file(),
-                                    egui::Button::new("Open selected .shade"),
-                                )
-                                .clicked()
-                            {
-                                requested_open = Some(preview.path.to_string_lossy().into_owned());
-                            }
-                            let folder = preview.path.parent().map(Path::to_path_buf);
-                            if ui
-                                .add_enabled(
-                                    folder.as_ref().is_some_and(|path| path.is_dir()),
-                                    egui::Button::new("Open shade folder"),
-                                )
-                                .clicked()
-                            {
-                                requested_folder = folder;
-                            }
-                        });
                     } else {
-                        columns[1].label("Select a project to inspect its embedded thumbnail, Snapshots and saved metadata.");
+                        columns[1].label("Select a project to inspect its thumbnail, Snapshots and metadata.");
                     }
                 });
             });
+
         self.show_previous_shades = open;
-        if clear_selection {
-            self.previous_shades_selected = None;
-            self.previous_shade_preview = None;
-            self.previous_shade_preview_error = None;
-            self.previous_shade_texture = None;
-        }
         if let Some(path) = requested_select {
-            self.load_previous_shade_preview(ctx, &path);
+            if self.previous_shades_selected.as_deref() != Some(path.as_str()) {
+                self.load_previous_shade_preview(ctx, &path);
+            }
         }
-        if let Some(folder) = requested_folder {
-            if let Err(err) = open_folder(&folder) {
+        if let Some(path) = requested_reveal {
+            if let Err(err) = reveal_in_explorer(Path::new(&path)) {
                 self.report_error(err);
+            }
+        }
+        if let Some(old_path) = requested_relink {
+            if let Some(new_path) = rfd::FileDialog::new()
+                .add_filter("Shade projects", &["shade"])
+                .pick_file()
+            {
+                match self.previous_shades.relink_path(&old_path, &new_path) {
+                    Ok(new_display) => {
+                        if let Err(err) = self.previous_shades.save() {
+                            self.log.error(&err);
+                        }
+                        self.previous_shade_list_textures.remove(&old_path);
+                        self.previous_shade_list_texture_lru
+                            .retain(|item| item != &old_path);
+                        self.load_previous_shade_preview(ctx, &new_display);
+                    }
+                    Err(err) => self.report_error(err),
+                }
+            }
+        }
+        if let Some(path) = requested_remove {
+            if self.previous_shades.remove_path(&path) {
+                if let Err(err) = self.previous_shades.save() {
+                    self.log.error(&err);
+                }
+                self.previous_shade_list_textures.remove(&path);
+                self.previous_shade_list_texture_lru
+                    .retain(|item| item != &path);
+                if self.previous_shades_selected.as_deref() == Some(path.as_str()) {
+                    self.previous_shades_selected = None;
+                    self.previous_shade_preview = None;
+                    self.previous_shade_preview_error = None;
+                    self.previous_shade_texture = None;
+                }
             }
         }
         if let Some(path) = requested_open {
@@ -3962,6 +4236,7 @@ impl eframe::App for ShadeApp {
         self.ui_about_window(ui.ctx());
         self.ui_logs_window(ui.ctx());
         self.ui_previous_shades_window(ui.ctx());
+        self.ui_export_all_window(ui.ctx());
         self.ui_recovery_window(ui.ctx());
         self.ui_snapshot_discard_confirmation(ui.ctx());
         self.ui_snapshot_save_reminder(ui.ctx());
@@ -5352,6 +5627,29 @@ fn unix_ms_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+fn adjustment_is_modified(adjustment: &ChannelAdjustment) -> bool {
+    let default = ChannelAdjustment::default();
+    adjustment.levels != default.levels
+        || adjustment.mixer != default.mixer
+        || adjustment.curve != default.curve
+}
+
+fn reveal_in_explorer(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        if path.is_file() {
+            std::process::Command::new("explorer.exe")
+                .arg("/select,")
+                .arg(path)
+                .spawn()
+                .map_err(|err| format!("Cannot reveal {} in Explorer: {err}", path.display()))?;
+            return Ok(());
+        }
+    }
+    let folder = path.parent().unwrap_or(path);
+    open_folder(folder)
 }
 
 fn open_folder(path: &Path) -> Result<(), String> {

@@ -16,10 +16,13 @@ pub fn build_project_thumbnail(
     let (width, height, resized) =
         resize_rgba(face.width, face.height, &rgba, THUMBNAIL_MAX_DIMENSION)?;
     let png = encode_png(width as u32, height as u32, &resized)?;
+    let encoded_bytes = png.len() as u64;
     Ok(ProjectThumbnail {
         mime_type: "image/png".to_owned(),
+        thumbnail_version: 1,
         width: width as u32,
         height: height as u32,
+        encoded_bytes,
         data_base64: BASE64_STANDARD.encode(png),
     })
 }

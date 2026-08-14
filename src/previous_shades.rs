@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{FaceFileMetadata, ProjectThumbnail, ShadeProject};
 use crate::thumbnail;
 
-const SNAPSHOT_CACHE_VERSION: u32 = 2;
+const SNAPSHOT_CACHE_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -37,6 +37,8 @@ pub struct PreviousShadeEntry {
     pub snapshots: Vec<CachedSnapshot>,
     pub test_code_text: String,
     pub face_count: usize,
+    pub active_face_index: usize,
+    pub active_face_label: String,
     pub total_source_bytes: u64,
     pub thumbnail: Option<ProjectThumbnail>,
 }
@@ -53,6 +55,8 @@ impl Default for PreviousShadeEntry {
             snapshots: Vec::new(),
             test_code_text: String::new(),
             face_count: 0,
+            active_face_index: 0,
+            active_face_label: String::new(),
             total_source_bytes: 0,
             thumbnail: None,
         }
@@ -121,6 +125,37 @@ impl PreviousShadeEntry {
             .map(|metadata| metadata.face_count)
             .filter(|count| *count > 0)
             .unwrap_or(project.faces.len());
+        self.active_face_index = project
+            .file_metadata
+            .as_ref()
+            .map(|metadata| metadata.active_face_index)
+            .unwrap_or(0);
+        self.active_face_label = project
+            .file_metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata
+                    .faces
+                    .get(self.active_face_index)
+                    .or_else(|| metadata.faces.first())
+            })
+            .map(|face| {
+                if face.label.trim().is_empty() {
+                    face.source_file_name.trim().to_owned()
+                } else {
+                    face.label.trim().to_owned()
+                }
+            })
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                project
+                    .faces
+                    .get(self.active_face_index)
+                    .or_else(|| project.faces.first())
+                    .map(|face| face.label.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_default();
         self.total_source_bytes = project
             .file_metadata
             .as_ref()
@@ -164,6 +199,36 @@ impl PreviousShadeEntry {
         !self.test_code_text.trim().is_empty()
             && contains_case_insensitive(&self.test_code_text, query_lower.trim())
     }
+
+    pub fn latest_snapshot(&self) -> Option<&CachedSnapshot> {
+        self.snapshots
+            .iter()
+            .max_by_key(|snapshot| (snapshot.created_at_unix_ms, snapshot.id))
+    }
+
+    pub fn active_face_display(&self) -> String {
+        if !self.active_face_label.trim().is_empty() {
+            return format!(
+                "Face {} · {}",
+                self.active_face_index.saturating_add(1),
+                self.active_face_label.trim()
+            );
+        }
+        if self.face_count > 0 {
+            format!(
+                "Face {}",
+                self.active_face_index
+                    .saturating_add(1)
+                    .min(self.face_count)
+            )
+        } else {
+            "No face metadata".to_owned()
+        }
+    }
+
+    pub fn is_missing(&self) -> bool {
+        !Path::new(&self.path).is_file()
+    }
 }
 
 impl PreviousShadesStore {
@@ -197,6 +262,57 @@ impl PreviousShadesStore {
 
     pub fn entries(&self) -> &[PreviousShadeEntry] {
         &self.entries
+    }
+
+    pub fn remove_path(&mut self, path: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| !same_path(&entry.path, path));
+        self.entries.len() != before
+    }
+
+    pub fn relink_path(&mut self, old_path: &str, new_path: &Path) -> Result<String, String> {
+        let project = ShadeProject::load(new_path)?;
+        let normalized = fs::canonicalize(new_path).unwrap_or_else(|_| new_path.to_path_buf());
+        let display = normalized.to_string_lossy().into_owned();
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| same_path(&entry.path, old_path))
+        else {
+            return Err("Previous Shades entry no longer exists.".to_owned());
+        };
+        let mut entry = self.entries.remove(index);
+        entry.path = display.clone();
+        entry.project_name = project_display_name(&project.name, new_path);
+        entry.last_opened_unix_ms = unix_ms_now();
+        entry.saved_at_unix_ms = project
+            .file_metadata
+            .as_ref()
+            .map(|metadata| metadata.saved_at_unix_ms)
+            .unwrap_or(entry.saved_at_unix_ms);
+        entry.refresh_from_project(&project);
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|existing| same_path(&existing.path, &display))
+        {
+            existing.open_count = existing.open_count.max(entry.open_count).max(1);
+            existing.last_opened_unix_ms =
+                existing.last_opened_unix_ms.max(entry.last_opened_unix_ms);
+            existing.saved_at_unix_ms = entry.saved_at_unix_ms;
+            existing.project_name = entry.project_name;
+            existing.snapshot_cache_version = entry.snapshot_cache_version;
+            existing.snapshots = entry.snapshots;
+            existing.test_code_text = entry.test_code_text;
+            existing.face_count = entry.face_count;
+            existing.active_face_index = entry.active_face_index;
+            existing.active_face_label = entry.active_face_label;
+            existing.total_source_bytes = entry.total_source_bytes;
+            existing.thumbnail = entry.thumbnail;
+        } else {
+            self.entries.push(entry);
+        }
+        Ok(display)
     }
 
     pub fn record_open(&mut self, path: &Path, project_name: &str) {
@@ -306,6 +422,8 @@ impl PreviousShadesStore {
                     existing.snapshots = entry.snapshots.clone();
                     existing.test_code_text = entry.test_code_text.clone();
                     existing.face_count = entry.face_count;
+                    existing.active_face_index = entry.active_face_index;
+                    existing.active_face_label = entry.active_face_label.clone();
                     existing.total_source_bytes = entry.total_source_bytes;
                     existing.thumbnail = entry.thumbnail.clone();
                 } else if entry.snapshot_cache_version > existing.snapshot_cache_version {
@@ -313,6 +431,8 @@ impl PreviousShadesStore {
                     existing.snapshots = entry.snapshots.clone();
                     existing.test_code_text = entry.test_code_text.clone();
                     existing.face_count = entry.face_count;
+                    existing.active_face_index = entry.active_face_index;
+                    existing.active_face_label = entry.active_face_label.clone();
                     existing.total_source_bytes = entry.total_source_bytes;
                     existing.thumbnail = entry.thumbnail.clone();
                 }
@@ -470,10 +590,13 @@ fn build_cached_list_thumbnail(source: &ProjectThumbnail) -> Option<ProjectThumb
     let (width, height, rgba) =
         thumbnail::resize_rgba(decoded.width, decoded.height, &decoded.rgba, 72).ok()?;
     let png = thumbnail::encode_png(width as u32, height as u32, &rgba).ok()?;
+    let encoded_bytes = png.len() as u64;
     Some(ProjectThumbnail {
         mime_type: "image/png".to_owned(),
+        thumbnail_version: 1,
         width: width as u32,
         height: height as u32,
+        encoded_bytes,
         data_base64: BASE64_STANDARD.encode(png),
     })
 }

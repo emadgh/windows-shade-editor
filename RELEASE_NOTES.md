@@ -1,3 +1,10 @@
+# Shade Editor 0.14.0
+
+- Export All workspace with destination field, folder TIFF warning, template naming, overwrite/skip/auto-number policies, and optional Explorer reveal after export.
+- Previous Shades promoted to a Project Browser with Remove from history, relink for missing .shade files, row-level latest Snapshot/active Face details, Explorer reveal, lazy row rendering, and a bounded thumbnail LRU cache.
+- Project thumbnails now persist thumbnail_version and encoded_bytes metadata alongside width/height.
+- Adjustment panel shows per-channel modified state and the total number of modified channels.
+
 # Shade Editor 0.13.2
 
 - Upgrade embedded project thumbnails to 512px PNG with bilinear resampling, high PNG compression, and RGB encoding when alpha is fully opaque.

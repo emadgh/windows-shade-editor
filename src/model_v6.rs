@@ -75,9 +75,17 @@ pub struct FaceRef {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectThumbnail {
     pub mime_type: String,
+    #[serde(default = "default_thumbnail_version")]
+    pub thumbnail_version: u32,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub encoded_bytes: u64,
     pub data_base64: String,
+}
+
+fn default_thumbnail_version() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
