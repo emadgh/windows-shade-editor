@@ -10,14 +10,34 @@ color.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
 
 export = Path("src/export.rs")
 text = export.read_text(encoding="utf-8")
-old_stream = "    let names = &stream.metadata.channel_names;\n"
-if text.count(old_stream) < 2:
-    raise RuntimeError("Expected two unused stream channel-name bindings")
-text = text.replace(old_stream, "", 2)
-old_metadata = "    let names = &metadata.channel_names;\n"
-if old_metadata not in text:
-    raise RuntimeError("Expected unused region channel-name binding")
-text = text.replace(old_metadata, "", 1)
+
+def remove_after_marker(source: str, marker: str, target: str, label: str) -> str:
+    before, sep, after = source.partition(marker)
+    if not sep:
+        raise RuntimeError(f"Missing {label} marker")
+    if target not in after:
+        raise RuntimeError(f"Missing unused binding in {label}")
+    after = after.replace(target, "", 1)
+    return before + sep + after
+
+text = remove_after_marker(
+    text,
+    "fn stream_spool_u8",
+    "    let names = &stream.metadata.channel_names;\n",
+    "stream_spool_u8",
+)
+text = remove_after_marker(
+    text,
+    "fn stream_spool_u16",
+    "    let names = &stream.metadata.channel_names;\n",
+    "stream_spool_u16",
+)
+text = remove_after_marker(
+    text,
+    "fn stream_spool_regions",
+    "    let names = &metadata.channel_names;\n",
+    "stream_spool_regions",
+)
 export.write_text(text, encoding="utf-8", newline="\n")
 
-print("Compile fix and unused export bindings applied.")
+print("Compile fix and scoped unused export bindings applied.")
