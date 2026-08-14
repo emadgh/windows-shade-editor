@@ -1,0 +1,54 @@
+name: Dev source inspection
+
+on:
+  push:
+    branches:
+      - work/production-softproof-queue
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Print source anchors
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/main.rs')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          patterns=[
+            'PreviewColorConfig {',
+            'fn preview_color',
+            'fn request_render',
+            'fn schedule_render',
+            'RenderResult {',
+            'fn ui_top',
+            'menu::bar',
+            'fn export_current',
+            'fn export_all',
+            'fn ui_export_all',
+            'JobResult::Export',
+            'fn ui_color_management_window',
+            'fn ui_history',
+            'describe_change(',
+            'impl eframe::App',
+            'fn update(&mut self',
+          ]
+          seen=set()
+          for pat in patterns:
+              for i,line in enumerate(lines):
+                  if pat in line:
+                      key=(pat,i)
+                      if key in seen: continue
+                      seen.add(key)
+                      lo=max(0,i-35); hi=min(len(lines),i+100)
+                      print('\n'+'='*100)
+                      print(f'PATTERN {pat!r} at line {i+1}')
+                      for j in range(lo,hi):
+                          print(f'{j+1:05d}: {lines[j]}')
+                      break
+          PY
