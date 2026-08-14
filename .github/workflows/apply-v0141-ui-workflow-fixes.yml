@@ -19,6 +19,8 @@ jobs:
           components: rustfmt
       - name: Apply source migration
         run: python scripts/apply_v0141_ui_workflow_fixes.py
+      - name: Apply egui 0.35 Panel API fix
+        run: python scripts/fix_v0141_egui_panel_api.py
       - name: Format
         run: cargo fmt --all
       - name: Verify diff
@@ -27,7 +29,8 @@ jobs:
           git diff --check
           Select-String -Path Cargo.toml -Pattern 'version = "0.14.1"' | Out-Null
           Select-String -Path src/app_main.rs -Pattern 'Window::new\("Project View"\)' | Out-Null
-          Select-String -Path src/app_main.rs -Pattern 'width_range\(320.0\.\.=580.0\)' | Out-Null
+          Select-String -Path src/app_main.rs -Pattern 'Panel::right\("project-view-preview-pane"\)' | Out-Null
+          Select-String -Path src/app_main.rs -Pattern 'size_range\(320.0\.\.=580.0\)' | Out-Null
           Select-String -Path src/app_main.rs -Pattern 'desired_width\(380.0\)' | Out-Null
           Select-String -Path src/workflow_v0103.rs -Pattern 'Key::E' | Out-Null
       - name: Check locked Windows build
