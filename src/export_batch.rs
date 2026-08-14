@@ -46,14 +46,12 @@ fn render_tokens(template: &str, context: &ExportNameContext<'_>) -> String {
     let source = nonempty(context.source_name).unwrap_or(face);
     let mut value = template.to_owned();
 
-    // New compact tokens.
     value = value.replace("{project}", project_name);
     value = value.replace("{face}", face);
     value = value.replace("{snapshot}", snapshot);
     value = value.replace("{source}", source);
     value = value.replace("{date}", context.date);
 
-    // Backward-compatible tokens from earlier Shade Editor builds.
     value = value.replace("{shade-name|project-name}", shade_name);
     value = value.replace("{shade-name}", shade_name);
     value = value.replace("{project-name}", project_name);
@@ -135,19 +133,23 @@ pub fn resolve_destination(
     resolve_destination_reserved(folder, filename, policy, &mut reserved)
 }
 
+/// `reserved` contains normalized path keys rather than raw `PathBuf`s so
+/// Windows case differences and resolvable aliases cannot reserve the same
+/// destination twice.
 pub fn resolve_destination_reserved(
     folder: &Path,
     filename: &str,
     policy: ConflictPolicy,
-    reserved: &mut BTreeSet<PathBuf>,
+    reserved: &mut BTreeSet<String>,
 ) -> DestinationDecision {
     let target = folder.join(filename);
+    let target_key = crate::path_safety::path_key(&target);
     if policy == ConflictPolicy::Overwrite {
-        reserved.insert(target.clone());
+        reserved.insert(target_key);
         return DestinationDecision::Write(target);
     }
-    if !target.exists() && !reserved.contains(&target) {
-        reserved.insert(target.clone());
+    if !target.exists() && !reserved.contains(&target_key) {
+        reserved.insert(target_key);
         return DestinationDecision::Write(target);
     }
     if policy == ConflictPolicy::Skip {
@@ -165,8 +167,9 @@ pub fn resolve_destination_reserved(
         .unwrap_or_else(|| "tif".to_owned());
     for number in 2u64.. {
         let candidate = folder.join(format!("{stem} ({number}).{extension}"));
-        if !candidate.exists() && !reserved.contains(&candidate) {
-            reserved.insert(candidate.clone());
+        let key = crate::path_safety::path_key(&candidate);
+        if !candidate.exists() && !reserved.contains(&key) {
+            reserved.insert(key);
             return DestinationDecision::Write(candidate);
         }
     }
@@ -246,5 +249,22 @@ mod tests {
     #[test]
     fn windows_reserved_filename_characters_are_sanitized() {
         assert_eq!(sanitize_filename_stem("A*B:C?D"), "A-B-C-D");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reservation_keys_are_case_insensitive() {
+        let mut reserved = BTreeSet::new();
+        reserved.insert(crate::path_safety::path_key(Path::new(r"C:\Exports\A.tif")));
+        let decision = resolve_destination_reserved(
+            Path::new(r"c:\exports"),
+            "a.tif",
+            ConflictPolicy::AutoNumber,
+            &mut reserved,
+        );
+        match decision {
+            DestinationDecision::Write(path) => assert!(path.ends_with("a (2).tif")),
+            DestinationDecision::Skip(_) => panic!("auto-number must not skip"),
+        }
     }
 }
