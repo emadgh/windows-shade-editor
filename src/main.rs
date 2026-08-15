@@ -35,6 +35,7 @@ mod tiff_inspect;
 mod tiff_io;
 mod update;
 mod validation;
+mod worker_guard;
 mod workflow;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -70,6 +71,7 @@ const APP_WINDOW_TITLE: &str = concat!(
 );
 
 fn main() -> eframe::Result {
+    app_log::install_panic_hook();
     let startup_project = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
@@ -193,6 +195,7 @@ enum JobResult {
     },
     InspectTiff(Result<tiff_inspect::TiffInspection, String>),
     Export(SnapshotExportBatchResult),
+    WorkerPanic(String),
 }
 
 struct SnapshotExportMark {
@@ -206,6 +209,14 @@ struct SnapshotExportBatchResult {
     result: Result<String, String>,
     marks: Vec<SnapshotExportMark>,
 }
+
+struct RenderFailure {
+    face_index: usize,
+    generation: u64,
+    message: String,
+}
+
+type RenderMessage = Result<RenderResult, RenderFailure>;
 
 struct RenderResult {
     face_index: usize,
@@ -283,8 +294,8 @@ struct ShadeApp {
     autosave_busy: bool,
     last_autosave: Instant,
     job: Option<JobHandle>,
-    render_tx: mpsc::Sender<RenderResult>,
-    render_rx: mpsc::Receiver<RenderResult>,
+    render_tx: mpsc::Sender<RenderMessage>,
+    render_rx: mpsc::Receiver<RenderMessage>,
     render_busy: Option<(usize, u64)>,
     snapshot_preview_cache: snapshot_preview_cache::SnapshotPreviewCache<SnapshotPreviewEntry>,
 }
@@ -530,7 +541,9 @@ impl ShadeApp {
         let (tx, rx) = mpsc::channel();
         let worker_progress = Arc::clone(&progress);
         std::thread::spawn(move || {
-            let result = task(worker_progress);
+            let result =
+                worker_guard::catch_value("Background operation", || task(worker_progress))
+                    .unwrap_or_else(JobResult::WorkerPanic);
             let _ = tx.send(result);
         });
         self.job = Some(JobHandle { progress, rx });
@@ -2194,6 +2207,9 @@ impl ShadeApp {
                 }
                 self.inspector.show = true;
             }
+            JobResult::WorkerPanic(err) => {
+                self.report_error(err);
+            }
             JobResult::Export(payload) => {
                 let export_ok = payload.result.is_ok();
                 if !payload.marks.is_empty() {
@@ -2322,7 +2338,17 @@ impl ShadeApp {
     }
 
     fn poll_render(&mut self, ctx: &egui::Context) {
-        while let Ok(result) = self.render_rx.try_recv() {
+        while let Ok(message) = self.render_rx.try_recv() {
+            let result = match message {
+                Ok(result) => result,
+                Err(failure) => {
+                    if self.render_busy == Some((failure.face_index, failure.generation)) {
+                        self.render_busy = None;
+                    }
+                    self.report_error(failure.message);
+                    continue;
+                }
+            };
             let face_index = result.face_index;
             let generation = result.generation;
             let solo_channel = result.solo_channel;
@@ -2412,65 +2438,77 @@ impl ShadeApp {
         let tx = self.render_tx.clone();
         self.render_busy = Some((face_index, generation));
         std::thread::spawn(move || {
-            let (adjusted, clipping) = render::adjusted_planes_with_stats(&preview, &project);
-            let color =
-                color_management::PreviewColorTransform::new(&preview.metadata, color_config);
-            let rgba =
-                render::rgba_from_planes_with_color(&preview, &adjusted, solo_channel, &color);
-            let original_rgba = render::rgba_from_planes_with_color(
-                &preview,
-                &preview.channels,
-                solo_channel,
-                &color,
-            );
-            let adjusted_histograms = adjusted
-                .iter()
-                .map(|values| render::histogram(values))
-                .collect::<Vec<_>>();
-            let color_status = color.status().clone();
-
-            let (embedded_original_rgba, embedded_original_status) = if needs_embedded_original {
-                let embedded_color = color_management::PreviewColorTransform::new(
-                    &preview.metadata,
-                    PreviewColorConfig {
-                        enabled: true,
-                        intent: PreviewRenderingIntent::Perceptual,
-                        black_point_compensation: false,
-                        assigned_profile_path: None,
-                        assigned_profile_identity: None,
-                        soft_proof_enabled: false,
-                        proof_profile_path: None,
-                        proof_profile_identity: None,
-                        proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
-                        monitor_profile_path: None,
-                        monitor_profile_identity: None,
-                        gamut_warning: false,
-                    },
-                );
-                let status = embedded_color.status().clone();
-                let source_rgba = render::rgba_from_planes_with_color(
+            let outcome = worker_guard::catch_value("Preview render worker", || {
+                let (adjusted, clipping) = render::adjusted_planes_with_stats(&preview, &project);
+                let color =
+                    color_management::PreviewColorTransform::new(&preview.metadata, color_config);
+                let rgba =
+                    render::rgba_from_planes_with_color(&preview, &adjusted, solo_channel, &color);
+                let original_rgba = render::rgba_from_planes_with_color(
                     &preview,
                     &preview.channels,
-                    None,
-                    &embedded_color,
+                    solo_channel,
+                    &color,
                 );
-                (Some(source_rgba), Some(status))
-            } else {
-                (None, None)
-            };
+                let adjusted_histograms = adjusted
+                    .iter()
+                    .map(|values| render::histogram(values))
+                    .collect::<Vec<_>>();
+                let color_status = color.status().clone();
 
-            let _ = tx.send(RenderResult {
-                face_index,
-                generation,
-                solo_channel,
-                adjusted_histograms,
-                clipping,
-                color_status,
-                rgba,
-                original_rgba,
-                embedded_original_rgba,
-                embedded_original_status,
+                let (embedded_original_rgba, embedded_original_status) = if needs_embedded_original
+                {
+                    let embedded_color = color_management::PreviewColorTransform::new(
+                        &preview.metadata,
+                        PreviewColorConfig {
+                            enabled: true,
+                            intent: PreviewRenderingIntent::Perceptual,
+                            black_point_compensation: false,
+                            assigned_profile_path: None,
+                            assigned_profile_identity: None,
+                            soft_proof_enabled: false,
+                            proof_profile_path: None,
+                            proof_profile_identity: None,
+                            proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
+                            monitor_profile_path: None,
+                            monitor_profile_identity: None,
+                            gamut_warning: false,
+                        },
+                    );
+                    let status = embedded_color.status().clone();
+                    let source_rgba = render::rgba_from_planes_with_color(
+                        &preview,
+                        &preview.channels,
+                        None,
+                        &embedded_color,
+                    );
+                    (Some(source_rgba), Some(status))
+                } else {
+                    (None, None)
+                };
+
+                RenderResult {
+                    face_index,
+                    generation,
+                    solo_channel,
+                    adjusted_histograms,
+                    clipping,
+                    color_status,
+                    rgba,
+                    original_rgba,
+                    embedded_original_rgba,
+                    embedded_original_status,
+                }
             });
+            let message = match outcome {
+                Ok(result) => Ok(result),
+                Err(message) => Err(RenderFailure {
+                    face_index,
+                    generation,
+                    message,
+                }),
+            };
+            let _ = tx.send(message);
         });
     }
 
@@ -5881,6 +5919,10 @@ impl ShadeApp {
                 ui.small("When enabled, Curve keeps only the draggable graph and hides the selected-point label, Input / Output fields, and helper text.");
                 ui.separator();
                 ui.heading("Color guides");
+                ui.horizontal(|ui| {
+                    ui.label("Curve / Histogram direction");
+                    changed |= tonal_display_mode_selector(ui, &mut self.settings.tonal_display_mode);
+                });
                 changed |= ui
                     .checkbox(
                         &mut self.settings.colorize_histograms,
@@ -7028,18 +7070,20 @@ fn all_mixers_ui(
 }
 
 fn tonal_display_mode_selector(ui: &mut egui::Ui, mode: &mut TonalDisplayMode) -> bool {
-    let mut changed = false;
-    changed |= ui
-        .selectable_value(mode, TonalDisplayMode::Light, "Light")
-        .on_hover_text(
-            "Light: 0 is black and 255 is white, matching the current Shade Editor display.",
-        )
-        .changed();
-    changed |= ui
-        .selectable_value(mode, TonalDisplayMode::Pigment, "Pigment")
-        .on_hover_text("Pigment: mirrors Curve axes and histograms like Photoshop Pigment/Ink, while keeping the labels 0-255. TIFF adjustment math is unchanged.")
-        .changed();
-    changed
+    let current = mode.label();
+    let next = mode.toggled().label();
+    if ui
+        .button(format!("Mode: {current}"))
+        .on_hover_text(format!(
+            "Click to switch Curve and Histogram display to {next}. This only changes presentation and interaction; TIFF adjustment math is unchanged."
+        ))
+        .clicked()
+    {
+        *mode = mode.toggled();
+        true
+    } else {
+        false
+    }
 }
 
 fn with_accent<R>(

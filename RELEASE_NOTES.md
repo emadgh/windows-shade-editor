@@ -1,3 +1,13 @@
+# Shade Editor 0.18.5
+
+- Harden Export Queue runtime stability: Release builds now unwind worker panics instead of aborting the entire process, export worker panics are converted into Failed queue rows, and panic details are written to the application log.
+- Move the large disk-backed export spool to a local ShadeEditor cache directory before memory mapping. Final TIFF staging/commit still happens beside the requested destination, including UNC/network destinations.
+- Protect preview/background jobs from taking down the whole process and surface unexpected worker termination as an application error.
+- Replace the two Light/Pigment selector buttons with one toggle button everywhere.
+- Correct the user-facing Light/Pigment labels while retaining the existing serialized enum values for settings compatibility.
+- Add the same tonal-direction toggle to Settings > Color guides.
+- Add regression coverage for worker panic isolation, local spool placement, and queue polling/enqueue activity while an export is processing.
+
 # Shade Editor 0.18.4
 
 - Curve keyboard editing: the selected point moves 1 unit with Arrow keys and 10 units with Shift+Arrow.

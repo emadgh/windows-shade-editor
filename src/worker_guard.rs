@@ -7,7 +7,10 @@ where
 {
     match catch_unwind(AssertUnwindSafe(task)) {
         Ok(value) => Ok(value),
-        Err(payload) => Err(format!("{label} panicked: {}", panic_payload_text(payload.as_ref()))),
+        Err(payload) => Err(format!(
+            "{label} panicked: {}",
+            panic_payload_text(payload.as_ref())
+        )),
     }
 }
 

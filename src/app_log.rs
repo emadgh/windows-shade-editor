@@ -61,3 +61,30 @@ impl AppLog {
         fs::write(&self.path, "").map_err(|err| format!("Cannot clear log: {err}"))
     }
 }
+
+pub fn install_panic_hook() {
+    let log = AppLog::default();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(message) = info.payload().downcast_ref::<&str>() {
+            (*message).to_owned()
+        } else if let Some(message) = info.payload().downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "unknown panic payload".to_owned()
+        };
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "unknown location".to_owned());
+        log.write("PANIC", &format!("{payload} @ {location}"));
+        default_hook(info);
+    }));
+}

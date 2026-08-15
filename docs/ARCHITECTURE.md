@@ -124,3 +124,8 @@ Photoshop Spot samples are normalized internally to ink-coverage polarity and co
 ## Production TIFF inspector
 
 `tiff_inspect.rs` is read-only. It combines decoded TIFF metadata with raw transport tags for diagnostics and never loads an inspected file into the editing project.
+
+
+## Export worker isolation (v0.18.5)
+
+Production Release builds use unwind semantics so a panic in a background worker cannot abort the entire GUI process. Export Queue workers convert panics into normal Failed completions and the global panic hook records details in `%LOCALAPPDATA%/ShadeEditor/shade-editor.log`. The large raw streaming spool is always created under the local ShadeEditor application-data directory before memory mapping; UNC/network destinations only receive the final temporary TIFF and atomic commit. This keeps the memory-mapped backing file local while preserving bounded-RAM export and network output support.

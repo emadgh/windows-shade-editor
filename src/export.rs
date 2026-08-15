@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fontdue::{Font, FontSettings};
 use memmap2::MmapOptions;
@@ -16,6 +17,8 @@ use crate::model::{
     ChannelAdjustment, MASTER_ADJUSTMENT_KEY, ShadeProject, TEST_CODE_ALL_CHANNELS,
     TestCodePosition, apply_curve, apply_levels,
 };
+static EXPORT_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
 use crate::tiff_io::{
     ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_region,
     for_each_decoded_strip, stream_info, tiff_sample_from_working, working_sample_from_tiff,
@@ -979,14 +982,27 @@ where
     Ok(())
 }
 
-fn temporary_spool_path(destination: &Path) -> Result<PathBuf, String> {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "export.tif".to_owned());
-    let final_name = file_name.strip_suffix(".tmp").unwrap_or(&file_name);
-    Ok(parent.join(format!("{final_name}.spool.tmp")))
+fn local_export_spool_root() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ShadeEditor")
+        .join("export-spool")
+}
+
+fn temporary_spool_path(_destination: &Path) -> Result<PathBuf, String> {
+    let root = local_export_spool_root();
+    fs::create_dir_all(&root).map_err(|err| {
+        format!(
+            "Cannot create local export spool folder {}: {err}",
+            root.display()
+        )
+    })?;
+    let sequence = EXPORT_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Ok(root.join(format!(
+        "export-{}-{sequence}.spool.tmp",
+        std::process::id()
+    )))
 }
 
 fn temporary_export_path(destination: &Path) -> Result<PathBuf, String> {
@@ -1306,19 +1322,24 @@ fn rasterize_text(font: &Font, text: &str, px: f32) -> TextBitmap {
 #[cfg(test)]
 mod streaming_tests {
     #[test]
-    fn temporary_export_and_spool_names_stay_short_and_deterministic() {
-        let destination = Path::new("Fabia_Gray_S8-E6_2026-08-15.tif");
+    fn temporary_export_name_stays_short_and_spool_is_local() {
+        let destination =
+            Path::new(r"\\192.168.100.154\DurstPrinter\TEST\Fabia_Gray_S8-E6_2026-08-15.tif");
         let temporary = temporary_export_path(destination).unwrap();
         assert_eq!(
             temporary.file_name().unwrap().to_string_lossy(),
             "Fabia_Gray_S8-E6_2026-08-15.tif.tmp"
         );
         let spool = temporary_spool_path(&temporary).unwrap();
-        assert_eq!(
-            spool.file_name().unwrap().to_string_lossy(),
-            "Fabia_Gray_S8-E6_2026-08-15.tif.spool.tmp"
+        assert_eq!(spool.parent().unwrap(), local_export_spool_root());
+        assert_ne!(spool.parent(), temporary.parent());
+        assert!(
+            spool
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".spool.tmp")
         );
-        assert!(!spool.to_string_lossy().contains("shade-editor-spool"));
     }
 
     use super::*;

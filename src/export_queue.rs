@@ -15,6 +15,7 @@ use crate::export_recipe::ExportRecipe;
 use crate::path_safety;
 use crate::safe_fs;
 use crate::validation;
+use crate::worker_guard;
 
 const QUEUE_FORMAT_VERSION: u32 = 1;
 const FINGERPRINT_SAMPLE_BYTES: usize = 1024 * 1024;
@@ -701,47 +702,50 @@ impl ExportQueue {
         let spec = queued.export;
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let validate_after_export = spec.validate_after_export;
-            let progress_tx = tx.clone();
-            let project = spec.recipe.materialize_project();
-            let result = export::export_face_with_progress_options(
-                &spec.source,
-                &spec.destination,
-                &project,
-                spec.default_dpi,
-                export::ExportOptions {
-                    force_lzw: spec.force_lzw,
-                },
-                move |fraction, detail| {
-                    let _ = progress_tx.send(ExportQueueEvent::Progress {
-                        id,
-                        fraction: if validate_after_export {
-                            fraction * 0.90
-                        } else {
-                            fraction
-                        },
-                        detail: detail.to_owned(),
-                    });
-                },
-            )
-            .and_then(|_| {
-                if spec.validate_after_export {
-                    let _ = tx.send(ExportQueueEvent::Progress {
-                        id,
-                        fraction: 0.94,
-                        detail: "Validating exported TIFF".to_owned(),
-                    });
-                    let verified = validation::validate_export_transport_with_options(
-                        &spec.source,
-                        &spec.destination,
-                        spec.force_lzw,
-                    )?;
-                    Ok(format!("Done · {verified}"))
-                } else {
-                    Ok("Done".to_owned())
-                }
+            let mark = spec.mark.clone();
+            let result = worker_guard::catch_result("Export worker", || {
+                let validate_after_export = spec.validate_after_export;
+                let progress_tx = tx.clone();
+                let project = spec.recipe.materialize_project();
+                export::export_face_with_progress_options(
+                    &spec.source,
+                    &spec.destination,
+                    &project,
+                    spec.default_dpi,
+                    export::ExportOptions {
+                        force_lzw: spec.force_lzw,
+                    },
+                    move |fraction, detail| {
+                        let _ = progress_tx.send(ExportQueueEvent::Progress {
+                            id,
+                            fraction: if validate_after_export {
+                                fraction * 0.90
+                            } else {
+                                fraction
+                            },
+                            detail: detail.to_owned(),
+                        });
+                    },
+                )
+                .and_then(|_| {
+                    if spec.validate_after_export {
+                        let _ = tx.send(ExportQueueEvent::Progress {
+                            id,
+                            fraction: 0.94,
+                            detail: "Validating exported TIFF".to_owned(),
+                        });
+                        let verified = validation::validate_export_transport_with_options(
+                            &spec.source,
+                            &spec.destination,
+                            spec.force_lzw,
+                        )?;
+                        Ok(format!("Done · {verified}"))
+                    } else {
+                        Ok("Done".to_owned())
+                    }
+                })
             });
-            let mark = result.as_ref().ok().and(spec.mark);
+            let mark = result.as_ref().ok().and(mark);
             let _ = tx.send(ExportQueueEvent::Finished {
                 id,
                 project_session_id: session_id,
@@ -912,6 +916,27 @@ mod tests {
         assert!(restored.items[0].spec.export.mark.is_none());
         assert_eq!(restored.items[0].spec.project_session_id, 0);
         let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn queue_can_be_read_and_extended_while_an_item_is_processing() {
+        let mut queue = ExportQueue::new();
+        let first = queue.enqueue(spec("first.tif"));
+        queue.items[0].status = ExportQueueStatus::Processing;
+        queue.active_id = Some(first);
+        let second = queue.enqueue(spec("second.tif"));
+
+        for _ in 0..200 {
+            let rows = queue
+                .items()
+                .iter()
+                .map(|item| (item.id, item.status, item.progress, item.detail.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(queue.active_id, Some(first));
+            assert_eq!(queue.items()[1].id, second);
+            assert_eq!(queue.items()[1].status, ExportQueueStatus::Waiting);
+        }
     }
 
     #[test]

@@ -26,9 +26,18 @@ impl Default for TonalDisplayMode {
 
 impl TonalDisplayMode {
     pub fn label(self) -> &'static str {
+        // v0.18.4 shipped the two presentation names reversed. Keep the enum
+        // variants stable for settings compatibility and correct only the UI label.
         match self {
-            Self::Light => "Light",
-            Self::Pigment => "Pigment",
+            Self::Light => "Pigment",
+            Self::Pigment => "Light",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Light => Self::Pigment,
+            Self::Pigment => Self::Light,
         }
     }
 }
@@ -259,6 +268,13 @@ mod tests {
     #[test]
     fn compact_curve_controls_default_off() {
         assert!(!AppSettings::default().compact_curve_controls);
+    }
+
+    #[test]
+    fn tonal_display_labels_match_the_corrected_ui_names() {
+        assert_eq!(TonalDisplayMode::Light.label(), "Pigment");
+        assert_eq!(TonalDisplayMode::Pigment.label(), "Light");
+        assert_eq!(TonalDisplayMode::Light.toggled(), TonalDisplayMode::Pigment);
     }
 
     #[test]
