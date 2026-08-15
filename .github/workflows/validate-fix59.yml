@@ -23,30 +23,21 @@ jobs:
       - name: Sync 0.20.3 metadata
         shell: pwsh
         run: |
-          Set-Content -Encoding ascii -NoNewline VERSION '0.20.3'
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'VERSION'), '0.20.3', [System.Text.Encoding]::ASCII)
 
           $cargo = Get-Content -Raw Cargo.toml
           $cargo = $cargo -replace '(?m)^version = "0\.20\.2"$', 'version = "0.20.3"'
-          Set-Content -Encoding utf8NoBOM -NoNewline Cargo.toml $cargo
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'Cargo.toml'), $cargo, $utf8)
 
           $lock = Get-Content -Raw Cargo.lock
           $lock = $lock -replace '(name = "windows-shade-editor"\r?\nversion = ")0\.20\.2("\r?\n)', '${1}0.20.3${2}'
-          Set-Content -Encoding utf8NoBOM -NoNewline Cargo.lock $lock
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'Cargo.lock'), $lock, $utf8)
 
           $notes = Get-Content -Raw RELEASE_NOTES.md
           if ($notes -notmatch '^# Shade Editor 0\.20\.3') {
-            $section = @'
-          # Shade Editor 0.20.3
-
-          - Allow opening or creating another `.shade` project while the Export Queue is waiting or processing.
-          - Keep queued exports independent from the active project by relying on their immutable export recipes; switching projects does not cancel or rebind queued jobs.
-          - Keep Exit blocked while exports are pending so closing the process cannot terminate active queue work.
-          - Preserve Save/Discard/Cancel protection for dirty projects and the existing active-operation guard during project transitions.
-          - Add lifecycle regression tests covering Open/New/Recover during queue activity, Exit blocking, and dirty-project confirmation.
-
-          '@
-            $section = ($section -replace '^          ', '') -replace "`n          ", "`n"
-            Set-Content -Encoding utf8NoBOM -NoNewline RELEASE_NOTES.md ($section + $notes)
+            $section = "# Shade Editor 0.20.3`r`n`r`n- Allow opening or creating another ``.shade`` project while the Export Queue is waiting or processing.`r`n- Keep queued exports independent from the active project by relying on their immutable export recipes; switching projects does not cancel or rebind queued jobs.`r`n- Keep Exit blocked while exports are pending so closing the process cannot terminate active queue work.`r`n- Preserve Save/Discard/Cancel protection for dirty projects and the existing active-operation guard during project transitions.`r`n- Add lifecycle regression tests covering Open/New/Recover during queue activity, Exit blocking, and dirty-project confirmation.`r`n`r`n"
+            [System.IO.File]::WriteAllText((Join-Path $PWD 'RELEASE_NOTES.md'), $section + $notes, $utf8)
           }
 
       - name: Format
@@ -110,7 +101,7 @@ jobs:
           New-Item -ItemType Directory -Force artifact | Out-Null
           $exe = 'target/x86_64-pc-windows-msvc/release/ShadeEditor.exe'
           $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
-          "$hash  ShadeEditor.exe" | Set-Content -Encoding ascii -NoNewline 'artifact/ShadeEditor.exe.sha256'
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'artifact/ShadeEditor.exe.sha256'), "$hash  ShadeEditor.exe", [System.Text.Encoding]::ASCII)
           Copy-Item $exe artifact/ShadeEditor.exe
           Copy-Item README.md artifact/README.md
           Copy-Item LICENSE artifact/LICENSE
