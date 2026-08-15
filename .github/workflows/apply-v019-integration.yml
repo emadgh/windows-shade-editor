@@ -1,0 +1,52 @@
+name: Validate v0.19.0 integration
+
+on:
+  push:
+    branches:
+      - chore/v019-integration
+
+permissions:
+  contents: write
+
+jobs:
+  integrate-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply integration metadata and invariants
+        run: python .github/scripts/apply_v019_integration.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Check locked Release graph
+        run: cargo check --release --locked
+      - name: Full Release tests
+        run: cargo test --release --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Validate version consistency
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($cargo -ne '0.19.0' -or $version -ne '0.19.0') { throw "Version mismatch: Cargo=$cargo VERSION=$version" }
+          if (-not (Select-String -Path Cargo.lock -Pattern 'version = "0.19.0"' -Quiet)) { throw "Cargo.lock root version was not updated" }
+      - name: Commit validated v0.19.0 integration
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(v0.19.0): integrate QoL features and risk audit (#40)"
+          git push
+      - name: Upload validated executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShadeEditor-v0.19.0-windows-x64
+          path: target/release/ShadeEditor.exe
+          if-no-files-found: error
