@@ -18,7 +18,7 @@ def replace_once(text, old, new, label):
 
 
 def regex_once(text, pattern, replacement, label):
-    new_text, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+    new_text, count = re.subn(pattern, lambda _match: replacement, text, count=1, flags=re.S)
     if count != 1:
         raise SystemExit(f"{label}: expected 1 regex match, found {count}")
     return new_text
@@ -103,7 +103,6 @@ settings = replace_once(
 ''',
     "tonal label correction",
 )
-# Add a compatibility regression test.
 settings = replace_once(
     settings,
     '''    #[test]
@@ -253,7 +252,6 @@ queue = regex_once(
         });''',
     "queue panic isolation",
 )
-# Add a state-machine stress regression that repeatedly reads queue rows while adding work.
 queue = replace_once(
     queue,
     '''    #[test]
@@ -360,7 +358,6 @@ main = replace_once(
 ''',
     "poll generic worker panic",
 )
-# Render worker panic isolation. The outcome is sent back as Result so render_busy cannot stick forever.
 main = replace_once(
     main,
     '''        self.render_busy = Some((face_index, generation));
@@ -482,7 +479,6 @@ main = replace_once(
 )
 write("src/main.rs", main)
 
-# Permanent architecture note for the crash fix.
 architecture = read("docs/ARCHITECTURE.md")
 append = """
 
