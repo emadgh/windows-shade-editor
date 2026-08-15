@@ -19,6 +19,10 @@ Shade Editor keeps source TIFF Faces immutable and stores non-destructive shade 
 - Assigned preview/proof profiles are saved in `.shade`; TIFF ICC bytes and source/export samples are never changed by them.
 - Color-managed project thumbnails use the same assigned profile and printer/RIP soft-proof transform as the viewport.
 - Export Queue provides Waiting / Processing / Done / Failed states with safe cancel/retry controls.
+- Export Queue supports pause/resume for waiting work, batch retry/cleanup, compact progress with ETA/throughput, and restart-safe recovered jobs.
+- Faces can be marked Accepted or Rejected; Rejected Faces remain traceable in the project but are excluded from Export All by default.
+- Quick Relative Adjustments provide cumulative Warmer/Cooler/Richer/Lighter/Redder/Beige tuning plus editable custom presets without overwriting the current recipe.
+- Saved projects use revision-safe smart autosave while preserving Snapshot dirty-state protections and crash recovery.
 - Export filename/folder templates support `{project}`, `{face}`, `{snapshot}`, `{date}` and `{source}`.
 - `File > Inspect TIFF` reports production transport metadata and can copy a diagnostic report.
 - Optional test-code raster in one separation or all separations.
