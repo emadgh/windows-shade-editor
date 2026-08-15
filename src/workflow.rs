@@ -21,6 +21,22 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
 }
 
 pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
+    let curve_graph_focused = ctx.data(|data| {
+        data.get_temp::<bool>(egui::Id::new("shade-editor-curve-graph-focused"))
+            .unwrap_or(false)
+    });
+    let modal_active = app.lifecycle.pending.is_some()
+        || app.lifecycle.after_save.is_some()
+        || app.lifecycle.backup_restore.is_some()
+        || app.pending_snapshot_action.is_some()
+        || app.recovery_candidate.is_some();
+    let input_context = input_router::classify(
+        ctx.wants_keyboard_input(),
+        curve_graph_focused,
+        modal_active,
+        app.show_previous_shades,
+    );
+
     let (new_project, save, save_as, export_face, export_all, update_snapshot) =
         ctx.input(|input| {
             (
@@ -48,25 +64,33 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
             )
         });
 
-    if new_project {
-        app.show_previous_shades = false;
-        app.new_project();
+    if input_context.allows_save_shortcuts() {
+        if save_as {
+            app.save_project(true);
+        } else if save {
+            app.save_project(false);
+        }
     }
-    if save_as {
-        app.save_project(true);
-    } else if save {
-        app.save_project(false);
-    }
-    if export_all {
-        app.export_all_dialog();
-    } else if export_face {
-        app.export_current_dialog();
-    }
-    if update_snapshot {
-        update_active_snapshot(app);
+    if input_context.allows_project_commands() {
+        if new_project {
+            app.show_previous_shades = false;
+            app.new_project();
+        }
+        if export_all {
+            app.export_all_dialog();
+        } else if export_face {
+            app.export_current_dialog();
+        }
+        if update_snapshot {
+            update_active_snapshot(app);
+        }
     }
 
-    let (channel, all_channels) = ctx.input(|input| {
+    if !input_context.allows_editor_shortcuts() {
+        return;
+    }
+
+    let (channel, all_channels, settings, fit, solo) = ctx.input(|input| {
         let no_modifiers = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
         let keys = [
             egui::Key::Num1,
@@ -83,38 +107,19 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
             .then(|| keys.iter().position(|key| input.key_pressed(*key)))
             .flatten();
         // Backtick is the logical key for both ` and Shift+` (~) in egui.
-        // Accept both so the shortcut remains reliable across keyboard layouts.
         let all_channels =
             !input.modifiers.ctrl && !input.modifiers.alt && input.key_pressed(egui::Key::Backtick);
-        (channel, all_channels)
-    });
-    let curve_graph_focused = ctx.data(|data| {
-        data.get_temp::<bool>(egui::Id::new("shade-editor-curve-graph-focused"))
-            .unwrap_or(false)
-    });
-    if ctx.wants_keyboard_input() {
-        if curve_graph_focused {
-            if all_channels {
-                select_all_channels_shortcut(app);
-            } else if let Some(channel) = channel {
-                select_channel_shortcut(app, channel);
-            }
-        }
-        return;
-    }
-    let (settings, fit, solo) = ctx.input(|input| {
-        let no_modifiers = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
         (
+            channel,
+            all_channels,
             no_modifiers && input.key_pressed(egui::Key::G),
             no_modifiers && input.key_pressed(egui::Key::F),
             no_modifiers && input.key_pressed(egui::Key::S),
         )
     });
+
     if settings {
         app.show_settings = true;
-    }
-    if app.show_previous_shades {
-        return;
     }
     if all_channels {
         select_all_channels_shortcut(app);
