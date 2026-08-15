@@ -1,3 +1,12 @@
+# Shade Editor 0.18.3
+
+- Replace destructive Levels/Curve Broadcast-to-all behavior with independent Photoshop-style Master Levels and Master Curve controls stored as a separate All Channels adjustment state.
+- Stack Master Levels/Curve with per-channel edits in preview and full-resolution export without copying, overriding or discarding channel-specific adjustments.
+- Keep Channel Mixer output rows per-channel; All Channels no longer mutates individual Levels/Curve controls or their enabled state.
+- Use a neutral aggregated histogram for Master Curve instead of borrowing the currently selected channel color/histogram.
+- Add `~` / backtick as the All Channels shortcut and return Solo view to Composite when used.
+- Preserve Master adjustment state automatically in Snapshots, History and compact Export Queue recipes without changing the `.shade` schema.
+
 # Shade Editor 0.18.2
 
 - Cache the latest rendered preview for each clean Snapshot/Face/display mode in a bounded in-memory LRU so repeated Snapshot comparisons switch immediately after the first render.

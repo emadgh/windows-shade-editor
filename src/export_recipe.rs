@@ -37,6 +37,7 @@ impl ExportRecipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::MASTER_ADJUSTMENT_KEY;
 
     #[test]
     fn recipe_excludes_heavy_project_state_and_freezes_test_code() {
@@ -52,8 +53,23 @@ mod tests {
             encoded_bytes: 4,
             data_base64: "AAAA".to_owned(),
         });
+        project
+            .adjustments
+            .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+            .or_default()
+            .levels
+            .gamma = 1.25;
         let recipe = ExportRecipe::from_project(&project);
         assert_eq!(recipe.test_code.text, expected);
+        assert_eq!(
+            recipe
+                .adjustments
+                .get(MASTER_ADJUSTMENT_KEY)
+                .unwrap()
+                .levels
+                .gamma,
+            1.25
+        );
         let materialized = recipe.materialize_project();
         assert!(materialized.thumbnail.is_none());
         assert!(materialized.snapshots.is_empty());

@@ -66,7 +66,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
         update_active_snapshot(app);
     }
 
-    let channel = ctx.input(|input| {
+    let (channel, all_channels) = ctx.input(|input| {
         let no_modifiers = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
         let keys = [
             egui::Key::Num1,
@@ -79,9 +79,14 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
             egui::Key::Num8,
             egui::Key::Num9,
         ];
-        no_modifiers
+        let channel = no_modifiers
             .then(|| keys.iter().position(|key| input.key_pressed(*key)))
-            .flatten()
+            .flatten();
+        // Backtick is the logical key for both ` and Shift+` (~) in egui.
+        // Accept both so the shortcut remains reliable across keyboard layouts.
+        let all_channels =
+            !input.modifiers.ctrl && !input.modifiers.alt && input.key_pressed(egui::Key::Backtick);
+        (channel, all_channels)
     });
     let curve_graph_focused = ctx.data(|data| {
         data.get_temp::<bool>(egui::Id::new("shade-editor-curve-graph-focused"))
@@ -89,7 +94,9 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
     });
     if ctx.wants_keyboard_input() {
         if curve_graph_focused {
-            if let Some(channel) = channel {
+            if all_channels {
+                select_all_channels_shortcut(app);
+            } else if let Some(channel) = channel {
                 select_channel_shortcut(app, channel);
             }
         }
@@ -109,6 +116,9 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
     if app.show_previous_shades {
         return;
     }
+    if all_channels {
+        select_all_channels_shortcut(app);
+    }
     if fit {
         app.fit_requested = true;
         app.viewport_recenter = true;
@@ -126,6 +136,15 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
         if app.solo_channel != previous {
             app.mark_current_preview_dirty();
         }
+    }
+}
+
+fn select_all_channels_shortcut(app: &mut ShadeApp) {
+    let previous_solo = app.solo_channel;
+    app.adjustment_scope = AdjustmentScope::All;
+    app.solo_channel = None;
+    if previous_solo.is_some() {
+        app.mark_current_preview_dirty();
     }
 }
 

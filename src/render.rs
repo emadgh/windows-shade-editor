@@ -1,5 +1,5 @@
 use crate::color_management::PreviewColorTransform;
-use crate::model::{ShadeProject, apply_curve, apply_levels};
+use crate::model::{Curve, Levels, MASTER_ADJUSTMENT_KEY, ShadeProject, apply_curve, apply_levels};
 use crate::tiff_io::{self, ColorModel, PreviewFace};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,6 +61,10 @@ pub fn adjusted_planes_with_stats(
     }
     let pixel_count = face.channels[0].len();
     let names = &face.metadata.channel_names;
+    let master = project
+        .adjustments
+        .get(MASTER_ADJUSTMENT_KEY)
+        .filter(|adjustment| adjustment.enabled);
     let mut stats = vec![
         ChannelClippingStats {
             sample_count: pixel_count as u64,
@@ -73,27 +77,34 @@ pub fn adjusted_planes_with_stats(
         .map(|_| vec![0.0f32; pixel_count])
         .collect::<Vec<_>>();
 
+    // Levels stage: channel-specific Levels first, then the independent Master
+    // Levels pass. The Master pass never writes back into any channel control.
     for channel in 0..channel_count {
         let adjustment = project.adjustments.get(&names[channel]);
         for pixel in 0..pixel_count {
             let raw = face.channels[channel][pixel] as f32 / 65535.0;
-            prepared[channel][pixel] = if let Some(adjustment) = adjustment {
-                if adjustment.enabled {
-                    let black = adjustment.levels.input_black.clamp(0.0, 0.9999);
-                    let white = adjustment.levels.input_white.clamp(black + 0.0001, 1.0);
-                    if black > 0.0 && raw <= black {
-                        stats[channel].levels_black_count += 1;
-                    }
-                    if white < 1.0 && raw >= white {
-                        stats[channel].levels_white_count += 1;
-                    }
-                    apply_levels(raw, adjustment.levels)
-                } else {
-                    raw
-                }
-            } else {
-                raw
-            };
+            let mut value = raw;
+            let mut clipped_black = false;
+            let mut clipped_white = false;
+            if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled) {
+                let (black, white) = levels_clipping(value, adjustment.levels);
+                clipped_black |= black;
+                clipped_white |= white;
+                value = apply_levels(value, adjustment.levels);
+            }
+            if let Some(master) = master {
+                let (black, white) = levels_clipping(value, master.levels);
+                clipped_black |= black;
+                clipped_white |= white;
+                value = apply_levels(value, master.levels);
+            }
+            prepared[channel][pixel] = value;
+            if clipped_black {
+                stats[channel].levels_black_count += 1;
+            }
+            if clipped_white {
+                stats[channel].levels_white_count += 1;
+            }
         }
     }
 
@@ -101,14 +112,14 @@ pub fn adjusted_planes_with_stats(
         .map(|_| vec![0u16; pixel_count])
         .collect::<Vec<_>>();
 
+    // Mixer remains channel-owned. Curve is then applied per-channel followed
+    // by the independent Master Curve as a common finishing pass.
     for out_channel in 0..channel_count {
         let name = &names[out_channel];
         let adjustment = project.adjustments.get(name);
         for pixel in 0..pixel_count {
-            let value = if let Some(adjustment) = adjustment {
-                if !adjustment.enabled {
-                    prepared[out_channel][pixel]
-                } else {
+            let mut value =
+                if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled) {
                     let mut mixed = adjustment.mixer.constant;
                     for source in 0..channel_count {
                         let coefficient = adjustment
@@ -119,27 +130,51 @@ pub fn adjusted_planes_with_stats(
                             .unwrap_or(if source == out_channel { 1.0 } else { 0.0 });
                         mixed += prepared[source][pixel] * coefficient;
                     }
-                    let curve_black = adjustment.curve.input_black.clamp(0.0, 1.0);
-                    let curve_white = adjustment
-                        .curve
-                        .input_white
-                        .clamp(curve_black + 1.0 / 65535.0, 1.0);
-                    if mixed < 0.0 || (curve_black > 0.0 && mixed <= curve_black) {
-                        stats[out_channel].curve_black_count += 1;
-                    }
-                    if mixed > 1.0 || (curve_white < 1.0 && mixed >= curve_white) {
-                        stats[out_channel].curve_white_count += 1;
-                    }
-                    apply_curve(mixed, adjustment.curve)
-                }
-            } else {
-                prepared[out_channel][pixel]
-            };
+                    mixed
+                } else {
+                    prepared[out_channel][pixel]
+                };
+
+            let mut clipped_black = false;
+            let mut clipped_white = false;
+            if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled) {
+                let (black, white) = curve_clipping(value, adjustment.curve);
+                clipped_black |= black;
+                clipped_white |= white;
+                value = apply_curve(value, adjustment.curve);
+            }
+            if let Some(master) = master {
+                let (black, white) = curve_clipping(value, master.curve);
+                clipped_black |= black;
+                clipped_white |= white;
+                value = apply_curve(value, master.curve);
+            }
+            if clipped_black {
+                stats[out_channel].curve_black_count += 1;
+            }
+            if clipped_white {
+                stats[out_channel].curve_white_count += 1;
+            }
             output[out_channel][pixel] = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
         }
     }
 
     (output, stats)
+}
+
+fn levels_clipping(value: f32, levels: Levels) -> (bool, bool) {
+    let black = levels.input_black.clamp(0.0, 0.9999);
+    let white = levels.input_white.clamp(black + 0.0001, 1.0);
+    (black > 0.0 && value <= black, white < 1.0 && value >= white)
+}
+
+fn curve_clipping(value: f32, curve: Curve) -> (bool, bool) {
+    let black = curve.input_black.clamp(0.0, 1.0);
+    let white = curve.input_white.clamp(black + 1.0 / 65535.0, 1.0);
+    (
+        value < 0.0 || (black > 0.0 && value <= black),
+        value > 1.0 || (white < 1.0 && value >= white),
+    )
 }
 
 pub fn rgba_from_planes(
@@ -410,5 +445,40 @@ mod tests {
         };
         let (_, stats) = adjusted_planes_with_stats(&face, &project(adjustment));
         assert_eq!(stats[0].curve_white_count, 2);
+    }
+    #[test]
+    fn master_levels_and_curve_stack_without_overwriting_channel_controls() {
+        let face = face(vec![32768]);
+        let mut local = ChannelAdjustment::default();
+        local.levels.gamma = 1.6;
+        local.curve = Curve {
+            midpoint_enabled: true,
+            midpoint_input: 0.5,
+            midpoint: 0.62,
+            ..Curve::default()
+        };
+        let local_before = local.clone();
+        let mut project = project(local);
+        let mut master = ChannelAdjustment::default();
+        master.levels.gamma = 0.82;
+        master.curve = Curve {
+            midpoint_enabled: true,
+            midpoint_input: 0.5,
+            midpoint: 0.44,
+            ..Curve::default()
+        };
+        project
+            .adjustments
+            .insert(MASTER_ADJUSTMENT_KEY.to_owned(), master.clone());
+
+        let (planes, _) = adjusted_planes_with_stats(&face, &project);
+        let raw = 32768.0 / 65535.0;
+        let after_local_levels = apply_levels(raw, local_before.levels);
+        let after_master_levels = apply_levels(after_local_levels, master.levels);
+        let after_local_curve = apply_curve(after_master_levels, local_before.curve);
+        let expected = apply_curve(after_local_curve, master.curve);
+        let actual = planes[0][0] as f32 / 65535.0;
+        assert!((actual - expected).abs() < 2.0 / 65535.0);
+        assert_eq!(project.adjustments.get("Ink").unwrap(), &local_before);
     }
 }

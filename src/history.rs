@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{
-    ChannelAdjustment, MAX_SNAPSHOT_HISTORY_STATES, SnapshotAdjustmentHistory, SnapshotHistoryState,
+    ChannelAdjustment, MASTER_ADJUSTMENT_KEY, MAX_SNAPSHOT_HISTORY_STATES,
+    SnapshotAdjustmentHistory, SnapshotHistoryState,
 };
 
 #[derive(Clone, Debug)]
@@ -164,7 +165,11 @@ pub fn describe_change(
         if old == new {
             continue;
         }
-        channels.push(name);
+        channels.push(if name == MASTER_ADJUSTMENT_KEY {
+            "All channels".to_owned()
+        } else {
+            name
+        });
         if old.enabled != new.enabled {
             kinds.insert("Enable");
         }
@@ -245,6 +250,18 @@ mod tests {
         assert_eq!(restored.len(), 3);
         assert_eq!(restored.cursor(), 1);
         assert!(restored.current_matches(&state(1.2)));
+    }
+
+    #[test]
+    fn master_change_description_uses_all_channels_label() {
+        let mut before = BTreeMap::new();
+        before.insert(
+            MASTER_ADJUSTMENT_KEY.to_owned(),
+            ChannelAdjustment::default(),
+        );
+        let mut after = before.clone();
+        after.get_mut(MASTER_ADJUSTMENT_KEY).unwrap().curve.midpoint = 0.6;
+        assert_eq!(describe_change(&before, &after), "Curve · All channels");
     }
 
     #[test]

@@ -10,6 +10,10 @@ use crate::palette::ChannelPalette;
 
 pub const SHADE_SCHEMA_VERSION: u32 = 9;
 pub const TEST_CODE_ALL_CHANNELS: &str = "__all_channels__";
+/// Reserved adjustment-map key for Photoshop-style Master/All Channels Levels and Curve.
+/// It is intentionally stored beside per-channel adjustments so snapshots/history/export
+/// recipes preserve it without changing the .shade schema. TIFF channel names never use it.
+pub const MASTER_ADJUSTMENT_KEY: &str = "__shade_editor_master__";
 pub const MAX_SNAPSHOT_HISTORY_STATES: usize = 50;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -911,7 +915,14 @@ mod tests {
         project.ensure_channels(&names);
         project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.8;
         project.adjustments.get_mut("Cyan").unwrap().mixer.constant = 0.2;
+        project
+            .adjustments
+            .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+            .or_default()
+            .levels
+            .gamma = 1.2;
         project.reset_adjustments(&names);
+        assert!(!project.adjustments.contains_key(MASTER_ADJUSTMENT_KEY));
 
         for output in &names {
             let adjustment = project.adjustments.get(output).unwrap();
@@ -934,12 +945,27 @@ mod tests {
         let mut project = ShadeProject::default();
         project.ensure_channels(&names);
         project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.4;
+        project
+            .adjustments
+            .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+            .or_default()
+            .curve
+            .midpoint = 0.62;
         let first = project.create_snapshot();
         assert!(project.active_snapshot_matches());
         project.adjustments.get_mut("purpol").unwrap().levels.gamma = 2.0;
         let second = project.create_snapshot();
         assert!(project.apply_snapshot(first));
         assert_eq!(project.adjustments.get("purpol").unwrap().levels.gamma, 1.4);
+        assert_eq!(
+            project
+                .adjustments
+                .get(MASTER_ADJUSTMENT_KEY)
+                .unwrap()
+                .curve
+                .midpoint,
+            0.62
+        );
         project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.6;
         assert!(project.update_snapshot(first));
         assert!(project.apply_snapshot(second));

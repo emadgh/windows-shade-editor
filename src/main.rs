@@ -47,8 +47,8 @@ use chrono::{Local, TimeZone};
 use color_management::{PreviewColorConfig, PreviewColorStatus};
 use eframe::egui;
 use model::{
-    ChannelAdjustment, PreviewRenderingIntent, ShadeProject, TEST_CODE_ALL_CHANNELS,
-    TestCodePosition,
+    ChannelAdjustment, MASTER_ADJUSTMENT_KEY, PreviewRenderingIntent, ShadeProject,
+    TEST_CODE_ALL_CHANNELS, TestCodePosition,
 };
 use palette::ChannelPalette;
 use project_lifecycle::{
@@ -3892,6 +3892,11 @@ impl ShadeApp {
             .adjustments
             .get(&output_name)
             .is_some_and(adjustment_is_modified);
+        let master_modified = self
+            .project
+            .adjustments
+            .get(MASTER_ADJUSTMENT_KEY)
+            .is_some_and(master_adjustment_is_modified);
 
         ui.horizontal(|ui| {
             ui.heading("Adjustments");
@@ -3909,7 +3914,12 @@ impl ShadeApp {
         });
         ui.horizontal_wrapped(|ui| {
             let mut all_channels = self.adjustment_scope == AdjustmentScope::All;
-            if ui.checkbox(&mut all_channels, "All channels").changed() {
+            let all_label = if master_modified {
+                "All channels  •   (~)"
+            } else {
+                "All channels   (~)"
+            };
+            if ui.checkbox(&mut all_channels, all_label).changed() {
                 self.adjustment_scope = if all_channels {
                     AdjustmentScope::All
                 } else {
@@ -3976,36 +3986,79 @@ impl ShadeApp {
                                 header_changed |= ui.checkbox(enabled, "Enabled").changed();
                             }
                             AdjustmentScope::All => {
-                                ui.strong("Editing: All channels");
-                                let mut all_enabled = channel_names.iter().all(|name| {
-                                    self.project
-                                        .adjustments
-                                        .get(name)
-                                        .map(|adjustment| adjustment.enabled)
-                                        .unwrap_or(true)
-                                });
-                                if ui.checkbox(&mut all_enabled, "Enabled").changed() {
-                                    for name in &channel_names {
-                                        self.project
+                                ui.strong("Editing: All channels / Master");
+                                match self.tool {
+                                    ToolPanel::Levels | ToolPanel::Curves => {
+                                        let mut master_enabled = self
+                                            .project
                                             .adjustments
-                                            .entry(name.clone())
-                                            .or_default()
-                                            .enabled = all_enabled;
+                                            .get(MASTER_ADJUSTMENT_KEY)
+                                            .map(|adjustment| adjustment.enabled)
+                                            .unwrap_or(true);
+                                        if ui
+                                            .checkbox(&mut master_enabled, "Master enabled")
+                                            .on_hover_text(
+                                                "Bypasses only Master Levels and Master Curve. Per-channel controls are never changed.",
+                                            )
+                                            .changed()
+                                        {
+                                            self.project
+                                                .adjustments
+                                                .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+                                                .or_default()
+                                                .enabled = master_enabled;
+                                            cleanup_master_adjustment(&mut self.project.adjustments);
+                                            header_changed = true;
+                                        }
                                     }
-                                    header_changed = true;
+                                    ToolPanel::Mixer => {
+                                        ui.small("Mixer rows remain channel-specific");
+                                    }
                                 }
                             }
                         }
+                        let reset_label = match self.adjustment_scope {
+                            AdjustmentScope::Selected => "Reset channel",
+                            AdjustmentScope::All => match self.tool {
+                                ToolPanel::Levels => "Reset Master Levels",
+                                ToolPanel::Curves => "Reset Master Curve",
+                                ToolPanel::Mixer => "Reset mixers",
+                            },
+                        };
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.small_button("Reset all").clicked()
+                            ui.small_button(reset_label).clicked()
                         })
                         .inner
                     })
                     .inner;
                 if reset_all {
-                    self.project.reset_adjustments(&channel_names);
+                    match self.adjustment_scope {
+                        AdjustmentScope::Selected => {
+                            let adjustment = self
+                                .project
+                                .adjustments
+                                .entry(output_name.clone())
+                                .or_default();
+                            *adjustment = ChannelAdjustment::default();
+                            reset_mixer_row(adjustment, &output_name, &channel_names);
+                            self.report_info(format!("Reset {output_display} adjustments"));
+                        }
+                        AdjustmentScope::All => match self.tool {
+                            ToolPanel::Levels => {
+                                reset_master_levels(&mut self.project.adjustments);
+                                self.report_info("Reset Master Levels");
+                            }
+                            ToolPanel::Curves => {
+                                reset_master_curve(&mut self.project.adjustments);
+                                self.report_info("Reset Master Curve");
+                            }
+                            ToolPanel::Mixer => {
+                                reset_all_mixers(&mut self.project.adjustments, &channel_names);
+                                self.report_info("Reset all Mixer rows");
+                            }
+                        },
+                    }
                     self.mark_all_previews_dirty();
-                    self.report_info("All adjustments reset to defaults");
                 }
                 let body_changed = match self.adjustment_scope {
                     AdjustmentScope::Selected => self.ui_selected_adjustment(
@@ -4019,11 +4072,9 @@ impl ShadeApp {
                     ),
                     AdjustmentScope::All => self.ui_all_adjustments(
                         ui,
-                        &output_name,
                         &channel_names,
                         &all_original_histograms,
                         &all_adjusted_histograms,
-                        control_accent,
                         palette.as_ref(),
                     ),
                 };
@@ -4140,29 +4191,32 @@ impl ShadeApp {
     fn ui_all_adjustments(
         &mut self,
         ui: &mut egui::Ui,
-        template_name: &str,
         channel_names: &[String],
         histograms_before: &[[u32; 256]],
         histograms_after: &[[u32; 256]],
-        accent: Option<egui::Color32>,
         palette: Option<&ChannelPalette>,
     ) -> bool {
         let mut changed = false;
         let compact_curve_controls = self.settings.compact_curve_controls;
         ui.small(
-            "Levels broadcasts to every channel. Mixer output rows remain independent. Curve keeps one Broadcast control plus independent per-channel foldouts.",
+            "Master Levels and Master Curve are independent All Channels controls. They stack with per-channel edits and never overwrite them. Mixer output rows remain channel-specific.",
         );
+
+        let master_histogram_before = self
+            .settings
+            .show_curve_histogram
+            .then(|| aggregate_histograms(histograms_before));
+        let master_histogram_after = self
+            .settings
+            .show_curve_histogram
+            .then(|| aggregate_histograms(histograms_after));
 
         if self.settings.adjustment_tabs {
             let reset_tool = adjustment_tab_bar(ui, &mut self.tool);
             if reset_tool {
                 match self.tool {
-                    ToolPanel::Levels => {
-                        reset_all_levels(&mut self.project.adjustments, channel_names)
-                    }
-                    ToolPanel::Curves => {
-                        reset_all_curves(&mut self.project.adjustments, channel_names)
-                    }
+                    ToolPanel::Levels => reset_master_levels(&mut self.project.adjustments),
+                    ToolPanel::Curves => reset_master_curve(&mut self.project.adjustments),
                     ToolPanel::Mixer => {
                         reset_all_mixers(&mut self.project.adjustments, channel_names)
                     }
@@ -4170,24 +4224,13 @@ impl ShadeApp {
                 changed = true;
             }
             changed |= match self.tool {
-                ToolPanel::Levels => broadcast_levels_ui(
+                ToolPanel::Levels => master_levels_ui(ui, &mut self.project.adjustments),
+                ToolPanel::Curves => master_curve_ui(
                     ui,
                     &mut self.project.adjustments,
-                    template_name,
-                    channel_names,
-                    accent,
-                ),
-                ToolPanel::Curves => all_curves_ui(
-                    ui,
-                    &mut self.project.adjustments,
-                    template_name,
-                    channel_names,
-                    histograms_before,
-                    histograms_after,
-                    self.settings.colorize_adjustments,
-                    self.settings.show_curve_histogram,
+                    master_histogram_before.as_ref(),
+                    master_histogram_after.as_ref(),
                     compact_curve_controls,
-                    palette,
                 ),
                 ToolPanel::Mixer => all_mixers_ui(
                     ui,
@@ -4200,22 +4243,14 @@ impl ShadeApp {
         } else {
             let (body_changed, reset) = adjustment_foldout(
                 ui,
-                "all-levels-section",
-                "Levels - all channels",
+                "master-levels-section",
+                "Master Levels - All channels",
                 true,
-                |ui| {
-                    broadcast_levels_ui(
-                        ui,
-                        &mut self.project.adjustments,
-                        template_name,
-                        channel_names,
-                        accent,
-                    )
-                },
+                |ui| master_levels_ui(ui, &mut self.project.adjustments),
             );
             changed |= body_changed.unwrap_or(false);
             if reset {
-                reset_all_levels(&mut self.project.adjustments, channel_names);
+                reset_master_levels(&mut self.project.adjustments);
                 changed = true;
             }
 
@@ -4244,27 +4279,22 @@ impl ShadeApp {
             ui.add_space(4.0);
             let (body_changed, reset) = adjustment_foldout(
                 ui,
-                "all-curves-section",
-                "Curve - broadcast + per channel",
+                "master-curve-section",
+                "Master Curve - All channels",
                 true,
                 |ui| {
-                    all_curves_ui(
+                    master_curve_ui(
                         ui,
                         &mut self.project.adjustments,
-                        template_name,
-                        channel_names,
-                        histograms_before,
-                        histograms_after,
-                        self.settings.colorize_adjustments,
-                        self.settings.show_curve_histogram,
+                        master_histogram_before.as_ref(),
+                        master_histogram_after.as_ref(),
                         compact_curve_controls,
-                        palette,
                     )
                 },
             );
             changed |= body_changed.unwrap_or(false);
             if reset {
-                reset_all_curves(&mut self.project.adjustments, channel_names);
+                reset_master_curve(&mut self.project.adjustments);
                 changed = true;
             }
         }
@@ -5933,7 +5963,7 @@ impl ShadeApp {
                         ui.label("F  Fit image   |   G  Settings");
                         ui.end_row();
                         ui.strong("Channels");
-                        ui.label("1-9  Select channel   |   S  Solo channel");
+                        ui.label("1-9  Select channel   |   ~  All channels   |   S  Solo channel");
                         ui.end_row();
                         ui.strong("Snapshot");
                         ui.label("Ctrl+Enter  Update active Snapshot");
@@ -6297,22 +6327,27 @@ fn reset_mixer_row(
     adjustment.mixer.constant = 0.0;
 }
 
-fn reset_all_levels(
-    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
-    channel_names: &[String],
-) {
-    for name in channel_names {
-        adjustments.entry(name.clone()).or_default().levels = model::Levels::default();
+fn cleanup_master_adjustment(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
+    let remove = adjustments
+        .get(MASTER_ADJUSTMENT_KEY)
+        .is_some_and(|adjustment| adjustment == &ChannelAdjustment::default());
+    if remove {
+        adjustments.remove(MASTER_ADJUSTMENT_KEY);
     }
 }
 
-fn reset_all_curves(
-    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
-    channel_names: &[String],
-) {
-    for name in channel_names {
-        adjustments.entry(name.clone()).or_default().curve = model::Curve::default();
+fn reset_master_levels(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
+    if let Some(master) = adjustments.get_mut(MASTER_ADJUSTMENT_KEY) {
+        master.levels = model::Levels::default();
     }
+    cleanup_master_adjustment(adjustments);
+}
+
+fn reset_master_curve(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
+    if let Some(master) = adjustments.get_mut(MASTER_ADJUSTMENT_KEY) {
+        master.curve = model::Curve::default();
+    }
+    cleanup_master_adjustment(adjustments);
 }
 
 fn reset_all_mixers(
@@ -6760,133 +6795,63 @@ fn mixer_ui(
         changed
     })
 }
-fn broadcast_levels_ui(
+fn master_levels_ui(
     ui: &mut egui::Ui,
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
-    template_name: &str,
-    channel_names: &[String],
-    accent: Option<egui::Color32>,
 ) -> bool {
-    let mut draft = adjustments.get(template_name).cloned().unwrap_or_default();
-    if !levels_ui(ui, &mut draft, accent) {
+    let mut draft = adjustments
+        .get(MASTER_ADJUSTMENT_KEY)
+        .cloned()
+        .unwrap_or_default();
+    if !levels_ui(ui, &mut draft, None) {
         return false;
     }
-    for name in channel_names {
-        adjustments.entry(name.clone()).or_default().levels = draft.levels;
-    }
+    adjustments
+        .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+        .or_default()
+        .levels = draft.levels;
+    cleanup_master_adjustment(adjustments);
     true
 }
 
-fn broadcast_curves_ui(
+fn master_curve_ui(
     ui: &mut egui::Ui,
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
-    template_name: &str,
-    channel_names: &[String],
     histogram_before: Option<&[u32; 256]>,
     histogram_after: Option<&[u32; 256]>,
-    accent: Option<egui::Color32>,
     compact_controls: bool,
 ) -> bool {
-    let mut draft = adjustments.get(template_name).cloned().unwrap_or_default();
+    let mut draft = adjustments
+        .get(MASTER_ADJUSTMENT_KEY)
+        .cloned()
+        .unwrap_or_default();
     if !curves_ui(
         ui,
         &mut draft,
         histogram_before,
         histogram_after,
-        accent,
+        Some(ui.visuals().text_color()),
         compact_controls,
         true,
     ) {
         return false;
     }
-    for name in channel_names {
-        adjustments.entry(name.clone()).or_default().curve = draft.curve;
-    }
+    adjustments
+        .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+        .or_default()
+        .curve = draft.curve;
+    cleanup_master_adjustment(adjustments);
     true
 }
 
-fn all_curves_ui(
-    ui: &mut egui::Ui,
-    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
-    template_name: &str,
-    channel_names: &[String],
-    histograms_before: &[[u32; 256]],
-    histograms_after: &[[u32; 256]],
-    colorize: bool,
-    show_histogram: bool,
-    compact_controls: bool,
-    palette: Option<&ChannelPalette>,
-) -> bool {
-    let mut changed = false;
-    let template_index = channel_names
-        .iter()
-        .position(|name| name == template_name)
-        .unwrap_or(0);
-    let broadcast_accent = colorize.then(|| channel_color(palette, template_name, template_index));
-    let broadcast_histogram_before = show_histogram
-        .then(|| histograms_before.get(template_index))
-        .flatten();
-    let broadcast_histogram_after = show_histogram
-        .then(|| histograms_after.get(template_index))
-        .flatten();
-
-    egui::Frame::new()
-        .inner_margin(6)
-        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-        .corner_radius(5)
-        .show(ui, |ui| {
-            ui.strong("Broadcast to all");
-            ui.small("Changes here are copied to every channel Curve.");
-            changed |= broadcast_curves_ui(
-                ui,
-                adjustments,
-                template_name,
-                channel_names,
-                broadcast_histogram_before,
-                broadcast_histogram_after,
-                broadcast_accent,
-                compact_controls,
-            );
-        });
-
-    ui.add_space(7.0);
-    ui.strong("Per-channel Curves");
-    ui.small("Open any channel to refine it after using Broadcast.");
-    for (index, name) in channel_names.iter().enumerate() {
-        let accent = colorize.then(|| channel_color(palette, name, index));
-        let title = if let Some(color) = accent {
-            egui::RichText::new(format!("●  {}", channel_display_name(palette, name, index)))
-                .color(color)
-        } else {
-            egui::RichText::new(channel_display_name(palette, name, index))
-        };
-        egui::CollapsingHeader::new(title)
-            .id_salt(format!("all-channel-curve-{index}-{name}"))
-            .default_open(false)
-            .show(ui, |ui| {
-                let histogram_before = if show_histogram {
-                    histograms_before.get(index)
-                } else {
-                    None
-                };
-                let histogram_after = if show_histogram {
-                    histograms_after.get(index)
-                } else {
-                    None
-                };
-                let adjustment = adjustments.entry(name.clone()).or_default();
-                changed |= curves_ui(
-                    ui,
-                    adjustment,
-                    histogram_before,
-                    histogram_after,
-                    accent,
-                    compact_controls,
-                    false,
-                );
-            });
+fn aggregate_histograms(histograms: &[[u32; 256]]) -> [u32; 256] {
+    let mut aggregate = [0u32; 256];
+    for histogram in histograms {
+        for (target, value) in aggregate.iter_mut().zip(histogram.iter()) {
+            *target = target.saturating_add(*value);
+        }
     }
-    changed
+    aggregate
 }
 
 fn all_mixers_ui(
@@ -7582,6 +7547,13 @@ fn unix_ms_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+fn master_adjustment_is_modified(adjustment: &ChannelAdjustment) -> bool {
+    let default = ChannelAdjustment::default();
+    adjustment.enabled != default.enabled
+        || adjustment.levels != default.levels
+        || adjustment.curve != default.curve
 }
 
 fn adjustment_is_modified(adjustment: &ChannelAdjustment) -> bool {

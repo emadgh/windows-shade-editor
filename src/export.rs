@@ -13,7 +13,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::dpi::{self, DpiInfo};
 use crate::model::{
-    ShadeProject, TEST_CODE_ALL_CHANNELS, TestCodePosition, apply_curve, apply_levels,
+    ChannelAdjustment, MASTER_ADJUSTMENT_KEY, ShadeProject, TEST_CODE_ALL_CHANNELS,
+    TestCodePosition, apply_curve, apply_levels,
 };
 use crate::tiff_io::{
     ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_region,
@@ -151,6 +152,10 @@ where
     let names = &decoded.metadata.channel_names;
     let mut output = vec![0u16; expected];
     let mut prepared = vec![0.0f32; channels];
+    let master = project
+        .adjustments
+        .get(MASTER_ADJUSTMENT_KEY)
+        .filter(|adjustment| adjustment.enabled);
 
     progress(0.08, "Applying adjustments");
     let progress_step = (height / 100).max(1);
@@ -165,15 +170,14 @@ where
                     decoded.samples[base + channel],
                 ) as f32
                     / 65535.0;
-                prepared[channel] = match project.adjustments.get(&names[channel]) {
-                    Some(adjustment) if adjustment.enabled => apply_levels(raw, adjustment.levels),
-                    _ => raw,
-                };
+                prepared[channel] =
+                    apply_levels_stack(raw, project.adjustments.get(&names[channel]), master);
             }
 
             for out_channel in 0..channels {
-                let value = match project.adjustments.get(&names[out_channel]) {
-                    Some(adjustment) if adjustment.enabled => {
+                let adjustment = project.adjustments.get(&names[out_channel]);
+                let mixed =
+                    if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled) {
                         let mut mixed = adjustment.mixer.constant;
                         for source_channel in 0..channels {
                             let coefficient = adjustment
@@ -188,10 +192,11 @@ where
                                 });
                             mixed += prepared[source_channel] * coefficient;
                         }
-                        apply_curve(mixed, adjustment.curve)
-                    }
-                    _ => prepared[out_channel],
-                };
+                        mixed
+                    } else {
+                        prepared[out_channel]
+                    };
+                let value = apply_curve_stack(mixed, adjustment, master);
                 let working = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
                 output[base + out_channel] =
                     tiff_sample_from_working(&decoded.metadata, out_channel, working);
@@ -412,42 +417,78 @@ fn adjusted_strip(input: &[u16], metadata: &TiffMetadata, project: &ShadeProject
     let pixel_count = input.len() / channels.max(1);
     let mut output = vec![0u16; pixel_count.saturating_mul(channels)];
     let mut prepared = vec![0.0f32; channels];
+    let master = project
+        .adjustments
+        .get(MASTER_ADJUSTMENT_KEY)
+        .filter(|adjustment| adjustment.enabled);
     for pixel in 0..pixel_count {
         let base = pixel * channels;
         for channel in 0..channels {
             let raw =
                 working_sample_from_tiff(metadata, channel, input[base + channel]) as f32 / 65535.0;
-            prepared[channel] = match project.adjustments.get(&names[channel]) {
-                Some(adjustment) if adjustment.enabled => apply_levels(raw, adjustment.levels),
-                _ => raw,
-            };
+            prepared[channel] =
+                apply_levels_stack(raw, project.adjustments.get(&names[channel]), master);
         }
         for out_channel in 0..channels {
-            let value = match project.adjustments.get(&names[out_channel]) {
-                Some(adjustment) if adjustment.enabled => {
-                    let mut mixed = adjustment.mixer.constant;
-                    for source_channel in 0..channels {
-                        let coefficient = adjustment
-                            .mixer
-                            .coefficients
-                            .get(&names[source_channel])
-                            .copied()
-                            .unwrap_or(if source_channel == out_channel {
-                                1.0
-                            } else {
-                                0.0
-                            });
-                        mixed += prepared[source_channel] * coefficient;
-                    }
-                    apply_curve(mixed, adjustment.curve)
+            let adjustment = project.adjustments.get(&names[out_channel]);
+            let mixed = if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled)
+            {
+                let mut mixed = adjustment.mixer.constant;
+                for source_channel in 0..channels {
+                    let coefficient = adjustment
+                        .mixer
+                        .coefficients
+                        .get(&names[source_channel])
+                        .copied()
+                        .unwrap_or(if source_channel == out_channel {
+                            1.0
+                        } else {
+                            0.0
+                        });
+                    mixed += prepared[source_channel] * coefficient;
                 }
-                _ => prepared[out_channel],
+                mixed
+            } else {
+                prepared[out_channel]
             };
+            let value = apply_curve_stack(mixed, adjustment, master);
             let working = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
             output[base + out_channel] = tiff_sample_from_working(metadata, out_channel, working);
         }
     }
     output
+}
+
+#[inline]
+fn apply_levels_stack(
+    raw: f32,
+    local: Option<&ChannelAdjustment>,
+    master: Option<&ChannelAdjustment>,
+) -> f32 {
+    let mut value = match local.filter(|adjustment| adjustment.enabled) {
+        Some(adjustment) => apply_levels(raw, adjustment.levels),
+        None => raw,
+    };
+    if let Some(master) = master {
+        value = apply_levels(value, master.levels);
+    }
+    value
+}
+
+#[inline]
+fn apply_curve_stack(
+    value: f32,
+    local: Option<&ChannelAdjustment>,
+    master: Option<&ChannelAdjustment>,
+) -> f32 {
+    let mut value = match local.filter(|adjustment| adjustment.enabled) {
+        Some(adjustment) => apply_curve(value, adjustment.curve),
+        None => value,
+    };
+    if let Some(master) = master {
+        value = apply_curve(value, master.curve);
+    }
+    value
 }
 
 fn stream_spool_u8<W, F>(
@@ -1341,6 +1382,45 @@ mod streaming_tests {
 
         let legacy = apply_curve(leveled_a, a.curve) * 0.5 + leveled_b * 0.5;
         assert!((actual - legacy).abs() > 0.20);
+    }
+
+    #[test]
+    fn master_levels_and_curve_stack_after_local_controls_without_overwrite() {
+        let names = vec!["A".to_owned(), "B".to_owned()];
+        let mut project = ShadeProject::default();
+        project.ensure_channels(&names);
+        {
+            let local = project.adjustments.get_mut("A").unwrap();
+            local.levels.gamma = 1.5;
+            local.curve.midpoint_enabled = true;
+            local.curve.midpoint_input = 0.5;
+            local.curve.midpoint = 0.65;
+        }
+        let local_before = project.adjustments.get("A").unwrap().clone();
+        let mut master = ChannelAdjustment::default();
+        master.levels.gamma = 0.8;
+        master.curve.midpoint_enabled = true;
+        master.curve.midpoint_input = 0.5;
+        master.curve.midpoint = 0.4;
+        project
+            .adjustments
+            .insert(MASTER_ADJUSTMENT_KEY.to_owned(), master.clone());
+
+        let input = [32_768u16, 20_000u16];
+        let metadata = test_metadata(&names, 2, vec![None; 2]);
+        let output = adjusted_strip(&input, &metadata, &project);
+
+        let raw = input[0] as f32 / 65_535.0;
+        let expected = apply_curve(
+            apply_curve(
+                apply_levels(apply_levels(raw, local_before.levels), master.levels),
+                local_before.curve,
+            ),
+            master.curve,
+        );
+        let actual = output[0] as f32 / 65_535.0;
+        assert!((actual - expected).abs() <= 2.0 / 65_535.0);
+        assert_eq!(project.adjustments.get("A").unwrap(), &local_before);
     }
 
     #[test]
