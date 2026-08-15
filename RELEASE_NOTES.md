@@ -1,3 +1,11 @@
+# Shade Editor 0.20.3
+
+- Allow opening or creating another `.shade` project while the Export Queue is waiting or processing.
+- Keep queued exports independent from the active project by relying on their immutable export recipes; switching projects does not cancel or rebind queued jobs.
+- Keep Exit blocked while exports are pending so closing the process cannot terminate active queue work.
+- Preserve Save/Discard/Cancel protection for dirty projects and the existing active-operation guard during project transitions.
+- Add lifecycle regression tests covering Open/New/Recover during queue activity, Exit blocking, and dirty-project confirmation.
+
 # Shade Editor 0.20.2
 
 - Complete the typed UI-action architecture follow-up for high-value Adjustment surfaces.
