@@ -104,6 +104,26 @@ mod tests {
                 "Export Queue presentation bypassed typed actions with {forbidden}"
             );
         }
+
+        let adjustments = include_str!("adjustments.rs");
+        for forbidden in [
+            "self.undo_adjustment(",
+            "self.redo_adjustment(",
+            "self.flush_history_now()",
+            "self.sync_history_to_active_snapshot()",
+            "self.apply_history_adjustments(",
+            "self.select_project_palette(",
+            "self.show_composite()",
+            "self.select_channel(",
+            "self.save_settings_quietly()",
+            "self.mark_all_previews_dirty()",
+            "self.queue_adjustment_history(",
+        ] {
+            assert!(
+                !adjustments.contains(forbidden),
+                "Adjustments presentation bypassed typed actions with {forbidden}"
+            );
+        }
     }
 
     #[test]
