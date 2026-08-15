@@ -1,0 +1,56 @@
+name: Validate UI decomposition v0.19.1
+
+on:
+  push:
+    branches:
+      - refactor/v020-ui-decomposition
+
+permissions:
+  contents: write
+
+jobs:
+  decompose-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply UI decomposition
+        run: python .github/scripts/apply_v020_ui_decomposition.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Check Release graph
+        run: cargo check --release --locked
+      - name: Full Release tests
+        run: cargo test --release --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Validate version and architecture
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($cargo -ne '0.19.1' -or $version -ne '0.19.1') { throw "Version mismatch: Cargo=$cargo VERSION=$version" }
+          foreach ($file in @('src/ui/mod.rs','src/ui/adjustments.rs','src/ui/export_queue.rs','src/ui/status_bar.rs','docs/UI_DECOMPOSITION.md')) {
+            if (-not (Test-Path $file)) { throw "Missing extracted architecture file: $file" }
+          }
+          $mainLines = (Get-Content src/main.rs).Count
+          Write-Host "src/main.rs lines after decomposition: $mainLines"
+      - name: Commit validated decomposition
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "refactor(ui): decompose editing queue and status UI (#40)"
+          git push
+      - name: Upload validated executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShadeEditor-v0.19.1-windows-x64
+          path: target/release/ShadeEditor.exe
+          if-no-files-found: error
