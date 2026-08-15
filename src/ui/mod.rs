@@ -1,3 +1,4 @@
+pub(crate) mod actions;
 pub(crate) mod adjustments;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
@@ -48,5 +49,39 @@ mod tests {
             !main.contains("mod input_router;"),
             "Input router regressed to the crate root"
         );
+    }
+
+    #[test]
+    fn extracted_presentation_uses_typed_actions_for_cross_domain_mutations() {
+        let faces = include_str!("faces.rs");
+        for forbidden in [
+            "app.remove_current_face()",
+            "app.mark_project_dirty()",
+            "relink_current_face_dialog(app)",
+            "relink_missing_faces_folder_dialog(app)",
+            "app.current_face = index;",
+        ] {
+            assert!(
+                !faces.contains(forbidden),
+                "Faces presentation bypassed typed actions with {forbidden}"
+            );
+        }
+
+        let navigation = include_str!("project_navigation.rs");
+        for forbidden in [
+            "self.new_project();",
+            "self.open_project_dialog();",
+            "self.save_project(",
+            "self.export_current_dialog();",
+            "self.export_all_dialog();",
+            "self.request_project_transition(",
+            "self.validate_current_face_dialog();",
+            "self.inspect_tiff_dialog();",
+        ] {
+            assert!(
+                !navigation.contains(forbidden),
+                "Project navigation bypassed typed actions with {forbidden}"
+            );
+        }
     }
 }
