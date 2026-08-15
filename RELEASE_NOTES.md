@@ -1,3 +1,13 @@
+# Shade Editor 0.19.2
+
+- Complete the main target set from Issue #40 by extracting Faces, Curve editing, Project View/Recent navigation and the typed input router into focused `src/ui` modules.
+- Keep Face relink/loading workflow logic in `workflow.rs` while moving only Faces presentation/context-menu behavior to `src/ui/faces.rs`.
+- Move Curve point state, graph interaction and Curve UI support out of the application shell into `src/ui/curve_editor.rs`; the Adjustments module consumes a single Curve UI entry point.
+- Move Project View plus the application menu surface that owns Recent Projects into `src/ui/project_navigation.rs`.
+- Move the input context router under `src/ui/input_router.rs` without changing shortcut semantics.
+- Strengthen architecture regression coverage so extracted UI cannot silently accumulate back in `main.rs` or `workflow.rs`.
+- Reduce `src/main.rs` from 7458 to 6347 lines and `src/workflow.rs` from 803 to 597 lines in this pass.
+
 # Shade Editor 0.19.1
 
 - Continue Issue #40 with a behavior-preserving UI decomposition pass: move History/Channels/Adjustments, Export Queue window and Status Bar methods out of the 300+ KB application shell into focused `src/ui` modules.
