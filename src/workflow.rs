@@ -13,8 +13,10 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
     app.flush_history_now();
     app.sync_history_to_active_snapshot();
     if app.project.update_snapshot(active_id) {
+        app.snapshot_preview_cache.remove_snapshot(active_id);
+        app.cache_current_snapshot_preview_if_ready();
         app.project_dirty = true;
-        app.report_info("Snapshot updated");
+        app.report_info("Snapshot updated · preview cache refreshed");
     }
 }
 
@@ -296,6 +298,7 @@ pub(super) fn apply_relinked_face(
             if index < app.faces.len() && index < app.project.faces.len() {
                 app.project
                     .ensure_channels(&item.preview.metadata.channel_names);
+                app.snapshot_preview_cache.clear();
                 app.project.faces[index].path = item.path.to_string_lossy().into_owned();
                 app.faces[index] = ShadeApp::make_runtime_face(item);
                 app.current_face = index;
@@ -327,6 +330,7 @@ pub(super) fn apply_relinked_folder(
         }
     }
     if relinked > 0 {
+        app.snapshot_preview_cache.clear();
         app.project_dirty = true;
         app.fit_requested = true;
         app.viewport_recenter = true;

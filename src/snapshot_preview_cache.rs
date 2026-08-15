@@ -174,8 +174,14 @@ mod tests {
         cache.insert(SnapshotPreviewKey::new(8, 0, None), 3, 10);
         cache.remove_snapshot(7);
         assert_eq!(cache.get_cloned(SnapshotPreviewKey::new(7, 0, None)), None);
-        assert_eq!(cache.get_cloned(SnapshotPreviewKey::new(7, 1, Some(2))), None);
-        assert_eq!(cache.get_cloned(SnapshotPreviewKey::new(8, 0, None)), Some(3));
+        assert_eq!(
+            cache.get_cloned(SnapshotPreviewKey::new(7, 1, Some(2))),
+            None
+        );
+        assert_eq!(
+            cache.get_cloned(SnapshotPreviewKey::new(8, 0, None)),
+            Some(3)
+        );
     }
 
     #[test]

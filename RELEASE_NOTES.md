@@ -1,3 +1,10 @@
+# Shade Editor 0.18.2
+
+- Cache the latest rendered preview for each clean Snapshot/Face/display mode in a bounded in-memory LRU so repeated Snapshot comparisons switch immediately after the first render.
+- Refresh a Snapshot cache entry when Update commits new adjustments; dirty uncommitted edits never overwrite the saved Snapshot cache.
+- Keep cache correctness across Face changes, relinks, preview rebuilds and ICC/display changes, and bound GPU preview cache growth to 32 entries / approximately 256 MiB.
+- Store adjusted preview histograms instead of retaining full adjusted preview planes after rendering, reducing CPU memory while keeping histogram/clipping UI synchronized with cached Snapshot previews.
+
 # Shade Editor 0.18.1
 
 - Shorten production export staging paths to deterministic sibling names: `final.tif.tmp` and `final.tif.spool.tmp`, avoiding path-length failures from nested timestamp/PID suffixes.

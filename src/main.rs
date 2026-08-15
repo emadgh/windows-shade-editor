@@ -29,6 +29,7 @@ mod recovery;
 mod render;
 mod safe_fs;
 mod settings;
+mod snapshot_preview_cache;
 mod thumbnail;
 mod tiff_inspect;
 mod tiff_io;
@@ -119,11 +120,12 @@ struct RuntimeFace {
     available: bool,
     preview: Arc<PreviewFace>,
     dpi: dpi::DpiInfo,
-    adjusted: Vec<Vec<u16>>,
+    adjusted_histograms: Vec<[u32; 256]>,
     clipping: Vec<render::ChannelClippingStats>,
     color_status: PreviewColorStatus,
     texture: Option<egui::TextureHandle>,
     original_texture: Option<egui::TextureHandle>,
+    original_rendered_solo: Option<Option<usize>>,
     embedded_original_texture: Option<egui::TextureHandle>,
     embedded_original_status: PreviewColorStatus,
     generation: u64,
@@ -202,13 +204,22 @@ struct SnapshotExportBatchResult {
 struct RenderResult {
     face_index: usize,
     generation: u64,
-    adjusted: Vec<Vec<u16>>,
+    solo_channel: Option<usize>,
+    adjusted_histograms: Vec<[u32; 256]>,
     clipping: Vec<render::ChannelClippingStats>,
     color_status: PreviewColorStatus,
     rgba: Vec<u8>,
     original_rgba: Vec<u8>,
     embedded_original_rgba: Option<Vec<u8>>,
     embedded_original_status: Option<PreviewColorStatus>,
+}
+
+#[derive(Clone)]
+struct SnapshotPreviewEntry {
+    texture: egui::TextureHandle,
+    adjusted_histograms: Vec<[u32; 256]>,
+    clipping: Vec<render::ChannelClippingStats>,
+    color_status: PreviewColorStatus,
 }
 
 struct ErrorToast {
@@ -269,6 +280,7 @@ struct ShadeApp {
     render_tx: mpsc::Sender<RenderResult>,
     render_rx: mpsc::Receiver<RenderResult>,
     render_busy: Option<(usize, u64)>,
+    snapshot_preview_cache: snapshot_preview_cache::SnapshotPreviewCache<SnapshotPreviewEntry>,
 }
 
 impl ShadeApp {
@@ -358,6 +370,7 @@ impl ShadeApp {
             render_tx,
             render_rx,
             render_busy: None,
+            snapshot_preview_cache: snapshot_preview_cache::SnapshotPreviewCache::default(),
         }
     }
 
@@ -444,6 +457,7 @@ impl ShadeApp {
 
     fn bump_project_session(&mut self) {
         self.lifecycle.bump_session();
+        self.snapshot_preview_cache.clear();
     }
 
     fn reset_to_new_project(&mut self) {
@@ -481,11 +495,12 @@ impl ShadeApp {
             available: item.available,
             preview: Arc::new(item.preview),
             dpi: item.dpi,
-            adjusted: Vec::new(),
+            adjusted_histograms: Vec::new(),
             clipping: Vec::new(),
             color_status: PreviewColorStatus::Pending,
             texture: None,
             original_texture: None,
+            original_rendered_solo: None,
             embedded_original_texture: None,
             embedded_original_status: PreviewColorStatus::Pending,
             generation: 1,
@@ -1983,6 +1998,7 @@ impl ShadeApp {
                     self.faces.push(Self::make_runtime_face(item));
                 }
                 if added > 0 {
+                    self.snapshot_preview_cache.clear();
                     self.current_face = self.faces.len().saturating_sub(added);
                     self.selected_channel = 0;
                     self.solo_channel = None;
@@ -2010,6 +2026,7 @@ impl ShadeApp {
                         .map(|face| face.generation)
                         .collect::<Vec<_>>();
                     self.faces = items.into_iter().map(Self::make_runtime_face).collect();
+                    self.snapshot_preview_cache.clear();
                     for (face, old_generation) in
                         self.faces.iter_mut().zip(old_generations.into_iter())
                     {
@@ -2194,30 +2211,112 @@ impl ShadeApp {
         if let Some(face) = self.faces.get_mut(self.current_face) {
             face.generation = face.generation.wrapping_add(1).max(1);
         }
+        let _ = self.restore_active_snapshot_preview();
     }
 
     /// Re-render textures for display-only color settings. The caller decides
     /// whether the project should be marked dirty; TIFF source/export data is never changed.
     fn invalidate_display_previews(&mut self) {
+        self.snapshot_preview_cache.clear();
         for face in &mut self.faces {
             face.generation = face.generation.wrapping_add(1).max(1);
             face.color_status = PreviewColorStatus::Pending;
+            face.original_rendered_solo = None;
         }
         self.render_busy = None;
     }
 
+    fn cache_rendered_snapshot_preview(
+        &mut self,
+        face_index: usize,
+        solo_channel: Option<usize>,
+    ) -> bool {
+        let Some(snapshot_id) = self.project.active_snapshot_id else {
+            return false;
+        };
+        if !self.project.active_snapshot_matches() {
+            return false;
+        }
+        let Some(face) = self.faces.get(face_index) else {
+            return false;
+        };
+        if !face.available
+            || face.rendered_generation != face.generation
+            || face.original_rendered_solo != Some(solo_channel)
+        {
+            return false;
+        }
+        let Some(texture) = face.texture.clone() else {
+            return false;
+        };
+        let estimated_bytes = face
+            .preview
+            .width
+            .saturating_mul(face.preview.height)
+            .saturating_mul(4);
+        let entry = SnapshotPreviewEntry {
+            texture,
+            adjusted_histograms: face.adjusted_histograms.clone(),
+            clipping: face.clipping.clone(),
+            color_status: face.color_status.clone(),
+        };
+        self.snapshot_preview_cache.insert(
+            snapshot_preview_cache::SnapshotPreviewKey::new(snapshot_id, face_index, solo_channel),
+            entry,
+            estimated_bytes,
+        );
+        true
+    }
+
+    fn cache_current_snapshot_preview_if_ready(&mut self) -> bool {
+        self.cache_rendered_snapshot_preview(self.current_face, self.solo_channel)
+    }
+
+    fn restore_active_snapshot_preview(&mut self) -> bool {
+        let Some(snapshot_id) = self.project.active_snapshot_id else {
+            return false;
+        };
+        if !self.project.active_snapshot_matches() {
+            return false;
+        }
+        let face_index = self.current_face;
+        let solo_channel = self.solo_channel;
+        let key =
+            snapshot_preview_cache::SnapshotPreviewKey::new(snapshot_id, face_index, solo_channel);
+        let Some(entry) = self.snapshot_preview_cache.get_cloned(key) else {
+            return false;
+        };
+        let Some(face) = self.faces.get_mut(face_index) else {
+            return false;
+        };
+        // BEFORE uses the same display/solo mode. If that companion texture is
+        // no longer current, fall through to the renderer rather than mixing states.
+        if !face.available || face.original_rendered_solo != Some(solo_channel) {
+            return false;
+        }
+        face.texture = Some(entry.texture);
+        face.adjusted_histograms = entry.adjusted_histograms;
+        face.clipping = entry.clipping;
+        face.color_status = entry.color_status;
+        face.rendered_generation = face.generation;
+        true
+    }
+
     fn poll_render(&mut self, ctx: &egui::Context) {
         while let Ok(result) = self.render_rx.try_recv() {
-            if self.render_busy == Some((result.face_index, result.generation)) {
+            let face_index = result.face_index;
+            let generation = result.generation;
+            let solo_channel = result.solo_channel;
+            if self.render_busy == Some((face_index, generation)) {
                 self.render_busy = None;
             }
-            let Some(face) = self.faces.get_mut(result.face_index) else {
+            let Some(face) = self.faces.get_mut(face_index) else {
                 continue;
             };
-            if face.generation != result.generation {
+            if face.generation != generation {
                 continue;
             }
-            face.adjusted = result.adjusted;
+            face.adjusted_histograms = result.adjusted_histograms;
             face.clipping = result.clipping;
             face.color_status = result.color_status;
             let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -2225,15 +2324,14 @@ impl ShadeApp {
                 &result.rgba,
             );
             let options = egui::TextureOptions::LINEAR;
-            if let Some(texture) = &mut face.texture {
-                texture.set(image, options);
-            } else {
-                face.texture = Some(ctx.load_texture(
-                    format!("face-preview-{}", result.face_index),
-                    image,
-                    options,
-                ));
-            }
+            // Snapshot cache entries hold immutable TextureHandles. Always create
+            // a fresh adjusted texture here so a later dirty render cannot mutate
+            // a texture that another Snapshot is using from the cache.
+            face.texture = Some(ctx.load_texture(
+                format!("face-preview-{face_index}-{generation}"),
+                image,
+                options,
+            ));
             let original_image = egui::ColorImage::from_rgba_unmultiplied(
                 [face.preview.width, face.preview.height],
                 &result.original_rgba,
@@ -2242,11 +2340,12 @@ impl ShadeApp {
                 texture.set(original_image, options);
             } else {
                 face.original_texture = Some(ctx.load_texture(
-                    format!("face-original-preview-{}", result.face_index),
+                    format!("face-original-preview-{face_index}"),
                     original_image,
                     options,
                 ));
             }
+            face.original_rendered_solo = Some(solo_channel);
             if let Some(source_rgba) = result.embedded_original_rgba {
                 let source_image = egui::ColorImage::from_rgba_unmultiplied(
                     [face.preview.width, face.preview.height],
@@ -2256,7 +2355,7 @@ impl ShadeApp {
                     texture.set(source_image, options);
                 } else {
                     face.embedded_original_texture = Some(ctx.load_texture(
-                        format!("face-embedded-source-preview-{}", result.face_index),
+                        format!("face-embedded-source-preview-{face_index}"),
                         source_image,
                         options,
                     ));
@@ -2265,7 +2364,9 @@ impl ShadeApp {
             if let Some(status) = result.embedded_original_status {
                 face.embedded_original_status = status;
             }
-            face.rendered_generation = result.generation;
+            face.rendered_generation = generation;
+            let _ = face;
+            self.cache_rendered_snapshot_preview(face_index, solo_channel);
         }
     }
 
@@ -2303,6 +2404,10 @@ impl ShadeApp {
                 solo_channel,
                 &color,
             );
+            let adjusted_histograms = adjusted
+                .iter()
+                .map(|values| render::histogram(values))
+                .collect::<Vec<_>>();
             let color_status = color.status().clone();
 
             let (embedded_original_rgba, embedded_original_status) = if needs_embedded_original {
@@ -2338,7 +2443,8 @@ impl ShadeApp {
             let _ = tx.send(RenderResult {
                 face_index,
                 generation,
-                adjusted,
+                solo_channel,
+                adjusted_histograms,
                 clipping,
                 color_status,
                 rgba,
@@ -2376,6 +2482,7 @@ impl ShadeApp {
         if self.job.is_some() || self.current_face >= self.faces.len() {
             return;
         }
+        self.snapshot_preview_cache.clear();
         self.faces.remove(self.current_face);
         if self.current_face < self.project.faces.len() {
             self.project.faces.remove(self.current_face);
@@ -2599,7 +2706,12 @@ impl ShadeApp {
             );
             return;
         }
-        if self.render_busy.is_some() {
+        if self.render_busy.is_some()
+            && self
+                .faces
+                .get(self.current_face)
+                .is_some_and(|face| face.rendered_generation != face.generation)
+        {
             ui.add(
                 egui::ProgressBar::new(0.45)
                     .desired_width(300.0)
@@ -2692,6 +2804,7 @@ impl ShadeApp {
                 self.snapshot_rename_buffer = snapshot.name.clone();
             }
             self.mark_all_previews_dirty();
+            let restored = self.restore_active_snapshot_preview();
             let history_label = self
                 .project
                 .active_snapshot_name()
@@ -2701,7 +2814,11 @@ impl ShadeApp {
             self.history_clear_backup = None;
             self.history_pending_label = None;
             self.history_pending_at = None;
-            self.report_info("Snapshot loaded");
+            if restored {
+                self.report_info("Snapshot loaded · cached preview");
+            } else {
+                self.report_info("Snapshot loaded");
+            }
         }
     }
 
@@ -3261,6 +3378,7 @@ impl ShadeApp {
             self.load_history_for_active_snapshot("Snapshot created");
             self.history_clear_backup = None;
             self.project_dirty = true;
+            self.cache_current_snapshot_preview_if_ready();
         }
         if export_all {
             self.export_snapshot_group_dialog(all_ids.clone(), "all snapshots".to_owned());
@@ -3411,6 +3529,7 @@ impl ShadeApp {
             workflow::update_active_snapshot(self);
         }
         if delete && self.project.delete_snapshot(active_id) {
+            self.snapshot_preview_cache.remove_snapshot(active_id);
             self.snapshot_rename_id = None;
             self.snapshot_rename_buffer.clear();
             self.history
@@ -3555,11 +3674,7 @@ impl ShadeApp {
         }
         let channel_names = face.preview.metadata.channel_names.clone();
         let original_histograms = face.preview.histograms.clone();
-        let adjusted_histograms = face
-            .adjusted
-            .iter()
-            .map(|values| render::histogram(values))
-            .collect::<Vec<_>>();
+        let adjusted_histograms = face.adjusted_histograms.clone();
         let clipping = face.clipping.clone();
         let base_count = face.preview.metadata.base_channel_count;
         let color_model = face.preview.metadata.color_model;
@@ -3753,11 +3868,7 @@ impl ShadeApp {
         let output_display =
             channel_display_name(palette.as_ref(), &output_name, self.selected_channel);
         let all_original_histograms = face.preview.histograms.clone();
-        let all_adjusted_histograms = face
-            .adjusted
-            .iter()
-            .map(|values| render::histogram(values))
-            .collect::<Vec<_>>();
+        let all_adjusted_histograms = face.adjusted_histograms.clone();
         let active_original_histogram = all_original_histograms.get(self.selected_channel).copied();
         let active_adjusted_histogram = all_adjusted_histograms.get(self.selected_channel).copied();
         let active_clipping = face.clipping.get(self.selected_channel).copied();
