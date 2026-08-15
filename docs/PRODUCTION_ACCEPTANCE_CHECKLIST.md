@@ -13,6 +13,7 @@ This checklist separates automated conformance evidence from checks that require
 - [x] BigTIFF structure/container behavior is tested without allocating multi-gigabyte sample buffers.
 - [x] Missing-Face placeholder/relink paths have automated unit coverage and remain guarded before export.
 - [x] No-adjustment validation compares channel order, samples, ICC, Photoshop resources, Spot DisplayInfo, DPI, compression and predictor.
+- [x] v0.18.1 queue/operator workflow fixes passed locked Windows check, the full Rust test suite and release build in Actions run `31869438054`, including explicit recovered-queue pause/resume and short export-temp naming regression tests.
 
 ## Photoshop production round-trip — external evidence required
 
