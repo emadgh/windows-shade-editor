@@ -1,0 +1,2202 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index a36cbab..5a3a80f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2773,7 +2773,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "windows-shade-editor"
+-version = "0.18.2"
++version = "0.18.3"
+ dependencies = [
+  "base64",
+  "chrono",
+diff --git a/Cargo.toml b/Cargo.toml
+index 3b1b0cd..6a2beee 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "windows-shade-editor"
+-version = "0.18.2"
++version = "0.18.3"
+ edition = "2024"
+ description = "Native multi-channel TIFF shade editor for digital ceramic printing"
+ license = "MIT"
+diff --git a/RELEASE_NOTES.md b/RELEASE_NOTES.md
+index 6fdc3c5..650ffca 100644
+--- a/RELEASE_NOTES.md
++++ b/RELEASE_NOTES.md
+@@ -1,3 +1,12 @@
++# Shade Editor 0.18.3
++
++- Replace destructive Levels/Curve Broadcast-to-all behavior with independent Photoshop-style Master Levels and Master Curve controls stored as a separate All Channels adjustment state.
++- Stack Master Levels/Curve with per-channel edits in preview and full-resolution export without copying, overriding or discarding channel-specific adjustments.
++- Keep Channel Mixer output rows per-channel; All Channels no longer mutates individual Levels/Curve controls or their enabled state.
++- Use a neutral aggregated histogram for Master Curve instead of borrowing the currently selected channel color/histogram.
++- Add `~` / backtick as the All Channels shortcut and return Solo view to Composite when used.
++- Preserve Master adjustment state automatically in Snapshots, History and compact Export Queue recipes without changing the `.shade` schema.
++
+ # Shade Editor 0.18.2
+ 
+ - Cache the latest rendered preview for each clean Snapshot/Face/display mode in a bounded in-memory LRU so repeated Snapshot comparisons switch immediately after the first render.
+diff --git a/VERSION b/VERSION
+index 503a21d..6692bf7 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-0.18.2
++0.18.3
+diff --git a/src/export.rs b/src/export.rs
+index 0cd9db3..c3bd0e4 100644
+--- a/src/export.rs
++++ b/src/export.rs
+@@ -13,7 +13,8 @@ use windows_sys::Win32::Storage::FileSystem::{
+ 
+ use crate::dpi::{self, DpiInfo};
+ use crate::model::{
+-    ShadeProject, TEST_CODE_ALL_CHANNELS, TestCodePosition, apply_curve, apply_levels,
++    ChannelAdjustment, MASTER_ADJUSTMENT_KEY, ShadeProject, TEST_CODE_ALL_CHANNELS,
++    TestCodePosition, apply_curve, apply_levels,
+ };
+ use crate::tiff_io::{
+     ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_region,
+@@ -151,6 +152,10 @@ where
+     let names = &decoded.metadata.channel_names;
+     let mut output = vec![0u16; expected];
+     let mut prepared = vec![0.0f32; channels];
++    let master = project
++        .adjustments
++        .get(MASTER_ADJUSTMENT_KEY)
++        .filter(|adjustment| adjustment.enabled);
+ 
+     progress(0.08, "Applying adjustments");
+     let progress_step = (height / 100).max(1);
+@@ -165,33 +170,37 @@ where
+                     decoded.samples[base + channel],
+                 ) as f32
+                     / 65535.0;
+-                prepared[channel] = match project.adjustments.get(&names[channel]) {
+-                    Some(adjustment) if adjustment.enabled => apply_levels(raw, adjustment.levels),
+-                    _ => raw,
+-                };
++                prepared[channel] = apply_levels_stack(
++                    raw,
++                    project.adjustments.get(&names[channel]),
++                    master,
++                );
+             }
+ 
+             for out_channel in 0..channels {
+-                let value = match project.adjustments.get(&names[out_channel]) {
+-                    Some(adjustment) if adjustment.enabled => {
+-                        let mut mixed = adjustment.mixer.constant;
+-                        for source_channel in 0..channels {
+-                            let coefficient = adjustment
+-                                .mixer
+-                                .coefficients
+-                                .get(&names[source_channel])
+-                                .copied()
+-                                .unwrap_or(if source_channel == out_channel {
+-                                    1.0
+-                                } else {
+-                                    0.0
+-                                });
+-                            mixed += prepared[source_channel] * coefficient;
+-                        }
+-                        apply_curve(mixed, adjustment.curve)
++                let adjustment = project.adjustments.get(&names[out_channel]);
++                let mixed = if let Some(adjustment) =
++                    adjustment.filter(|adjustment| adjustment.enabled)
++                {
++                    let mut mixed = adjustment.mixer.constant;
++                    for source_channel in 0..channels {
++                        let coefficient = adjustment
++                            .mixer
++                            .coefficients
++                            .get(&names[source_channel])
++                            .copied()
++                            .unwrap_or(if source_channel == out_channel {
++                                1.0
++                            } else {
++                                0.0
++                            });
++                        mixed += prepared[source_channel] * coefficient;
+                     }
+-                    _ => prepared[out_channel],
++                    mixed
++                } else {
++                    prepared[out_channel]
+                 };
++                let value = apply_curve_stack(mixed, adjustment, master);
+                 let working = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                 output[base + out_channel] =
+                     tiff_sample_from_working(&decoded.metadata, out_channel, working);
+@@ -412,37 +421,43 @@ fn adjusted_strip(input: &[u16], metadata: &TiffMetadata, project: &ShadeProject) -> Vec<u16> {
+     let pixel_count = input.len() / channels.max(1);
+     let mut output = vec![0u16; pixel_count.saturating_mul(channels)];
+     let mut prepared = vec![0.0f32; channels];
++    let master = project
++        .adjustments
++        .get(MASTER_ADJUSTMENT_KEY)
++        .filter(|adjustment| adjustment.enabled);
+     for pixel in 0..pixel_count {
+         let base = pixel * channels;
+         for channel in 0..channels {
+             let raw =
+                 working_sample_from_tiff(metadata, channel, input[base + channel]) as f32 / 65535.0;
+-            prepared[channel] = match project.adjustments.get(&names[channel]) {
+-                Some(adjustment) if adjustment.enabled => apply_levels(raw, adjustment.levels),
+-                _ => raw,
+-            };
++            prepared[channel] = apply_levels_stack(
++                raw,
++                project.adjustments.get(&names[channel]),
++                master,
++            );
+         }
+         for out_channel in 0..channels {
+-            let value = match project.adjustments.get(&names[out_channel]) {
+-                Some(adjustment) if adjustment.enabled => {
+-                    let mut mixed = adjustment.mixer.constant;
+-                    for source_channel in 0..channels {
+-                        let coefficient = adjustment
+-                            .mixer
+-                            .coefficients
+-                            .get(&names[source_channel])
+-                            .copied()
+-                            .unwrap_or(if source_channel == out_channel {
+-                                1.0
+-                            } else {
+-                                0.0
+-                            });
+-                        mixed += prepared[source_channel] * coefficient;
+-                    }
+-                    apply_curve(mixed, adjustment.curve)
++            let adjustment = project.adjustments.get(&names[out_channel]);
++            let mixed = if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled) {
++                let mut mixed = adjustment.mixer.constant;
++                for source_channel in 0..channels {
++                    let coefficient = adjustment
++                        .mixer
++                        .coefficients
++                        .get(&names[source_channel])
++                        .copied()
++                        .unwrap_or(if source_channel == out_channel {
++                            1.0
++                        } else {
++                            0.0
++                        });
++                    mixed += prepared[source_channel] * coefficient;
+                 }
+-                _ => prepared[out_channel],
++                mixed
++            } else {
++                prepared[out_channel]
+             };
++            let value = apply_curve_stack(mixed, adjustment, master);
+             let working = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+             output[base + out_channel] = tiff_sample_from_working(metadata, out_channel, working);
+         }
+@@ -450,6 +465,38 @@ fn adjusted_strip(input: &[u16], metadata: &TiffMetadata, project: &ShadeProject) -> Vec<u16> {
+     output
+ }
+ 
++#[inline]
++fn apply_levels_stack(
++    raw: f32,
++    local: Option<&ChannelAdjustment>,
++    master: Option<&ChannelAdjustment>,
++) -> f32 {
++    let mut value = match local.filter(|adjustment| adjustment.enabled) {
++        Some(adjustment) => apply_levels(raw, adjustment.levels),
++        None => raw,
++    };
++    if let Some(master) = master {
++        value = apply_levels(value, master.levels);
++    }
++    value
++}
++
++#[inline]
++fn apply_curve_stack(
++    value: f32,
++    local: Option<&ChannelAdjustment>,
++    master: Option<&ChannelAdjustment>,
++) -> f32 {
++    let mut value = match local.filter(|adjustment| adjustment.enabled) {
++        Some(adjustment) => apply_curve(value, adjustment.curve),
++        None => value,
++    };
++    if let Some(master) = master {
++        value = apply_curve(value, master.curve);
++    }
++    value
++}
++
+ fn stream_spool_u8<W, F>(
+     source: &Path,
+     stream: &StreamInfo,
+@@ -1344,6 +1391,45 @@ mod streaming_tests {
+     }
+ 
+     #[test]
++    fn master_levels_and_curve_stack_after_local_controls_without_overwrite() {
++        let names = vec!["A".to_owned(), "B".to_owned()];
++        let mut project = ShadeProject::default();
++        project.ensure_channels(&names);
++        {
++            let local = project.adjustments.get_mut("A").unwrap();
++            local.levels.gamma = 1.5;
++            local.curve.midpoint_enabled = true;
++            local.curve.midpoint_input = 0.5;
++            local.curve.midpoint = 0.65;
++        }
++        let local_before = project.adjustments.get("A").unwrap().clone();
++        let mut master = ChannelAdjustment::default();
++        master.levels.gamma = 0.8;
++        master.curve.midpoint_enabled = true;
++        master.curve.midpoint_input = 0.5;
++        master.curve.midpoint = 0.4;
++        project
++            .adjustments
++            .insert(MASTER_ADJUSTMENT_KEY.to_owned(), master.clone());
++
++        let input = [32_768u16, 20_000u16];
++        let metadata = test_metadata(&names, 2, vec![None; 2]);
++        let output = adjusted_strip(&input, &metadata, &project);
++
++        let raw = input[0] as f32 / 65_535.0;
++        let expected = apply_curve(
++            apply_curve(
++                apply_levels(apply_levels(raw, local_before.levels), master.levels),
++                local_before.curve,
++            ),
++            master.curve,
++        );
++        let actual = output[0] as f32 / 65_535.0;
++        assert!((actual - expected).abs() <= 2.0 / 65_535.0);
++        assert_eq!(project.adjustments.get("A").unwrap(), &local_before);
++    }
++
++    #[test]
+     fn gray_adjustment_pipeline_preserves_single_channel_semantics() {
+         let names = vec!["Gray".to_owned()];
+         let mut metadata = test_metadata(&names, 1, vec![None]);
+diff --git a/src/export_recipe.rs b/src/export_recipe.rs
+index f469e78..bc573ab 100644
+--- a/src/export_recipe.rs
++++ b/src/export_recipe.rs
+@@ -37,6 +37,7 @@ impl ExportRecipe {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::model::MASTER_ADJUSTMENT_KEY;
+ 
+     #[test]
+     fn recipe_excludes_heavy_project_state_and_freezes_test_code() {
+@@ -52,8 +53,23 @@ mod tests {
+             encoded_bytes: 4,
+             data_base64: "AAAA".to_owned(),
+         });
++        project
++            .adjustments
++            .entry(MASTER_ADJUSTMENT_KEY.to_owned())
++            .or_default()
++            .levels
++            .gamma = 1.25;
+         let recipe = ExportRecipe::from_project(&project);
+         assert_eq!(recipe.test_code.text, expected);
++        assert_eq!(
++            recipe
++                .adjustments
++                .get(MASTER_ADJUSTMENT_KEY)
++                .unwrap()
++                .levels
++                .gamma,
++            1.25
++        );
+         let materialized = recipe.materialize_project();
+         assert!(materialized.thumbnail.is_none());
+         assert!(materialized.snapshots.is_empty());
+diff --git a/src/history.rs b/src/history.rs
+index 25693ed..b846a6b 100644
+--- a/src/history.rs
++++ b/src/history.rs
+@@ -1,7 +1,8 @@
+ use std::collections::{BTreeMap, BTreeSet};
+ 
+ use crate::model::{
+-    ChannelAdjustment, MAX_SNAPSHOT_HISTORY_STATES, SnapshotAdjustmentHistory, SnapshotHistoryState,
++    ChannelAdjustment, MASTER_ADJUSTMENT_KEY, MAX_SNAPSHOT_HISTORY_STATES,
++    SnapshotAdjustmentHistory, SnapshotHistoryState,
+ };
+ 
+ #[derive(Clone, Debug)]
+@@ -164,7 +165,11 @@ pub fn describe_change(
+         if old == new {
+             continue;
+         }
+-        channels.push(name);
++        channels.push(if name == MASTER_ADJUSTMENT_KEY {
++            "All channels".to_owned()
++        } else {
++            name
++        });
+         if old.enabled != new.enabled {
+             kinds.insert("Enable");
+         }
+@@ -248,6 +253,19 @@ mod tests {
+     }
+ 
+     #[test]
++    fn master_change_description_uses_all_channels_label() {
++        let mut before = BTreeMap::new();
++        before.insert(MASTER_ADJUSTMENT_KEY.to_owned(), ChannelAdjustment::default());
++        let mut after = before.clone();
++        after
++            .get_mut(MASTER_ADJUSTMENT_KEY)
++            .unwrap()
++            .curve
++            .midpoint = 0.6;
++        assert_eq!(describe_change(&before, &after), "Curve · All channels");
++    }
++
++    #[test]
+     fn change_description_detects_adjustment_type() {
+         let a = state(1.0);
+         let b = state(1.5);
+diff --git a/src/main.rs b/src/main.rs
+index 8582a18..52b227a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -47,8 +47,8 @@ use color_management::{PreviewColorConfig, PreviewColorStatus};
+ use eframe::egui;
+ use model::{
+-    ChannelAdjustment, PreviewRenderingIntent, ShadeProject, TEST_CODE_ALL_CHANNELS,
+-    TestCodePosition,
++    ChannelAdjustment, MASTER_ADJUSTMENT_KEY, PreviewRenderingIntent, ShadeProject,
++    TEST_CODE_ALL_CHANNELS, TestCodePosition,
+ };
+ use palette::ChannelPalette;
+ use project_lifecycle::{
+@@ -3892,6 +3892,11 @@ impl ShadeApp {
+             .adjustments
+             .get(&output_name)
+             .is_some_and(adjustment_is_modified);
++        let master_modified = self
++            .project
++            .adjustments
++            .get(MASTER_ADJUSTMENT_KEY)
++            .is_some_and(master_adjustment_is_modified);
+ 
+         ui.horizontal(|ui| {
+             ui.heading("Adjustments");
+@@ -3909,7 +3914,12 @@ impl ShadeApp {
+         });
+         ui.horizontal_wrapped(|ui| {
+             let mut all_channels = self.adjustment_scope == AdjustmentScope::All;
+-            if ui.checkbox(&mut all_channels, "All channels").changed() {
++            let all_label = if master_modified {
++                "All channels  •   (~)"
++            } else {
++                "All channels   (~)"
++            };
++            if ui.checkbox(&mut all_channels, all_label).changed() {
+                 self.adjustment_scope = if all_channels {
+                     AdjustmentScope::All
+                 } else {
+@@ -3976,36 +3986,79 @@ impl ShadeApp {
+                                 header_changed |= ui.checkbox(enabled, "Enabled").changed();
+                             }
+                             AdjustmentScope::All => {
+-                                ui.strong("Editing: All channels");
+-                                let mut all_enabled = channel_names.iter().all(|name| {
+-                                    self.project
+-                                        .adjustments
+-                                        .get(name)
+-                                        .map(|adjustment| adjustment.enabled)
+-                                        .unwrap_or(true)
+-                                });
+-                                if ui.checkbox(&mut all_enabled, "Enabled").changed() {
+-                                    for name in &channel_names {
+-                                        self.project
+-                                            .adjustments
+-                                            .entry(name.clone())
+-                                            .or_default()
+-                                            .enabled = all_enabled;
++                                ui.strong("Editing: All channels / Master");
++                                match self.tool {
++                                    ToolPanel::Levels | ToolPanel::Curves => {
++                                        let mut master_enabled = self
++                                            .project
++                                            .adjustments
++                                            .get(MASTER_ADJUSTMENT_KEY)
++                                            .map(|adjustment| adjustment.enabled)
++                                            .unwrap_or(true);
++                                        if ui
++                                            .checkbox(&mut master_enabled, "Master enabled")
++                                            .on_hover_text(
++                                                "Bypasses only Master Levels and Master Curve. Per-channel controls are never changed.",
++                                            )
++                                            .changed()
++                                        {
++                                            self.project
++                                                .adjustments
++                                                .entry(MASTER_ADJUSTMENT_KEY.to_owned())
++                                                .or_default()
++                                                .enabled = master_enabled;
++                                            cleanup_master_adjustment(&mut self.project.adjustments);
++                                            header_changed = true;
++                                        }
++                                    }
++                                    ToolPanel::Mixer => {
++                                        ui.small("Mixer rows remain channel-specific");
+                                     }
+-                                    header_changed = true;
+                                 }
+                             }
+                         }
++                        let reset_label = match self.adjustment_scope {
++                            AdjustmentScope::Selected => "Reset channel",
++                            AdjustmentScope::All => match self.tool {
++                                ToolPanel::Levels => "Reset Master Levels",
++                                ToolPanel::Curves => "Reset Master Curve",
++                                ToolPanel::Mixer => "Reset mixers",
++                            },
++                        };
++                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                            ui.small_button(reset_label).clicked()
++                        })
++                        .inner
++                    })
++                    .inner;
++                if reset_all {
++                    match self.adjustment_scope {
++                        AdjustmentScope::Selected => {
++                            let adjustment = self
++                                .project
++                                .adjustments
++                                .entry(output_name.clone())
++                                .or_default();
++                            *adjustment = ChannelAdjustment::default();
++                            reset_mixer_row(adjustment, &output_name, &channel_names);
++                            self.report_info(format!("Reset {output_display} adjustments"));
++                        }
++                        AdjustmentScope::All => match self.tool {
++                            ToolPanel::Levels => {
++                                reset_master_levels(&mut self.project.adjustments);
++                                self.report_info("Reset Master Levels");
++                            }
++                            ToolPanel::Curves => {
++                                reset_master_curve(&mut self.project.adjustments);
++                                self.report_info("Reset Master Curve");
++                            }
++                            ToolPanel::Mixer => {
++                                reset_all_mixers(&mut self.project.adjustments, &channel_names);
++                                self.report_info("Reset all Mixer rows");
++                            }
++                        },
++                    }
++                    self.mark_all_previews_dirty();
++                }
++                let body_changed = match self.adjustment_scope {
++                    AdjustmentScope::Selected => self.ui_selected_adjustment(
++                        ui,
++                        &output_name,
++                        &channel_names,
++                        active_original_histogram.as_ref(),
++                        active_adjusted_histogram.as_ref(),
++                        control_accent,
++                        palette.as_ref(),
++                    ),
++                    AdjustmentScope::All => self.ui_all_adjustments(
++                        ui,
++                        &channel_names,
++                        &all_original_histograms,
++                        &all_adjusted_histograms,
++                        palette.as_ref(),
++                    ),
++                };
++                header_changed || body_changed
++            })
++            .inner;
++        if changed {
++            self.mark_all_previews_dirty();
++        }
++        if self.project.adjustments != adjustments_before {
++            self.queue_adjustment_history(&adjustments_before);
++        }
++    }
++
++    fn ui_selected_adjustment(
++        &mut self,
++        ui: &mut egui::Ui,
++        output_name: &str,
++        channel_names: &[String],
++        histogram_before: Option<&[u32; 256]>,
++        histogram_after: Option<&[u32; 256]>,
++        accent: Option<egui::Color32>,
++        palette: Option<&ChannelPalette>,
++    ) -> bool {
++        let mut changed = false;
++        let compact_curve_controls = self.settings.compact_curve_controls;
++        let adjustment = self
++            .project
++            .adjustments
++            .entry(output_name.to_owned())
++            .or_default();
++        ui.add_enabled_ui(adjustment.enabled, |ui| {
++            if self.settings.adjustment_tabs {
++                let reset_tool = adjustment_tab_bar(ui, &mut self.tool);
++                if reset_tool {
++                    match self.tool {
++                        ToolPanel::Levels => adjustment.levels = model::Levels::default(),
++                        ToolPanel::Curves => adjustment.curve = model::Curve::default(),
++                        ToolPanel::Mixer => reset_mixer_row(adjustment, output_name, channel_names),
++                    }
++                    changed = true;
++                }
++                changed |= match self.tool {
++                    ToolPanel::Levels => levels_ui(ui, adjustment, accent),
++                    ToolPanel::Curves => curves_ui(
++                        ui,
++                        adjustment,
++                        histogram_before.filter(|_| self.settings.show_curve_histogram),
++                        histogram_after.filter(|_| self.settings.show_curve_histogram),
++                        accent,
++                        compact_curve_controls,
++                        false,
++                    ),
++                    ToolPanel::Mixer => {
++                        mixer_ui(ui, adjustment, output_name, channel_names, accent, palette)
++                    }
++                };
++            } else {
++                let (body_changed, reset) = adjustment_foldout(
++                    ui,
++                    format!("selected-levels-{output_name}"),
++                    "Levels",
++                    true,
++                    |ui| levels_ui(ui, adjustment, accent),
++                );
++                changed |= body_changed.unwrap_or(false);
++                if reset {
++                    adjustment.levels = model::Levels::default();
++                    changed = true;
++                }
++
++                ui.add_space(4.0);
++                let (body_changed, reset) = adjustment_foldout(
++                    ui,
++                    format!("selected-mixer-{output_name}"),
++                    "Channel Mixer",
++                    true,
++                    |ui| mixer_ui(ui, adjustment, output_name, channel_names, accent, palette),
++                );
++                changed |= body_changed.unwrap_or(false);
++                if reset {
++                    reset_mixer_row(adjustment, output_name, channel_names);
++                    changed = true;
++                }
++
++                ui.add_space(4.0);
++                let (body_changed, reset) = adjustment_foldout(
++                    ui,
++                    format!("selected-curve-{output_name}"),
++                    "Curve",
++                    true,
++                    |ui| {
++                        curves_ui(
++                            ui,
++                            adjustment,
++                            histogram_before.filter(|_| self.settings.show_curve_histogram),
++                            histogram_after.filter(|_| self.settings.show_curve_histogram),
++                            accent,
++                            compact_curve_controls,
++                            false,
++                        )
++                    },
++                );
++                changed |= body_changed.unwrap_or(false);
++                if reset {
++                    adjustment.curve = model::Curve::default();
++                    changed = true;
++                }
++            }
++        });
++        changed
++    }
++
++    fn ui_all_adjustments(
++        &mut self,
++        ui: &mut egui::Ui,
++        channel_names: &[String],
++        histograms_before: &[[u32; 256]],
++        histograms_after: &[[u32; 256]],
++        palette: Option<&ChannelPalette>,
++    ) -> bool {
++        let mut changed = false;
++        let compact_curve_controls = self.settings.compact_curve_controls;
++        ui.small(
++            "Master Levels and Master Curve are independent All Channels controls. They stack with per-channel edits and never overwrite them. Mixer output rows remain channel-specific.",
++        );
++
++        let master_histogram_before = self
++            .settings
++            .show_curve_histogram
++            .then(|| aggregate_histograms(histograms_before));
++        let master_histogram_after = self
++            .settings
++            .show_curve_histogram
++            .then(|| aggregate_histograms(histograms_after));
++
++        if self.settings.adjustment_tabs {
++            let reset_tool = adjustment_tab_bar(ui, &mut self.tool);
++            if reset_tool {
++                match self.tool {
++                    ToolPanel::Levels => reset_master_levels(&mut self.project.adjustments),
++                    ToolPanel::Curves => reset_master_curve(&mut self.project.adjustments),
++                    ToolPanel::Mixer => {
++                        reset_all_mixers(&mut self.project.adjustments, channel_names)
++                    }
++                }
++                changed = true;
++            }
++            changed |= match self.tool {
++                ToolPanel::Levels => master_levels_ui(ui, &mut self.project.adjustments),
++                ToolPanel::Curves => master_curve_ui(
++                    ui,
++                    &mut self.project.adjustments,
++                    master_histogram_before.as_ref(),
++                    master_histogram_after.as_ref(),
++                    compact_curve_controls,
++                ),
++                ToolPanel::Mixer => all_mixers_ui(
++                    ui,
++                    &mut self.project.adjustments,
++                    channel_names,
++                    self.settings.colorize_adjustments,
++                    palette,
++                ),
++            };
++        } else {
++            let (body_changed, reset) = adjustment_foldout(
++                ui,
++                "master-levels-section",
++                "Master Levels - All channels",
++                true,
++                |ui| master_levels_ui(ui, &mut self.project.adjustments),
++            );
++            changed |= body_changed.unwrap_or(false);
++            if reset {
++                reset_master_levels(&mut self.project.adjustments);
++                changed = true;
++            }
++
++            ui.add_space(4.0);
++            let (body_changed, reset) = adjustment_foldout(
++                ui,
++                "all-mixers-section",
++                "Channel Mixer - all output rows",
++                true,
++                |ui| {
++                    all_mixers_ui(
++                        ui,
++                        &mut self.project.adjustments,
++                        channel_names,
++                        self.settings.colorize_adjustments,
++                        palette,
++                    )
++                },
++            );
++            changed |= body_changed.unwrap_or(false);
++            if reset {
++                reset_all_mixers(&mut self.project.adjustments, channel_names);
++                changed = true;
++            }
++
++            ui.add_space(4.0);
++            let (body_changed, reset) = adjustment_foldout(
++                ui,
++                "master-curve-section",
++                "Master Curve - All channels",
++                true,
++                |ui| {
++                    master_curve_ui(
++                        ui,
++                        &mut self.project.adjustments,
++                        master_histogram_before.as_ref(),
++                        master_histogram_after.as_ref(),
++                        compact_curve_controls,
++                    )
++                },
++            );
++            changed |= body_changed.unwrap_or(false);
++            if reset {
++                reset_master_curve(&mut self.project.adjustments);
++                changed = true;
++            }
++        }
++        changed
++    }
++    fn ui_tools(&mut self, ui: &mut egui::Ui) {
++        ui.horizontal(|ui| {
++            ui.strong("Tools");
++            let layout = if self.settings.sidebar_two_columns {
++                "2 columns"
++            } else {
++                "1 column"
++            };
++            if ui.small_button(layout).clicked() {
++                self.settings.sidebar_two_columns = !self.settings.sidebar_two_columns;
++                self.save_settings_quietly();
++            }
++        });
++        ui.separator();
++        if self.settings.sidebar_two_columns {
++            ui.columns(2, |columns| {
++                egui::ScrollArea::vertical()
++                    .id_salt("channels-column")
++                    .show(&mut columns[0], |ui| self.ui_channels_histogram(ui));
++                egui::ScrollArea::vertical()
++                    .id_salt("adjustments-column")
++                    .show(&mut columns[1], |ui| self.ui_adjustments(ui));
++            });
++        } else {
++            egui::ScrollArea::vertical().show(ui, |ui| {
++                self.ui_channels_histogram(ui);
++                ui.separator();
++                self.ui_adjustments(ui);
++            });
++        }
++    }
++
++}
++
++fn mixer_ui(
++    ui: &mut egui::Ui,
++    adjustment: &mut ChannelAdjustment,
++    output_name: &str,
++    channel_names: &[String],
++    accent: Option<egui::Color32>,
++    palette: Option<&ChannelPalette>,
++) -> bool {
++    with_accent(ui, accent, |ui| {
++        let output_index = channel_names
++            .iter()
++            .position(|name| name == output_name)
++            .unwrap_or(0);
++        let output_display = channel_display_name(palette, output_name, output_index);
++        if let Some(color) = accent {
++            ui.colored_label(color, format!("Output: {output_display}"));
++        } else {
++            ui.label(format!("Output: {output_display}"));
++        }
++        let mut changed = false;
++        for (index, name) in channel_names.iter().enumerate() {
++            let default = if name == output_name { 1.0 } else { 0.0 };
++            let coefficient = adjustment
++                .mixer
++                .coefficients
++                .entry(name.clone())
++                .or_insert(default);
++            let row_accent = accent.map(|_| channel_color(palette, name, index));
++            changed |= with_accent(ui, row_accent, |ui| {
++                let mut slider = egui::Slider::new(coefficient, -2.0..=2.0)
++                    .text(channel_display_name(palette, name, index))
++                    .trailing_fill(true);
++                if let Some(color) = row_accent {
++                    slider = slider.text_color(color);
++                }
++                ui.add(slider).changed()
++            });
++        }
++        ui.add_space(10.0);
++        ui.separator();
++        ui.add_space(6.0);
++        let mut constant_slider = egui::Slider::new(&mut adjustment.mixer.constant, -1.0..=1.0)
++            .text("Constant")
++            .trailing_fill(true);
++        if let Some(color) = accent {
++            constant_slider = constant_slider.text_color(color);
++        }
++        changed |= ui.add(constant_slider).changed();
++        changed
++    })
++}
++fn adjustment_tab_bar(ui: &mut egui::Ui, tool: &mut ToolPanel) -> bool {
++    ui.horizontal(|ui| {
++        ui.selectable_value(tool, ToolPanel::Levels, "Levels");
++        ui.selectable_value(tool, ToolPanel::Mixer, "Mixer");
++        ui.selectable_value(tool, ToolPanel::Curves, "Curve");
++        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++            ui.small_button("Reset").clicked()
++        })
++        .inner
++    })
++    .inner
++}
++
++fn adjustment_foldout<R>(
++    ui: &mut egui::Ui,
++    id_salt: impl std::hash::Hash,
++    title: impl Into<egui::WidgetText>,
++    default_open: bool,
++    body: impl FnOnce(&mut egui::Ui) -> R,
++) -> (Option<R>, bool) {
++    let id = ui.make_persistent_id(id_salt);
++    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
++        ui.ctx(),
++        id,
++        default_open,
++    );
++    let title = title.into();
++    let mut reset = false;
++    let header = ui.horizontal(|ui| {
++        state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
++        let title_response = ui.add(egui::Label::new(title).sense(egui::Sense::click()));
++        if title_response.clicked() {
++            state.toggle(ui);
++        }
++        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++            reset = ui.small_button("Reset").clicked();
++        });
++    });
++    let body = state.show_body_indented(&header.response, ui, body);
++    (body.map(|response| response.inner), reset)
++}
++
++fn reset_mixer_row(
++    adjustment: &mut ChannelAdjustment,
++    output_name: &str,
++    channel_names: &[String],
++) {
++    adjustment.mixer.coefficients.clear();
++    for name in channel_names {
++        adjustment
++            .mixer
++            .coefficients
++            .insert(name.clone(), if name == output_name { 1.0 } else { 0.0 });
++    }
++    adjustment.mixer.constant = 0.0;
++}
++
++fn cleanup_master_adjustment(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
++    let remove = adjustments
++        .get(MASTER_ADJUSTMENT_KEY)
++        .is_some_and(|adjustment| *adjustment == ChannelAdjustment::default());
++    if remove {
++        adjustments.remove(MASTER_ADJUSTMENT_KEY);
++    }
++}
++
++fn reset_master_levels(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
++    if let Some(master) = adjustments.get_mut(MASTER_ADJUSTMENT_KEY) {
++        master.levels = model::Levels::default();
++    }
++    cleanup_master_adjustment(adjustments);
++}
++
++fn reset_master_curve(adjustments: &mut BTreeMap<String, ChannelAdjustment>) {
++    if let Some(master) = adjustments.get_mut(MASTER_ADJUSTMENT_KEY) {
++        master.curve = model::Curve::default();
++    }
++    cleanup_master_adjustment(adjustments);
++}
++
++fn reset_all_mixers(
++    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
++    channel_names: &[String],
++) {
++    for output_name in channel_names {
++        let adjustment = adjustments.entry(output_name.clone()).or_default();
++        reset_mixer_row(adjustment, output_name, channel_names);
++    }
++}
++
++fn levels_ui(
++    ui: &mut egui::Ui,
++    adjustment: &mut ChannelAdjustment,
++    accent: Option<egui::Color32>,
++) -> bool {
++    with_accent(ui, accent, |ui| {
++        let levels = &mut adjustment.levels;
++        let mut changed = false;
++        changed |= ui
++            .add(egui::Slider::new(&mut levels.input_black, 0.0..=0.98).text("Input black"))
++            .changed();
++        changed |= ui
++            .add(
++                egui::Slider::new(&mut levels.gamma, 0.1..=4.0)
++                    .logarithmic(true)
++                    .text("Gamma (relative)"),
++            )
++            .changed();
++        changed |= ui
++            .add(egui::Slider::new(&mut levels.input_white, 0.02..=1.0).text("Input white"))
++            .changed();
++        changed |= ui
++            .add(egui::Slider::new(&mut levels.output_black, 0.0..=1.0).text("Output black"))
++            .changed();
++        changed |= ui
++            .add(egui::Slider::new(&mut levels.output_white, 0.0..=1.0).text("Output white"))
++            .changed();
++        if levels.input_white <= levels.input_black {
++            levels.input_white = (levels.input_black + 0.01).min(1.0);
++            changed = true;
++        }
++        if levels.output_white < levels.output_black {
++            std::mem::swap(&mut levels.output_white, &mut levels.output_black);
++            changed = true;
++        }
++        ui.add_space(8.0);
++        ui.label("Gamma midpoint");
++        let mut gamma_mid = model::levels_gamma_mid_output(*levels);
++        let min_mid = levels.output_black.min(levels.output_white);
++        let max_mid = levels.output_black.max(levels.output_white);
++        let gamma_response = ui.add(
++            egui::Slider::new(&mut gamma_mid, min_mid..=max_mid)
++                .show_value(false)
++                .trailing_fill(true),
++        );
++        if gamma_response.changed() {
++            let range = (levels.output_white - levels.output_black).abs();
++            if range > 0.0001 {
++                let normalized = ((gamma_mid - levels.output_black) / range).clamp(0.0001, 0.9999);
++                levels.gamma = (0.5f32.ln() / normalized.ln()).clamp(0.1, 4.0);
++                changed = true;
++            }
++        }
++        changed
++    })
++}
++
++fn with_accent<R>(ui: &mut egui::Ui, accent: Option<egui::Color32>, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
++    if let Some(accent) = accent {
++        ui.scope(|ui| {
++            ui.visuals_mut().selection.stroke.color = accent;
++            ui.visuals_mut().widgets.active.bg_fill = accent.gamma_multiply(0.55);
++            ui.visuals_mut().widgets.hovered.bg_fill = accent.gamma_multiply(0.26);
++            body(ui)
++        })
++        .inner
++    } else {
++        body(ui)
++    }
++}
++
++fn curve_editor_graph(
++    ui: &mut egui::Ui,
++    curve: &mut model::Curve,
++    histogram_before: Option<&[u32; 256]>,
++    histogram_after: Option<&[u32; 256]>,
++    accent: Option<egui::Color32>,
++    neutral_histogram: bool,
++) -> (bool, CurvePoint) {
++    let desired = egui::vec2(ui.available_width().max(120.0), 220.0);
++    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
++    let painter = ui.painter_at(rect);
++    let bg = ui.visuals().extreme_bg_color;
++    painter.rect_filled(rect, 5.0, bg);
++    painter.rect_stroke(
++        rect,
++        5.0,
++        ui.visuals().widgets.noninteractive.bg_stroke,
++        egui::StrokeKind::Inside,
++    );
++
++    let grid = ui.visuals().widgets.noninteractive.fg_stroke.color.gamma_multiply(0.18);
++    for step in 1..4 {
++        let t = step as f32 / 4.0;
++        let x = egui::lerp(rect.x_range(), t);
++        let y = egui::lerp(rect.y_range(), t);
++        painter.line_segment(
++            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
++            egui::Stroke::new(1.0, grid),
++        );
++        painter.line_segment(
++            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
++            egui::Stroke::new(1.0, grid),
++        );
++    }
++
++    let histogram_max = histogram_before
++        .into_iter()
++        .flat_map(|bins| bins.iter())
++        .chain(histogram_after.into_iter().flat_map(|bins| bins.iter()))
++        .copied()
++        .max()
++        .unwrap_or(1)
++        .max(1) as f32;
++    if let Some(bins) = histogram_before {
++        let color = ui.visuals().weak_text_color().gamma_multiply(0.34);
++        for (index, value) in bins.iter().enumerate() {
++            let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
++            let h = *value as f32 / histogram_max * rect.height();
++            painter.line_segment(
++                [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
++                egui::Stroke::new(1.0, color),
++            );
++        }
++    }
++    if let Some(bins) = histogram_after {
++        let color = if neutral_histogram {
++            ui.visuals().text_color().gamma_multiply(0.38)
++        } else {
++            accent
++                .unwrap_or(ui.visuals().selection.stroke.color)
++                .gamma_multiply(0.38)
++        };
++        for (index, value) in bins.iter().enumerate() {
++            let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
++            let h = *value as f32 / histogram_max * rect.height();
++            painter.line_segment(
++                [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
++                egui::Stroke::new(1.0, color),
++            );
++        }
++    }
++
++    let curve_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
++    let mut points = Vec::with_capacity(3);
++    points.push((CurvePoint::Black, curve.input_black, curve.black));
++    if curve.midpoint_enabled {
++        points.push((CurvePoint::Mid, curve.midpoint_input, curve.midpoint));
++    }
++    points.push((CurvePoint::White, curve.input_white, curve.white));
++
++    let to_screen = |x: f32, y: f32| {
++        egui::pos2(
++            egui::lerp(rect.x_range(), x.clamp(0.0, 1.0)),
++            egui::lerp(rect.y_range(), 1.0 - y.clamp(0.0, 1.0)),
++        )
++    };
++    let sample_count = 128;
++    let mut polyline = Vec::with_capacity(sample_count + 1);
++    for index in 0..=sample_count {
++        let input = index as f32 / sample_count as f32;
++        let output = model::apply_curve(input, *curve);
++        polyline.push(to_screen(input, output));
++    }
++    painter.add(egui::Shape::line(polyline, egui::Stroke::new(2.0, curve_color)));
++
++    let focus_id = egui::Id::new("shade-editor-curve-graph-focused");
++    let selection_id = response.id.with("curve-point-selection");
++    let mut selected = ui
++        .ctx()
++        .data(|data| data.get_temp::<CurvePoint>(selection_id))
++        .unwrap_or(CurvePoint::Mid);
++    if !curve.midpoint_enabled && selected == CurvePoint::Mid {
++        selected = CurvePoint::Black;
++    }
++
++    let pointer = response.interact_pointer_pos();
++    let mut changed = false;
++    if response.clicked() || response.drag_started() {
++        ui.ctx().data_mut(|data| data.insert_temp(focus_id, true));
++        if let Some(pointer) = pointer {
++            let mut nearest = None;
++            for (point, x, y) in &points {
++                let distance = to_screen(*x, *y).distance(pointer);
++                if distance <= 16.0 && nearest.map(|(_, best)| distance < best).unwrap_or(true) {
++                    nearest = Some((*point, distance));
++                }
++            }
++            if let Some((point, _)) = nearest {
++                selected = point;
++                ui.ctx().data_mut(|data| data.insert_temp(selection_id, selected));
++            }
++        }
++    }
++
++    if response.double_clicked() {
++        if let Some(pointer) = pointer {
++            let midpoint_screen = to_screen(curve.midpoint_input, curve.midpoint);
++            if curve.midpoint_enabled && midpoint_screen.distance(pointer) <= 18.0 {
++                curve.midpoint_enabled = false;
++                selected = CurvePoint::Black;
++                changed = true;
++            } else {
++                let x = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
++                let y = (1.0 - (pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
++                curve.midpoint_enabled = true;
++                curve.midpoint_input = x.clamp(curve.input_black + 0.001, curve.input_white - 0.001);
++                curve.midpoint = y;
++                selected = CurvePoint::Mid;
++                changed = true;
++            }
++            ui.ctx().data_mut(|data| data.insert_temp(selection_id, selected));
++        }
++    } else if response.dragged() {
++        if let Some(pointer) = pointer {
++            let x = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
++            let y = (1.0 - (pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
++            set_curve_point(curve, selected, x, y);
++            changed = true;
++        }
++    }
++
++    if response.clicked_elsewhere() && !response.dragged() {
++        ui.ctx().data_mut(|data| data.insert_temp(focus_id, false));
++    }
++
++    for (point, x, y) in points {
++        let center = to_screen(x, y);
++        let radius = if selected == point { 6.5 } else { 5.0 };
++        painter.circle_filled(center, radius, if selected == point { curve_color } else { bg });
++        painter.circle_stroke(center, radius, egui::Stroke::new(2.0, curve_color));
++    }
++
++    if ui.ctx().data(|data| data.get_temp::<bool>(focus_id).unwrap_or(false)) {
++        let (left, right, up, down, large) = ui.input(|input| {
++            (
++                input.key_pressed(egui::Key::ArrowLeft),
++                input.key_pressed(egui::Key::ArrowRight),
++                input.key_pressed(egui::Key::ArrowUp),
++                input.key_pressed(egui::Key::ArrowDown),
++                input.modifiers.shift,
++            )
++        });
++        let step = if large { 10.0 / 255.0 } else { 1.0 / 255.0 };
++        let (mut x, mut y) = curve_point_values(curve, selected);
++        if left {
++            x -= step;
++        }
++        if right {
++            x += step;
++        }
++        if up {
++            y += step;
++        }
++        if down {
++            y -= step;
++        }
++        if left || right || up || down {
++            set_curve_point(curve, selected, x, y);
++            changed = true;
++        }
++    }
++
++    (changed, selected)
++}
++
++fn curve_point_values(curve: &model::Curve, point: CurvePoint) -> (f32, f32) {
++    match point {
++        CurvePoint::Black => (curve.input_black, curve.black),
++        CurvePoint::Mid => (curve.midpoint_input, curve.midpoint),
++        CurvePoint::White => (curve.input_white, curve.white),
++    }
++}
++
++fn set_curve_point(curve: &mut model::Curve, point: CurvePoint, x: f32, y: f32) {
++    match point {
++        CurvePoint::Black => {
++            let upper = if curve.midpoint_enabled {
++                curve.midpoint_input - 0.001
++            } else {
++                curve.input_white - 0.001
++            };
++            curve.input_black = x.clamp(0.0, upper.max(0.0));
++            curve.black = y.clamp(0.0, 1.0);
++        }
++        CurvePoint::Mid => {
++            if curve.midpoint_enabled {
++                curve.midpoint_input = x.clamp(curve.input_black + 0.001, curve.input_white - 0.001);
++                curve.midpoint = y.clamp(0.0, 1.0);
++            }
++        }
++        CurvePoint::White => {
++            let lower = if curve.midpoint_enabled {
++                curve.midpoint_input + 0.001
++            } else {
++                curve.input_black + 0.001
++            };
++            curve.input_white = x.clamp(lower.min(1.0), 1.0);
++            curve.white = y.clamp(0.0, 1.0);
++        }
++    }
++}
++
++fn curve_point_fields(ui: &mut egui::Ui, curve: &mut model::Curve, selected: CurvePoint) -> bool {
++    let (x, y) = curve_point_values(curve, selected);
++    let mut input_value = (x * 255.0).round() as i32;
++    let mut output_value = (y * 255.0).round() as i32;
++    let mut input_changed = false;
++    let mut output_changed = false;
++    ui.columns(2, |columns| {
++        columns[0].label("Input");
++        input_changed = columns[0]
++            .add(
++                egui::DragValue::new(&mut input_value)
++                    .range(0..=255)
++                    .speed(1),
++            )
++            .changed();
++        columns[1].label("Output");
++        output_changed = columns[1]
++            .add(
++                egui::DragValue::new(&mut output_value)
++                    .range(0..=255)
++                    .speed(1),
++            )
++            .changed();
++    });
++    if input_changed || output_changed {
++        set_curve_point(
++            curve,
++            selected,
++            input_value as f32 / 255.0,
++            output_value as f32 / 255.0,
++        );
++        true
++    } else {
++        false
++    }
++}
++
++fn curves_ui(
++    ui: &mut egui::Ui,
++    adjustment: &mut ChannelAdjustment,
++    histogram_before: Option<&[u32; 256]>,
++    histogram_after: Option<&[u32; 256]>,
++    accent: Option<egui::Color32>,
++    compact_controls: bool,
++    neutral_histogram: bool,
++) -> bool {
++    with_accent(ui, accent, |ui| {
++        let (graph_changed, selected) = curve_editor_graph(
++            ui,
++            &mut adjustment.curve,
++            histogram_before,
++            histogram_after,
++            accent,
++            neutral_histogram,
++        );
++        if histogram_before.is_some() && histogram_after.is_some() {
++            ui.horizontal(|ui| {
++                ui.colored_label(ui.visuals().weak_text_color(), "Before");
++                let after_color = if neutral_histogram {
++                    ui.visuals().weak_text_color()
++                } else {
++                    accent.unwrap_or(ui.visuals().selection.stroke.color)
++                };
++                ui.colored_label(after_color, "After");
++            });
++        }
++        let mut changed = graph_changed;
++        if !compact_controls {
++            ui.add_space(6.0);
++            changed |= curve_point_fields(ui, &mut adjustment.curve, selected);
++            ui.add_space(4.0);
++            ui.small("Double-click the Curve line to add the midpoint; double-click the midpoint to remove it. Drag active points directly. Input / Output use Photoshop-style 0-255 values.");
++        }
++        changed
++    })
++}
++
++fn master_levels_ui(
++    ui: &mut egui::Ui,
++    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
++) -> bool {
++    let mut draft = adjustments
++        .get(MASTER_ADJUSTMENT_KEY)
++        .cloned()
++        .unwrap_or_default();
++    if !levels_ui(ui, &mut draft, None) {
++        return false;
++    }
++    adjustments
++        .entry(MASTER_ADJUSTMENT_KEY.to_owned())
++        .or_default()
++        .levels = draft.levels;
++    cleanup_master_adjustment(adjustments);
++    true
++}
++
++fn master_curve_ui(
++    ui: &mut egui::Ui,
++    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
++    histogram_before: Option<&[u32; 256]>,
++    histogram_after: Option<&[u32; 256]>,
++    compact_controls: bool,
++) -> bool {
++    let mut draft = adjustments
++        .get(MASTER_ADJUSTMENT_KEY)
++        .cloned()
++        .unwrap_or_default();
++    if !curves_ui(
++        ui,
++        &mut draft,
++        histogram_before,
++        histogram_after,
++        None,
++        compact_controls,
++        true,
++    ) {
++        return false;
++    }
++    adjustments
++        .entry(MASTER_ADJUSTMENT_KEY.to_owned())
++        .or_default()
++        .curve = draft.curve;
++    cleanup_master_adjustment(adjustments);
++    true
++}
++
++fn aggregate_histograms(histograms: &[[u32; 256]]) -> [u32; 256] {
++    let mut aggregate = [0u32; 256];
++    for histogram in histograms {
++        for (target, value) in aggregate.iter_mut().zip(histogram.iter()) {
++            *target = target.saturating_add(*value);
++        }
++    }
++    aggregate
++}
++
++fn all_mixers_ui(
++    ui: &mut egui::Ui,
++    adjustments: &mut BTreeMap<String, ChannelAdjustment>,
++    channel_names: &[String],
++    colorize: bool,
++    palette: Option<&ChannelPalette>,
++) -> bool {
++    let mut changed = false;
++    for (index, output_name) in channel_names.iter().enumerate() {
++        let accent = colorize.then(|| channel_color(palette, output_name, index));
++        let title = if let Some(color) = accent {
++            egui::RichText::new(format!("●  {}", channel_display_name(palette, output_name, index)))
++                .color(color)
++        } else {
++            egui::RichText::new(channel_display_name(palette, output_name, index))
++        };
++        egui::CollapsingHeader::new(title)
++            .id_salt(format!("all-mixer-{index}-{output_name}"))
++            .default_open(index == 0)
++            .show(ui, |ui| {
++                let adjustment = adjustments.entry(output_name.clone()).or_default();
++                changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);
++            });
++    }
++    changed
++}
++
++fn master_adjustment_is_modified(adjustment: &ChannelAdjustment) -> bool {
++    let default = ChannelAdjustment::default();
++    adjustment.enabled != default.enabled
++        || adjustment.levels != default.levels
++        || adjustment.curve != default.curve
++}
++
++fn adjustment_is_modified(adjustment: &ChannelAdjustment) -> bool {
++    let default = ChannelAdjustment::default();
++    adjustment.levels != default.levels
++        || adjustment.mixer != default.mixer
++        || adjustment.curve != default.curve
++}
++
++fn reveal_in_explorer(path: &Path) -> Result<(), String> {
++    #[cfg(target_os = "windows")]
++    {
++        if path.is_file() {
++            std::process::Command::new("explorer.exe")
++                .arg("/select,")
++                .arg(path)
++                .spawn()
++                .map_err(|err| format!("Cannot reveal {} in Explorer: {err}", path.display()))?;
++            return Ok(());
++        }
++    }
++    let folder = path.parent().unwrap_or(path);
++    open_folder(folder)
++}
++
++fn open_folder(path: &Path) -> Result<(), String> {
++    #[cfg(target_os = "windows")]
++    {
++        std::process::Command::new("explorer.exe")
++            .arg(path)
++            .spawn()
++            .map_err(|err| format!("Cannot open {}: {err}", path.display()))?;
++        return Ok(());
++    }
++    #[allow(unreachable_code)]
++    Err("Open folder is only supported on Windows.".to_owned())
++}
++
++fn snapshot_day_time(value: i64) -> (String, String) {
++    let local = Local
++        .timestamp_millis_opt(value)
++        .single()
++        .unwrap_or_else(Local::now);
++    (
++        local.format("%Y-%m-%d").to_string(),
++        local.format("%H:%M").to_string(),
++    )
++}
++
++fn project_name_for_path(current: &str, path: &Path) -> String {
++    path.file_stem()
++        .and_then(|name| name.to_str())
++        .filter(|name| !name.trim().is_empty())
++        .map(str::to_owned)
++        .unwrap_or_else(|| current.to_owned())
++}
++
++fn app_settings_dir() -> Option<PathBuf> {
++    std::env::var_os("LOCALAPPDATA")
++        .map(PathBuf::from)
++        .map(|path| path.join("ShadeEditor"))
++}
++
++fn application_log_path() -> Option<PathBuf> {
++    app_settings_dir().map(|path| path.join("ShadeEditor.log"))
++}
++
++fn snapshot_row_with_actions(
++    ui: &mut egui::Ui,
++    selected: bool,
++    dirty: bool,
++    label: &str,
++    time: &str,
++    exported: bool,
++    can_export: bool,
++) -> (egui::Response, bool, bool) {
++    let row_height = 31.0;
++    let desired = egui::vec2(ui.available_width().max(80.0), row_height);
++    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
++    let visuals = ui.visuals();
++    let fill = if selected {
++        visuals.selection.bg_fill
++    } else if response.hovered() {
++        visuals.widgets.hovered.bg_fill
++    } else {
++        egui::Color32::TRANSPARENT
++    };
++    ui.painter().rect_filled(rect, 4.0, fill);
++    let icon_width = 23.0;
++    let gap = 3.0;
++    let right_padding = 3.0;
++    let mut right = rect.right() - right_padding;
++    let action_size = egui::vec2(icon_width, 22.0);
++    let mut export_clicked = false;
++    let mut folder_clicked = false;
++    if exported {
++        let action_rect = egui::Rect::from_min_size(
++            egui::pos2(right - icon_width, rect.center().y - action_size.y / 2.0),
++            action_size,
++        );
++        folder_clicked = ui
++            .put(action_rect, VectorIconButton::check())
++            .on_hover_text("Exported - open folder")
++            .clicked();
++        right -= icon_width + gap;
++    }
++    let action_rect = egui::Rect::from_min_size(
++        egui::pos2(right - icon_width, rect.center().y - action_size.y / 2.0),
++        action_size,
++    );
++    export_clicked = ui
++        .put(
++            action_rect,
++            VectorIconButton::export().enabled(can_export),
++        )
++        .on_hover_text("Export this Snapshot")
++        .clicked();
++    right -= icon_width + gap;
++
++    let text_left = rect.left() + 8.0;
++    let time_width = 42.0;
++    let time_left = (right - time_width).max(text_left + 24.0);
++    let label_rect = egui::Rect::from_min_max(
++        egui::pos2(text_left, rect.top()),
++        egui::pos2(time_left - 4.0, rect.bottom()),
++    );
++    let time_rect = egui::Rect::from_min_max(
++        egui::pos2(time_left, rect.top()),
++        egui::pos2(right, rect.bottom()),
++    );
++    let mut label_text = egui::RichText::new(label).size(13.0);
++    if selected {
++        label_text = label_text.strong();
++    }
++    if dirty {
++        label_text = label_text.color(egui::Color32::from_rgb(240, 185, 75));
++    }
++    ui.put(label_rect, egui::Label::new(label_text).truncate());
++    ui.put(
++        time_rect,
++        egui::Label::new(egui::RichText::new(time).small().weak()).truncate(),
++    );
++    (response, export_clicked, folder_clicked)
++}
++
++fn clickable_row(
++    ui: &mut egui::Ui,
++    selected: bool,
++    label: &str,
++    trailing: Option<&str>,
++    accent: Option<egui::Color32>,
++    height: f32,
++) -> egui::Response {
++    let desired = egui::vec2(ui.available_width().max(80.0), height);
++    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
++    let visuals = ui.visuals();
++    let fill = if selected {
++        visuals.selection.bg_fill
++    } else if response.hovered() {
++        visuals.widgets.hovered.bg_fill
++    } else {
++        egui::Color32::TRANSPARENT
++    };
++    ui.painter().rect_filled(rect, 4.0, fill);
++    if let Some(accent) = accent {
++        ui.painter().rect_filled(
++            egui::Rect::from_min_max(
++                rect.left_top(),
++                egui::pos2(rect.left() + 3.0, rect.bottom()),
++            ),
++            1.0,
++            accent,
++        );
++    }
++    let text_color = if selected {
++        visuals.selection.stroke.color
++    } else {
++        visuals.text_color()
++    };
++    let text_left = rect.left() + if accent.is_some() { 9.0 } else { 7.0 };
++    let trailing_width = trailing.map(|_| 92.0).unwrap_or(0.0);
++    let label_rect = egui::Rect::from_min_max(
++        egui::pos2(text_left, rect.top()),
++        egui::pos2((rect.right() - trailing_width - 5.0).max(text_left), rect.bottom()),
++    );
++    let mut label_text = egui::RichText::new(label).color(text_color);
++    if selected {
++        label_text = label_text.strong();
++    }
++    ui.put(label_rect, egui::Label::new(label_text).truncate());
++    if let Some(trailing) = trailing {
++        let trailing_rect = egui::Rect::from_min_max(
++            egui::pos2(rect.right() - trailing_width, rect.top()),
++            egui::pos2(rect.right() - 7.0, rect.bottom()),
++        );
++        ui.put(
++            trailing_rect,
++            egui::Label::new(egui::RichText::new(trailing).weak().small()).truncate(),
++        );
++    }
++    response
++}
++
++fn clickable_channel_row(
++    ui: &mut egui::Ui,
++    selected: bool,
++    solo: bool,
++    label: &str,
++    accent: egui::Color32,
++    warning: Option<egui::Color32>,
++    height: f32,
++) -> egui::Response {
++    let desired = egui::vec2(ui.available_width().max(80.0), height);
++    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
++    let visuals = ui.visuals();
++    let fill = if selected {
++        accent.gamma_multiply(0.28)
++    } else if response.hovered() {
++        visuals.widgets.hovered.bg_fill
++    } else {
++        egui::Color32::TRANSPARENT
++    };
++    ui.painter().rect_filled(rect, 4.0, fill);
++    ui.painter().rect_filled(
++        egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.left() + 4.0, rect.bottom())),
++        2.0,
++        accent,
++    );
++    let dot_center = egui::pos2(rect.left() + 14.0, rect.center().y);
++    ui.painter().circle_filled(dot_center, 4.0, accent);
++    let mut label_text = egui::RichText::new(label).color(if selected {
++        accent
++    } else {
++        visuals.text_color()
++    });
++    if selected {
++        label_text = label_text.strong();
++    }
++    let right_reserved = if warning.is_some() { 54.0 } else { 34.0 };
++    let label_rect = egui::Rect::from_min_max(
++        egui::pos2(rect.left() + 24.0, rect.top()),
++        egui::pos2(rect.right() - right_reserved, rect.bottom()),
++    );
++    ui.put(label_rect, egui::Label::new(label_text).truncate());
++    if solo {
++        let solo_rect = egui::Rect::from_min_max(
++            egui::pos2(rect.right() - 28.0, rect.top()),
++            egui::pos2(rect.right() - 5.0, rect.bottom()),
++        );
++        ui.put(
++            solo_rect,
++            egui::Label::new(egui::RichText::new("S").strong().color(accent)),
++        );
++    }
++    if let Some(warning) = warning {
++        ui.painter().circle_filled(egui::pos2(rect.right() - 39.0, rect.center().y), 4.0, warning);
++    }
++    response
++}
++
++fn channel_click_state(
++    selected_channel: usize,
++    solo_channel: Option<usize>,
++    clicked_channel: usize,
++) -> (usize, Option<usize>) {
++    if selected_channel == clicked_channel {
++        (
++            selected_channel,
++            if solo_channel == Some(clicked_channel) {
++                None
++            } else {
++                Some(clicked_channel)
++            },
++        )
++    } else {
++        (clicked_channel, Some(clicked_channel))
++    }
++}
++
++fn clipping_warning_color(stats: render::ChannelClippingStats) -> Option<egui::Color32> {
++    let max = stats.max_percent();
++    if max >= 1.0 {
++        Some(egui::Color32::from_rgb(235, 85, 85))
++    } else if max >= 0.15 {
++        Some(egui::Color32::from_rgb(240, 180, 70))
++    } else {
++        None
++    }
++}
++
++fn clipping_tooltip(stats: render::ChannelClippingStats) -> String {
++    format!(
++        "Preview clipping estimate\nLevels: black {:.2}% · white {:.2}%\nCurve: black {:.2}% · white {:.2}%",
++        stats.levels_black_percent(),
++        stats.levels_white_percent(),
++        stats.curve_black_percent(),
++        stats.curve_white_percent()
++    )
++}
++
++fn clipping_summary_ui(ui: &mut egui::Ui, stats: render::ChannelClippingStats) {
++    if let Some(color) = clipping_warning_color(stats) {
++        ui.colored_label(color, clipping_tooltip(stats).replace('\n', "   "));
++    }
++}
++
++fn channel_color(
++    palette: Option<&ChannelPalette>,
++    name: &str,
++    index: usize,
++) -> egui::Color32 {
++    if let Some(entry) = palette.and_then(|palette| palette.entry(index, name)) {
++        return egui::Color32::from_rgb(entry.color_rgb[0], entry.color_rgb[1], entry.color_rgb[2]);
++    }
++    fallback_channel_color(name)
++}
++
++fn channel_color_with_photoshop(
++    palette: Option<&ChannelPalette>,
++    display: &[Option<tiff_io::PhotoshopChannelDisplay>],
++    name: &str,
++    index: usize,
++) -> egui::Color32 {
++    if let Some(entry) = palette.and_then(|palette| palette.entry(index, name)) {
++        return egui::Color32::from_rgb(entry.color_rgb[0], entry.color_rgb[1], entry.color_rgb[2]);
++    }
++    if let Some(rgb) = display
++        .get(index)
++        .and_then(|value| *value)
++        .and_then(|value| value.rgb)
++    {
++        return egui::Color32::from_rgb(
++            (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
++            (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
++            (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
++        );
++    }
++    fallback_channel_color(name)
++}
++
++fn channel_display_name<'a>(
++    palette: Option<&'a ChannelPalette>,
++    name: &'a str,
++    index: usize,
++) -> &'a str {
++    palette
++        .and_then(|palette| palette.display_name(index, name))
++        .unwrap_or(name)
++}
++
++fn fallback_channel_color(name: &str) -> egui::Color32 {
++    match name.to_ascii_lowercase().as_str() {
++        "cyan" | "c" => egui::Color32::from_rgb(0, 180, 215),
++        "magenta" | "m" => egui::Color32::from_rgb(220, 55, 160),
++        "yellow" | "y" => egui::Color32::from_rgb(225, 185, 35),
++        "black" | "k" => egui::Color32::from_rgb(130, 130, 130),
++        "red" | "r" => egui::Color32::from_rgb(225, 75, 75),
++        "green" | "g" => egui::Color32::from_rgb(70, 185, 105),
++        "blue" | "b" => egui::Color32::from_rgb(70, 115, 225),
++        _ => {
++            const COLORS: [[u8; 3]; 8] = [
++                [55, 200, 145],
++                [235, 110, 70],
++                [115, 105, 230],
++                [225, 95, 185],
++                [100, 180, 230],
++                [185, 145, 60],
++                [95, 195, 205],
++                [175, 100, 215],
++            ];
++            let hash = name.bytes().fold(0usize, |acc, value| {
++                acc.wrapping_mul(31).wrapping_add(value as usize)
++            });
++            let rgb = COLORS[hash % COLORS.len()];
++            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
++        }
++    }
++}
++
++fn draw_histogram(
++    ui: &mut egui::Ui,
++    original: Option<&[u32; 256]>,
++    adjusted: Option<&[u32; 256]>,
++    accent: Option<egui::Color32>,
++) {
++    let desired = egui::vec2(ui.available_width().max(80.0), 105.0);
++    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
++    let painter = ui.painter_at(rect);
++    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
++    painter.rect_stroke(
++        rect,
++        4.0,
++        ui.visuals().widgets.noninteractive.bg_stroke,
++        egui::StrokeKind::Inside,
++    );
++    let max_value = original
++        .into_iter()
++        .flat_map(|bins| bins.iter())
++        .chain(adjusted.into_iter().flat_map(|bins| bins.iter()))
++        .copied()
++        .max()
++        .unwrap_or(1)
++        .max(1) as f32;
++    let original_color = ui.visuals().weak_text_color();
++    let adjusted_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
++    for index in 0..256 {
++        let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
++        if let Some(bins) = original {
++            let h = bins[index] as f32 / max_value * rect.height();
++            painter.line_segment(
++                [
++                    egui::pos2(x, rect.bottom()),
++                    egui::pos2(x, rect.bottom() - h),
++                ],
++                egui::Stroke::new(1.0, original_color),
++            );
++        }
++        if let Some(bins) = adjusted {
++            let h = bins[index] as f32 / max_value * rect.height();
++            painter.line_segment(
++                [
++                    egui::pos2(x, rect.bottom()),
++                    egui::pos2(x, rect.bottom() - h),
++                ],
++                egui::Stroke::new(1.0, adjusted_color),
++            );
++        }
++    }
++}
++
++fn apply_theme(ctx: &egui::Context, dark: bool) {
++    if dark {
++        ctx.set_visuals(egui::Visuals::dark());
++    } else {
++        ctx.set_visuals(egui::Visuals::light());
++    }
++}
++
++fn format_bytes(bytes: u64) -> String {
++    const KB: f64 = 1024.0;
++    const MB: f64 = KB * 1024.0;
++    const GB: f64 = MB * 1024.0;
++    let value = bytes as f64;
++    if value >= GB {
++        format!("{:.2} GiB", value / GB)
++    } else if value >= MB {
++        format!("{:.1} MiB", value / MB)
++    } else if value >= KB {
++        format!("{:.1} KiB", value / KB)
++    } else {
++        format!("{bytes} B")
++    }
++}
++
++fn physical_dimensions_cm(width: u32, height: u32, dpi: dpi::DpiInfo) -> (f64, f64) {
++    let safe_x = dpi.x.max(1.0);
++    let safe_y = dpi.y.max(1.0);
++    (
++        width as f64 / safe_x * 2.54,
++        height as f64 / safe_y * 2.54,
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn channel_click_state_selects_and_toggles_solo() {
++        assert_eq!(channel_click_state(0, None, 2), (2, Some(2)));
++        assert_eq!(channel_click_state(2, Some(2), 2), (2, None));
++        assert_eq!(channel_click_state(2, None, 2), (2, Some(2)));
++    }
++}
++diff --git a/src/model.rs b/src/model.rs
++index 41038c7..7246dc5 100644
++--- a/src/model.rs
+++++ b/src/model.rs
++@@ -10,6 +10,10 @@ use crate::palette::ChannelPalette;
++ 
++ pub const SHADE_SCHEMA_VERSION: u32 = 9;
++ pub const TEST_CODE_ALL_CHANNELS: &str = "__all_channels__";
+++/// Reserved adjustment-map key for Photoshop-style Master/All Channels Levels and Curve.
+++/// It is intentionally stored beside per-channel adjustments so snapshots/history/export
+++/// recipes preserve it without changing the .shade schema. TIFF channel names never use it.
+++pub const MASTER_ADJUSTMENT_KEY: &str = "__shade_editor_master__";
++ pub const MAX_SNAPSHOT_HISTORY_STATES: usize = 50;
++ 
++ #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
++@@ -911,7 +915,14 @@ mod tests {
++         project.ensure_channels(&names);
++         project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.8;
++         project.adjustments.get_mut("Cyan").unwrap().mixer.constant = 0.2;
+++        project
+++            .adjustments
+++            .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+++            .or_default()
+++            .levels
+++            .gamma = 1.2;
++         project.reset_adjustments(&names);
+++        assert!(!project.adjustments.contains_key(MASTER_ADJUSTMENT_KEY));
++ 
++         for output in &names {
++             let adjustment = project.adjustments.get(output).unwrap();
++@@ -934,12 +945,27 @@ mod tests {
++         let mut project = ShadeProject::default();
++         project.ensure_channels(&names);
++         project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.4;
+++        project
+++            .adjustments
+++            .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+++            .or_default()
+++            .curve
+++            .midpoint = 0.62;
++         let first = project.create_snapshot();
++         assert!(project.active_snapshot_matches());
++         project.adjustments.get_mut("purpol").unwrap().levels.gamma = 2.0;
++         let second = project.create_snapshot();
++         assert!(project.apply_snapshot(first));
++         assert_eq!(project.adjustments.get("purpol").unwrap().levels.gamma, 1.4);
+++        assert_eq!(
+++            project
+++                .adjustments
+++                .get(MASTER_ADJUSTMENT_KEY)
+++                .unwrap()
+++                .curve
+++                .midpoint,
+++            0.62
+++        );
++         project.adjustments.get_mut("purpol").unwrap().levels.gamma = 1.6;
++         assert!(project.update_snapshot(first));
++         assert!(project.apply_snapshot(second));
++diff --git a/src/render.rs b/src/render.rs
++index 13fa016..fd34899 100644
++--- a/src/render.rs
+++++ b/src/render.rs
++@@ -1,5 +1,5 @@
++ use crate::color_management::PreviewColorTransform;
++-use crate::model::{ShadeProject, apply_curve, apply_levels};
+++use crate::model::{Curve, Levels, MASTER_ADJUSTMENT_KEY, ShadeProject, apply_curve, apply_levels};
++ use crate::tiff_io::{self, ColorModel, PreviewFace};
++ 
++ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++@@ -61,6 +61,10 @@ pub fn adjusted_planes_with_stats(
++     }
++     let pixel_count = face.channels[0].len();
++     let names = &face.metadata.channel_names;
+++    let master = project
+++        .adjustments
+++        .get(MASTER_ADJUSTMENT_KEY)
+++        .filter(|adjustment| adjustment.enabled);
++     let mut stats = vec![
++         ChannelClippingStats {
++             sample_count: pixel_count as u64,
++@@ -73,27 +77,34 @@ pub fn adjusted_planes_with_stats(
++         .map(|_| vec![0.0f32; pixel_count])
++         .collect::<Vec<_>>();
++ 
+++    // Levels stage: channel-specific Levels first, then the independent Master
+++    // Levels pass. The Master pass never writes back into any channel control.
++     for channel in 0..channel_count {
++         let adjustment = project.adjustments.get(&names[channel]);
++         for pixel in 0..pixel_count {
++             let raw = face.channels[channel][pixel] as f32 / 65535.0;
++-            prepared[channel][pixel] = if let Some(adjustment) = adjustment {
++-                if adjustment.enabled {
++-                    let black = adjustment.levels.input_black.clamp(0.0, 0.9999);
++-                    let white = adjustment.levels.input_white.clamp(black + 0.0001, 1.0);
++-                    if black > 0.0 && raw <= black {
++-                        stats[channel].levels_black_count += 1;
++-                    }
++-                    if white < 1.0 && raw >= white {
++-                        stats[channel].levels_white_count += 1;
++-                    }
++-                    apply_levels(raw, adjustment.levels)
++-                } else {
++-                    raw
++-                }
++-            } else {
++-                raw
++-            };
+++            let mut value = raw;
+++            let mut clipped_black = false;
+++            let mut clipped_white = false;
+++            if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled) {
+++                let (black, white) = levels_clipping(value, adjustment.levels);
+++                clipped_black |= black;
+++                clipped_white |= white;
+++                value = apply_levels(value, adjustment.levels);
+++            }
+++            if let Some(master) = master {
+++                let (black, white) = levels_clipping(value, master.levels);
+++                clipped_black |= black;
+++                clipped_white |= white;
+++                value = apply_levels(value, master.levels);
+++            }
+++            prepared[channel][pixel] = value;
+++            if clipped_black {
+++                stats[channel].levels_black_count += 1;
+++            }
+++            if clipped_white {
+++                stats[channel].levels_white_count += 1;
+++            }
++         }
++     }
++ 
++@@ -101,40 +112,48 @@ pub fn adjusted_planes_with_stats(
++         .map(|_| vec![0u16; pixel_count])
++         .collect::<Vec<_>>();
++ 
+++    // Mixer remains channel-owned. Curve is then applied per-channel followed
+++    // by the independent Master Curve as a common finishing pass.
++     for out_channel in 0..channel_count {
++         let name = &names[out_channel];
++         let adjustment = project.adjustments.get(name);
++         for pixel in 0..pixel_count {
++-            let value = if let Some(adjustment) = adjustment {
++-                if !adjustment.enabled {
++-                    prepared[out_channel][pixel]
++-                } else {
++-                    let mut mixed = adjustment.mixer.constant;
++-                    for source in 0..channel_count {
++-                        let coefficient = adjustment
++-                            .mixer
++-                            .coefficients
++-                            .get(&names[source])
++-                            .copied()
++-                            .unwrap_or(if source == out_channel { 1.0 } else { 0.0 });
++-                        mixed += prepared[source][pixel] * coefficient;
++-                    }
++-                    let curve_black = adjustment.curve.input_black.clamp(0.0, 1.0);
++-                    let curve_white = adjustment
++-                        .curve
++-                        .input_white
++-                        .clamp(curve_black + 1.0 / 65535.0, 1.0);
++-                    if mixed < 0.0 || (curve_black > 0.0 && mixed <= curve_black) {
++-                        stats[out_channel].curve_black_count += 1;
++-                    }
++-                    if mixed > 1.0 || (curve_white < 1.0 && mixed >= curve_white) {
++-                        stats[out_channel].curve_white_count += 1;
++-                    }
++-                    apply_curve(mixed, adjustment.curve)
+++            let mut value = if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled) {
+++                let mut mixed = adjustment.mixer.constant;
+++                for source in 0..channel_count {
+++                    let coefficient = adjustment
+++                        .mixer
+++                        .coefficients
+++                        .get(&names[source])
+++                        .copied()
+++                        .unwrap_or(if source == out_channel { 1.0 } else { 0.0 });
+++                    mixed += prepared[source][pixel] * coefficient;
++                 }
+++                mixed
++             } else {
++                 prepared[out_channel][pixel]
++             };
+++
+++            let mut clipped_black = false;
+++            let mut clipped_white = false;
+++            if let Some(adjustment) = adjustment.filter(|adjustment| adjustment.enabled) {
+++                let (black, white) = curve_clipping(value, adjustment.curve);
+++                clipped_black |= black;
+++                clipped_white |= white;
+++                value = apply_curve(value, adjustment.curve);
+++            }
+++            if let Some(master) = master {
+++                let (black, white) = curve_clipping(value, master.curve);
+++                clipped_black |= black;
+++                clipped_white |= white;
+++                value = apply_curve(value, master.curve);
+++            }
+++            if clipped_black {
+++                stats[out_channel].curve_black_count += 1;
+++            }
+++            if clipped_white {
+++                stats[out_channel].curve_white_count += 1;
+++            }
++             output[out_channel][pixel] = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
++         }
++     }
++@@ -142,6 +161,23 @@ pub fn adjusted_planes_with_stats(
++     (output, stats)
++ }
++ 
+++fn levels_clipping(value: f32, levels: Levels) -> (bool, bool) {
+++    let black = levels.input_black.clamp(0.0, 0.9999);
+++    let white = levels.input_white.clamp(black + 0.0001, 1.0);
+++    (black > 0.0 && value <= black, white < 1.0 && value >= white)
+++}
+++
+++fn curve_clipping(value: f32, curve: Curve) -> (bool, bool) {
+++    let black = curve.input_black.clamp(0.0, 1.0);
+++    let white = curve
+++        .input_white
+++        .clamp(black + 1.0 / 65535.0, 1.0);
+++    (
+++        value < 0.0 || (black > 0.0 && value <= black),
+++        value > 1.0 || (white < 1.0 && value >= white),
+++    )
+++}
+++
++ pub fn rgba_from_planes(
++     face: &PreviewFace,
++     planes: &[Vec<u16>],
++@@ -411,4 +447,40 @@ mod tests {
++         let (_, stats) = adjusted_planes_with_stats(&face, &project(adjustment));
++         assert_eq!(stats[0].curve_white_count, 2);
++     }
+++    #[test]
+++    fn master_levels_and_curve_stack_without_overwriting_channel_controls() {
+++        let face = face(vec![32768]);
+++        let mut local = ChannelAdjustment::default();
+++        local.levels.gamma = 1.6;
+++        local.curve = Curve {
+++            midpoint_enabled: true,
+++            midpoint_input: 0.5,
+++            midpoint: 0.62,
+++            ..Curve::default()
+++        };
+++        let local_before = local.clone();
+++        let mut project = project(local);
+++        let mut master = ChannelAdjustment::default();
+++        master.levels.gamma = 0.82;
+++        master.curve = Curve {
+++            midpoint_enabled: true,
+++            midpoint_input: 0.5,
+++            midpoint: 0.44,
+++            ..Curve::default()
+++        };
+++        project
+++            .adjustments
+++            .insert(MASTER_ADJUSTMENT_KEY.to_owned(), master.clone());
+++
+++        let (planes, _) = adjusted_planes_with_stats(&face, &project);
+++        let raw = 32768.0 / 65535.0;
+++        let after_local_levels = apply_levels(raw, local_before.levels);
+++        let after_master_levels = apply_levels(after_local_levels, master.levels);
+++        let after_local_curve = apply_curve(after_master_levels, local_before.curve);
+++        let expected = apply_curve(after_local_curve, master.curve);
+++        let actual = planes[0][0] as f32 / 65535.0;
+++        assert!((actual - expected).abs() < 2.0 / 65535.0);
+++        assert_eq!(project.adjustments.get("Ink").unwrap(), &local_before);
+++    }
+++
++ }
++diff --git a/src/workflow.rs b/src/workflow.rs
++index 3f570b5..9950fbc 100644
++--- a/src/workflow.rs
+++++ b/src/workflow.rs
++@@ -66,7 +66,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
++         update_active_snapshot(app);
++     }
++ 
++-    let channel = ctx.input(|input| {
+++    let (channel, all_channels) = ctx.input(|input| {
++         let no_modifiers = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
++         let keys = [
++             egui::Key::Num1,
++@@ -79,9 +79,15 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
++             egui::Key::Num8,
++             egui::Key::Num9,
++         ];
++-        no_modifiers
+++        let channel = no_modifiers
++             .then(|| keys.iter().position(|key| input.key_pressed(*key)))
++-            .flatten()
+++            .flatten();
+++        // Backtick is the logical key for both ` and Shift+` (~) in egui.
+++        // Accept both so the shortcut remains reliable across keyboard layouts.
+++        let all_channels = !input.modifiers.ctrl
+++            && !input.modifiers.alt
+++            && input.key_pressed(egui::Key::Backtick);
+++        (channel, all_channels)
++     });
++     let curve_graph_focused = ctx.data(|data| {
++         data.get_temp::<bool>(egui::Id::new("shade-editor-curve-graph-focused"))
++@@ -89,7 +95,9 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
++     });
++     if ctx.wants_keyboard_input() {
++         if curve_graph_focused {
++-            if let Some(channel) = channel {
+++            if all_channels {
+++                select_all_channels_shortcut(app);
+++            } else if let Some(channel) = channel {
++                 select_channel_shortcut(app, channel);
++             }
++         }
++@@ -109,6 +117,9 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
++     if app.show_previous_shades {
++         return;
++     }
+++    if all_channels {
+++        select_all_channels_shortcut(app);
+++    }
++     if fit {
++         app.fit_requested = true;
++         app.viewport_recenter = true;
++@@ -129,6 +140,15 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
++     }
++ }
++ 
+++fn select_all_channels_shortcut(app: &mut ShadeApp) {
+++    let previous_solo = app.solo_channel;
+++    app.adjustment_scope = AdjustmentScope::All;
+++    app.solo_channel = None;
+++    if previous_solo.is_some() {
+++        app.mark_current_preview_dirty();
+++    }
+++}
+++
++ fn select_channel_shortcut(app: &mut ShadeApp, channel: usize) {
++     if app
++         .faces
