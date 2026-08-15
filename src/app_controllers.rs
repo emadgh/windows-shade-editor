@@ -16,10 +16,11 @@ pub struct ExportController {
 
 impl ExportController {
     pub fn new(queue: ExportQueue) -> Self {
+        let show_queue = queue.restored_count() > 0;
         Self {
             show_all: false,
             all_folder: String::new(),
-            show_queue: false,
+            show_queue,
             queue,
             open_folder_after: None,
             remind_after_export: false,

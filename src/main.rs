@@ -952,83 +952,162 @@ impl ShadeApp {
                     item.progress,
                     item.detail.clone(),
                     item.error.clone(),
+                    item.restored,
+                    item.requires_resume,
                 )
             })
             .collect::<Vec<_>>();
         let pending = self.export.queue.pending_count();
+        let recovered_waiting = self.export.queue.recovered_waiting_count();
         let mut cancel_id = None;
+        let mut resume_id = None;
         let mut retry_id = None;
+        let mut reveal_folder = None;
+        let mut resume_recovered = false;
         let mut cancel_waiting = false;
         let mut clear_finished = false;
 
         egui::Window::new("Export Queue")
             .open(&mut open)
             .resizable(true)
-            .default_size([760.0, 520.0])
+            .default_size([820.0, 540.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Export Queue");
                     ui.label(format!("{pending} pending"));
+                    if recovered_waiting > 0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(225, 175, 70),
+                            format!("{recovered_waiting} recovered · paused"),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         clear_finished = ui.button("Clear finished").clicked();
                         cancel_waiting = ui.button("Cancel waiting").clicked();
+                        if recovered_waiting > 0 {
+                            resume_recovered = ui.button("Resume recovered").clicked();
+                        }
                     });
                 });
-                ui.small("Waiting items can be cancelled immediately. Processing items use Stop after current: the current atomic TIFF finishes safely, then remaining waiting items are cancelled.");
+                if recovered_waiting > 0 {
+                    ui.small("Recovered exports are never started automatically. Resume individual rows or use Resume recovered when you want them to run.");
+                } else {
+                    ui.small("Waiting items can be cancelled immediately. Processing items use Stop after current so the current atomic TIFF finishes safely.");
+                }
                 ui.separator();
 
                 if rows.is_empty() {
                     ui.label("No export jobs yet.");
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (id, label, destination, status, progress, detail, error) in &rows {
+                        for (id, label, destination, status, progress, detail, error, restored, requires_resume) in &rows {
+                            let (fill, status_color) = match status {
+                                export_queue::ExportQueueStatus::Waiting => (
+                                    egui::Color32::from_rgba_unmultiplied(135, 95, 20, 34),
+                                    egui::Color32::from_rgb(230, 180, 70),
+                                ),
+                                export_queue::ExportQueueStatus::Processing => (
+                                    egui::Color32::from_rgba_unmultiplied(25, 90, 165, 38),
+                                    egui::Color32::from_rgb(90, 165, 255),
+                                ),
+                                export_queue::ExportQueueStatus::Done => (
+                                    egui::Color32::from_rgba_unmultiplied(30, 115, 60, 32),
+                                    egui::Color32::from_rgb(90, 205, 125),
+                                ),
+                                export_queue::ExportQueueStatus::Failed => (
+                                    egui::Color32::from_rgba_unmultiplied(155, 35, 35, 40),
+                                    egui::Color32::from_rgb(245, 105, 105),
+                                ),
+                                export_queue::ExportQueueStatus::Cancelled => (
+                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 26),
+                                    egui::Color32::from_rgb(165, 165, 165),
+                                ),
+                            };
+                            let status_text = if *requires_resume {
+                                "Waiting · paused"
+                            } else {
+                                status.label()
+                            };
                             egui::Frame::new()
                                 .inner_margin(8)
-                                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.0, status_color))
                                 .corner_radius(5)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.strong(label);
-                                        ui.label(status.label());
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            match status {
-                                                export_queue::ExportQueueStatus::Waiting
-                                                | export_queue::ExportQueueStatus::Processing => {
-                                                    let button = if *status == export_queue::ExportQueueStatus::Processing {
-                                                        "Stop after current"
-                                                    } else {
-                                                        "Cancel"
-                                                    };
-                                                    if ui.small_button(button).clicked() {
+                                        if *restored && !*requires_resume {
+                                            ui.small("restored");
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(status_text)
+                                                        .color(status_color)
+                                                        .strong(),
+                                                );
+                                                if ui.small_button("Reveal folder").clicked() {
+                                                    reveal_folder = Some(
+                                                        destination
+                                                            .parent()
+                                                            .unwrap_or_else(|| Path::new("."))
+                                                            .to_path_buf(),
+                                                    );
+                                                }
+                                                if *requires_resume {
+                                                    if ui.small_button("Resume").clicked() {
+                                                        resume_id = Some(*id);
+                                                    }
+                                                    if ui.small_button("Cancel").clicked() {
                                                         cancel_id = Some(*id);
                                                     }
-                                                }
-                                                export_queue::ExportQueueStatus::Failed
-                                                | export_queue::ExportQueueStatus::Cancelled => {
-                                                    if ui.small_button("Retry").clicked() {
-                                                        retry_id = Some(*id);
+                                                } else {
+                                                    match status {
+                                                        export_queue::ExportQueueStatus::Waiting => {
+                                                            if ui.small_button("Cancel").clicked() {
+                                                                cancel_id = Some(*id);
+                                                            }
+                                                        }
+                                                        export_queue::ExportQueueStatus::Processing => {
+                                                            if ui.small_button("Stop after current").clicked() {
+                                                                cancel_id = Some(*id);
+                                                            }
+                                                        }
+                                                        export_queue::ExportQueueStatus::Failed
+                                                        | export_queue::ExportQueueStatus::Cancelled => {
+                                                            if ui.small_button("Retry").clicked() {
+                                                                retry_id = Some(*id);
+                                                            }
+                                                        }
+                                                        export_queue::ExportQueueStatus::Done => {}
                                                     }
                                                 }
-                                                export_queue::ExportQueueStatus::Done => {}
-                                            }
-                                        });
+                                            },
+                                        );
                                     });
-                                    if matches!(
-                                        status,
-                                        export_queue::ExportQueueStatus::Waiting
-                                            | export_queue::ExportQueueStatus::Processing
-                                    ) {
+
+                                    if *status == export_queue::ExportQueueStatus::Processing {
                                         ui.add(
                                             egui::ProgressBar::new(*progress)
                                                 .desired_width(f32::INFINITY)
                                                 .text(if detail.trim().is_empty() {
-                                                    status.label().to_owned()
+                                                    "Processing".to_owned()
                                                 } else {
                                                     detail.clone()
                                                 }),
                                         );
-                                    } else if !detail.trim().is_empty() {
-                                        ui.small(detail);
+                                    } else {
+                                        let detail = detail.trim();
+                                        if !detail.is_empty()
+                                            && detail != status.label()
+                                            && detail != "Done"
+                                        {
+                                            let detail = detail.strip_prefix("Done · ").unwrap_or(detail);
+                                            if !detail.is_empty() {
+                                                ui.small(detail);
+                                            }
+                                        }
                                     }
                                     ui.small(destination.display().to_string());
                                     if let Some(error) = error {
@@ -1040,20 +1119,33 @@ impl ShadeApp {
                     });
                 }
             });
-
         self.export.show_queue = open;
-        if let Some(id) = cancel_id {
-            self.export.queue.cancel(id);
-        }
-        if let Some(id) = retry_id {
-            self.export.queue.retry(id);
-            self.export.show_queue = true;
+
+        if resume_recovered {
+            let count = self.export.queue.resume_recovered();
+            if count > 0 {
+                self.report_info(format!("Resumed {count} recovered export(s)"));
+            }
         }
         if cancel_waiting {
             self.export.queue.cancel_all_waiting();
         }
         if clear_finished {
             self.export.queue.clear_finished();
+        }
+        if let Some(id) = resume_id {
+            self.export.queue.resume(id);
+        }
+        if let Some(id) = cancel_id {
+            self.export.queue.cancel(id);
+        }
+        if let Some(id) = retry_id {
+            self.export.queue.retry(id);
+        }
+        if let Some(folder) = reveal_folder {
+            if let Err(err) = open_folder(&folder) {
+                self.report_error(err);
+            }
         }
     }
 
@@ -1647,11 +1739,20 @@ impl ShadeApp {
             .file_stem()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "face".to_owned());
-        let suggested = format!(
-            "{}-{}.tif",
-            sanitize_filename(&stem),
-            sanitize_filename(&snapshot.name)
-        );
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let test_code = self.project.effective_test_code_text();
+        let context = export_batch::ExportNameContext {
+            shade_name: None,
+            project_name: &self.project.name,
+            snapshot_name: &snapshot.name,
+            test_code: &test_code,
+            face_number: self.current_face + 1,
+            face_name: &stem,
+            source_name: &stem,
+            date: &today,
+        };
+        let suggested =
+            export_batch::render_export_filename(&self.settings.snapshot_export_template, &context);
         let Some(destination) = rfd::FileDialog::new()
             .add_filter("TIFF image", &["tif", "tiff"])
             .set_file_name(suggested)
@@ -1772,8 +1873,10 @@ impl ShadeApp {
                 ));
                 return;
             }
-            let filename =
-                export_batch::render_export_filename(&self.settings.export_all_template, &context);
+            let filename = export_batch::render_export_filename(
+                &self.settings.snapshot_export_template,
+                &context,
+            );
             let destination = match export_batch::resolve_destination_reserved(
                 &folder,
                 &filename,
@@ -2423,7 +2526,13 @@ impl ShadeApp {
                 ui.separator();
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export face")).clicked() { self.export_current_dialog(); }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
-                let queue_label = format!("Queue ({})", self.export.queue.pending_count());
+                let queue_pending = self.export.queue.pending_count();
+                let queue_recovered = self.export.queue.recovered_waiting_count();
+                let queue_label = if queue_recovered > 0 {
+                    format!("Queue ({queue_pending} + {queue_recovered} recovered)")
+                } else {
+                    format!("Queue ({queue_pending})")
+                };
                 if ui.button(queue_label).clicked() { self.export.show_queue = true; }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Validate face")).on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.").clicked() { self.validate_current_face_dialog(); }
                 ui.separator();
@@ -4069,11 +4178,7 @@ impl ShadeApp {
             ui.columns(2, |columns| {
                 egui::ScrollArea::vertical()
                     .id_salt("channels-column")
-                    .show(&mut columns[0], |ui| {
-                        self.ui_channels_histogram(ui);
-                        ui.separator();
-                        self.ui_history(ui);
-                    });
+                    .show(&mut columns[0], |ui| self.ui_channels_histogram(ui));
                 egui::ScrollArea::vertical()
                     .id_salt("adjustments-column")
                     .show(&mut columns[1], |ui| self.ui_adjustments(ui));
@@ -4081,8 +4186,6 @@ impl ShadeApp {
         } else {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.ui_channels_histogram(ui);
-                ui.separator();
-                self.ui_history(ui);
                 ui.separator();
                 self.ui_adjustments(ui);
             });
@@ -5471,6 +5574,15 @@ impl ShadeApp {
                     )
                     .changed();
                 ui.small("Off by default: Export all writes clean Face TIFFs without Test Code. Enable this only when every Face in Export all should receive the current Test Code configuration.");
+                ui.add_space(8.0);
+                ui.strong("Snapshot / Test export filename template");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.settings.snapshot_export_template)
+                            .desired_width(520.0),
+                    )
+                    .changed();
+                ui.small("Used only by Snapshot/Test exports. Tokens: {project}, {face}, {snapshot}, {testcode}, {source}, {date}. Export Face keeps its manual Save As filename, and Export All keeps the template in its own window.");
                 let old_default_dpi = self.settings.default_dpi;
                 changed |= ui
                     .add(

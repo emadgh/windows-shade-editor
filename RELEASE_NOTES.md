@@ -1,3 +1,11 @@
+# Shade Editor 0.18.1
+
+- Shorten production export staging paths to deterministic sibling names: `final.tif.tmp` and `final.tif.spool.tmp`, avoiding path-length failures from nested timestamp/PID suffixes.
+- Keep persisted Export Queue rows visible after restart but pause every recovered Waiting/Processing job until the operator explicitly resumes it; recovered work can be resumed or cancelled per row or as a group.
+- Separate Snapshot/Test export filename templating from Export All. Export Face remains a manual Save As filename, Export All keeps its editable template window, and Snapshot/Test exports use a dedicated Settings template.
+- Move History from the right Tools sidebar to the left sidebar directly below Test Code.
+- Color-code Export Queue rows by Waiting/Processing/Done/Failed/Cancelled state, move status to the right side, remove duplicate Done text, and add Reveal folder per row.
+
 # Shade Editor 0.18.0
 
 - Centralize New/Open/Project View/Recovery/Exit lifecycle transitions behind one typed Save / Discard / Cancel policy and block unsafe transitions while export work is active.

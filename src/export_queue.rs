@@ -152,6 +152,10 @@ pub struct ExportQueueItem {
     pub progress: f32,
     pub detail: String,
     pub error: Option<String>,
+    /// True when this row came from a previous application session.
+    pub restored: bool,
+    /// Restored Waiting/Processing work never starts until the operator explicitly resumes it.
+    pub requires_resume: bool,
     spec: QueuedExportSpec,
 }
 
@@ -253,6 +257,10 @@ impl ExportQueue {
                 continue;
             }
             let recovered_processing = saved.status == ExportQueueStatus::Processing;
+            let requires_resume = matches!(
+                saved.status,
+                ExportQueueStatus::Waiting | ExportQueueStatus::Processing
+            );
             let status = if recovered_processing {
                 ExportQueueStatus::Waiting
             } else {
@@ -268,12 +276,14 @@ impl ExportQueue {
                 destination: spec.export.destination.clone(),
                 status,
                 progress: 0.0,
-                detail: if recovered_processing {
-                    "Recovered after restart · ready to resume".to_owned()
+                detail: if requires_resume {
+                    "Recovered from previous session · paused until you resume it".to_owned()
                 } else {
                     String::new()
                 },
                 error: saved.error,
+                restored: true,
+                requires_resume,
                 spec,
             });
         }
@@ -324,6 +334,8 @@ impl ExportQueue {
             progress: 0.0,
             detail: String::new(),
             error: None,
+            restored: false,
+            requires_resume: false,
             spec: QueuedExportSpec {
                 export: spec,
                 protected_sources: Vec::new(),
@@ -361,6 +373,8 @@ impl ExportQueue {
             progress: 0.0,
             detail: String::new(),
             error: None,
+            restored: false,
+            requires_resume: false,
             spec: QueuedExportSpec {
                 export: spec,
                 protected_sources,
@@ -376,14 +390,51 @@ impl ExportQueue {
         &self.items
     }
 
+    pub fn restored_count(&self) -> usize {
+        self.items.iter().filter(|item| item.restored).count()
+    }
+
+    pub fn recovered_waiting_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.status == ExportQueueStatus::Waiting && item.requires_resume)
+            .count()
+    }
+
+    pub fn resume(&mut self, id: u64) -> bool {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        if item.status != ExportQueueStatus::Waiting || !item.requires_resume {
+            return false;
+        }
+        item.requires_resume = false;
+        item.detail.clear();
+        self.persist();
+        true
+    }
+
+    pub fn resume_recovered(&mut self) -> usize {
+        let mut resumed = 0usize;
+        for item in &mut self.items {
+            if item.status == ExportQueueStatus::Waiting && item.requires_resume {
+                item.requires_resume = false;
+                item.detail.clear();
+                resumed += 1;
+            }
+        }
+        if resumed > 0 {
+            self.persist();
+        }
+        resumed
+    }
+
     pub fn pending_count(&self) -> usize {
         self.items
             .iter()
             .filter(|item| {
-                matches!(
-                    item.status,
-                    ExportQueueStatus::Waiting | ExportQueueStatus::Processing
-                )
+                item.status == ExportQueueStatus::Processing
+                    || (item.status == ExportQueueStatus::Waiting && !item.requires_resume)
             })
             .count()
     }
@@ -423,6 +474,7 @@ impl ExportQueue {
         let changed = match item.status {
             ExportQueueStatus::Waiting => {
                 item.status = ExportQueueStatus::Cancelled;
+                item.requires_resume = false;
                 item.detail = "Cancelled before processing".to_owned();
                 true
             }
@@ -457,6 +509,7 @@ impl ExportQueue {
             return false;
         }
         item.status = ExportQueueStatus::Waiting;
+        item.requires_resume = false;
         item.progress = 0.0;
         item.detail.clear();
         item.error = None;
@@ -469,6 +522,7 @@ impl ExportQueue {
         for item in &mut self.items {
             if item.status == ExportQueueStatus::Waiting {
                 item.status = ExportQueueStatus::Cancelled;
+                item.requires_resume = false;
                 item.detail = "Cancelled before processing".to_owned();
                 changed = true;
             }
@@ -554,7 +608,7 @@ impl ExportQueue {
         let Some(index) = self
             .items
             .iter()
-            .position(|item| item.status == ExportQueueStatus::Waiting)
+            .position(|item| item.status == ExportQueueStatus::Waiting && !item.requires_resume)
         else {
             return false;
         };
@@ -638,6 +692,7 @@ impl ExportQueue {
         }
 
         self.items[index].status = ExportQueueStatus::Processing;
+        self.items[index].requires_resume = false;
         self.items[index].progress = 0.0;
         self.items[index].detail = "Starting".to_owned();
         self.items[index].error = None;
@@ -850,8 +905,37 @@ mod tests {
 
         let restored = ExportQueue::load_from_path(path).unwrap();
         assert_eq!(restored.items[0].status, ExportQueueStatus::Waiting);
+        assert!(restored.items[0].restored);
+        assert!(restored.items[0].requires_resume);
+        assert_eq!(restored.pending_count(), 0);
+        assert_eq!(restored.recovered_waiting_count(), 1);
         assert!(restored.items[0].spec.export.mark.is_none());
         assert_eq!(restored.items[0].spec.project_session_id, 0);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn restored_waiting_work_requires_explicit_resume() {
+        let folder = temp_folder("paused-restore");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = folder.join("source.tif");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let destination = folder.join("out.tif");
+        let path = folder.join("queue.json");
+        let mut queue = ExportQueue::empty(Some(path.clone()));
+        let mut queued = spec(destination.to_str().unwrap());
+        queued.source = source.clone();
+        let id = queue.enqueue_for_project(queued, vec![source], 55).unwrap();
+        queue.persist();
+        drop(queue);
+
+        let mut restored = ExportQueue::load_from_path(path).unwrap();
+        assert_eq!(restored.pending_count(), 0);
+        assert!(restored.active_id.is_none());
+        assert!(restored.poll().is_empty());
+        assert!(restored.active_id.is_none());
+        assert!(restored.resume(id));
+        assert_eq!(restored.pending_count(), 1);
         let _ = std::fs::remove_dir_all(folder);
     }
 }

@@ -72,6 +72,7 @@ where
     F: FnMut(f32, &str),
 {
     let temporary = temporary_export_path(destination)?;
+    remove_stale_temp(&temporary, "temporary export TIFF")?;
     let result = export_face_direct_with_progress(
         source,
         &temporary,
@@ -291,6 +292,7 @@ where
         dpi_info,
     )?;
     let spool_path = temporary_spool_path(destination)?;
+    remove_stale_temp(&spool_path, "temporary export spool")?;
 
     let result = (|| -> Result<(), String> {
         progress(0.05, "Streaming adjustments to disk spool");
@@ -940,44 +942,27 @@ fn temporary_spool_path(destination: &Path) -> Result<PathBuf, String> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let file_name = destination
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("export.tif");
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    for attempt in 0..32u32 {
-        let candidate = parent.join(format!(
-            ".{file_name}.shade-editor-spool-{}-{stamp}-{attempt}.raw",
-            std::process::id()
-        ));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err("Cannot allocate a temporary export spool beside the destination.".to_owned())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "export.tif".to_owned());
+    let final_name = file_name.strip_suffix(".tmp").unwrap_or(&file_name);
+    Ok(parent.join(format!("{final_name}.spool.tmp")))
 }
 
 fn temporary_export_path(destination: &Path) -> Result<PathBuf, String> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let file_name = destination
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("export.tif");
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    for attempt in 0..32u32 {
-        let candidate = parent.join(format!(
-            ".{file_name}.shade-editor-{}-{stamp}-{attempt}.tmp",
-            std::process::id()
-        ));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "export.tif".to_owned());
+    Ok(parent.join(format!("{file_name}.tmp")))
+}
+
+fn remove_stale_temp(path: &Path, label: &str) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
     }
-    Err("Cannot allocate a temporary export file beside the destination.".to_owned())
+    fs::remove_file(path)
+        .map_err(|err| format!("Cannot remove stale {label} {}: {err}", path.display()))
 }
 
 fn atomic_replace(source: &Path, destination: &Path) -> Result<(), String> {
@@ -1279,6 +1264,22 @@ fn rasterize_text(font: &Font, text: &str, px: f32) -> TextBitmap {
 
 #[cfg(test)]
 mod streaming_tests {
+    #[test]
+    fn temporary_export_and_spool_names_stay_short_and_deterministic() {
+        let destination = Path::new("Fabia_Gray_S8-E6_2026-08-15.tif");
+        let temporary = temporary_export_path(destination).unwrap();
+        assert_eq!(
+            temporary.file_name().unwrap().to_string_lossy(),
+            "Fabia_Gray_S8-E6_2026-08-15.tif.tmp"
+        );
+        let spool = temporary_spool_path(&temporary).unwrap();
+        assert_eq!(
+            spool.file_name().unwrap().to_string_lossy(),
+            "Fabia_Gray_S8-E6_2026-08-15.tif.spool.tmp"
+        );
+        assert!(!spool.to_string_lossy().contains("shade-editor-spool"));
+    }
+
     use super::*;
     use tiff::encoder::{Compression, TiffEncoder, colortype};
     use tiff::tags::ExtraSamples;

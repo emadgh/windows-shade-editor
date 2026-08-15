@@ -157,9 +157,9 @@ insert_before_export_tests = '''    #[test]
 marker = "#[cfg(test)]\nmod tests {\n"
 export_rs = replace_once(export_rs, marker, marker + "    use super::*;\n\n" if "mod tests {\n    use super::*;" not in export_rs else marker, "export test module") if False else export_rs
 # Insert into the existing test module after its opening without duplicating imports.
-module_at = export_rs.find("#[cfg(test)]\nmod tests {")
+module_at = export_rs.find("#[cfg(test)]\nmod streaming_tests {")
 if module_at < 0:
-    raise RuntimeError("export tests module not found")
+    raise RuntimeError("export streaming_tests module not found")
 brace_at = export_rs.find("{", module_at)
 insert_at = export_rs.find("\n", brace_at) + 1
 export_rs = export_rs[:insert_at] + insert_before_export_tests + export_rs[insert_at:]
@@ -491,18 +491,37 @@ controller_rs = replace_once(
 write("src/app_controllers.rs", controller_rs)
 
 main_rs = read("src/main.rs")
-main_rs = replace_inside_function(
+main_rs = replace_once(
     main_rs,
-    "    fn export_snapshot_dialog(&mut self, snapshot_id: u64)",
-    "self.settings.export_all_template",
-    "self.settings.snapshot_export_template",
-    "single snapshot template",
+    r'''        let suggested = format!(
+            "{}-{}.tif",
+            sanitize_filename(&stem),
+            sanitize_filename(&snapshot.name)
+        );
+''',
+    r'''        let today = Local::now().format("%Y-%m-%d").to_string();
+        let test_code = self.project.effective_test_code_text();
+        let context = export_batch::ExportNameContext {
+            shade_name: None,
+            project_name: &self.project.name,
+            snapshot_name: &snapshot.name,
+            test_code: &test_code,
+            face_number: self.current_face + 1,
+            face_name: &stem,
+            source_name: &stem,
+            date: &today,
+        };
+        let suggested = export_batch::render_export_filename(
+            &self.settings.snapshot_export_template,
+            &context,
+        );
+''',
+    "single snapshot template suggestion",
 )
-main_rs = replace_inside_function(
+main_rs = replace_once(
     main_rs,
-    "    fn export_snapshot_group_dialog(&mut self, snapshot_ids: Vec<u64>, label: String)",
-    "self.settings.export_all_template",
-    "self.settings.snapshot_export_template",
+    "export_batch::render_export_filename(&self.settings.export_all_template, &context)",
+    "export_batch::render_export_filename(&self.settings.snapshot_export_template, &context)",
     "snapshot group template",
 )
 main_rs = replace_once(

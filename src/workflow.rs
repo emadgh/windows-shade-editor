@@ -457,6 +457,8 @@ pub(super) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
     app.ui_snapshots(ui);
     ui.separator();
     app.ui_test_code(ui);
+    ui.separator();
+    app.ui_history(ui);
 }
 
 pub(super) fn ui_missing_viewport(app: &mut ShadeApp, ui: &mut egui::Ui) -> bool {

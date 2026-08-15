@@ -29,6 +29,7 @@ pub struct AppSettings {
     pub validate_after_export: bool,
     pub export_all_test_code: bool,
     pub export_all_template: String,
+    pub snapshot_export_template: String,
     pub export_folder_template: String,
     pub export_all_conflict_policy: ConflictPolicy,
     pub export_all_open_folder: bool,
@@ -58,6 +59,7 @@ impl Default for AppSettings {
             validate_after_export: false,
             export_all_test_code: false,
             export_all_template: DEFAULT_EXPORT_TEMPLATE.to_owned(),
+            snapshot_export_template: DEFAULT_EXPORT_TEMPLATE.to_owned(),
             export_folder_template: DEFAULT_FOLDER_TEMPLATE.to_owned(),
             export_all_conflict_policy: ConflictPolicy::AutoNumber,
             export_all_open_folder: false,
@@ -101,6 +103,9 @@ impl AppSettings {
         self.default_dpi = self.default_dpi.clamp(36.0, 2400.0);
         if self.export_all_template.trim().is_empty() {
             self.export_all_template = DEFAULT_EXPORT_TEMPLATE.to_owned();
+        }
+        if self.snapshot_export_template.trim().is_empty() {
+            self.snapshot_export_template = DEFAULT_EXPORT_TEMPLATE.to_owned();
         }
         if self
             .monitor_profile_path
@@ -260,6 +265,7 @@ mod tests {
     fn export_all_defaults_are_safe() {
         let settings = AppSettings::default();
         assert_eq!(settings.export_all_template, DEFAULT_EXPORT_TEMPLATE);
+        assert_eq!(settings.snapshot_export_template, DEFAULT_EXPORT_TEMPLATE);
         assert_eq!(settings.export_folder_template, DEFAULT_FOLDER_TEMPLATE);
         assert_eq!(
             settings.export_all_conflict_policy,
