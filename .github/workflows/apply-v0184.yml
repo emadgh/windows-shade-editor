@@ -35,6 +35,16 @@ jobs:
               raise SystemExit(f'payload checksum mismatch: {digest}')
           Path('apply_v0184.py').write_bytes(gzip.decompress(base64.b64decode(encoded)))
           '@ | python -
+          @'
+          from pathlib import Path
+          path = Path('apply_v0184.py')
+          text = path.read_text(encoding='utf-8')
+          old = "text = replace_once(text, '        self.pending_snapshot_load = None;', '        self.pending_snapshot_action = None;', 'pending reset')"
+          new = "text = replace_all_checked(text, '        self.pending_snapshot_load = None;', '        self.pending_snapshot_action = None;', 3, 'pending reset')"
+          if old not in text:
+              raise SystemExit('pending reset migration anchor missing')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          '@ | python -
           python apply_v0184.py
 
       - name: Format
