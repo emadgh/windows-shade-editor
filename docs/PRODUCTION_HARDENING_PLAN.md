@@ -108,6 +108,8 @@ Manual evidence for these four items is tracked in `docs/PRODUCTION_ACCEPTANCE_C
 
 Acceptance: all automatable checks are CI-covered; real-environment checks remain explicit and cannot be mistaken for completed automated validation.
 
+Final v0.18.0 clean-tree validation: Actions run `31864112759` passed `rustfmt --check`, locked Windows `cargo check`, the full locked test suite, version consistency checks, and explicit temporary-file absence checks. The validated promotion source commit is `41bdb49c5e53cf6c7e3a39b8e3bfc81ffc20eb4b`.
+
 ## Completion policy
 
 1. Execute phases in numeric order.
