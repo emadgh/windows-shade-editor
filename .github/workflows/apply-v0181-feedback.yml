@@ -19,6 +19,8 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
           components: rustfmt
+      - name: Fix patcher compatibility
+        run: python tools/fix_v0181_patcher.py
       - name: Apply operator feedback patch
         run: python tools/apply_v0181_feedback.py
       - name: Refresh lockfile for v0.18.1
@@ -46,6 +48,7 @@ jobs:
         run: |
           git rm .github/workflows/apply-v0181-feedback.yml
           git rm tools/apply_v0181_feedback.py
+          git rm tools/fix_v0181_patcher.py
       - name: Commit validated v0.18.1 source
         shell: pwsh
         run: |
