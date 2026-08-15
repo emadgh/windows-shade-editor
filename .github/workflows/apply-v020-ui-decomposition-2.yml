@@ -1,0 +1,57 @@
+name: Validate UI decomposition v0.19.2
+
+on:
+  push:
+    branches:
+      - refactor/v020-ui-decomposition-2
+
+permissions:
+  contents: write
+
+jobs:
+  decompose-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply second UI decomposition
+        run: python .github/scripts/apply_v020_ui_decomposition_2.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Check Release graph
+        run: cargo check --release --locked
+      - name: Full Release tests
+        run: cargo test --release --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Validate version and architecture
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"$' | Select-Object -First 1).Matches.Groups[1].Value
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($cargo -ne '0.19.2' -or $version -ne '0.19.2') { throw "Version mismatch: Cargo=$cargo VERSION=$version" }
+          foreach ($file in @('src/ui/faces.rs','src/ui/curve_editor.rs','src/ui/project_navigation.rs','src/ui/input_router.rs','docs/UI_DECOMPOSITION.md')) {
+            if (-not (Test-Path $file)) { throw "Missing extracted architecture file: $file" }
+          }
+          if (Test-Path src/input_router.rs) { throw 'Legacy root input_router.rs still exists' }
+          Write-Host "main.rs lines: $((Get-Content src/main.rs).Count)"
+          Write-Host "workflow.rs lines: $((Get-Content src/workflow.rs).Count)"
+      - name: Commit validated second pass
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "refactor(ui): extract faces curve and project navigation (#40)"
+          git push
+      - name: Upload validated executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShadeEditor-v0.19.2-windows-x64
+          path: target/release/ShadeEditor.exe
+          if-no-files-found: error
