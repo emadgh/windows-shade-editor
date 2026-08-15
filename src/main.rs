@@ -20,6 +20,7 @@ mod export_batch;
 mod export_queue;
 mod export_recipe;
 mod history;
+mod input_router;
 mod model;
 mod palette;
 mod path_safety;
@@ -6644,6 +6645,29 @@ fn nudge_curve_point(
     );
 }
 
+fn remove_selected_curve_point(
+    curve: &mut model::Curve,
+    selected: CurvePointKind,
+) -> (CurvePointKind, bool) {
+    if selected == CurvePointKind::Midpoint && curve.midpoint_enabled {
+        curve.midpoint_enabled = false;
+        (CurvePointKind::Black, true)
+    } else {
+        (selected, false)
+    }
+}
+
+fn reset_selected_curve_point(curve: &mut model::Curve, selected: CurvePointKind) {
+    match selected {
+        CurvePointKind::Black => set_curve_point(curve, selected, 0.0, 0.0),
+        CurvePointKind::Midpoint => {
+            let input = curve.midpoint_input;
+            set_curve_point(curve, selected, input, input);
+        }
+        CurvePointKind::White => set_curve_point(curve, selected, 1.0, 1.0),
+    }
+}
+
 fn curve_editor_graph(
     ui: &mut egui::Ui,
     curve: &mut model::Curve,
@@ -6687,11 +6711,11 @@ fn curve_editor_graph(
             egui::Sense::click_and_drag(),
         );
         if point == CurvePointKind::Midpoint && response.double_clicked() {
-            curve.midpoint_enabled = false;
-            midpoint_removed_this_frame = true;
-            selected = CurvePointKind::Black;
+            let (next, removed) = remove_selected_curve_point(curve, point);
+            midpoint_removed_this_frame = removed;
+            selected = next;
             ui.data_mut(|data| data.insert_temp(selection_id, selected));
-            changed = true;
+            changed |= removed;
             continue;
         }
         if response.clicked() || response.drag_started() {
@@ -6747,16 +6771,28 @@ fn curve_editor_graph(
                 },
             );
         });
-        let (left, right, up, down, shift) = ui.input(|input| {
+        let (left, right, up, down, shift, delete, home) = ui.input(|input| {
             (
                 input.key_pressed(egui::Key::ArrowLeft),
                 input.key_pressed(egui::Key::ArrowRight),
                 input.key_pressed(egui::Key::ArrowUp),
                 input.key_pressed(egui::Key::ArrowDown),
                 input.modifiers.shift,
+                input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace),
+                input.key_pressed(egui::Key::Home),
             )
         });
-        if left || right || up || down {
+        if delete {
+            let (next, removed) = remove_selected_curve_point(curve, selected);
+            if removed {
+                selected = next;
+                ui.data_mut(|data| data.insert_temp(selection_id, selected));
+                changed = true;
+            }
+        } else if home {
+            reset_selected_curve_point(curve, selected);
+            changed = true;
+        } else if left || right || up || down {
             // Focus navigation is decided at the start of the frame, before this
             // custom graph sees the key event. Cancel that pending movement so the
             // first arrow press after selecting a point cannot escape the graph.
@@ -6947,10 +6983,57 @@ fn curves_ui(
             ui.add_space(6.0);
             changed |= curve_point_fields(ui, &mut adjustment.curve, selected, display_mode);
             ui.add_space(4.0);
-            ui.small("Double-click the Curve line to add the midpoint; double-click the midpoint to remove it. Arrow keys move the selected point by 1; Shift+Arrow moves by 10. Input / Output stay 0-255 in both Light and Pigment display modes.");
+            ui.small("Double-click the Curve line to add the midpoint; double-click or press Delete/Backspace on the midpoint to remove it. Arrow keys move the selected point by 1; Shift+Arrow moves by 10; Home returns the selected point to the identity line. Input / Output stay 0-255 in both Light and Pigment display modes.");
         }
         changed
     })
+}
+
+#[cfg(test)]
+mod curve_qol_tests {
+    use super::*;
+
+    #[test]
+    fn delete_only_removes_optional_midpoint_and_keeps_selection_valid() {
+        let mut curve = model::Curve {
+            midpoint_enabled: true,
+            midpoint_input: 0.5,
+            midpoint: 0.6,
+            ..Default::default()
+        };
+        let (selected, changed) = remove_selected_curve_point(&mut curve, CurvePointKind::Midpoint);
+        assert!(changed);
+        assert!(!curve.midpoint_enabled);
+        assert_eq!(selected, CurvePointKind::Black);
+
+        let before = curve;
+        let (selected, changed) = remove_selected_curve_point(&mut curve, CurvePointKind::White);
+        assert!(!changed);
+        assert_eq!(selected, CurvePointKind::White);
+        assert_eq!(curve, before);
+    }
+
+    #[test]
+    fn home_returns_selected_point_to_identity_without_breaking_input_order() {
+        let mut curve = model::Curve {
+            input_black: 0.10,
+            black: 0.25,
+            midpoint_enabled: true,
+            midpoint_input: 0.55,
+            midpoint: 0.75,
+            input_white: 0.90,
+            white: 0.80,
+        };
+        reset_selected_curve_point(&mut curve, CurvePointKind::Midpoint);
+        assert!((curve.midpoint - curve.midpoint_input).abs() < f32::EPSILON);
+        assert!(curve.input_black < curve.midpoint_input);
+        assert!(curve.midpoint_input < curve.input_white);
+
+        reset_selected_curve_point(&mut curve, CurvePointKind::Black);
+        assert_eq!((curve.input_black, curve.black), (0.0, 0.0));
+        reset_selected_curve_point(&mut curve, CurvePointKind::White);
+        assert_eq!((curve.input_white, curve.white), (1.0, 1.0));
+    }
 }
 
 fn mixer_ui(
