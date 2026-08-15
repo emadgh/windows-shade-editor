@@ -36,6 +36,23 @@ jobs:
           $text = Get-Content $path -Raw
           $text = $text.Replace('main.contains(""Recent projects"")', 'main.contains(r#""Recent projects""#)')
           Set-Content -Path $path -Value $text -NoNewline
+      - name: Expose shared Curve entry points
+        shell: pwsh
+        run: |
+          $curvePath = 'src/ui/curve_editor.rs'
+          $curve = Get-Content $curvePath -Raw
+          $old = 'fn tonal_display_value(value: f32, mode: TonalDisplayMode) -> f32 {'
+          $new = 'pub(crate) fn tonal_display_value(value: f32, mode: TonalDisplayMode) -> f32 {'
+          if (-not $curve.Contains($old)) { throw 'tonal_display_value signature not found' }
+          $curve = $curve.Replace($old, $new)
+          Set-Content -Path $curvePath -Value $curve -NoNewline
+
+          $mainPath = 'src/main.rs'
+          $main = Get-Content $mainPath -Raw
+          $anchor = "use ui::input_router;"
+          if (-not $main.Contains($anchor)) { throw 'input router import anchor not found' }
+          $main = $main.Replace($anchor, "use ui::curve_editor::{curves_ui, tonal_display_value};`r`nuse ui::input_router;")
+          Set-Content -Path $mainPath -Value $main -NoNewline
       - name: Format
         run: cargo fmt --all
       - name: Format check
