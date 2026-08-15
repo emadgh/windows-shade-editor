@@ -1,0 +1,127 @@
+name: Validate project switching during export
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - fix/open-project-during-export
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/open-project-during-export
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Sync 0.20.3 metadata
+        shell: pwsh
+        run: |
+          Set-Content -Encoding ascii -NoNewline VERSION '0.20.3'
+
+          $cargo = Get-Content -Raw Cargo.toml
+          $cargo = $cargo -replace '(?m)^version = "0\.20\.2"$', 'version = "0.20.3"'
+          Set-Content -Encoding utf8NoBOM -NoNewline Cargo.toml $cargo
+
+          $lock = Get-Content -Raw Cargo.lock
+          $lock = $lock -replace '(name = "windows-shade-editor"\r?\nversion = ")0\.20\.2("\r?\n)', '${1}0.20.3${2}'
+          Set-Content -Encoding utf8NoBOM -NoNewline Cargo.lock $lock
+
+          $notes = Get-Content -Raw RELEASE_NOTES.md
+          if ($notes -notmatch '^# Shade Editor 0\.20\.3') {
+            $section = @'
+          # Shade Editor 0.20.3
+
+          - Allow opening or creating another `.shade` project while the Export Queue is waiting or processing.
+          - Keep queued exports independent from the active project by relying on their immutable export recipes; switching projects does not cancel or rebind queued jobs.
+          - Keep Exit blocked while exports are pending so closing the process cannot terminate active queue work.
+          - Preserve Save/Discard/Cancel protection for dirty projects and the existing active-operation guard during project transitions.
+          - Add lifecycle regression tests covering Open/New/Recover during queue activity, Exit blocking, and dirty-project confirmation.
+
+          '@
+            $section = ($section -replace '^          ', '') -replace "`n          ", "`n"
+            Set-Content -Encoding utf8NoBOM -NoNewline RELEASE_NOTES.md ($section + $notes)
+          }
+
+      - name: Format
+        run: cargo fmt --all
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Check
+        run: cargo check --release --locked --target x86_64-pc-windows-msvc
+      - name: Full Release tests
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+      - name: Release build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Build and test native Shell extension
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist shell\bin mkdir shell\bin
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeProjectDataTests.exe shell\ShadeProjectDataTests.cpp shell\ShadeProjectData.cpp
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeProjectDataTests.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /LD /Fe:shell\bin\ShadeEditorShell.dll shell\ShadeEditorShell.cpp shell\ShadeProjectData.cpp /link ole32.lib shlwapi.lib windowscodecs.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeShellTests.exe shell\ShadeShellTests.cpp /link ole32.lib shlwapi.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeShellTests.exe shell\bin\ShadeEditorShell.dll
+          if errorlevel 1 exit /b 1
+
+      - name: Validate Shell property schema XML
+        shell: pwsh
+        run: '[xml](Get-Content -Raw shell/ShadeEditor.propdesc) | Out-Null'
+
+      - name: Validate version and lifecycle policy
+        shell: pwsh
+        run: |
+          if ((Get-Content -Raw VERSION).Trim() -ne '0.20.3') { throw 'VERSION mismatch' }
+          if ((Get-Content -Raw Cargo.toml) -notmatch '(?m)^version = "0\.20\.3"$') { throw 'Cargo.toml version mismatch' }
+          $lock = Get-Content -Raw Cargo.lock
+          if ($lock -notmatch 'name = "windows-shade-editor"\r?\nversion = "0\.20\.3"') { throw 'Cargo.lock version mismatch' }
+          $lifecycle = Get-Content -Raw src/project_lifecycle.rs
+          if ($lifecycle -notmatch 'export_queue_pending && transition\.blocks_on_export_queue\(\)') { throw 'queue transition policy missing' }
+          if ($lifecycle -notmatch 'matches!\(self, Self::Exit\)') { throw 'Exit-only queue blocker missing' }
+
+      - name: Commit validated production tree and remove temporary workflow
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/validate-fix59.yml
+          git add src/project_lifecycle.rs Cargo.toml Cargo.lock VERSION RELEASE_NOTES.md
+          git diff --cached --check
+          git commit -m 'fix(lifecycle): allow opening projects during export queue processing (#59)'
+          git push origin HEAD:fix/open-project-during-export
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          $exe = 'target/x86_64-pc-windows-msvc/release/ShadeEditor.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  ShadeEditor.exe" | Set-Content -Encoding ascii -NoNewline 'artifact/ShadeEditor.exe.sha256'
+          Copy-Item $exe artifact/ShadeEditor.exe
+          Copy-Item README.md artifact/README.md
+          Copy-Item LICENSE artifact/LICENSE
+          New-Item -ItemType Directory -Force artifact/Shell | Out-Null
+          Copy-Item shell/bin/ShadeEditorShell.dll artifact/Shell/ShadeEditorShell.dll
+          Copy-Item shell/ShadeEditor.propdesc artifact/Shell/ShadeEditor.propdesc
+          Copy-Item shell/Install-ShadeEditorShell.ps1 artifact/Shell/Install-ShadeEditorShell.ps1
+          Copy-Item shell/Uninstall-ShadeEditorShell.ps1 artifact/Shell/Uninstall-ShadeEditorShell.ps1
+          Copy-Item shell/README.md artifact/Shell/README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShadeEditor-v0.20.3-win-x64
+          path: artifact
