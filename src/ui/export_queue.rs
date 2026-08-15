@@ -1,3 +1,4 @@
+use crate::ui::actions::ExportQueueUiAction;
 use crate::*;
 use eframe::egui;
 
@@ -31,16 +32,7 @@ impl ShadeApp {
         let queue_paused = self.export.queue.is_paused();
         let (_, _, done_count, failed_count, _) = self.export.queue.status_counts();
         let recovered_waiting = self.export.queue.recovered_waiting_count();
-        let mut cancel_id = None;
-        let mut resume_id = None;
-        let mut retry_id = None;
-        let mut reveal_folder = None;
-        let mut resume_recovered = false;
-        let mut cancel_waiting = false;
-        let mut pause_toggle = false;
-        let mut retry_all_failed = false;
-        let mut clear_completed = false;
-        let mut clear_failed = false;
+        let mut actions = Vec::new();
 
         egui::Window::new("Export Queue")
             .open(&mut open)
@@ -58,18 +50,41 @@ impl ShadeApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if failed_count > 0 {
-                            clear_failed = ui.button(format!("Clear failed ({failed_count})")).clicked();
-                            retry_all_failed = ui.button(format!("Retry all failed ({failed_count})")).clicked();
+                            if ui
+                                .button(format!("Clear failed ({failed_count})"))
+                                .clicked()
+                            {
+                                actions.push(ExportQueueUiAction::ClearFailed);
+                            }
+                            if ui
+                                .button(format!("Retry all failed ({failed_count})"))
+                                .clicked()
+                            {
+                                actions.push(ExportQueueUiAction::RetryAllFailed);
+                            }
                         }
-                        if done_count > 0 {
-                            clear_completed = ui.button(format!("Clear completed ({done_count})")).clicked();
+                        if done_count > 0
+                            && ui
+                                .button(format!("Clear completed ({done_count})"))
+                                .clicked()
+                        {
+                            actions.push(ExportQueueUiAction::ClearCompleted);
                         }
-                        cancel_waiting = ui.button("Cancel waiting").clicked();
-                        pause_toggle = ui
-                            .button(if queue_paused { "Resume queue" } else { "Pause queue" })
-                            .clicked();
-                        if recovered_waiting > 0 {
-                            resume_recovered = ui.button("Resume recovered").clicked();
+                        if ui.button("Cancel waiting").clicked() {
+                            actions.push(ExportQueueUiAction::CancelAllWaiting);
+                        }
+                        if ui
+                            .button(if queue_paused {
+                                "Resume queue"
+                            } else {
+                                "Pause queue"
+                            })
+                            .clicked()
+                        {
+                            actions.push(ExportQueueUiAction::TogglePaused);
+                        }
+                        if recovered_waiting > 0 && ui.button("Resume recovered").clicked() {
+                            actions.push(ExportQueueUiAction::ResumeRecovered);
                         }
                     });
                 });
@@ -84,7 +99,19 @@ impl ShadeApp {
                     ui.label("No export jobs yet.");
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (id, label, destination, status, progress, detail, error, restored, requires_resume, metrics) in &rows {
+                        for (
+                            id,
+                            label,
+                            destination,
+                            status,
+                            progress,
+                            detail,
+                            error,
+                            restored,
+                            requires_resume,
+                            metrics,
+                        ) in &rows
+                        {
                             let (fill, status_color) = match status {
                                 export_queue::ExportQueueStatus::Waiting => (
                                     egui::Color32::from_rgba_unmultiplied(135, 95, 20, 34),
@@ -132,36 +159,45 @@ impl ShadeApp {
                                                         .strong(),
                                                 );
                                                 if ui.small_button("Reveal folder").clicked() {
-                                                    reveal_folder = Some(
+                                                    actions.push(ExportQueueUiAction::RevealFolder(
                                                         destination
                                                             .parent()
                                                             .unwrap_or_else(|| Path::new("."))
                                                             .to_path_buf(),
-                                                    );
+                                                    ));
                                                 }
                                                 if *requires_resume {
                                                     if ui.small_button("Resume").clicked() {
-                                                        resume_id = Some(*id);
+                                                        actions.push(ExportQueueUiAction::Resume(*id));
                                                     }
                                                     if ui.small_button("Cancel").clicked() {
-                                                        cancel_id = Some(*id);
+                                                        actions.push(ExportQueueUiAction::Cancel(*id));
                                                     }
                                                 } else {
                                                     match status {
                                                         export_queue::ExportQueueStatus::Waiting => {
                                                             if ui.small_button("Cancel").clicked() {
-                                                                cancel_id = Some(*id);
+                                                                actions.push(
+                                                                    ExportQueueUiAction::Cancel(*id),
+                                                                );
                                                             }
                                                         }
                                                         export_queue::ExportQueueStatus::Processing => {
-                                                            if ui.small_button("Stop after current").clicked() {
-                                                                cancel_id = Some(*id);
+                                                            if ui
+                                                                .small_button("Stop after current")
+                                                                .clicked()
+                                                            {
+                                                                actions.push(
+                                                                    ExportQueueUiAction::Cancel(*id),
+                                                                );
                                                             }
                                                         }
                                                         export_queue::ExportQueueStatus::Failed
                                                         | export_queue::ExportQueueStatus::Cancelled => {
                                                             if ui.small_button("Retry").clicked() {
-                                                                retry_id = Some(*id);
+                                                                actions.push(
+                                                                    ExportQueueUiAction::Retry(*id),
+                                                                );
                                                             }
                                                         }
                                                         export_queue::ExportQueueStatus::Done => {}
@@ -206,51 +242,12 @@ impl ShadeApp {
                     });
                 }
             });
-        self.export.show_queue = open;
 
-        if resume_recovered {
-            let count = self.export.queue.resume_recovered();
-            if count > 0 {
-                self.report_info(format!("Resumed {count} recovered export(s)"));
-            }
+        if open != self.export.show_queue {
+            actions.push(ExportQueueUiAction::SetOpen(open));
         }
-        if pause_toggle {
-            let paused = !self.export.queue.is_paused();
-            self.export.queue.set_paused(paused);
-            self.report_info(if paused {
-                "Export Queue paused; current atomic export may finish safely"
-            } else {
-                "Export Queue resumed"
-            });
-        }
-        if retry_all_failed {
-            let count = self.export.queue.retry_all_failed();
-            if count > 0 {
-                self.report_info(format!("Retried {count} failed export(s)"));
-            }
-        }
-        if cancel_waiting {
-            self.export.queue.cancel_all_waiting();
-        }
-        if clear_completed {
-            self.export.queue.clear_completed();
-        }
-        if clear_failed {
-            self.export.queue.clear_failed();
-        }
-        if let Some(id) = resume_id {
-            self.export.queue.resume(id);
-        }
-        if let Some(id) = cancel_id {
-            self.export.queue.cancel(id);
-        }
-        if let Some(id) = retry_id {
-            self.export.queue.retry(id);
-        }
-        if let Some(folder) = reveal_folder {
-            if let Err(err) = open_folder(&folder) {
-                self.report_error(err);
-            }
+        for action in actions {
+            self.dispatch_export_queue_ui_action(action);
         }
     }
 }
