@@ -19,6 +19,13 @@ jobs:
           components: rustfmt
       - name: Apply second UI decomposition
         run: python .github/scripts/apply_v020_ui_decomposition_2.py
+      - name: Fix generated Recent assertion quoting
+        shell: pwsh
+        run: |
+          $path = 'src/ui/mod.rs'
+          $text = Get-Content $path -Raw
+          $text = $text.Replace('main.contains(""Recent projects"")', 'main.contains(r#""Recent projects""#)')
+          Set-Content -Path $path -Value $text -NoNewline
       - name: Format
         run: cargo fmt --all
       - name: Format check
