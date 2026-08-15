@@ -73,32 +73,38 @@ Validation: Windows `cargo fmt`, `cargo check` and full `cargo test` passed in A
 
 Issue: #30
 
-- [ ] Extract project lifecycle state/logic from `main.rs`.
-- [ ] Extract export queue/orchestration state from `main.rs`.
-- [ ] Extract color-management UI/controller state from `main.rs` where practical.
-- [ ] Extract TIFF inspector controller state from `main.rs`.
-- [ ] Replace scattered transition booleans with typed transition state.
-- [ ] Add integration-level regression tests for New/Open/Exit guards and queue lifecycle.
-- [ ] Add feature-wiring smoke tests so backend modules cannot silently exist without application entry points.
+- [x] Extract project lifecycle state/logic from `main.rs`.
+- [x] Extract export queue/orchestration state from `main.rs`.
+- [x] Extract color-management UI/controller state from `main.rs` where practical.
+- [x] Extract TIFF inspector controller state from `main.rs`.
+- [x] Replace scattered transition booleans with typed transition state.
+- [x] Add integration-level regression tests for New/Open/Exit guards and queue lifecycle.
+- [x] Add feature-wiring smoke tests so backend modules cannot silently exist without application entry points.
 
 Acceptance: `ShadeApp` is primarily composition/UI routing and critical workflows have integration-level coverage.
+
+Validation: Windows `cargo fmt`, `cargo check` and full `cargo test` passed in Actions run `31843574891`; validated Phase 4 source commit is `24b424725ab246a309960237dca163ae027e7325`.
 
 ## Phase 5 — Production transport validation and acceptance
 
 Issue: #31
 
 Automatable:
-- [ ] Expand TIFF fixtures across compression, predictors, 8/16-bit, ExtraSamples, Spot metadata, tiled and planar paths.
-- [ ] Add BigTIFF-oriented conformance/structure tests without committing multi-gigabyte binaries.
-- [ ] Exercise missing-Face relink and large-file validation paths in CI where feasible.
-- [ ] Keep native Shell extension build/tests/schema validation in the required CI path.
-- [ ] Add a production acceptance checklist document with exact manual evidence fields.
+- [x] Expand TIFF fixtures across compression, predictors, 8/16-bit, ExtraSamples, Spot metadata, tiled and planar paths.
+- [x] Add BigTIFF-oriented conformance/structure tests without committing multi-gigabyte binaries.
+- [x] Exercise missing-Face relink and large-file validation paths in CI where feasible.
+- [x] Keep native Shell extension build/tests/schema validation in the required CI path.
+- [x] Add a production acceptance checklist document with exact manual evidence fields.
+
+Validation: Windows `cargo fmt`, locked `cargo check` and full locked `cargo test` passed in Actions run `31863506989`; validated automated Phase 5 source commit is `ef23cf16873d4cb8de55dfe7b832301110f22c1a`. The temporary Phase 5 validation workflow was removed after the successful run.
 
 External environment sign-off (cannot be truthfully automated without the actual applications/hardware):
 - [ ] Photoshop round-trip on representative production CMYK + Spot TIFFs.
 - [ ] Actual RIP/printer interpretation and proof comparison.
 - [ ] >4 GiB BigTIFF acceptance by the production Photoshop/RIP versions.
 - [ ] Clean-workstation Explorer thumbnail/property handler install, upgrade and uninstall.
+
+Manual evidence for these four items is tracked in `docs/PRODUCTION_ACCEPTANCE_CHECKLIST.md` and remains intentionally open until operator reports are supplied.
 
 Acceptance: all automatable checks are CI-covered; real-environment checks remain explicit and cannot be mistaken for completed automated validation.
 
