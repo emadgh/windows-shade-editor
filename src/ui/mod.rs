@@ -84,6 +84,26 @@ mod tests {
                 "Project navigation bypassed typed actions with {forbidden}"
             );
         }
+
+        let export_queue = include_str!("export_queue.rs");
+        for forbidden in [
+            "self.export.show_queue =",
+            "self.export.queue.resume_recovered()",
+            "self.export.queue.set_paused(",
+            "self.export.queue.retry_all_failed()",
+            "self.export.queue.cancel_all_waiting()",
+            "self.export.queue.clear_completed()",
+            "self.export.queue.clear_failed()",
+            "self.export.queue.resume(",
+            "self.export.queue.cancel(",
+            "self.export.queue.retry(",
+            "open_folder(&",
+        ] {
+            assert!(
+                !export_queue.contains(forbidden),
+                "Export Queue presentation bypassed typed actions with {forbidden}"
+            );
+        }
     }
 
     #[test]
