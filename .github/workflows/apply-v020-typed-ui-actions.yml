@@ -17,6 +17,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Fix bool-returning navigation action arms
+        shell: pwsh
+        run: |
+          $path = '.github/scripts/apply_v020_typed_ui_actions.py'
+          $text = Get-Content $path -Raw
+          $text = $text.Replace('NavigationUiAction::QuickSave => self.quick_save_project(),', "NavigationUiAction::QuickSave => {`n                self.quick_save_project();`n            }")
+          $text = $text.Replace('NavigationUiAction::Save => self.save_project(false),', "NavigationUiAction::Save => {`n                self.save_project(false);`n            }")
+          $text = $text.Replace('NavigationUiAction::SaveAs => self.save_project(true),', "NavigationUiAction::SaveAs => {`n                self.save_project(true);`n            }")
+          Set-Content -Path $path -Value $text -NoNewline
       - name: Apply typed UI action refactor
         run: python .github/scripts/apply_v020_typed_ui_actions.py
       - name: Format
