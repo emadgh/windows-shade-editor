@@ -36,6 +36,34 @@ jobs:
           $text = Get-Content $path -Raw
           $text = $text.Replace('main.contains(""Recent projects"")', 'main.contains(r#""Recent projects""#)')
           Set-Content -Path $path -Value $text -NoNewline
+      - name: Move Curve regression tests with implementation
+        shell: pwsh
+        run: |
+          $mainPath = 'src/main.rs'
+          $curvePath = 'src/ui/curve_editor.rs'
+          $lines = [System.Collections.Generic.List[string]](Get-Content $mainPath)
+          $moduleIndex = -1
+          for ($i = 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i].Trim() -eq 'mod tonal_curve_interaction_tests {' -and $lines[$i - 1].Trim() -eq '#[cfg(test)]') {
+              $moduleIndex = $i
+              break
+            }
+          }
+          if ($moduleIndex -lt 1) { throw 'tonal_curve_interaction_tests module not found' }
+          $start = $moduleIndex - 1
+          $end = -1
+          for ($i = $moduleIndex + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i].StartsWith('fn snapshot_day_time(')) {
+              $end = $i
+              break
+            }
+          }
+          if ($end -le $start) { throw 'snapshot_day_time boundary after Curve tests not found' }
+          $block = $lines.GetRange($start, $end - $start)
+          $lines.RemoveRange($start, $end - $start)
+          Set-Content -Path $mainPath -Value $lines
+          Add-Content -Path $curvePath -Value ''
+          Add-Content -Path $curvePath -Value $block
       - name: Expose shared Curve entry points
         shell: pwsh
         run: |
@@ -73,6 +101,8 @@ jobs:
             if (-not (Test-Path $file)) { throw "Missing extracted architecture file: $file" }
           }
           if (Test-Path src/input_router.rs) { throw 'Legacy root input_router.rs still exists' }
+          if (Select-String -Path src/main.rs -Pattern 'mod tonal_curve_interaction_tests' -Quiet) { throw 'Curve tests still live in main.rs' }
+          if (-not (Select-String -Path src/ui/curve_editor.rs -Pattern 'mod tonal_curve_interaction_tests' -Quiet)) { throw 'Curve tests were not moved with implementation' }
           Write-Host "main.rs lines: $((Get-Content src/main.rs).Count)"
           Write-Host "workflow.rs lines: $((Get-Content src/workflow.rs).Count)"
       - name: Commit validated second pass
