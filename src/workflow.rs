@@ -141,7 +141,11 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
 
 fn select_all_channels_shortcut(app: &mut ShadeApp) {
     let previous_solo = app.solo_channel;
-    app.adjustment_scope = AdjustmentScope::All;
+    app.adjustment_scope = if app.adjustment_scope == AdjustmentScope::All {
+        AdjustmentScope::Selected
+    } else {
+        AdjustmentScope::All
+    };
     app.solo_channel = None;
     if previous_solo.is_some() {
         app.mark_current_preview_dirty();

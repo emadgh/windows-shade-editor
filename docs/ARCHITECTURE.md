@@ -45,6 +45,13 @@ Schema v9 remains the clean-break format. New fields that are safe to default ca
 
 These values are not part of Snapshot adjustment history because they describe the project viewing environment rather than a shade recipe. They are saved in `.shade` so reopening the project reproduces the preview setup when the referenced profile is available.
 
+## Editing interaction invariants
+
+- `Master` is a separate Levels/Curve adjustment layer, never a broadcast copy into channel controls.
+- `~` toggles Master and selected-channel scope. Selecting any channel exits Master.
+- A dirty active Snapshot must be resolved through Stay / Discard / Update before switching Snapshots or saving the project. Discard also removes the discarded redo branch from Snapshot history.
+- Light/Pigment is an application display preference only. Pigment mirrors Curve coordinates and histogram bins for Photoshop-style ink interpretation while the stored Curve, render math and export recipe remain unchanged.
+
 ## Adjustment/render data flow
 
 Production adjustment order:

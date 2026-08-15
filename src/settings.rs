@@ -12,6 +12,27 @@ use crate::palette::{
 
 pub const DEFAULT_DPI: f64 = 220.0;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TonalDisplayMode {
+    Light,
+    Pigment,
+}
+
+impl Default for TonalDisplayMode {
+    fn default() -> Self {
+        Self::Light
+    }
+}
+
+impl TonalDisplayMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Pigment => "Pigment",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -26,6 +47,7 @@ pub struct AppSettings {
     pub colorize_adjustments: bool,
     pub show_curve_histogram: bool,
     pub compact_curve_controls: bool,
+    pub tonal_display_mode: TonalDisplayMode,
     pub validate_after_export: bool,
     pub export_all_test_code: bool,
     pub export_all_template: String,
@@ -56,6 +78,7 @@ impl Default for AppSettings {
             colorize_adjustments: true,
             show_curve_histogram: true,
             compact_curve_controls: false,
+            tonal_display_mode: TonalDisplayMode::Light,
             validate_after_export: false,
             export_all_test_code: false,
             export_all_template: DEFAULT_EXPORT_TEMPLATE.to_owned(),
@@ -236,6 +259,14 @@ mod tests {
     #[test]
     fn compact_curve_controls_default_off() {
         assert!(!AppSettings::default().compact_curve_controls);
+    }
+
+    #[test]
+    fn tonal_display_defaults_to_light() {
+        assert_eq!(
+            AppSettings::default().tonal_display_mode,
+            TonalDisplayMode::Light
+        );
     }
 
     #[test]

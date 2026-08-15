@@ -145,6 +145,26 @@ impl AdjustmentHistory {
             .get(self.cursor)
             .is_some_and(|entry| entry.adjustments == *adjustments)
     }
+
+    /// Discard working history states that happened after a saved Snapshot state.
+    /// This keeps undo history up to the saved adjustment map while ensuring a
+    /// discarded branch cannot be restored accidentally through Redo.
+    pub fn discard_to_state(
+        &mut self,
+        adjustments: &BTreeMap<String, ChannelAdjustment>,
+        fallback_label: impl Into<String>,
+    ) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.adjustments == *adjustments)
+        {
+            self.entries.truncate(index + 1);
+            self.cursor = index;
+        } else {
+            self.reset(adjustments, fallback_label);
+        }
+    }
 }
 
 pub fn describe_change(
@@ -166,7 +186,7 @@ pub fn describe_change(
             continue;
         }
         channels.push(if name == MASTER_ADJUSTMENT_KEY {
-            "All channels".to_owned()
+            "Master".to_owned()
         } else {
             name
         });
@@ -228,6 +248,21 @@ mod tests {
     }
 
     #[test]
+    fn discard_to_saved_state_removes_redo_branch() {
+        let mut history = AdjustmentHistory::default();
+        let a = state(1.0);
+        let b = state(1.2);
+        let c = state(1.4);
+        history.reset(&a, "Start");
+        history.record(&b, "Second");
+        history.record(&c, "Third");
+        history.discard_to_state(&b, "Snapshot state");
+        assert_eq!(history.len(), 2);
+        assert!(history.current_matches(&b));
+        assert!(!history.can_redo());
+    }
+
+    #[test]
     fn history_is_capped_at_fifty_states() {
         let mut history = AdjustmentHistory::default();
         history.reset(&state(1.0), "Start");
@@ -261,7 +296,7 @@ mod tests {
         );
         let mut after = before.clone();
         after.get_mut(MASTER_ADJUSTMENT_KEY).unwrap().curve.midpoint = 0.6;
-        assert_eq!(describe_change(&before, &after), "Curve · All channels");
+        assert_eq!(describe_change(&before, &after), "Curve · Master");
     }
 
     #[test]

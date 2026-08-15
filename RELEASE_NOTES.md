@@ -1,3 +1,13 @@
+# Shade Editor 0.18.4
+
+- Curve keyboard editing: the selected point moves 1 unit with Arrow keys and 10 units with Shift+Arrow.
+- Snapshot dirty guard now offers Stay / Discard / Update snapshot both when switching Snapshots and before project Save/Quick Save.
+- Project Save can no longer silently persist a working adjustment state while leaving the active Snapshot stale.
+- `~` now toggles Master ↔ selected-channel editing; selecting a channel from keyboard or Channels immediately exits Master.
+- Master replaces the previous All channels wording across the editing UI/history.
+- History follows newly appended states automatically.
+- Added persistent Light / Pigment tonal display modes. Pigment mirrors Curve axes, point values and histograms while keeping 0-255 labels; production adjustment math and TIFF export remain unchanged.
+
 # Shade Editor 0.18.3
 
 - Replace destructive Levels/Curve Broadcast-to-all behavior with independent Photoshop-style Master Levels and Master Curve controls stored as a separate All Channels adjustment state.

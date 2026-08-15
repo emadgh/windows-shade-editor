@@ -54,7 +54,7 @@ use palette::ChannelPalette;
 use project_lifecycle::{
     BackupRestoreCandidate, ProjectLifecycleController, ProjectTransition, TransitionRequest,
 };
-use settings::AppSettings;
+use settings::{AppSettings, TonalDisplayMode};
 use tiff_io::PreviewFace;
 use update::{UpdateManager, UpdateStatus};
 
@@ -113,6 +113,12 @@ enum ToolPanel {
 enum AdjustmentScope {
     Selected,
     All,
+}
+
+#[derive(Clone, Debug)]
+enum PendingSnapshotAction {
+    Load(u64),
+    Save(PathBuf),
 }
 
 struct RuntimeFace {
@@ -266,7 +272,7 @@ struct ShadeApp {
     project_dirty: bool,
     snapshot_rename_id: Option<u64>,
     snapshot_rename_buffer: String,
-    pending_snapshot_load: Option<u64>,
+    pending_snapshot_action: Option<PendingSnapshotAction>,
     history: history::AdjustmentHistory,
     history_clear_backup: Option<(Option<u64>, history::AdjustmentHistory)>,
     history_pending_label: Option<String>,
@@ -356,7 +362,7 @@ impl ShadeApp {
             project_dirty: false,
             snapshot_rename_id: None,
             snapshot_rename_buffer: String::new(),
-            pending_snapshot_load: None,
+            pending_snapshot_action: None,
             history,
             history_clear_backup: None,
             history_pending_label: None,
@@ -474,7 +480,7 @@ impl ShadeApp {
         self.project_dirty = false;
         self.snapshot_rename_id = None;
         self.snapshot_rename_buffer.clear();
-        self.pending_snapshot_load = None;
+        self.pending_snapshot_action = None;
         self.lifecycle.cancel_pending();
         self.color.show = false;
         self.color.query.clear();
@@ -700,6 +706,19 @@ impl ShadeApp {
         });
     }
 
+    fn active_snapshot_has_unupdated_changes(&self) -> bool {
+        self.project.active_snapshot_id.is_some() && !self.project.active_snapshot_matches()
+    }
+
+    fn request_project_save(&mut self, path: PathBuf) -> bool {
+        if self.active_snapshot_has_unupdated_changes() {
+            self.pending_snapshot_action = Some(PendingSnapshotAction::Save(path));
+            true
+        } else {
+            self.begin_project_save(path)
+        }
+    }
+
     fn begin_project_save(&mut self, path: PathBuf) -> bool {
         if self.job.is_some() || self.faces.is_empty() {
             return false;
@@ -778,7 +797,7 @@ impl ShadeApp {
         let Some(path) = target else {
             return false;
         };
-        self.begin_project_save(path)
+        self.request_project_save(path)
     }
 
     fn quick_save_target(&self) -> Option<PathBuf> {
@@ -812,7 +831,7 @@ impl ShadeApp {
         let Some(path) = self.quick_save_target() else {
             return false;
         };
-        self.begin_project_save(path)
+        self.request_project_save(path)
     }
 
     fn snapshot_project_needs_save_reminder(&self) -> bool {
@@ -2457,7 +2476,9 @@ impl ShadeApp {
 
     fn select_channel(&mut self, channel: usize, isolate: bool) {
         let previous_solo = self.solo_channel;
-        if isolate {
+        let was_master = self.adjustment_scope == AdjustmentScope::All;
+        self.adjustment_scope = AdjustmentScope::Selected;
+        if isolate && !was_master {
             let (selected, solo) =
                 channel_click_state(self.selected_channel, self.solo_channel, channel);
             self.selected_channel = selected;
@@ -2826,17 +2847,61 @@ impl ShadeApp {
         if self.project.active_snapshot_id == Some(id) {
             return;
         }
-        let active_snapshot_dirty =
-            self.project.active_snapshot_id.is_some() && !self.project.active_snapshot_matches();
-        if active_snapshot_dirty {
-            self.pending_snapshot_load = Some(id);
+        if self.active_snapshot_has_unupdated_changes() {
+            self.pending_snapshot_action = Some(PendingSnapshotAction::Load(id));
         } else {
             self.apply_snapshot_now(id);
         }
     }
 
-    fn ui_snapshot_discard_confirmation(&mut self, ctx: &egui::Context) {
-        let Some(target_id) = self.pending_snapshot_load else {
+    fn discard_active_snapshot_changes(&mut self) -> bool {
+        let Some(active_id) = self.project.active_snapshot_id else {
+            return false;
+        };
+        let Some(saved_adjustments) = self
+            .project
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == active_id)
+            .map(|snapshot| snapshot.adjustments.clone())
+        else {
+            return false;
+        };
+        self.project.adjustments = saved_adjustments.clone();
+        self.history_pending_label = None;
+        self.history_pending_at = None;
+        self.history_clear_backup = None;
+        self.history
+            .discard_to_state(&saved_adjustments, "Snapshot state");
+        self.sync_history_to_active_snapshot();
+        self.mark_all_previews_dirty();
+        let _ = self.restore_active_snapshot_preview();
+        self.report_info("Snapshot changes discarded");
+        true
+    }
+
+    fn continue_snapshot_action_after_choice(
+        &mut self,
+        action: PendingSnapshotAction,
+        update: bool,
+    ) {
+        if update {
+            workflow::update_active_snapshot(self);
+        } else {
+            self.discard_active_snapshot_changes();
+        }
+        match action {
+            PendingSnapshotAction::Load(target_id) => self.apply_snapshot_now(target_id),
+            PendingSnapshotAction::Save(path) => {
+                if !self.begin_project_save(path) && self.lifecycle.after_save.is_some() {
+                    self.lifecycle.save_failed();
+                }
+            }
+        }
+    }
+
+    fn ui_snapshot_update_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_snapshot_action.clone() else {
             return;
         };
         let current_name = self
@@ -2844,15 +2909,24 @@ impl ShadeApp {
             .active_snapshot_name()
             .unwrap_or("Current snapshot")
             .to_owned();
-        let target_name = self
-            .project
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.id == target_id)
-            .map(|snapshot| snapshot.name.clone())
-            .unwrap_or_else(|| "selected snapshot".to_owned());
+        let action_text = match &action {
+            PendingSnapshotAction::Load(target_id) => {
+                let target_name = self
+                    .project
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.id == *target_id)
+                    .map(|snapshot| snapshot.name.clone())
+                    .unwrap_or_else(|| "selected snapshot".to_owned());
+                format!("Switch to {target_name}?")
+            }
+            PendingSnapshotAction::Save(_) => {
+                "Save the project with this Snapshot state?".to_owned()
+            }
+        };
         let mut stay = false;
         let mut discard = false;
+        let mut update = false;
         egui::Window::new("Snapshot changes not updated")
             .collapsible(false)
             .resizable(false)
@@ -2861,18 +2935,25 @@ impl ShadeApp {
                 ui.label(format!(
                     "{current_name} has adjustment changes that have not been written back with Update."
                 ));
-                ui.label(format!("Switch to {target_name}?"));
+                ui.label(action_text);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    stay = ui.button("Stay editing").clicked();
-                    discard = ui.button("Discard changes and switch").clicked();
+                    stay = ui.button("Stay").clicked();
+                    discard = ui.button("Discard").clicked();
+                    update = ui.button("Update snapshot").clicked();
                 });
             });
         if stay {
-            self.pending_snapshot_load = None;
+            self.pending_snapshot_action = None;
+            if matches!(action, PendingSnapshotAction::Save(_)) {
+                self.lifecycle.cancel_pending();
+            }
         } else if discard {
-            self.pending_snapshot_load = None;
-            self.apply_snapshot_now(target_id);
+            self.pending_snapshot_action = None;
+            self.continue_snapshot_action_after_choice(action, false);
+        } else if update {
+            self.pending_snapshot_action = None;
+            self.continue_snapshot_action_after_choice(action, true);
         }
     }
 
@@ -3143,6 +3224,7 @@ impl ShadeApp {
         egui::ScrollArea::vertical()
             .id_salt("adjustment-history")
             .max_height(210.0)
+            .stick_to_bottom(true)
             .show(ui, |ui| {
                 for (index, label) in rows {
                     if clickable_row(ui, index == cursor, &label, None, None, 28.0).clicked() {
@@ -3565,7 +3647,7 @@ impl ShadeApp {
                 .changed();
             if !channel_names.is_empty() {
                 let selected_display = if self.project.test_code.channel == TEST_CODE_ALL_CHANNELS {
-                    "All channels".to_owned()
+                    "Master".to_owned()
                 } else {
                     let selected_index = channel_names
                         .iter()
@@ -3585,7 +3667,7 @@ impl ShadeApp {
                             .selectable_value(
                                 &mut self.project.test_code.channel,
                                 TEST_CODE_ALL_CHANNELS.to_owned(),
-                                "All channels",
+                                "Master",
                             )
                             .changed();
                         ui.separator();
@@ -3794,10 +3876,11 @@ impl ShadeApp {
         }
 
         ui.separator();
+        let mut tonal_display_changed = false;
         ui.horizontal(|ui| {
             ui.strong("Histogram");
             let label = if self.settings.show_all_histograms {
-                "All channels"
+                "Master"
             } else {
                 "Selected"
             };
@@ -3805,7 +3888,13 @@ impl ShadeApp {
                 self.settings.show_all_histograms = !self.settings.show_all_histograms;
                 self.save_settings_quietly();
             }
+            ui.separator();
+            tonal_display_changed |=
+                tonal_display_mode_selector(ui, &mut self.settings.tonal_display_mode);
         });
+        if tonal_display_changed {
+            self.save_settings_quietly();
+        }
         if self.settings.show_all_histograms {
             for (index, name) in channel_names.iter().enumerate() {
                 let accent = self.settings.colorize_histograms.then(|| {
@@ -3823,6 +3912,7 @@ impl ShadeApp {
                     original_histograms.get(index),
                     adjusted_histograms.get(index),
                     accent,
+                    self.settings.tonal_display_mode,
                 );
             }
         } else {
@@ -3843,6 +3933,7 @@ impl ShadeApp {
                 original_histograms.get(index),
                 adjusted_histograms.get(index),
                 accent,
+                self.settings.tonal_display_mode,
             );
         }
     }
@@ -3898,6 +3989,7 @@ impl ShadeApp {
             .get(MASTER_ADJUSTMENT_KEY)
             .is_some_and(master_adjustment_is_modified);
 
+        let mut tonal_display_changed = false;
         ui.horizontal(|ui| {
             ui.heading("Adjustments");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3910,14 +4002,20 @@ impl ShadeApp {
                     self.settings.adjustment_tabs = !self.settings.adjustment_tabs;
                     self.save_settings_quietly();
                 }
+                ui.separator();
+                tonal_display_changed |=
+                    tonal_display_mode_selector(ui, &mut self.settings.tonal_display_mode);
             });
         });
+        if tonal_display_changed {
+            self.save_settings_quietly();
+        }
         ui.horizontal_wrapped(|ui| {
             let mut all_channels = self.adjustment_scope == AdjustmentScope::All;
             let all_label = if master_modified {
-                "All channels  •   (~)"
+                "Master  •   (~)"
             } else {
-                "All channels   (~)"
+                "Master   (~)"
             };
             if ui.checkbox(&mut all_channels, all_label).changed() {
                 self.adjustment_scope = if all_channels {
@@ -3986,7 +4084,7 @@ impl ShadeApp {
                                 header_changed |= ui.checkbox(enabled, "Enabled").changed();
                             }
                             AdjustmentScope::All => {
-                                ui.strong("Editing: All channels / Master");
+                                ui.strong("Editing: Master");
                                 match self.tool {
                                     ToolPanel::Levels | ToolPanel::Curves => {
                                         let mut master_enabled = self
@@ -4101,6 +4199,7 @@ impl ShadeApp {
     ) -> bool {
         let mut changed = false;
         let compact_curve_controls = self.settings.compact_curve_controls;
+        let tonal_display_mode = self.settings.tonal_display_mode;
         let adjustment = self
             .project
             .adjustments
@@ -4125,6 +4224,7 @@ impl ShadeApp {
                         histogram_before.filter(|_| self.settings.show_curve_histogram),
                         histogram_after.filter(|_| self.settings.show_curve_histogram),
                         accent,
+                        tonal_display_mode,
                         compact_curve_controls,
                         false,
                     ),
@@ -4173,6 +4273,7 @@ impl ShadeApp {
                             histogram_before.filter(|_| self.settings.show_curve_histogram),
                             histogram_after.filter(|_| self.settings.show_curve_histogram),
                             accent,
+                            tonal_display_mode,
                             compact_curve_controls,
                             false,
                         )
@@ -4198,8 +4299,9 @@ impl ShadeApp {
     ) -> bool {
         let mut changed = false;
         let compact_curve_controls = self.settings.compact_curve_controls;
+        let tonal_display_mode = self.settings.tonal_display_mode;
         ui.small(
-            "Master Levels and Master Curve are independent All Channels controls. They stack with per-channel edits and never overwrite them. Mixer output rows remain channel-specific.",
+            "Master Levels and Master Curve are independent Master controls. They stack with per-channel edits and never overwrite them. Mixer output rows remain channel-specific.",
         );
 
         let master_histogram_before = self
@@ -4230,6 +4332,7 @@ impl ShadeApp {
                     &mut self.project.adjustments,
                     master_histogram_before.as_ref(),
                     master_histogram_after.as_ref(),
+                    tonal_display_mode,
                     compact_curve_controls,
                 ),
                 ToolPanel::Mixer => all_mixers_ui(
@@ -4241,13 +4344,10 @@ impl ShadeApp {
                 ),
             };
         } else {
-            let (body_changed, reset) = adjustment_foldout(
-                ui,
-                "master-levels-section",
-                "Master Levels - All channels",
-                true,
-                |ui| master_levels_ui(ui, &mut self.project.adjustments),
-            );
+            let (body_changed, reset) =
+                adjustment_foldout(ui, "master-levels-section", "Master Levels", true, |ui| {
+                    master_levels_ui(ui, &mut self.project.adjustments)
+                });
             changed |= body_changed.unwrap_or(false);
             if reset {
                 reset_master_levels(&mut self.project.adjustments);
@@ -4277,21 +4377,17 @@ impl ShadeApp {
             }
 
             ui.add_space(4.0);
-            let (body_changed, reset) = adjustment_foldout(
-                ui,
-                "master-curve-section",
-                "Master Curve - All channels",
-                true,
-                |ui| {
+            let (body_changed, reset) =
+                adjustment_foldout(ui, "master-curve-section", "Master Curve", true, |ui| {
                     master_curve_ui(
                         ui,
                         &mut self.project.adjustments,
                         master_histogram_before.as_ref(),
                         master_histogram_after.as_ref(),
+                        tonal_display_mode,
                         compact_curve_controls,
                     )
-                },
-            );
+                });
             changed |= body_changed.unwrap_or(false);
             if reset {
                 reset_master_curve(&mut self.project.adjustments);
@@ -5963,7 +6059,9 @@ impl ShadeApp {
                         ui.label("F  Fit image   |   G  Settings");
                         ui.end_row();
                         ui.strong("Channels");
-                        ui.label("1-9  Select channel   |   ~  All channels   |   S  Solo channel");
+                        ui.label(
+                            "1-9  Select channel   |   ~  Toggle Master   |   S  Solo channel",
+                        );
                         ui.end_row();
                         ui.strong("Snapshot");
                         ui.label("Ctrl+Enter  Update active Snapshot");
@@ -6070,7 +6168,7 @@ impl eframe::App for ShadeApp {
         self.ui_tiff_inspector_window(ui.ctx());
         self.ui_backup_restore_window(ui.ctx());
         self.ui_recovery_window(ui.ctx());
-        self.ui_snapshot_discard_confirmation(ui.ctx());
+        self.ui_snapshot_update_confirmation(ui.ctx());
         self.ui_snapshot_save_reminder(ui.ctx());
         self.ui_project_transition_confirmation(ui.ctx());
         self.commit_pending_history(ui.ctx(), false);
@@ -6456,11 +6554,51 @@ fn set_curve_point(curve: &mut model::Curve, point: CurvePointKind, input: f32, 
     }
 }
 
-fn curve_point_screen(rect: egui::Rect, input: f32, output: f32) -> egui::Pos2 {
+fn tonal_display_value(value: f32, mode: TonalDisplayMode) -> f32 {
+    match mode {
+        TonalDisplayMode::Light => value.clamp(0.0, 1.0),
+        TonalDisplayMode::Pigment => 1.0 - value.clamp(0.0, 1.0),
+    }
+}
+
+fn tonal_working_value(value: f32, mode: TonalDisplayMode) -> f32 {
+    // Light and Pigment are inverse presentation transforms. Pigment mirrors
+    // both axes while keeping all production adjustment math in working space.
+    tonal_display_value(value, mode)
+}
+
+fn curve_point_screen(
+    rect: egui::Rect,
+    input: f32,
+    output: f32,
+    mode: TonalDisplayMode,
+) -> egui::Pos2 {
+    let display_input = tonal_display_value(input, mode);
+    let display_output = tonal_display_value(output, mode);
     egui::pos2(
-        egui::lerp(rect.x_range(), input.clamp(0.0, 1.0)),
-        egui::lerp(rect.bottom()..=rect.top(), output.clamp(0.0, 1.0)),
+        egui::lerp(rect.x_range(), display_input),
+        egui::lerp(rect.bottom()..=rect.top(), display_output),
     )
+}
+
+fn nudge_curve_point(
+    curve: &mut model::Curve,
+    selected: CurvePointKind,
+    horizontal_units: i32,
+    vertical_units: i32,
+    mode: TonalDisplayMode,
+) {
+    let (input, output) = curve_point_xy(*curve, selected);
+    let mut display_input = tonal_display_value(input, mode);
+    let mut display_output = tonal_display_value(output, mode);
+    display_input += horizontal_units as f32 / 255.0;
+    display_output += vertical_units as f32 / 255.0;
+    set_curve_point(
+        curve,
+        selected,
+        tonal_working_value(display_input, mode),
+        tonal_working_value(display_output, mode),
+    );
 }
 
 fn curve_editor_graph(
@@ -6470,6 +6608,7 @@ fn curve_editor_graph(
     histogram_after: Option<&[u32; 256]>,
     accent: Option<egui::Color32>,
     neutral_histogram: bool,
+    display_mode: TonalDisplayMode,
 ) -> (bool, CurvePointKind) {
     let desired = egui::vec2(ui.available_width().min(340.0).max(150.0), 210.0);
     let (rect, graph_response) = ui.allocate_exact_size(desired, egui::Sense::click());
@@ -6497,7 +6636,7 @@ fn curve_editor_graph(
             continue;
         }
         let (input, output) = curve_point_xy(*curve, point);
-        let center = curve_point_screen(rect, input, output);
+        let center = curve_point_screen(rect, input, output, display_mode);
         let hit_rect = egui::Rect::from_center_size(center, egui::vec2(22.0, 22.0));
         let response = ui.interact(
             hit_rect,
@@ -6519,9 +6658,14 @@ fn curve_editor_graph(
         }
         if response.dragged() {
             if let Some(pointer) = response.interact_pointer_pos() {
-                let input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                let output = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
-                set_curve_point(curve, point, input, output);
+                let display_input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let display_output = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
+                set_curve_point(
+                    curve,
+                    point,
+                    tonal_working_value(display_input, display_mode),
+                    tonal_working_value(display_output, display_mode),
+                );
                 selected = point;
                 ui.data_mut(|data| data.insert_temp(selection_id, point));
                 changed = true;
@@ -6531,11 +6675,12 @@ fn curve_editor_graph(
 
     if !curve.midpoint_enabled && !midpoint_removed_this_frame && graph_response.double_clicked() {
         if let Some(pointer) = graph_response.interact_pointer_pos() {
-            let input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let display_input = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let input = tonal_working_value(display_input, display_mode);
             let gap = 1.0 / 255.0;
             if input > curve.input_black + gap && input < curve.input_white - gap {
                 let output = model::curve_linear_output(input, *curve);
-                let line_point = curve_point_screen(rect, input, output);
+                let line_point = curve_point_screen(rect, input, output, display_mode);
                 if pointer.distance(line_point) <= 16.0 {
                     curve.midpoint_enabled = true;
                     curve.midpoint_input = input;
@@ -6559,21 +6704,22 @@ fn curve_editor_graph(
             )
         });
         if left || right || up || down {
-            let step = if shift { 10.0 / 255.0 } else { 1.0 / 255.0 };
-            let (mut input_value, mut output_value) = curve_point_xy(*curve, selected);
-            if left {
-                input_value -= step;
-            }
-            if right {
-                input_value += step;
-            }
-            if up {
-                output_value += step;
-            }
-            if down {
-                output_value -= step;
-            }
-            set_curve_point(curve, selected, input_value, output_value);
+            let units = if shift { 10 } else { 1 };
+            let horizontal = if left {
+                -units
+            } else if right {
+                units
+            } else {
+                0
+            };
+            let vertical = if down {
+                -units
+            } else if up {
+                units
+            } else {
+                0
+            };
+            nudge_curve_point(curve, selected, horizontal, vertical, display_mode);
             changed = true;
         }
     }
@@ -6607,7 +6753,10 @@ fn curve_editor_graph(
         ] {
             if let Some(bins) = bins {
                 for (index, value) in bins.iter().enumerate() {
-                    let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
+                    let x = egui::lerp(
+                        rect.x_range(),
+                        tonal_display_value(index as f32 / 255.0, display_mode),
+                    );
                     let h = *value as f32 / max_value * rect.height();
                     painter.line_segment(
                         [
@@ -6632,7 +6781,7 @@ fn curve_editor_graph(
     for step in 0..=128 {
         let x = step as f32 / 128.0;
         let y = model::apply_curve(x, *curve);
-        let point = curve_point_screen(rect, x, y);
+        let point = curve_point_screen(rect, x, y, display_mode);
         if let Some(previous) = last {
             painter.line_segment([previous, point], egui::Stroke::new(2.0, curve_color));
         }
@@ -6643,7 +6792,7 @@ fn curve_editor_graph(
             continue;
         }
         let (input, output) = curve_point_xy(*curve, point);
-        let center = curve_point_screen(rect, input, output);
+        let center = curve_point_screen(rect, input, output, display_mode);
         let is_selected = point == selected;
         let radius = if is_selected { 6.5 } else { 5.0 };
         let fill = if is_selected {
@@ -6666,10 +6815,11 @@ fn curve_point_fields(
     ui: &mut egui::Ui,
     curve: &mut model::Curve,
     selected: CurvePointKind,
+    display_mode: TonalDisplayMode,
 ) -> bool {
     let (input, output) = curve_point_xy(*curve, selected);
-    let mut input_value = (input * 255.0).round() as i32;
-    let mut output_value = (output * 255.0).round() as i32;
+    let mut input_value = (tonal_display_value(input, display_mode) * 255.0).round() as i32;
+    let mut output_value = (tonal_display_value(output, display_mode) * 255.0).round() as i32;
     ui.small(selected.label());
     let mut input_changed = false;
     let mut output_changed = false;
@@ -6695,8 +6845,8 @@ fn curve_point_fields(
         set_curve_point(
             curve,
             selected,
-            input_value as f32 / 255.0,
-            output_value as f32 / 255.0,
+            tonal_working_value(input_value as f32 / 255.0, display_mode),
+            tonal_working_value(output_value as f32 / 255.0, display_mode),
         );
         true
     } else {
@@ -6710,6 +6860,7 @@ fn curves_ui(
     histogram_before: Option<&[u32; 256]>,
     histogram_after: Option<&[u32; 256]>,
     accent: Option<egui::Color32>,
+    display_mode: TonalDisplayMode,
     compact_controls: bool,
     neutral_histogram: bool,
 ) -> bool {
@@ -6721,6 +6872,7 @@ fn curves_ui(
             histogram_after,
             accent,
             neutral_histogram,
+            display_mode,
         );
         if histogram_before.is_some() && histogram_after.is_some() {
             ui.horizontal(|ui| {
@@ -6736,9 +6888,9 @@ fn curves_ui(
         let mut changed = graph_changed;
         if !compact_controls {
             ui.add_space(6.0);
-            changed |= curve_point_fields(ui, &mut adjustment.curve, selected);
+            changed |= curve_point_fields(ui, &mut adjustment.curve, selected, display_mode);
             ui.add_space(4.0);
-            ui.small("Double-click the Curve line to add the midpoint; double-click the midpoint to remove it. Drag active points directly. Input / Output use Photoshop-style 0-255 values.");
+            ui.small("Double-click the Curve line to add the midpoint; double-click the midpoint to remove it. Arrow keys move the selected point by 1; Shift+Arrow moves by 10. Input / Output stay 0-255 in both Light and Pigment display modes.");
         }
         changed
     })
@@ -6819,6 +6971,7 @@ fn master_curve_ui(
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
     histogram_before: Option<&[u32; 256]>,
     histogram_after: Option<&[u32; 256]>,
+    display_mode: TonalDisplayMode,
     compact_controls: bool,
 ) -> bool {
     let mut draft = adjustments
@@ -6831,6 +6984,7 @@ fn master_curve_ui(
         histogram_before,
         histogram_after,
         Some(ui.visuals().text_color()),
+        display_mode,
         compact_controls,
         true,
     ) {
@@ -6870,6 +7024,21 @@ fn all_mixers_ui(
             changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);
         });
     }
+    changed
+}
+
+fn tonal_display_mode_selector(ui: &mut egui::Ui, mode: &mut TonalDisplayMode) -> bool {
+    let mut changed = false;
+    changed |= ui
+        .selectable_value(mode, TonalDisplayMode::Light, "Light")
+        .on_hover_text(
+            "Light: 0 is black and 255 is white, matching the current Shade Editor display.",
+        )
+        .changed();
+    changed |= ui
+        .selectable_value(mode, TonalDisplayMode::Pigment, "Pigment")
+        .on_hover_text("Pigment: mirrors Curve axes and histograms like Photoshop Pigment/Ink, while keeping the labels 0-255. TIFF adjustment math is unchanged.")
+        .changed();
     changed
 }
 
@@ -7375,6 +7544,55 @@ fn snapshot_row_with_actions(
     (row_response, export_clicked, folder_clicked)
 }
 
+#[cfg(test)]
+mod tonal_curve_interaction_tests {
+    use super::{CurvePointKind, TonalDisplayMode, nudge_curve_point, tonal_display_value};
+    use crate::model::Curve;
+
+    #[test]
+    fn light_and_pigment_are_inverse_display_coordinates() {
+        assert!((tonal_display_value(0.25, TonalDisplayMode::Light) - 0.25).abs() < 1e-6);
+        assert!((tonal_display_value(0.25, TonalDisplayMode::Pigment) - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arrow_nudge_is_one_unit_and_shift_nudge_can_be_ten() {
+        let mut curve = Curve::default();
+        curve.midpoint_enabled = true;
+        nudge_curve_point(
+            &mut curve,
+            CurvePointKind::Midpoint,
+            1,
+            0,
+            TonalDisplayMode::Light,
+        );
+        assert!((curve.midpoint_input - (0.5 + 1.0 / 255.0)).abs() < 1e-5);
+        nudge_curve_point(
+            &mut curve,
+            CurvePointKind::Midpoint,
+            0,
+            10,
+            TonalDisplayMode::Light,
+        );
+        assert!((curve.midpoint - (0.5 + 10.0 / 255.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pigment_arrow_direction_matches_the_mirrored_graph() {
+        let mut curve = Curve::default();
+        curve.midpoint_enabled = true;
+        nudge_curve_point(
+            &mut curve,
+            CurvePointKind::Midpoint,
+            1,
+            10,
+            TonalDisplayMode::Pigment,
+        );
+        assert!((curve.midpoint_input - (0.5 - 1.0 / 255.0)).abs() < 1e-5);
+        assert!((curve.midpoint - (0.5 - 10.0 / 255.0)).abs() < 1e-5);
+    }
+}
+
 fn snapshot_day_time(created_at_unix_ms: i64) -> (String, String) {
     if created_at_unix_ms <= 0 {
         return ("Earlier snapshots".to_owned(), "-".to_owned());
@@ -7393,6 +7611,7 @@ fn draw_histogram(
     original: Option<&[u32; 256]>,
     adjusted: Option<&[u32; 256]>,
     accent: Option<egui::Color32>,
+    display_mode: TonalDisplayMode,
 ) {
     let desired = egui::vec2(ui.available_width().max(80.0), 105.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
@@ -7414,7 +7633,10 @@ fn draw_histogram(
     let original_color = ui.visuals().weak_text_color();
     let adjusted_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
     for index in 0..256 {
-        let x = egui::lerp(rect.x_range(), index as f32 / 255.0);
+        let x = egui::lerp(
+            rect.x_range(),
+            tonal_display_value(index as f32 / 255.0, display_mode),
+        );
         if let Some(bins) = original {
             let h = bins[index] as f32 / max_value * rect.height();
             painter.line_segment(
