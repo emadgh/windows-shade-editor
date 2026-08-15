@@ -21,6 +21,7 @@ Legacy version-suffixed implementations were removed. Active modules have canoni
 - `color_management.rs` — embedded/assigned ICC preview transforms and installed Windows profile discovery.
 - `tiff_io.rs` — TIFF decode, channel discovery, Photoshop resources, Spot polarity and metadata.
 - `render.rs` — preview adjustment pipeline, clipping estimates and RGB/Spot composition.
+- `snapshot_preview_cache.rs` — bounded in-memory LRU for per-Snapshot/Face/display-mode preview textures and compact histogram/clipping state.
 - `export.rs` — full-resolution production TIFF renderer/writer.
 - `validation.rs` — production round-trip comparison.
 - `settings.rs` — application-only preferences such as layout, diagnostics, palettes and export defaults.
@@ -70,6 +71,12 @@ adjusted base RGB/CMYK/Gray
 Solo-channel view intentionally remains an engineering separation view, not a colorimetric composite.
 
 Assigned ICC is an **input/source-profile override for preview**. Printer/RIP Soft Proof is a separate project-owned output-device ICC using a LittleCMS proofing transform. Both remain display-only and are forbidden inputs to `export.rs`.
+
+## Snapshot preview cache
+
+Repeated Snapshot comparison is session-local and render-cached. After the first successful render of a clean saved Snapshot, the adjusted preview texture plus compact histogram/clipping/color-status state is cached by Snapshot ID, Face index and Composite/Solo display mode. Switching back to a cached state reuses that immutable texture immediately instead of re-running the adjustment and color-management pipeline.
+
+Dirty uncommitted edits never replace the saved Snapshot cache entry. `Update` explicitly refreshes the active Snapshot's cache with its latest committed render. Project/session transitions, Face topology or relink changes, preview rebuilds and ICC/display-preview invalidation clear runtime cache state. The cache is memory-only, never serialized into `.shade`, and is bounded to 32 entries / approximately 256 MiB with LRU eviction.
 
 ## ICC profile catalog
 
