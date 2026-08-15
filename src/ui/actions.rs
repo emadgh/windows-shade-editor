@@ -46,6 +46,21 @@ pub(crate) enum ProjectViewUiAction {
     Open(String),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExportQueueUiAction {
+    SetOpen(bool),
+    ResumeRecovered,
+    TogglePaused,
+    RetryAllFailed,
+    CancelAllWaiting,
+    ClearCompleted,
+    ClearFailed,
+    Resume(u64),
+    Cancel(u64),
+    Retry(u64),
+    RevealFolder(PathBuf),
+}
+
 impl ShadeApp {
     pub(crate) fn dispatch_face_ui_action(&mut self, action: FaceUiAction) {
         match action {
@@ -192,6 +207,44 @@ impl ShadeApp {
             }
         }
     }
+
+    pub(crate) fn dispatch_export_queue_ui_action(&mut self, action: ExportQueueUiAction) {
+        match action {
+            ExportQueueUiAction::SetOpen(open) => self.export.show_queue = open,
+            ExportQueueUiAction::ResumeRecovered => {
+                let count = self.export.queue.resume_recovered();
+                if count > 0 {
+                    self.report_info(format!("Resumed {count} recovered export(s)"));
+                }
+            }
+            ExportQueueUiAction::TogglePaused => {
+                let paused = !self.export.queue.is_paused();
+                self.export.queue.set_paused(paused);
+                self.report_info(if paused {
+                    "Export Queue paused; current atomic export may finish safely"
+                } else {
+                    "Export Queue resumed"
+                });
+            }
+            ExportQueueUiAction::RetryAllFailed => {
+                let count = self.export.queue.retry_all_failed();
+                if count > 0 {
+                    self.report_info(format!("Retried {count} failed export(s)"));
+                }
+            }
+            ExportQueueUiAction::CancelAllWaiting => self.export.queue.cancel_all_waiting(),
+            ExportQueueUiAction::ClearCompleted => self.export.queue.clear_completed(),
+            ExportQueueUiAction::ClearFailed => self.export.queue.clear_failed(),
+            ExportQueueUiAction::Resume(id) => self.export.queue.resume(id),
+            ExportQueueUiAction::Cancel(id) => self.export.queue.cancel(id),
+            ExportQueueUiAction::Retry(id) => self.export.queue.retry(id),
+            ExportQueueUiAction::RevealFolder(folder) => {
+                if let Err(err) = open_folder(&folder) {
+                    self.report_error(err);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +272,16 @@ mod tests {
         assert_eq!(
             NavigationUiAction::OpenRecent(path.clone()),
             NavigationUiAction::OpenRecent(path)
+        );
+    }
+
+    #[test]
+    fn export_queue_actions_preserve_job_and_folder_payloads() {
+        assert_eq!(ExportQueueUiAction::Retry(42), ExportQueueUiAction::Retry(42));
+        let folder = PathBuf::from(r"C:\exports\batch-42");
+        assert_eq!(
+            ExportQueueUiAction::RevealFolder(folder.clone()),
+            ExportQueueUiAction::RevealFolder(folder)
         );
     }
 }
