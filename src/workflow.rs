@@ -15,7 +15,7 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
     if app.project.update_snapshot(active_id) {
         app.snapshot_preview_cache.remove_snapshot(active_id);
         app.cache_current_snapshot_preview_if_ready();
-        app.project_dirty = true;
+        app.mark_project_dirty();
         app.report_info("Snapshot updated · preview cache refreshed");
     }
 }
@@ -334,7 +334,7 @@ pub(super) fn apply_relinked_face(
                 app.solo_channel = None;
                 app.fit_requested = true;
                 app.viewport_recenter = true;
-                app.project_dirty = true;
+                app.mark_project_dirty();
                 app.report_info("Face relinked and verified");
             }
         }
@@ -359,7 +359,7 @@ pub(super) fn apply_relinked_folder(
     }
     if relinked > 0 {
         app.snapshot_preview_cache.clear();
-        app.project_dirty = true;
+        app.mark_project_dirty();
         app.fit_requested = true;
         app.viewport_recenter = true;
         app.report_info(format!("Relinked and verified {relinked} missing Face(s)"));
@@ -382,7 +382,7 @@ pub(super) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
         )
         .changed()
     {
-        app.project_dirty = true;
+        app.mark_project_dirty();
     }
     ui.add_space(4.0);
     ui.separator();
