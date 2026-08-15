@@ -232,12 +232,24 @@ impl ShadeApp {
                     self.report_info(format!("Retried {count} failed export(s)"));
                 }
             }
-            ExportQueueUiAction::CancelAllWaiting => self.export.queue.cancel_all_waiting(),
-            ExportQueueUiAction::ClearCompleted => self.export.queue.clear_completed(),
-            ExportQueueUiAction::ClearFailed => self.export.queue.clear_failed(),
-            ExportQueueUiAction::Resume(id) => self.export.queue.resume(id),
-            ExportQueueUiAction::Cancel(id) => self.export.queue.cancel(id),
-            ExportQueueUiAction::Retry(id) => self.export.queue.retry(id),
+            ExportQueueUiAction::CancelAllWaiting => {
+                self.export.queue.cancel_all_waiting();
+            }
+            ExportQueueUiAction::ClearCompleted => {
+                self.export.queue.clear_completed();
+            }
+            ExportQueueUiAction::ClearFailed => {
+                self.export.queue.clear_failed();
+            }
+            ExportQueueUiAction::Resume(id) => {
+                self.export.queue.resume(id);
+            }
+            ExportQueueUiAction::Cancel(id) => {
+                self.export.queue.cancel(id);
+            }
+            ExportQueueUiAction::Retry(id) => {
+                self.export.queue.retry(id);
+            }
             ExportQueueUiAction::RevealFolder(folder) => {
                 if let Err(err) = open_folder(&folder) {
                     self.report_error(err);
