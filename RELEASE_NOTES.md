@@ -1,3 +1,11 @@
+# Shade Editor 0.20.0
+
+- Introduce typed Face, navigation and Project View UI actions so egui presentation code no longer directly orchestrates save/export/delete/relink/lifecycle operations.
+- Centralize action dispatch in `src/ui/actions.rs` while preserving the existing project lifecycle, export, Face status, relink and autosave safety paths.
+- Make project-title edits emit a typed rename action so revision-aware dirty tracking remains application-owned.
+- Add architecture regression coverage that rejects high-risk direct cross-domain mutations from `ui/faces.rs` and `ui/project_navigation.rs`.
+- No intended editing, color, TIFF or export behavior change.
+
 # Shade Editor 0.19.2
 
 - Complete the main target set from Issue #40 by extracting Faces, Curve editing, Project View/Recent navigation and the typed input router into focused `src/ui` modules.

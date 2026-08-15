@@ -1,8 +1,10 @@
+use super::actions::{NavigationUiAction, ProjectViewUiAction};
 use crate::*;
 use eframe::egui;
 
 impl ShadeApp {
     pub(crate) fn ui_toolbar(&mut self, ui: &mut egui::Ui) {
+        let mut actions = Vec::new();
         let mut dismiss_error = false;
         let mut inspect_requested = false;
         let mut queue_requested = false;
@@ -18,10 +20,10 @@ impl ShadeApp {
                 let enabled = self.job.is_none() && !self.project_autosave_busy;
                 ui.menu_button("File", |ui| {
                     if ui.add_enabled(enabled, egui::Button::new("New project")).clicked() {
-                        self.new_project();
+                        actions.push(NavigationUiAction::NewProject);
                     }
                     if ui.add_enabled(enabled, egui::Button::new("Open .shade...")).clicked() {
-                        self.open_project_dialog();
+                        actions.push(NavigationUiAction::OpenProjectDialog);
                     }
                     ui.menu_button("Recent projects", |ui| {
                         if recent_projects.is_empty() {
@@ -45,14 +47,14 @@ impl ShadeApp {
                         }
                     });
                     if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces...")).clicked() {
-                        self.add_faces_dialog();
+                        actions.push(NavigationUiAction::AddFacesDialog);
                     }
                     ui.separator();
                     if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() {
-                        self.save_project(false);
+                        actions.push(NavigationUiAction::Save);
                     }
                     if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save As...")).clicked() {
-                        self.save_project(true);
+                        actions.push(NavigationUiAction::SaveAs);
                     }
                     ui.separator();
                     if ui.button(app_features::TIFF_INSPECTOR_LABEL).clicked() {
@@ -62,17 +64,17 @@ impl ShadeApp {
                         queue_requested = true;
                     }
                 });
-                if ui.add_enabled(enabled, egui::Button::new("New")).clicked() { self.new_project(); }
-                if ui.add_enabled(enabled, egui::Button::new("Open .shade")).clicked() { self.open_project_dialog(); }
-                if ui.button("Project View").clicked() { self.show_previous_shades = true; }
-                if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces")).clicked() { self.add_faces_dialog(); }
+                if ui.add_enabled(enabled, egui::Button::new("New")).clicked() { actions.push(NavigationUiAction::NewProject); }
+                if ui.add_enabled(enabled, egui::Button::new("Open .shade")).clicked() { actions.push(NavigationUiAction::OpenProjectDialog); }
+                if ui.button("Project View").clicked() { actions.push(NavigationUiAction::ShowProjectView); }
+                if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces")).clicked() { actions.push(NavigationUiAction::AddFacesDialog); }
                 ui.separator();
-                if self.project_path.is_none() && ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Quick Save")).on_hover_text("Create the first .shade project beside the source TIFF files without opening a Save dialog").clicked() { self.quick_save_project(); }
-                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() { self.save_project(false); }
-                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save As")).clicked() { self.save_project(true); }
+                if self.project_path.is_none() && ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Quick Save")).on_hover_text("Create the first .shade project beside the source TIFF files without opening a Save dialog").clicked() { actions.push(NavigationUiAction::QuickSave); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() { actions.push(NavigationUiAction::Save); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save As")).clicked() { actions.push(NavigationUiAction::SaveAs); }
                 ui.separator();
-                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export face")).clicked() { self.export_current_dialog(); }
-                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export face")).clicked() { actions.push(NavigationUiAction::ExportCurrent); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export all")).clicked() { actions.push(NavigationUiAction::ExportAll); }
                 let queue_pending = self.export.queue.pending_count();
                 let queue_recovered = self.export.queue.recovered_waiting_count();
                 let queue_label = self.export.queue.compact_status().unwrap_or_else(|| {
@@ -82,11 +84,11 @@ impl ShadeApp {
                         format!("Queue ({queue_pending})")
                     }
                 });
-                if ui.button(queue_label).clicked() { self.export.show_queue = true; }
-                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Validate face")).on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.").clicked() { self.validate_current_face_dialog(); }
+                if ui.button(queue_label).clicked() { actions.push(NavigationUiAction::ShowExportQueue); }
+                if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Validate face")).on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.").clicked() { actions.push(NavigationUiAction::ValidateCurrent); }
                 ui.separator();
-                if ui.button("Settings").clicked() { self.show_settings = true; }
-                if ui.button("About").clicked() { self.show_about = true; }
+                if ui.button("Settings").clicked() { actions.push(NavigationUiAction::ShowSettings); }
+                if ui.button("About").clicked() { actions.push(NavigationUiAction::ShowAbout); }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (save_state, save_error) = self.project_save_state_label();
@@ -100,7 +102,7 @@ impl ShadeApp {
                     }
                 }
                 self.ui_operation_progress(ui);
-                if ui.small_button("Logs").clicked() { self.log_cache = self.log.read(); self.show_logs = true; }
+                if ui.small_button("Logs").clicked() { actions.push(NavigationUiAction::ShowLogs); }
                 self.ui_update_compact(ui);
                 if let Some(toast) = &self.toast {
                     ui.horizontal(|ui| {
@@ -114,19 +116,19 @@ impl ShadeApp {
             });
         });
         if inspect_requested {
-            self.inspect_tiff_dialog();
+            actions.push(NavigationUiAction::InspectTiff);
         }
         if queue_requested {
-            self.export.show_queue = true;
+            actions.push(NavigationUiAction::ShowExportQueue);
         }
         if let Some(path) = recent_requested {
-            self.request_project_transition(ProjectTransition::Open(path), Some(ui.ctx()));
+            actions.push(NavigationUiAction::OpenRecent(path));
         }
         if dismiss_error {
-            self.toast = None;
-            if self.status_message == "Error - see Logs" {
-                self.status_message = "Ready".to_owned();
-            }
+            actions.push(NavigationUiAction::DismissError);
+        }
+        for action in actions {
+            self.dispatch_navigation_ui_action(action, ui.ctx());
         }
     }
 
@@ -134,6 +136,7 @@ impl ShadeApp {
         if !self.show_previous_shades {
             return;
         }
+        let mut actions = Vec::new();
         let mut open = self.show_previous_shades;
         let query_before = self.previous_shades_query.clone();
         let mut requested_open: Option<String> = None;
@@ -553,54 +556,24 @@ impl ShadeApp {
                 }
             });
 
-        self.show_previous_shades = open;
+        actions.push(ProjectViewUiAction::SetOpen(open));
         if let Some(path) = requested_select {
-            if self.previous_shades_selected.as_deref() != Some(path.as_str()) {
-                self.load_previous_shade_preview(ctx, &path);
-            }
+            actions.push(ProjectViewUiAction::Select(path));
         }
         if let Some(path) = requested_reveal {
-            if let Err(err) = reveal_in_explorer(Path::new(&path)) {
-                self.report_error(err);
-            }
+            actions.push(ProjectViewUiAction::Reveal(path));
         }
-        if let Some(old_path) = requested_relink {
-            if let Some(new_path) = rfd::FileDialog::new()
-                .add_filter("Shade projects", &["shade"])
-                .pick_file()
-            {
-                match self.previous_shades.relink_path(&old_path, &new_path) {
-                    Ok(new_display) => {
-                        if let Err(err) = self.previous_shades.save() {
-                            self.log.error(&err);
-                        }
-                        self.previous_shade_list_textures.remove(&old_path);
-                        self.previous_shade_list_texture_lru
-                            .retain(|item| item != &old_path);
-                        self.load_previous_shade_preview(ctx, &new_display);
-                    }
-                    Err(err) => self.report_error(err),
-                }
-            }
+        if let Some(path) = requested_relink {
+            actions.push(ProjectViewUiAction::Relink(path));
         }
         if let Some(path) = requested_remove {
-            if self.previous_shades.remove_path(&path) {
-                if let Err(err) = self.previous_shades.save() {
-                    self.log.error(&err);
-                }
-                self.previous_shade_list_textures.remove(&path);
-                self.previous_shade_list_texture_lru
-                    .retain(|item| item != &path);
-                if self.previous_shades_selected.as_deref() == Some(path.as_str()) {
-                    self.previous_shades_selected = None;
-                    self.previous_shade_preview = None;
-                    self.previous_shade_preview_error = None;
-                    self.previous_shade_texture = None;
-                }
-            }
+            actions.push(ProjectViewUiAction::Remove(path));
         }
         if let Some(path) = requested_open {
-            self.request_project_transition(ProjectTransition::Open(PathBuf::from(path)), None);
+            actions.push(ProjectViewUiAction::Open(path));
+        }
+        for action in actions {
+            self.dispatch_project_view_ui_action(action, ctx);
         }
     }
 }

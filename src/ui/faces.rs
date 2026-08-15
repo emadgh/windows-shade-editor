@@ -1,4 +1,4 @@
-use crate::workflow::*;
+use super::actions::FaceUiAction;
 use crate::*;
 use eframe::egui;
 
@@ -17,16 +17,18 @@ fn duplicate_face_counts(faces: &[RuntimeFace]) -> BTreeMap<String, usize> {
 }
 
 pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
+    let mut actions = Vec::new();
     ui.label("Project title");
+    let mut project_name = app.project.name.clone();
     if ui
         .add(
-            egui::TextEdit::singleline(&mut app.project.name)
+            egui::TextEdit::singleline(&mut project_name)
                 .hint_text("Uses the .shade filename after first save")
                 .desired_width(f32::INFINITY),
         )
         .changed()
     {
-        app.mark_project_dirty();
+        actions.push(FaceUiAction::RenameProject(project_name));
     }
     ui.add_space(4.0);
     ui.separator();
@@ -151,37 +153,12 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
         }
 
         if let Some((index, status)) = requested_status {
-            if let Some(face) = app.project.faces.get_mut(index) {
-                if face.status != status {
-                    face.status = status;
-                    app.mark_project_dirty();
-                    app.report_info(match status {
-                        model::FaceStatus::Accepted => "Face marked Accepted — eligible for Export All",
-                        model::FaceStatus::Rejected => "Face marked Rejected — retained for reference and excluded from Export All",
-                    });
-                }
-            }
+            actions.push(FaceUiAction::SetStatus { index, status });
         }
         if let Some(index) = requested_delete {
-            app.current_face = index;
-            app.remove_current_face();
+            actions.push(FaceUiAction::Delete(index));
         } else if let Some(index) = requested_face {
-            app.current_face = index;
-            app.selected_channel = 0;
-            app.solo_channel = None;
-            app.fit_requested = true;
-            app.viewport_recenter = true;
-            app.mark_current_preview_dirty();
-            if app
-                .project
-                .faces
-                .get(index)
-                .is_some_and(|face| face.status.is_rejected())
-            {
-                app.report_info(
-                    "Warning: selected Face is Rejected and is excluded from Export All",
-                );
-            }
+            actions.push(FaceUiAction::Select(index));
         }
         ui.add_space(4.0);
         let active_missing = app
@@ -207,11 +184,11 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
             remove = ui.button("Remove active face").clicked();
         });
         if locate_file {
-            relink_current_face_dialog(app);
+            actions.push(FaceUiAction::RelinkCurrent);
         } else if locate_folder {
-            relink_missing_faces_folder_dialog(app);
+            actions.push(FaceUiAction::RelinkMissingFolder);
         } else if remove {
-            app.remove_current_face();
+            actions.push(FaceUiAction::Delete(app.current_face));
         }
     }
     ui.separator();
@@ -220,4 +197,7 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
     app.ui_test_code(ui);
     ui.separator();
     app.ui_history(ui);
+    for action in actions {
+        app.dispatch_face_ui_action(action);
+    }
 }
