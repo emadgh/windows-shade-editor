@@ -10,6 +10,7 @@ impl ContextKeyboardCompat for eframe::egui::Context {
     }
 }
 
+mod adjustment_tools;
 mod app_controllers;
 mod app_features;
 mod app_log;
@@ -289,6 +290,8 @@ struct ShadeApp {
     history_clear_backup: Option<(Option<u64>, history::AdjustmentHistory)>,
     history_pending_label: Option<String>,
     history_pending_at: Option<Instant>,
+    adjustment_clipboard: Option<adjustment_tools::AdjustmentClipboard>,
+    relative_preset_draft: Option<adjustment_tools::RelativePresetDraft>,
     recovery_candidate: Option<recovery::RecoveryFile>,
     autosave_tx: mpsc::Sender<Result<PathBuf, String>>,
     autosave_rx: mpsc::Receiver<Result<PathBuf, String>>,
@@ -379,6 +382,8 @@ impl ShadeApp {
             history_clear_backup: None,
             history_pending_label: None,
             history_pending_at: None,
+            adjustment_clipboard: None,
+            relative_preset_draft: None,
             recovery_candidate,
             autosave_tx,
             autosave_rx,
@@ -3977,6 +3982,237 @@ impl ShadeApp {
             );
         }
     }
+    fn ui_adjustment_quick_tools(
+        &mut self,
+        ui: &mut egui::Ui,
+        channel_names: &[String],
+        palette: Option<&ChannelPalette>,
+        output_name: &str,
+    ) -> bool {
+        let display_names = channel_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| channel_display_name(palette, name, index).to_owned())
+            .collect::<Vec<_>>();
+        let custom_presets = self.settings.relative_adjustment_presets.clone();
+        let mut changed = false;
+        let mut settings_changed = false;
+        let mut copy_part = None;
+        let mut paste_requested = false;
+        let scope_is_master = self.adjustment_scope == AdjustmentScope::All;
+        let source_adjustment = if scope_is_master {
+            self.project
+                .adjustments
+                .get(MASTER_ADJUSTMENT_KEY)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            self.project
+                .adjustments
+                .get(output_name)
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        egui::CollapsingHeader::new("Quick relative adjustments / Presets")
+            .id_salt("relative-adjustment-presets")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.small("Each click changes the current mixer intensity relatively; repeated clicks accumulate. Existing cross-channel mix values are not replaced.");
+                ui.horizontal_wrapped(|ui| {
+                    for preset in adjustment_tools::BUILTIN_RELATIVE_PRESETS {
+                        if ui.small_button(preset.label).clicked() {
+                            if adjustment_tools::apply_builtin(
+                                &mut self.project.adjustments,
+                                channel_names,
+                                &display_names,
+                                preset.id,
+                            ) {
+                                changed = true;
+                                self.report_info(format!("Applied {} relative adjustment", preset.label));
+                            } else {
+                                self.report_info(format!("{}: no matching channels in this project", preset.label));
+                            }
+                        }
+                    }
+                });
+
+                if !custom_presets.is_empty() {
+                    ui.add_space(5.0);
+                    ui.strong("Custom presets");
+                    for (index, preset) in custom_presets.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button(&preset.name).clicked()
+                                && adjustment_tools::apply_custom(
+                                    &mut self.project.adjustments,
+                                    channel_names,
+                                    preset,
+                                )
+                            {
+                                changed = true;
+                                self.report_info(format!("Applied relative preset: {}", preset.name));
+                            }
+                            if ui.small_button("Edit").clicked() {
+                                self.relative_preset_draft = Some(adjustment_tools::RelativePresetDraft {
+                                    name: preset.name.clone(),
+                                    channel_percent: preset.channel_percent.clone(),
+                                });
+                            }
+                            if ui.small_button("Delete").clicked() {
+                                if index < self.settings.relative_adjustment_presets.len() {
+                                    self.settings.relative_adjustment_presets.remove(index);
+                                    settings_changed = true;
+                                }
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.menu_button("Copy", |ui| {
+                        if ui.button("All adjustments").clicked() {
+                            copy_part = Some(adjustment_tools::ClipboardPart::All);
+                            ui.close();
+                        }
+                        if ui.button("Levels").clicked() {
+                            copy_part = Some(adjustment_tools::ClipboardPart::Levels);
+                            ui.close();
+                        }
+                        if ui.button("Curve").clicked() {
+                            copy_part = Some(adjustment_tools::ClipboardPart::Curve);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(!scope_is_master, egui::Button::new("Mixer"))
+                            .clicked()
+                        {
+                            copy_part = Some(adjustment_tools::ClipboardPart::Mixer);
+                            ui.close();
+                        }
+                    });
+                    let paste_label = self
+                        .adjustment_clipboard
+                        .as_ref()
+                        .map(|item| format!("Paste {}", item.label()))
+                        .unwrap_or_else(|| "Paste".to_owned());
+                    let paste_allowed = self.adjustment_clipboard.as_ref().is_some_and(|item| {
+                        !scope_is_master || !item.is_mixer_only()
+                    });
+                    paste_requested = ui
+                        .add_enabled(paste_allowed, egui::Button::new(paste_label))
+                        .clicked();
+                    if ui.small_button("New custom preset").clicked() {
+                        self.relative_preset_draft = Some(adjustment_tools::RelativePresetDraft {
+                            name: String::new(),
+                            channel_percent: channel_names
+                                .iter()
+                                .map(|name| (name.clone(), 0.0))
+                                .collect(),
+                        });
+                    }
+                });
+
+                let mut save_draft = false;
+                let mut cancel_draft = false;
+                if let Some(draft) = self.relative_preset_draft.as_mut() {
+                    ui.add_space(7.0);
+                    egui::Frame::new()
+                        .inner_margin(7)
+                        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                        .corner_radius(4)
+                        .show(ui, |ui| {
+                            ui.strong("Custom relative preset editor");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.name)
+                                    .hint_text("Preset name")
+                                    .desired_width(220.0),
+                            );
+                            ui.small("Relative percent per channel. Example: -2 means current value × 0.98; +2 means × 1.02.");
+                            for (index, channel) in channel_names.iter().enumerate() {
+                                let display = display_names.get(index).map(String::as_str).unwrap_or(channel);
+                                let value = draft.channel_percent.entry(channel.clone()).or_insert(0.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(display);
+                                    ui.add(
+                                        egui::DragValue::new(value)
+                                            .range(-25.0..=25.0)
+                                            .speed(0.25)
+                                            .suffix(" %"),
+                                    );
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                save_draft = ui
+                                    .add_enabled(!draft.name.trim().is_empty(), egui::Button::new("Save preset"))
+                                    .clicked();
+                                cancel_draft = ui.button("Cancel").clicked();
+                            });
+                        });
+                }
+                if save_draft {
+                    if let Some(draft) = self.relative_preset_draft.take() {
+                        let name = draft.name.trim().to_owned();
+                        let preset = adjustment_tools::RelativePreset {
+                            name: name.clone(),
+                            channel_percent: draft.channel_percent,
+                        };
+                        if let Some(existing) = self
+                            .settings
+                            .relative_adjustment_presets
+                            .iter_mut()
+                            .find(|item| item.name.eq_ignore_ascii_case(&name))
+                        {
+                            *existing = preset;
+                        } else {
+                            self.settings.relative_adjustment_presets.push(preset);
+                        }
+                        settings_changed = true;
+                    }
+                } else if cancel_draft {
+                    self.relative_preset_draft = None;
+                }
+            });
+
+        if let Some(part) = copy_part {
+            self.adjustment_clipboard = Some(adjustment_tools::AdjustmentClipboard::capture(
+                &source_adjustment,
+                part,
+            ));
+            if let Some(item) = &self.adjustment_clipboard {
+                self.report_info(format!("Copied {}", item.label()));
+            }
+        }
+        if paste_requested {
+            if let Some(clipboard) = self.adjustment_clipboard.clone() {
+                let target = if scope_is_master {
+                    self.project
+                        .adjustments
+                        .entry(MASTER_ADJUSTMENT_KEY.to_owned())
+                        .or_default()
+                } else {
+                    self.project
+                        .adjustments
+                        .entry(output_name.to_owned())
+                        .or_default()
+                };
+                if clipboard.paste_into(target, !scope_is_master) {
+                    changed = true;
+                    if scope_is_master {
+                        cleanup_master_adjustment(&mut self.project.adjustments);
+                    }
+                    self.report_info(format!("Pasted {}", clipboard.label()));
+                }
+            }
+        }
+        if settings_changed {
+            self.settings.sanitize();
+            self.save_settings_quietly();
+        }
+        changed
+    }
+
     fn ui_adjustments(&mut self, ui: &mut egui::Ui) {
         let adjustments_before = self.project.adjustments.clone();
         let Some(face) = self.faces.get(self.current_face) else {
@@ -4050,6 +4286,12 @@ impl ShadeApp {
         if tonal_display_changed {
             self.save_settings_quietly();
         }
+        let quick_changed =
+            self.ui_adjustment_quick_tools(ui, &channel_names, palette.as_ref(), &output_name);
+        if quick_changed {
+            self.mark_all_previews_dirty();
+        }
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             let mut all_channels = self.adjustment_scope == AdjustmentScope::All;
             let all_label = if master_modified {

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::adjustment_tools::RelativePreset;
 use crate::export_batch::{ConflictPolicy, DEFAULT_EXPORT_TEMPLATE, DEFAULT_FOLDER_TEMPLATE};
 use crate::model::IccProfileIdentity;
 use crate::palette::{
@@ -71,6 +72,7 @@ pub struct AppSettings {
     pub default_dpi: f64,
     pub default_palette_id: String,
     pub custom_palettes: Vec<ChannelPalette>,
+    pub relative_adjustment_presets: Vec<RelativePreset>,
 }
 
 impl Default for AppSettings {
@@ -102,6 +104,7 @@ impl Default for AppSettings {
             default_dpi: DEFAULT_DPI,
             default_palette_id: AUTO_PALETTE_ID.to_owned(),
             custom_palettes: Vec::new(),
+            relative_adjustment_presets: Vec::new(),
         }
     }
 }
@@ -172,6 +175,21 @@ impl AppSettings {
         {
             self.default_palette_id = AUTO_PALETTE_ID.to_owned();
         }
+
+        let mut preset_names = HashSet::new();
+        self.relative_adjustment_presets.retain_mut(|preset| {
+            preset.name = preset.name.trim().to_owned();
+            if preset.name.is_empty() || !preset_names.insert(preset.name.to_ascii_lowercase()) {
+                return false;
+            }
+            preset
+                .channel_percent
+                .retain(|channel, value| !channel.trim().is_empty() && value.is_finite());
+            for value in preset.channel_percent.values_mut() {
+                *value = value.clamp(-25.0, 25.0);
+            }
+            true
+        });
     }
 
     pub fn palette_library(&self) -> Vec<ChannelPalette> {
