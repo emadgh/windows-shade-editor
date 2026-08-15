@@ -7,5 +7,8 @@ Shade Editor's extracted egui modules render state and emit typed actions. Cross
 - `FaceUiAction` — rename/select/status/delete/relink.
 - `NavigationUiAction` — project lifecycle, save/export, queue, inspector, settings/about/logs.
 - `ProjectViewUiAction` — open/select/reveal/relink/remove Project View entries.
+- `ExportQueueUiAction` — window state plus resume/pause/retry/cancel/clear/reveal intents for queued exports.
+
+Export Queue presentation may read queue rows, progress, metrics and status counts, but mutation stays in the action dispatcher so persistence and atomic-export semantics remain owned by `ExportQueue`.
 
 Presentation modules may still own local widget state and read application state. They should not duplicate production safety rules or directly invoke lifecycle/export/destructive operations when a typed action exists.
