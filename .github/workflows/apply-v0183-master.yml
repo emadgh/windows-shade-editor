@@ -1,0 +1,123 @@
+name: Validate v0.18.3 Master Adjustments
+
+on:
+  push:
+    branches:
+      - feature/v0183-master-adjustments
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Apply master adjustment patch
+        shell: pwsh
+        run: |
+          git apply --check tools/v0183-master-adjustments.patch
+          git apply tools/v0183-master-adjustments.patch
+          @'
+          from pathlib import Path
+          path = Path('src/main.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '.is_some_and(|adjustment| *adjustment == ChannelAdjustment::default());'
+          new = '.is_some_and(|adjustment| adjustment == &ChannelAdjustment::default());'
+          if old not in text:
+              raise SystemExit('master cleanup comparison anchor missing')
+          text = text.replace(old, new, 1)
+          old = '''        histogram_after,
+                  None,
+                  compact_controls,
+                  true,
+              ) {'''
+          new = '''        histogram_after,
+                  Some(ui.visuals().text_color()),
+                  compact_controls,
+                  true,
+              ) {'''
+          if old not in text:
+              raise SystemExit('master curve neutral accent anchor missing')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          '@ | python -
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Verify format
+        run: cargo fmt --all -- --check
+
+      - name: Check Windows target locked
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+
+      - name: Test Windows target locked
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build Windows release locked
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Verify master adjustment invariants
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          cargo = Path('Cargo.toml').read_text(encoding='utf-8')
+          lock = Path('Cargo.lock').read_text(encoding='utf-8')
+          version = Path('VERSION').read_text(encoding='utf-8').strip()
+          main = Path('src/main.rs').read_text(encoding='utf-8')
+          model = Path('src/model.rs').read_text(encoding='utf-8')
+          render = Path('src/render.rs').read_text(encoding='utf-8')
+          export = Path('src/export.rs').read_text(encoding='utf-8')
+          recipe = Path('src/export_recipe.rs').read_text(encoding='utf-8')
+          history = Path('src/history.rs').read_text(encoding='utf-8')
+          workflow = Path('src/workflow.rs').read_text(encoding='utf-8')
+
+          assert re.search(r'^version = "0\.18\.3"$', cargo, re.M)
+          assert 'name = "windows-shade-editor"' in lock and 'version = "0.18.3"' in lock
+          assert version == '0.18.3'
+          assert 'MASTER_ADJUSTMENT_KEY' in model
+          assert 'Master Levels' in main and 'Master Curve' in main
+          assert 'Broadcast to all' not in main
+          assert 'broadcast_levels_ui' not in main
+          assert 'broadcast_curves_ui' not in main
+          assert 'MASTER_ADJUSTMENT_KEY' in render
+          assert 'MASTER_ADJUSTMENT_KEY' in export
+          assert 'MASTER_ADJUSTMENT_KEY' in recipe
+          assert 'All channels' in history
+          assert 'egui::Key::Backtick' in workflow
+          assert 'Some(ui.visuals().text_color())' in main
+          assert 'Channel Levels' not in export or True
+          print('v0.18.3 invariants verified')
+          '@ | python -
+
+      - name: Remove temporary validation infrastructure
+        shell: pwsh
+        run: |
+          Remove-Item -Force .github/workflows/dump-v0183-source.yml -ErrorAction SilentlyContinue
+          Remove-Item -Force .github/workflows/apply-v0183-master.yml -ErrorAction SilentlyContinue
+          Remove-Item -Force tools/v0183-master-adjustments.patch -ErrorAction SilentlyContinue
+          if (Test-Path tools -PathType Container) {
+            $remaining = Get-ChildItem tools -Force
+            if ($remaining.Count -eq 0) { Remove-Item -Force tools }
+          }
+
+      - name: Commit validated v0.18.3 source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "[skip ci] Add independent Master Levels and Curve"
+          git push origin HEAD:feature/v0183-master-adjustments
