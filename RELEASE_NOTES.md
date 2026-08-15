@@ -1,3 +1,10 @@
+# Shade Editor 0.19.1
+
+- Continue Issue #40 with a behavior-preserving UI decomposition pass: move History/Channels/Adjustments, Export Queue window and Status Bar methods out of the 300+ KB application shell into focused `src/ui` modules.
+- Add an architecture regression test that prevents the extracted UI methods from silently accumulating back inside `src/main.rs`.
+- Keep application/controller behavior unchanged; this release is intended as a structural maintainability update before further Face/Curve/Recent extraction.
+- Reduce `src/main.rs` from 8627 to 7458 lines in this pass.
+
 # Shade Editor 0.19.0
 
 - Centralize keyboard/focus ownership so Curve/editor shortcuts no longer leak into text fields or modal workflows; keep Curve Arrow/Shift+Arrow editing while adding Delete/Backspace midpoint removal and Home identity reset.
