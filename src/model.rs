@@ -146,10 +146,26 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FaceStatus {
+    #[default]
+    Accepted,
+    Rejected,
+}
+
+impl FaceStatus {
+    pub fn is_rejected(self) -> bool {
+        self == Self::Rejected
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FaceRef {
     pub path: String,
     pub label: String,
+    #[serde(default)]
+    pub status: FaceStatus,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1057,5 +1073,29 @@ mod tests {
         let error = ShadeProject::load(&path).unwrap_err();
         let _ = fs::remove_file(&path);
         assert!(error.contains("accepts schema 9 only"));
+    }
+}
+
+#[cfg(test)]
+mod face_status_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_face_without_status_defaults_to_accepted() {
+        let face: FaceRef = serde_json::from_str(r#"{"path":"face.tif","label":"Face 1"}"#)
+            .expect("legacy FaceRef should deserialize");
+        assert_eq!(face.status, FaceStatus::Accepted);
+    }
+
+    #[test]
+    fn rejected_status_round_trips() {
+        let face = FaceRef {
+            path: "face.tif".to_owned(),
+            label: "Face 1".to_owned(),
+            status: FaceStatus::Rejected,
+        };
+        let json = serde_json::to_string(&face).unwrap();
+        let loaded: FaceRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.status, FaceStatus::Rejected);
     }
 }

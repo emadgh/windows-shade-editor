@@ -939,6 +939,24 @@ impl ShadeApp {
             );
             return;
         }
+        if self
+            .project
+            .faces
+            .get(self.current_face)
+            .is_some_and(|face| face.status.is_rejected())
+        {
+            let answer = rfd::MessageDialog::new()
+                .set_title("Export rejected Face?")
+                .set_description(
+                    "This Face is marked Rejected and is normally excluded from production output. Export this Face anyway?",
+                )
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .set_level(rfd::MessageLevel::Warning)
+                .show();
+            if answer != rfd::MessageDialogResult::Yes {
+                return;
+            }
+        }
         let Some(face) = self.faces.get(self.current_face) else {
             return;
         };
@@ -1461,8 +1479,27 @@ impl ShadeApp {
         if self.job.is_some() || self.faces.is_empty() {
             return;
         }
-        if self.faces.iter().any(|face| !face.available) {
-            self.report_error("Export all requires every Face source TIFF to be available. Relink missing Faces first.");
+        let accepted_count = self
+            .project
+            .faces
+            .iter()
+            .filter(|face| !face.status.is_rejected())
+            .count();
+        if accepted_count == 0 {
+            self.report_error(
+                "Export all has no Accepted Faces. Re-accept at least one Face first.",
+            );
+            return;
+        }
+        if self.faces.iter().enumerate().any(|(index, face)| {
+            !self
+                .project
+                .faces
+                .get(index)
+                .is_some_and(|item| item.status.is_rejected())
+                && !face.available
+        }) {
+            self.report_error("Export all requires every Accepted Face source TIFF to be available. Relink missing Accepted Faces first.");
             return;
         }
         if self.export.all_folder.trim().is_empty() {
@@ -1498,21 +1535,45 @@ impl ShadeApp {
             ));
             return;
         }
-        if self.faces.iter().any(|face| !face.available) {
-            self.report_error("Export all requires every Face source TIFF to be available. Relink missing Faces first.");
-            return;
-        }
-
-        let sources = self
-            .faces
-            .iter()
-            .map(|face| face.path.clone())
-            .collect::<Vec<_>>();
-        let face_names = self
+        let accepted_count = self
             .project
             .faces
             .iter()
-            .map(|face| face.label.clone())
+            .filter(|face| !face.status.is_rejected())
+            .count();
+        if accepted_count == 0 {
+            self.report_error(
+                "Export all has no Accepted Faces. Re-accept at least one Face first.",
+            );
+            return;
+        }
+        if self.faces.iter().enumerate().any(|(index, face)| {
+            !self
+                .project
+                .faces
+                .get(index)
+                .is_some_and(|item| item.status.is_rejected())
+                && !face.available
+        }) {
+            self.report_error("Export all requires every Accepted Face source TIFF to be available. Relink missing Accepted Faces first.");
+            return;
+        }
+
+        let rejected_count = self
+            .project
+            .faces
+            .iter()
+            .filter(|face| face.status.is_rejected())
+            .count();
+        let export_faces = self
+            .faces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, face)| {
+                let project_face = self.project.faces.get(index)?;
+                (!project_face.status.is_rejected())
+                    .then(|| (index, face.path.clone(), project_face.label.clone()))
+            })
             .collect::<Vec<_>>();
         let shade_name = self
             .project_path
@@ -1537,11 +1598,9 @@ impl ShadeApp {
         let mut queued = 0usize;
         let mut skipped = 0usize;
 
-        for (index, source) in sources.iter().enumerate() {
-            let face_name = face_names
-                .get(index)
-                .map(String::as_str)
-                .filter(|name| !name.trim().is_empty())
+        for (original_index, source, configured_name) in &export_faces {
+            let face_name = (!configured_name.trim().is_empty())
+                .then_some(configured_name.as_str())
                 .or_else(|| source.file_stem().and_then(|value| value.to_str()))
                 .unwrap_or("face");
             let source_name = source
@@ -1553,7 +1612,7 @@ impl ShadeApp {
                 project_name: &project_name,
                 snapshot_name: &snapshot_name,
                 test_code: &test_code,
-                face_number: index + 1,
+                face_number: original_index + 1,
                 face_name,
                 source_name,
                 date: &date,
@@ -1604,15 +1663,23 @@ impl ShadeApp {
         }
         let _ = self.settings.save();
         if queued > 0 {
-            self.report_info(if skipped > 0 {
-                format!("Queued {queued} export(s) · skipped {skipped} existing file(s)")
-            } else {
-                format!("Queued {queued} export(s)")
-            });
-        } else if skipped > 0 {
-            self.report_info(format!(
-                "No exports queued · skipped {skipped} existing file(s)"
-            ));
+            let mut parts = vec![format!("Queued {queued} export(s)")];
+            if rejected_count > 0 {
+                parts.push(format!("excluded {rejected_count} Rejected Face(s)"));
+            }
+            if skipped > 0 {
+                parts.push(format!("skipped {skipped} existing file(s)"));
+            }
+            self.report_info(parts.join(" · "));
+        } else {
+            let mut parts = vec!["No exports queued".to_owned()];
+            if rejected_count > 0 {
+                parts.push(format!("excluded {rejected_count} Rejected Face(s)"));
+            }
+            if skipped > 0 {
+                parts.push(format!("skipped {skipped} existing file(s)"));
+            }
+            self.report_info(parts.join(" · "));
         }
     }
 
@@ -2084,6 +2151,7 @@ impl ShadeApp {
                     self.project.faces.push(model::FaceRef {
                         path: item.path.to_string_lossy().into_owned(),
                         label,
+                        status: model::FaceStatus::Accepted,
                     });
                     self.faces.push(Self::make_runtime_face(item));
                 }
@@ -2611,6 +2679,14 @@ impl ShadeApp {
         self.faces.remove(self.current_face);
         if self.current_face < self.project.faces.len() {
             self.project.faces.remove(self.current_face);
+        }
+        // A preview worker may still finish with the removed Face's old index.
+        // Invalidate every surviving generation before accepting any future result
+        // so a shifted Face can never receive stale pixels from that worker.
+        self.render_busy = None;
+        for face in &mut self.faces {
+            face.generation = face.generation.wrapping_add(1).max(1);
+            face.rendered_generation = 0;
         }
         self.current_face = self.current_face.min(self.faces.len().saturating_sub(1));
         self.selected_channel = 0;
@@ -7868,10 +7944,30 @@ fn clickable_row(
     accent: Option<egui::Color32>,
     height: f32,
 ) -> egui::Response {
+    clickable_row_tinted(ui, selected, left, trailing, accent, None, height)
+}
+
+fn clickable_row_tinted(
+    ui: &mut egui::Ui,
+    selected: bool,
+    left: &str,
+    trailing: Option<&str>,
+    accent: Option<egui::Color32>,
+    base_fill: Option<egui::Color32>,
+    height: f32,
+) -> egui::Response {
     let width = ui.available_width().max(1.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let visuals = ui.visuals();
-    let fill = if selected {
+    let fill = if let Some(base) = base_fill {
+        if selected {
+            base.gamma_multiply(1.35)
+        } else if response.hovered() {
+            base.gamma_multiply(1.18)
+        } else {
+            base
+        }
+    } else if selected {
         visuals.selection.bg_fill.gamma_multiply(0.72)
     } else if response.hovered() {
         visuals.widgets.hovered.bg_fill
