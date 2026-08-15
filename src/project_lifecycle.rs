@@ -26,6 +26,13 @@ impl ProjectTransition {
             Self::Recover => "recover",
         }
     }
+
+    /// Queued exports own immutable export recipes and can continue safely when
+    /// the active project changes. Only transitions that terminate the process
+    /// must wait for the queue to become idle.
+    pub fn blocks_on_export_queue(&self) -> bool {
+        matches!(self, Self::Exit)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -79,7 +86,7 @@ impl ProjectLifecycleController {
         if operation_busy {
             return TransitionRequest::BlockedByOperation;
         }
-        if export_queue_pending {
+        if export_queue_pending && transition.blocks_on_export_queue() {
             return TransitionRequest::BlockedByExportQueue;
         }
         if requires_save_confirmation(project_dirty, has_faces, has_saved_path) {
@@ -149,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn new_open_and_exit_share_the_same_guard() {
+    fn new_open_and_exit_share_the_same_dirty_guard() {
         for transition in [
             ProjectTransition::New,
             ProjectTransition::Open(PathBuf::from("other.shade")),
@@ -165,17 +172,60 @@ mod tests {
     }
 
     #[test]
-    fn queue_and_active_operation_block_every_destructive_transition() {
+    fn active_operation_blocks_every_destructive_transition() {
+        for transition in [
+            ProjectTransition::New,
+            ProjectTransition::Open(PathBuf::from("other.shade")),
+            ProjectTransition::Exit,
+            ProjectTransition::Recover,
+        ] {
+            let mut lifecycle = ProjectLifecycleController::default();
+            assert_eq!(
+                lifecycle.request(transition, true, false, false, false, false),
+                TransitionRequest::BlockedByOperation
+            );
+            assert!(lifecycle.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn export_queue_allows_project_switch_but_blocks_exit() {
+        for transition in [
+            ProjectTransition::New,
+            ProjectTransition::Open(PathBuf::from("other.shade")),
+            ProjectTransition::Recover,
+        ] {
+            let mut lifecycle = ProjectLifecycleController::default();
+            assert_eq!(
+                lifecycle.request(
+                    transition.clone(),
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                ),
+                TransitionRequest::Execute(transition)
+            );
+        }
+
         let mut lifecycle = ProjectLifecycleController::default();
-        assert_eq!(
-            lifecycle.request(ProjectTransition::New, true, false, false, false, false),
-            TransitionRequest::BlockedByOperation
-        );
         assert_eq!(
             lifecycle.request(ProjectTransition::Exit, false, true, false, false, false),
             TransitionRequest::BlockedByExportQueue
         );
         assert!(lifecycle.pending.is_none());
+    }
+
+    #[test]
+    fn dirty_project_still_requires_confirmation_while_queue_is_active() {
+        let transition = ProjectTransition::Open(PathBuf::from("other.shade"));
+        let mut lifecycle = ProjectLifecycleController::default();
+        assert_eq!(
+            lifecycle.request(transition.clone(), false, true, true, true, true),
+            TransitionRequest::AwaitingConfirmation
+        );
+        assert_eq!(lifecycle.pending, Some(transition));
     }
 
     #[test]
