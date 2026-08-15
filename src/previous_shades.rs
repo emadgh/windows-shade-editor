@@ -290,6 +290,18 @@ impl PreviousShadesStore {
         &self.entries
     }
 
+    pub fn recent(&self, limit: usize) -> Vec<&PreviousShadeEntry> {
+        let mut rows = self.entries.iter().collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .last_opened_unix_ms
+                .cmp(&left.last_opened_unix_ms)
+                .then_with(|| right.saved_at_unix_ms.cmp(&left.saved_at_unix_ms))
+        });
+        rows.truncate(limit);
+        rows
+    }
+
     pub fn remove_path(&mut self, path: &str) -> bool {
         let before = self.entries.len();
         self.entries.retain(|entry| !same_path(&entry.path, path));
