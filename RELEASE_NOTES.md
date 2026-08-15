@@ -1,3 +1,16 @@
+# Shade Editor 0.18.0
+
+- Centralize New/Open/Project View/Recovery/Exit lifecycle transitions behind one typed Save / Discard / Cancel policy and block unsafe transitions while export work is active.
+- Prevent every export path from targeting any source TIFF, including Windows path aliases/file identity, and reserve queued destinations globally before processing.
+- Make Export Queue restart-safe with persistent compact immutable recipes, source fingerprints, safe cancellation/retry, project-scoped completion marks, and unambiguous `{snapshot}` / `{testcode}` naming tokens.
+- Add Gray TIFF export parity while retaining the production TIFF transport invariants for RGB/CMYK + Spot, compression, predictor, metadata, DPI and atomic destination replacement.
+- Complete preview color management as Source ICC -> optional Printer/RIP Soft Proof -> optional Monitor/Display ICC, with optional gamut warning and external profile identity/relink. ICC payloads are not embedded in `.shade`.
+- Run TIFF inspection asynchronously with bounded parser limits and expanded production diagnostics, including byte order, SampleFormat, FillOrder, Orientation, strip/tile geometry, page count, InkSet/InkNames and RIP-risk warnings.
+- Add explicit validated `.shade.bak` restoration and migrate readable legacy recovery state to the current checksummed recovery format.
+- Extract lifecycle, export, color-management and TIFF-inspector controller state from the application shell and add feature-wiring/integration regression guards.
+- Add production acceptance guards for lossless compression/predictor, 8/16-bit, Spot/ExtraSamples/Photoshop resources, six-channel streaming, tiled and planar decoding, BigTIFF structure/export, missing-Face relink safety, and required native Windows Shell CI.
+- Keep Photoshop/RIP/real >4 GiB BigTIFF and clean-workstation Shell acceptance as explicit manual sign-off items in `docs/PRODUCTION_ACCEPTANCE_CHECKLIST.md`.
+
 # Shade Editor 0.17.2
 
 - Protect `New project` from destructive state loss: dirty projects and unsaved projects with Faces now require an explicit Save / Discard / Cancel decision.
@@ -252,3 +265,4 @@ Snapshot export workflow and expanded Curve controls.
 ## Adjustment layout
 
 - In Stacked mode, Levels, Curve and Channel Mixer can each be collapsed/expanded independently.
+
