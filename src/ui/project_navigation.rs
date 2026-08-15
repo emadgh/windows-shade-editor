@@ -133,12 +133,12 @@ impl ShadeApp {
     }
 
     pub(crate) fn ui_previous_shades_window(&mut self, ctx: &egui::Context) {
-        if !self.show_previous_shades {
+        if !self.project_view.open {
             return;
         }
         let mut actions = Vec::new();
-        let mut open = self.show_previous_shades;
-        let query_before = self.previous_shades_query.clone();
+        let mut open = self.project_view.open;
+        let query_before = self.project_view.query.clone();
         let mut requested_open: Option<String> = None;
         let mut requested_select: Option<String> = None;
         let mut requested_reveal: Option<String> = None;
@@ -159,7 +159,7 @@ impl ShadeApp {
                 ui.horizontal(|ui| {
                     ui.label("Search");
                     let search = ui.add(
-                        egui::TextEdit::singleline(&mut self.previous_shades_query)
+                        egui::TextEdit::singleline(&mut self.project_view.query)
                             .hint_text("Project, path, Snapshot name / ID / Test Code")
                             .desired_width(390.0),
                     );
@@ -177,13 +177,13 @@ impl ShadeApp {
                                 .collect::<String>()
                         });
                         if !typed.is_empty() {
-                            self.previous_shades_query.push_str(&typed);
+                            self.project_view.query.push_str(&typed);
                             search.request_focus();
                         }
                     }
                     ui.label("Sort");
                     egui::ComboBox::from_id_salt("previous-shades-sort")
-                        .selected_text(self.previous_shades_sort.label())
+                        .selected_text(self.project_view.sort.label())
                         .show_ui(ui, |ui| {
                             for sort in [
                                 previous_shades::PreviousShadesSort::LastOpened,
@@ -191,12 +191,12 @@ impl ShadeApp {
                                 previous_shades::PreviousShadesSort::SavedAt,
                                 previous_shades::PreviousShadesSort::Path,
                             ] {
-                                ui.selectable_value(&mut self.previous_shades_sort, sort, sort.label());
+                                ui.selectable_value(&mut self.project_view.sort, sort, sort.label());
                             }
                         });
                 });
 
-                let query = self.previous_shades_query.trim().to_lowercase();
+                let query = self.project_view.query.trim().to_lowercase();
                 let entries = self.previous_shades.entries();
                 let mut indices = entries
                     .iter()
@@ -204,7 +204,7 @@ impl ShadeApp {
                     .filter(|(_, entry)| entry.matches_query(&query))
                     .map(|(index, _)| index)
                     .collect::<Vec<_>>();
-                match self.previous_shades_sort {
+                match self.project_view.sort {
                     previous_shades::PreviousShadesSort::LastOpened => indices.sort_by(|a, b| {
                         entries[*b].last_opened_unix_ms.cmp(&entries[*a].last_opened_unix_ms)
                     }),
@@ -223,12 +223,12 @@ impl ShadeApp {
                     .map(|index| entries[*index].path.clone())
                     .collect::<Vec<_>>();
 
-                if query_before != self.previous_shades_query {
+                if query_before != self.project_view.query {
                     requested_select = paths.first().cloned();
                 }
                 let current_path = requested_select
                     .as_deref()
-                    .or(self.previous_shades_selected.as_deref());
+                    .or(self.project_view.selected.as_deref());
                 let current_position = current_path.and_then(|path| paths.iter().position(|item| item == path));
                 let (up, down, enter) = ctx.input(|input| {
                     (
@@ -250,7 +250,7 @@ impl ShadeApp {
                 if enter {
                     requested_open = requested_select
                         .clone()
-                        .or_else(|| self.previous_shades_selected.clone())
+                        .or_else(|| self.project_view.selected.clone())
                         .filter(|path| Path::new(path).is_file());
                 }
 
@@ -258,7 +258,7 @@ impl ShadeApp {
 
                 let selected_path = requested_select
                     .clone()
-                    .or_else(|| self.previous_shades_selected.clone());
+                    .or_else(|| self.project_view.selected.clone());
                 let cached_selected = selected_path.as_deref().and_then(|path| {
                     self.previous_shades
                         .entries()
@@ -300,7 +300,7 @@ impl ShadeApp {
                         });
                         preview_ui.separator();
 
-                        if let Some(error) = self.previous_shade_preview_error.as_ref() {
+                        if let Some(error) = self.project_view.preview_error.as_ref() {
                             preview_ui.colored_label(egui::Color32::YELLOW, error);
                             if let Some(entry) = cached_selected.as_ref() {
                                 preview_ui.label(format!(
@@ -319,13 +319,13 @@ impl ShadeApp {
                             return;
                         }
 
-                        let Some(preview) = self.previous_shade_preview.as_ref() else {
+                        let Some(preview) = self.project_view.preview.as_ref() else {
                             preview_ui.label("Loading project inspection...");
                             return;
                         };
 
                         preview_ui.heading(&preview.project_name);
-                        if let Some(texture) = self.previous_shade_texture.as_ref() {
+                        if let Some(texture) = self.project_view.texture.as_ref() {
                             let natural = texture.size_vec2();
                             if natural.x > 0.0 && natural.y > 0.0 {
                                 let max_size = egui::vec2(
@@ -532,9 +532,9 @@ impl ShadeApp {
                                 };
                                 let selected = requested_select
                                     .as_deref()
-                                    .or(self.previous_shades_selected.as_deref())
+                                    .or(self.project_view.selected.as_deref())
                                     == Some(entry.path.as_str());
-                                let thumbnail = self.previous_shade_list_textures.get(&entry.path);
+                                let thumbnail = self.project_view.list_textures.get(&entry.path);
                                 let response = previous_shade_history_row(
                                     ui,
                                     selected,

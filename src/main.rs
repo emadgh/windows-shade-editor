@@ -99,10 +99,10 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let mut app = ShadeApp::new(cc);
             if let Some(path) = startup_project.clone() {
-                app.show_previous_shades = false;
+                app.project_view.open = false;
                 app.open_project_path(path);
             } else {
-                app.show_previous_shades = true;
+                app.project_view.open = true;
             }
             Ok(Box::new(app))
         }),
@@ -268,16 +268,8 @@ struct ShadeApp {
     color: ColorManagementController,
     show_about: bool,
     show_logs: bool,
-    show_previous_shades: bool,
     previous_shades: previous_shades::PreviousShadesStore,
-    previous_shades_query: String,
-    previous_shades_sort: previous_shades::PreviousShadesSort,
-    previous_shades_selected: Option<String>,
-    previous_shade_preview: Option<previous_shades::ShadeInspection>,
-    previous_shade_preview_error: Option<String>,
-    previous_shade_texture: Option<egui::TextureHandle>,
-    previous_shade_list_textures: BTreeMap<String, egui::TextureHandle>,
-    previous_shade_list_texture_lru: VecDeque<String>,
+    project_view: ui::project_view_state::ProjectViewState,
     export: ExportController,
     inspector: TiffInspectorController,
     lifecycle: ProjectLifecycleController,
@@ -367,16 +359,8 @@ impl ShadeApp {
             color: ColorManagementController::default(),
             show_about: false,
             show_logs: false,
-            show_previous_shades: false,
             previous_shades,
-            previous_shades_query: String::new(),
-            previous_shades_sort: previous_shades::PreviousShadesSort::LastOpened,
-            previous_shades_selected: None,
-            previous_shade_preview: None,
-            previous_shade_preview_error: None,
-            previous_shade_texture: None,
-            previous_shade_list_textures: BTreeMap::new(),
-            previous_shade_list_texture_lru: VecDeque::new(),
+            project_view: ui::project_view_state::ProjectViewState::default(),
             export: ExportController::new(export_queue),
             inspector: TiffInspectorController::default(),
             lifecycle: ProjectLifecycleController::default(),
@@ -484,7 +468,7 @@ impl ShadeApp {
         match transition {
             ProjectTransition::New => self.reset_to_new_project(),
             ProjectTransition::Open(path) => {
-                self.show_previous_shades = false;
+                self.project_view.open = false;
                 self.open_project_path(path);
             }
             ProjectTransition::Exit => {
@@ -2466,7 +2450,7 @@ impl ShadeApp {
     }
 
     fn remember_previous_shade(&mut self, path: &Path) {
-        self.previous_shade_list_textures.clear();
+        self.project_view.list_textures.clear();
         self.previous_shades.record_open(path, &self.project.name);
         if let Err(err) = self.previous_shades.save() {
             self.log.error(&err);
@@ -2474,10 +2458,10 @@ impl ShadeApp {
     }
 
     fn load_previous_shade_preview(&mut self, ctx: &egui::Context, path: &str) {
-        self.previous_shades_selected = Some(path.to_owned());
-        self.previous_shade_texture = None;
-        self.previous_shade_preview = None;
-        self.previous_shade_preview_error = None;
+        self.project_view.selected = Some(path.to_owned());
+        self.project_view.texture = None;
+        self.project_view.preview = None;
+        self.project_view.preview_error = None;
         match previous_shades::inspect(Path::new(path)) {
             Ok(mut preview) => {
                 if let Some(thumbnail) = preview.thumbnail.take() {
@@ -2485,15 +2469,15 @@ impl ShadeApp {
                         [thumbnail.width, thumbnail.height],
                         &thumbnail.rgba,
                     );
-                    self.previous_shade_texture = Some(ctx.load_texture(
+                    self.project_view.texture = Some(ctx.load_texture(
                         format!("previous-shade-thumbnail:{path}"),
                         image,
                         egui::TextureOptions::LINEAR,
                     ));
                 }
-                self.previous_shade_preview = Some(preview);
+                self.project_view.preview = Some(preview);
             }
-            Err(err) => self.previous_shade_preview_error = Some(err),
+            Err(err) => self.project_view.preview_error = Some(err),
         }
     }
 
@@ -3884,10 +3868,11 @@ impl ShadeApp {
         entry: &previous_shades::PreviousShadeEntry,
     ) {
         let key = entry.path.clone();
-        if self.previous_shade_list_textures.contains_key(&key) {
-            self.previous_shade_list_texture_lru
+        if self.project_view.list_textures.contains_key(&key) {
+            self.project_view
+                .list_texture_lru
                 .retain(|item| item != &key);
-            self.previous_shade_list_texture_lru.push_back(key);
+            self.project_view.list_texture_lru.push_back(key);
             return;
         }
         let Ok(Some(thumbnail)) = previous_shades::decode_cached_thumbnail(entry) else {
@@ -3902,14 +3887,14 @@ impl ShadeApp {
             image,
             egui::TextureOptions::LINEAR,
         );
-        self.previous_shade_list_textures
-            .insert(key.clone(), texture);
-        self.previous_shade_list_texture_lru
+        self.project_view.list_textures.insert(key.clone(), texture);
+        self.project_view
+            .list_texture_lru
             .retain(|item| item != &key);
-        self.previous_shade_list_texture_lru.push_back(key);
-        while self.previous_shade_list_texture_lru.len() > PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT {
-            if let Some(oldest) = self.previous_shade_list_texture_lru.pop_front() {
-                self.previous_shade_list_textures.remove(&oldest);
+        self.project_view.list_texture_lru.push_back(key);
+        while self.project_view.list_texture_lru.len() > PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT {
+            if let Some(oldest) = self.project_view.list_texture_lru.pop_front() {
+                self.project_view.list_textures.remove(&oldest);
             }
         }
     }
@@ -4916,7 +4901,7 @@ impl eframe::App for ShadeApp {
         self.poll_project_autosave();
         self.handle_dropped_files(ui.ctx());
         workflow::handle_shortcuts(self, ui.ctx());
-        if !self.show_previous_shades {
+        if !self.project_view.open {
             self.handle_history_shortcuts(ui.ctx());
         }
         ui.ctx().data_mut(|data| {

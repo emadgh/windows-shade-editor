@@ -19,3 +19,7 @@ The modules extend `ShadeApp` only where application-level orchestration is stil
 Second pass: `src/main.rs` 7458 -> 6347 lines; `src/workflow.rs` 803 -> 597 lines.
 
 Further architecture work should focus on typed UI action return values for cross-domain mutations and narrower Project View/controller state, rather than moving code merely to reduce line counts.
+
+## Project View state boundary
+
+`PreviousShadesStore` remains the persistent history/cache metadata owner. `ProjectViewState` owns only transient UI state: open/query/sort/selection, loaded inspection/preview status and runtime egui texture caches. Cross-domain operations continue through typed UI actions and the existing lifecycle/workflow controllers.
