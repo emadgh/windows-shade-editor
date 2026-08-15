@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -157,6 +157,7 @@ pub struct ExportQueueItem {
     pub restored: bool,
     /// Restored Waiting/Processing work never starts until the operator explicitly resumes it.
     pub requires_resume: bool,
+    started_at: Option<Instant>,
     spec: QueuedExportSpec,
 }
 
@@ -186,6 +187,8 @@ enum ExportQueueEvent {
 struct PersistedQueue {
     format_version: u32,
     next_id: u64,
+    #[serde(default)]
+    paused: bool,
     items: Vec<PersistedQueueItem>,
 }
 
@@ -202,6 +205,7 @@ pub struct ExportQueue {
     next_id: u64,
     active_id: Option<u64>,
     stop_after_current: bool,
+    paused: bool,
     tx: mpsc::Sender<ExportQueueEvent>,
     rx: mpsc::Receiver<ExportQueueEvent>,
     persistence_path: Option<PathBuf>,
@@ -230,6 +234,7 @@ impl ExportQueue {
             next_id: 1,
             active_id: None,
             stop_after_current: false,
+            paused: false,
             tx,
             rx,
             persistence_path,
@@ -253,6 +258,7 @@ impl ExportQueue {
             ));
         }
         queue.next_id = persisted.next_id.max(1);
+        queue.paused = persisted.paused;
         for saved in persisted.items {
             if saved.status == ExportQueueStatus::Done {
                 continue;
@@ -285,6 +291,7 @@ impl ExportQueue {
                 error: saved.error,
                 restored: true,
                 requires_resume,
+                started_at: None,
                 spec,
             });
         }
@@ -313,6 +320,7 @@ impl ExportQueue {
         let persisted = PersistedQueue {
             format_version: QUEUE_FORMAT_VERSION,
             next_id: self.next_id,
+            paused: self.paused,
             items,
         };
         let result = serde_json::to_vec_pretty(&persisted)
@@ -337,6 +345,7 @@ impl ExportQueue {
             error: None,
             restored: false,
             requires_resume: false,
+            started_at: None,
             spec: QueuedExportSpec {
                 export: spec,
                 protected_sources: Vec::new(),
@@ -376,6 +385,7 @@ impl ExportQueue {
             error: None,
             restored: false,
             requires_resume: false,
+            started_at: None,
             spec: QueuedExportSpec {
                 export: spec,
                 protected_sources,
@@ -444,6 +454,86 @@ impl ExportQueue {
         self.pending_count() > 0
     }
 
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn set_paused(&mut self, paused: bool) -> bool {
+        if self.paused == paused {
+            return false;
+        }
+        self.paused = paused;
+        self.persist();
+        true
+    }
+
+    pub fn status_counts(&self) -> (usize, usize, usize, usize, usize) {
+        let mut waiting = 0;
+        let mut processing = 0;
+        let mut done = 0;
+        let mut failed = 0;
+        let mut cancelled = 0;
+        for item in &self.items {
+            match item.status {
+                ExportQueueStatus::Waiting => waiting += 1,
+                ExportQueueStatus::Processing => processing += 1,
+                ExportQueueStatus::Done => done += 1,
+                ExportQueueStatus::Failed => failed += 1,
+                ExportQueueStatus::Cancelled => cancelled += 1,
+            }
+        }
+        (waiting, processing, done, failed, cancelled)
+    }
+
+    pub fn retry_all_failed(&mut self) -> usize {
+        let mut reserved = self.reserved_destination_keys();
+        let mut retried = 0;
+        for item in &mut self.items {
+            if item.status != ExportQueueStatus::Failed {
+                continue;
+            }
+            let key = path_safety::path_key(&item.destination);
+            if reserved.contains(&key) {
+                item.error = Some("Destination is reserved by another queued export.".to_owned());
+                continue;
+            }
+            reserved.insert(key);
+            item.status = ExportQueueStatus::Waiting;
+            item.requires_resume = false;
+            item.progress = 0.0;
+            item.started_at = None;
+            item.detail.clear();
+            item.error = None;
+            retried += 1;
+        }
+        if retried > 0 {
+            self.persist();
+        }
+        retried
+    }
+
+    pub fn clear_completed(&mut self) -> usize {
+        let before = self.items.len();
+        self.items
+            .retain(|item| item.status != ExportQueueStatus::Done);
+        let removed = before - self.items.len();
+        if removed > 0 {
+            self.persist();
+        }
+        removed
+    }
+
+    pub fn clear_failed(&mut self) -> usize {
+        let before = self.items.len();
+        self.items
+            .retain(|item| item.status != ExportQueueStatus::Failed);
+        let removed = before - self.items.len();
+        if removed > 0 {
+            self.persist();
+        }
+        removed
+    }
+
     pub fn reserved_destination_keys(&self) -> BTreeSet<String> {
         self.items
             .iter()
@@ -460,12 +550,75 @@ impl ExportQueue {
     pub fn active_summary(&self) -> Option<(f32, String)> {
         let id = self.active_id?;
         let item = self.items.iter().find(|item| item.id == id)?;
-        let text = if item.detail.trim().is_empty() {
+        let mut text = if item.detail.trim().is_empty() {
             item.label.clone()
         } else {
             format!("{} · {}", item.label, item.detail)
         };
-        Some((item.progress, text))
+        if let Some(metrics) = self.metrics_text(id) {
+            text.push_str(" · ");
+            text.push_str(&metrics);
+        }
+        Some((finite_progress(item.progress), text))
+    }
+
+    pub fn metrics_text(&self, id: u64) -> Option<String> {
+        let item = self.items.iter().find(|item| item.id == id)?;
+        if item.status != ExportQueueStatus::Processing {
+            return None;
+        }
+        let progress = finite_progress(item.progress);
+        let elapsed = item.started_at.map(|at| at.elapsed()).unwrap_or_default();
+        let mut parts = vec![format_duration(elapsed)];
+        if progress > 0.01 && elapsed.as_secs_f64() > 0.25 {
+            let total_seconds = elapsed.as_secs_f64() / progress as f64;
+            let eta = Duration::from_secs_f64((total_seconds - elapsed.as_secs_f64()).max(0.0));
+            parts.push(format!("~{} left", format_duration(eta)));
+            let source_bytes = item
+                .spec
+                .source_fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.size_bytes)
+                .or_else(|| {
+                    std::fs::metadata(&item.source)
+                        .ok()
+                        .map(|metadata| metadata.len())
+                });
+            if let Some(source_bytes) = source_bytes {
+                let equivalent = source_bytes as f64 * progress as f64 / elapsed.as_secs_f64();
+                if equivalent.is_finite() && equivalent > 0.0 {
+                    parts.push(format!("~{:.1} MB/s", equivalent / 1_048_576.0));
+                }
+            }
+        }
+        Some(parts.join(" · "))
+    }
+
+    pub fn compact_status(&self) -> Option<String> {
+        if let Some(id) = self.active_id {
+            let item = self.items.iter().find(|item| item.id == id)?;
+            let index = self.items.iter().position(|row| row.id == id).unwrap_or(0) + 1;
+            let total = self.items.len().max(1);
+            let percent = (finite_progress(item.progress) * 100.0).round() as u32;
+            let mut text = format!("Exporting {index}/{total} · {percent}%");
+            if let Some(metrics) = self.metrics_text(id) {
+                text.push_str(" · ");
+                text.push_str(&metrics);
+            }
+            return Some(text);
+        }
+        let waiting = self
+            .items
+            .iter()
+            .filter(|item| item.status == ExportQueueStatus::Waiting && !item.requires_resume)
+            .count();
+        if self.paused && waiting > 0 {
+            Some(format!("Queue paused · {waiting} waiting"))
+        } else if waiting > 0 {
+            Some(format!("Queue · {waiting} waiting"))
+        } else {
+            None
+        }
     }
 
     pub fn cancel(&mut self, id: u64) -> bool {
@@ -477,6 +630,7 @@ impl ExportQueue {
                 item.status = ExportQueueStatus::Cancelled;
                 item.requires_resume = false;
                 item.detail = "Cancelled before processing".to_owned();
+                item.started_at = None;
                 true
             }
             ExportQueueStatus::Processing => {
@@ -512,6 +666,7 @@ impl ExportQueue {
         item.status = ExportQueueStatus::Waiting;
         item.requires_resume = false;
         item.progress = 0.0;
+        item.started_at = None;
         item.detail.clear();
         item.error = None;
         self.persist();
@@ -525,6 +680,7 @@ impl ExportQueue {
                 item.status = ExportQueueStatus::Cancelled;
                 item.requires_resume = false;
                 item.detail = "Cancelled before processing".to_owned();
+                item.started_at = None;
                 changed = true;
             }
         }
@@ -549,7 +705,11 @@ impl ExportQueue {
                     detail,
                 } => {
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
-                        item.progress = fraction.clamp(0.0, 1.0);
+                        item.progress = if fraction.is_finite() {
+                            fraction.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
                         item.detail = detail;
                     }
                 }
@@ -596,7 +756,7 @@ impl ExportQueue {
             }
         }
 
-        if self.active_id.is_none() && !self.stop_after_current {
+        if self.active_id.is_none() && !self.stop_after_current && !self.paused {
             changed |= self.start_next();
         }
         if changed {
@@ -695,6 +855,7 @@ impl ExportQueue {
         self.items[index].status = ExportQueueStatus::Processing;
         self.items[index].requires_resume = false;
         self.items[index].progress = 0.0;
+        self.items[index].started_at = Some(Instant::now());
         self.items[index].detail = "Starting".to_owned();
         self.items[index].error = None;
         self.active_id = Some(id);
@@ -764,6 +925,7 @@ impl ExportQueue {
         err: String,
     ) -> bool {
         self.items[index].status = ExportQueueStatus::Processing;
+        self.items[index].started_at = Some(Instant::now());
         self.active_id = Some(id);
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -776,6 +938,21 @@ impl ExportQueue {
         });
         true
     }
+}
+
+fn finite_progress(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let minutes = total / 60;
+    let seconds = total % 60;
+    format!("{minutes:02}:{seconds:02}")
 }
 
 fn queue_persistence_path() -> PathBuf {
@@ -962,5 +1139,64 @@ mod tests {
         assert!(restored.resume(id));
         assert_eq!(restored.pending_count(), 1);
         let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn paused_queue_does_not_start_waiting_work_until_resumed() {
+        let mut queue = ExportQueue::new();
+        queue.enqueue(spec("paused.tif"));
+        assert!(queue.set_paused(true));
+        assert!(queue.poll().is_empty());
+        assert!(queue.active_id.is_none());
+        assert_eq!(queue.pending_count(), 1);
+        assert!(queue.set_paused(false));
+        let _ = queue.poll();
+        assert!(queue.active_id.is_some());
+    }
+
+    #[test]
+    fn retry_all_failed_only_requeues_failed_rows() {
+        let mut queue = ExportQueue::new();
+        let failed = queue.enqueue(spec("failed.tif"));
+        let cancelled = queue.enqueue(spec("cancelled.tif"));
+        queue
+            .items
+            .iter_mut()
+            .find(|item| item.id == failed)
+            .unwrap()
+            .status = ExportQueueStatus::Failed;
+        queue
+            .items
+            .iter_mut()
+            .find(|item| item.id == cancelled)
+            .unwrap()
+            .status = ExportQueueStatus::Cancelled;
+        assert_eq!(queue.retry_all_failed(), 1);
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .find(|item| item.id == failed)
+                .unwrap()
+                .status,
+            ExportQueueStatus::Waiting
+        );
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .find(|item| item.id == cancelled)
+                .unwrap()
+                .status,
+            ExportQueueStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn non_finite_progress_is_sanitized() {
+        assert_eq!(finite_progress(f32::NAN), 0.0);
+        assert_eq!(finite_progress(f32::INFINITY), 0.0);
+        assert_eq!(finite_progress(-1.0), 0.0);
+        assert_eq!(finite_progress(2.0), 1.0);
     }
 }

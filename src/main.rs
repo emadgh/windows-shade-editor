@@ -1002,10 +1002,13 @@ impl ShadeApp {
                     item.error.clone(),
                     item.restored,
                     item.requires_resume,
+                    self.export.queue.metrics_text(item.id),
                 )
             })
             .collect::<Vec<_>>();
         let pending = self.export.queue.pending_count();
+        let queue_paused = self.export.queue.is_paused();
+        let (_, _, done_count, failed_count, _) = self.export.queue.status_counts();
         let recovered_waiting = self.export.queue.recovered_waiting_count();
         let mut cancel_id = None;
         let mut resume_id = None;
@@ -1013,7 +1016,10 @@ impl ShadeApp {
         let mut reveal_folder = None;
         let mut resume_recovered = false;
         let mut cancel_waiting = false;
-        let mut clear_finished = false;
+        let mut pause_toggle = false;
+        let mut retry_all_failed = false;
+        let mut clear_completed = false;
+        let mut clear_failed = false;
 
         egui::Window::new("Export Queue")
             .open(&mut open)
@@ -1030,8 +1036,17 @@ impl ShadeApp {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        clear_finished = ui.button("Clear finished").clicked();
+                        if failed_count > 0 {
+                            clear_failed = ui.button(format!("Clear failed ({failed_count})")).clicked();
+                            retry_all_failed = ui.button(format!("Retry all failed ({failed_count})")).clicked();
+                        }
+                        if done_count > 0 {
+                            clear_completed = ui.button(format!("Clear completed ({done_count})")).clicked();
+                        }
                         cancel_waiting = ui.button("Cancel waiting").clicked();
+                        pause_toggle = ui
+                            .button(if queue_paused { "Resume queue" } else { "Pause queue" })
+                            .clicked();
                         if recovered_waiting > 0 {
                             resume_recovered = ui.button("Resume recovered").clicked();
                         }
@@ -1048,7 +1063,7 @@ impl ShadeApp {
                     ui.label("No export jobs yet.");
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (id, label, destination, status, progress, detail, error, restored, requires_resume) in &rows {
+                        for (id, label, destination, status, progress, detail, error, restored, requires_resume, metrics) in &rows {
                             let (fill, status_color) = match status {
                                 export_queue::ExportQueueStatus::Waiting => (
                                     egui::Color32::from_rgba_unmultiplied(135, 95, 20, 34),
@@ -1136,15 +1151,18 @@ impl ShadeApp {
                                     });
 
                                     if *status == export_queue::ExportQueueStatus::Processing {
-                                        export_queue_progress_bar(
-                                            ui,
-                                            *progress,
+                                        let progress_text = if let Some(metrics) = metrics {
                                             if detail.trim().is_empty() {
-                                                "Processing"
+                                                format!("Processing · {metrics}")
                                             } else {
-                                                detail
-                                            },
-                                        );
+                                                format!("{detail} · {metrics}")
+                                            }
+                                        } else if detail.trim().is_empty() {
+                                            "Processing".to_owned()
+                                        } else {
+                                            detail.clone()
+                                        };
+                                        export_queue_progress_bar(ui, *progress, &progress_text);
                                     } else {
                                         let detail = detail.trim();
                                         if !detail.is_empty()
@@ -1175,11 +1193,29 @@ impl ShadeApp {
                 self.report_info(format!("Resumed {count} recovered export(s)"));
             }
         }
+        if pause_toggle {
+            let paused = !self.export.queue.is_paused();
+            self.export.queue.set_paused(paused);
+            self.report_info(if paused {
+                "Export Queue paused; current atomic export may finish safely"
+            } else {
+                "Export Queue resumed"
+            });
+        }
+        if retry_all_failed {
+            let count = self.export.queue.retry_all_failed();
+            if count > 0 {
+                self.report_info(format!("Retried {count} failed export(s)"));
+            }
+        }
         if cancel_waiting {
             self.export.queue.cancel_all_waiting();
         }
-        if clear_finished {
-            self.export.queue.clear_finished();
+        if clear_completed {
+            self.export.queue.clear_completed();
+        }
+        if clear_failed {
+            self.export.queue.clear_failed();
         }
         if let Some(id) = resume_id {
             self.export.queue.resume(id);
@@ -2654,6 +2690,13 @@ impl ShadeApp {
         let mut dismiss_error = false;
         let mut inspect_requested = false;
         let mut queue_requested = false;
+        let recent_projects = self
+            .previous_shades
+            .recent(8)
+            .into_iter()
+            .map(|entry| (entry.display_name(), entry.path.clone(), entry.is_missing()))
+            .collect::<Vec<_>>();
+        let mut recent_requested: Option<PathBuf> = None;
         ui.horizontal(|ui| {
             ui.horizontal_wrapped(|ui| {
                 let enabled = self.job.is_none();
@@ -2664,6 +2707,27 @@ impl ShadeApp {
                     if ui.add_enabled(enabled, egui::Button::new("Open .shade...")).clicked() {
                         self.open_project_dialog();
                     }
+                    ui.menu_button("Recent projects", |ui| {
+                        if recent_projects.is_empty() {
+                            ui.label("No recent projects");
+                        } else {
+                            for (name, path, missing) in &recent_projects {
+                                let label = if *missing {
+                                    format!("{name}  [missing]")
+                                } else {
+                                    name.clone()
+                                };
+                                if ui
+                                    .add_enabled(enabled && !*missing, egui::Button::new(label))
+                                    .on_hover_text(path)
+                                    .clicked()
+                                {
+                                    recent_requested = Some(PathBuf::from(path));
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
                     if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces...")).clicked() {
                         self.add_faces_dialog();
                     }
@@ -2695,11 +2759,13 @@ impl ShadeApp {
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Export all")).clicked() { self.export_all_dialog(); }
                 let queue_pending = self.export.queue.pending_count();
                 let queue_recovered = self.export.queue.recovered_waiting_count();
-                let queue_label = if queue_recovered > 0 {
-                    format!("Queue ({queue_pending} + {queue_recovered} recovered)")
-                } else {
-                    format!("Queue ({queue_pending})")
-                };
+                let queue_label = self.export.queue.compact_status().unwrap_or_else(|| {
+                    if queue_recovered > 0 {
+                        format!("Queue ({queue_pending} + {queue_recovered} recovered)")
+                    } else {
+                        format!("Queue ({queue_pending})")
+                    }
+                });
                 if ui.button(queue_label).clicked() { self.export.show_queue = true; }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Validate face")).on_hover_text("Run a no-adjustment export through the production TIFF backend, re-decode it, and compare pixels plus critical Photoshop/TIFF metadata.").clicked() { self.validate_current_face_dialog(); }
                 ui.separator();
@@ -2726,6 +2792,9 @@ impl ShadeApp {
         }
         if queue_requested {
             self.export.show_queue = true;
+        }
+        if let Some(path) = recent_requested {
+            self.request_project_transition(ProjectTransition::Open(path), Some(ui.ctx()));
         }
         if dismiss_error {
             self.toast = None;
