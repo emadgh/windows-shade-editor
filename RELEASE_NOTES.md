@@ -1,3 +1,11 @@
+# Shade Editor 0.20.1
+
+- Extract Project View transient state into a focused `ProjectViewState` instead of keeping query/sort/selection/preview/texture-cache fields directly on `ShadeApp`.
+- Keep `PreviousShadesStore` as the single persistent recent-project/history owner; the new state object owns UI/session state only.
+- Centralize Project View selection and cache cleanup policy with `needs_preview_load`, `clear_selection` and `forget_path` helpers.
+- Add state unit tests plus an architecture regression guard preventing Project View transient fields from drifting back to top-level `ShadeApp`.
+- No intended Project View, project lifecycle, TIFF, color or export behavior change.
+
 # Shade Editor 0.20.0
 
 - Introduce typed Face, navigation and Project View UI actions so egui presentation code no longer directly orchestrates save/export/delete/relink/lifecycle operations.

@@ -34,7 +34,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
         ctx.wants_keyboard_input(),
         curve_graph_focused,
         modal_active,
-        app.show_previous_shades,
+        app.project_view.open,
     );
 
     let (new_project, save, save_as, export_face, export_all, update_snapshot) =
@@ -73,7 +73,7 @@ pub(super) fn handle_shortcuts(app: &mut ShadeApp, ctx: &egui::Context) {
     }
     if input_context.allows_project_commands() {
         if new_project {
-            app.show_previous_shades = false;
+            app.project_view.open = false;
             app.new_project();
         }
         if export_all {

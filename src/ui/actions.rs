@@ -114,7 +114,7 @@ impl ShadeApp {
             NavigationUiAction::OpenRecent(path) => {
                 self.request_project_transition(ProjectTransition::Open(path), Some(ctx));
             }
-            NavigationUiAction::ShowProjectView => self.show_previous_shades = true,
+            NavigationUiAction::ShowProjectView => self.project_view.open = true,
             NavigationUiAction::AddFacesDialog => self.add_faces_dialog(),
             NavigationUiAction::QuickSave => {
                 self.quick_save_project();
@@ -151,9 +151,9 @@ impl ShadeApp {
         ctx: &egui::Context,
     ) {
         match action {
-            ProjectViewUiAction::SetOpen(open) => self.show_previous_shades = open,
+            ProjectViewUiAction::SetOpen(open) => self.project_view.open = open,
             ProjectViewUiAction::Select(path) => {
-                if self.previous_shades_selected.as_deref() != Some(path.as_str()) {
+                if self.project_view.needs_preview_load(&path) {
                     self.load_previous_shade_preview(ctx, &path);
                 }
             }
@@ -172,9 +172,7 @@ impl ShadeApp {
                             if let Err(err) = self.previous_shades.save() {
                                 self.log.error(&err);
                             }
-                            self.previous_shade_list_textures.remove(&old_path);
-                            self.previous_shade_list_texture_lru
-                                .retain(|item| item != &old_path);
+                            self.project_view.forget_path(&old_path);
                             self.load_previous_shade_preview(ctx, &new_display);
                         }
                         Err(err) => self.report_error(err),
@@ -186,15 +184,7 @@ impl ShadeApp {
                     if let Err(err) = self.previous_shades.save() {
                         self.log.error(&err);
                     }
-                    self.previous_shade_list_textures.remove(&path);
-                    self.previous_shade_list_texture_lru
-                        .retain(|item| item != &path);
-                    if self.previous_shades_selected.as_deref() == Some(path.as_str()) {
-                        self.previous_shades_selected = None;
-                        self.previous_shade_preview = None;
-                        self.previous_shade_preview_error = None;
-                        self.previous_shade_texture = None;
-                    }
+                    self.project_view.forget_path(&path);
                 }
             }
             ProjectViewUiAction::Open(path) => {

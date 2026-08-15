@@ -5,6 +5,7 @@ pub(crate) mod export_queue;
 pub(crate) mod faces;
 pub(crate) mod input_router;
 pub(crate) mod project_navigation;
+pub(crate) mod project_view_state;
 pub(crate) mod status_bar;
 
 #[cfg(test)]
@@ -83,5 +84,30 @@ mod tests {
                 "Project navigation bypassed typed actions with {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn project_view_transient_state_stays_behind_focused_state_object() {
+        let main = include_str!("../main.rs");
+        for legacy_field in [
+            "show_previous_shades: bool",
+            "previous_shades_query: String",
+            "previous_shades_sort: previous_shades::PreviousShadesSort",
+            "previous_shades_selected: Option<String>",
+            "previous_shade_preview: Option<previous_shades::ShadeInspection>",
+            "previous_shade_preview_error: Option<String>",
+            "previous_shade_texture: Option<egui::TextureHandle>",
+            "previous_shade_list_textures: BTreeMap<String, egui::TextureHandle>",
+            "previous_shade_list_texture_lru: VecDeque<String>",
+        ] {
+            assert!(
+                !main.contains(legacy_field),
+                "Project View transient state regressed to ShadeApp: {legacy_field}"
+            );
+        }
+        assert!(
+            main.contains("project_view: ui::project_view_state::ProjectViewState"),
+            "ShadeApp must own one focused ProjectViewState"
+        );
     }
 }
