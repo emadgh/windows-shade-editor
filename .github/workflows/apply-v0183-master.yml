@@ -21,35 +21,17 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Apply master adjustment patch
+      - name: Decode and apply exact master adjustment patch
         shell: pwsh
         run: |
-          git apply --check tools/v0183-master-adjustments.patch
-          git apply tools/v0183-master-adjustments.patch
           @'
           from pathlib import Path
-          path = Path('src/main.rs')
-          text = path.read_text(encoding='utf-8')
-          old = '.is_some_and(|adjustment| *adjustment == ChannelAdjustment::default());'
-          new = '.is_some_and(|adjustment| adjustment == &ChannelAdjustment::default());'
-          if old not in text:
-              raise SystemExit('master cleanup comparison anchor missing')
-          text = text.replace(old, new, 1)
-          old = '''        histogram_after,
-                  None,
-                  compact_controls,
-                  true,
-              ) {'''
-          new = '''        histogram_after,
-                  Some(ui.visuals().text_color()),
-                  compact_controls,
-                  true,
-              ) {'''
-          if old not in text:
-              raise SystemExit('master curve neutral accent anchor missing')
-          text = text.replace(old, new, 1)
-          path.write_text(text, encoding='utf-8')
+          import base64, gzip
+          encoded = Path('tools/v0183-master.patch.gz.b64').read_text(encoding='utf-8').strip()
+          Path('v0183-master.patch').write_bytes(gzip.decompress(base64.b64decode(encoded)))
           '@ | python -
+          git apply --check v0183-master.patch
+          git apply v0183-master.patch
 
       - name: Format
         run: cargo fmt --all
@@ -98,7 +80,8 @@ jobs:
           assert 'All channels' in history
           assert 'egui::Key::Backtick' in workflow
           assert 'Some(ui.visuals().text_color())' in main
-          assert 'Channel Levels' not in export or True
+          assert 'master_levels_and_curve_stack_without_overwriting_channel_controls' in render
+          assert 'master_levels_and_curve_stack_after_local_controls_without_overwrite' in export
           print('v0.18.3 invariants verified')
           '@ | python -
 
@@ -108,6 +91,8 @@ jobs:
           Remove-Item -Force .github/workflows/dump-v0183-source.yml -ErrorAction SilentlyContinue
           Remove-Item -Force .github/workflows/apply-v0183-master.yml -ErrorAction SilentlyContinue
           Remove-Item -Force tools/v0183-master-adjustments.patch -ErrorAction SilentlyContinue
+          Remove-Item -Force tools/v0183-master.patch.gz.b64 -ErrorAction SilentlyContinue
+          Remove-Item -Force v0183-master.patch -ErrorAction SilentlyContinue
           if (Test-Path tools -PathType Container) {
             $remaining = Get-ChildItem tools -Force
             if ($remaining.Count -eq 0) { Remove-Item -Force tools }
