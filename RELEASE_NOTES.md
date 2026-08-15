@@ -3,6 +3,7 @@
 - Fix the reproducible Export Queue crash triggered by moving the pointer over the application while an item is Processing.
 - Replace the queue progress bar's infinite requested width with bounded finite UI geometry; this prevents invalid hit-test rectangles from reaching egui's pointer interaction path.
 - Sanitize non-finite queue progress values before rendering and add a regression test that exercises a second hover frame over the Processing progress bar.
+- Use a neutral gray highlight for the contextual selected channel while editing Master, so the channel color no longer implies that Master adjustments target that channel.
 
 # Shade Editor 0.18.5
 

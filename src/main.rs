@@ -3898,6 +3898,7 @@ impl ShadeApp {
             let response = clickable_channel_row(
                 ui,
                 self.selected_channel == index,
+                self.adjustment_scope == AdjustmentScope::All,
                 is_solo,
                 &label,
                 accent,
@@ -7495,6 +7496,7 @@ fn clipping_summary_ui(ui: &mut egui::Ui, stats: render::ChannelClippingStats) {
 fn clickable_channel_row(
     ui: &mut egui::Ui,
     selected: bool,
+    master_context: bool,
     solo: bool,
     label: &str,
     accent: egui::Color32,
@@ -7504,13 +7506,7 @@ fn clickable_channel_row(
     let width = ui.available_width().max(1.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let visuals = ui.visuals();
-    let fill = if selected {
-        visuals.selection.bg_fill.gamma_multiply(0.72)
-    } else if response.hovered() {
-        visuals.widgets.hovered.bg_fill
-    } else {
-        egui::Color32::TRANSPARENT
-    };
+    let fill = channel_row_fill(visuals, selected, master_context, response.hovered());
     if fill != egui::Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 4.0, fill);
     }
@@ -7541,6 +7537,48 @@ fn clickable_channel_row(
             .circle_filled(egui::pos2(rect.right() - 10.0, rect.center().y), 4.5, color);
     }
     response
+}
+
+fn channel_row_fill(
+    visuals: &egui::Visuals,
+    selected: bool,
+    master_context: bool,
+    hovered: bool,
+) -> egui::Color32 {
+    if selected && master_context {
+        // The channel remains selected as context for histograms and Mixer,
+        // but a neutral highlight makes it clear that Levels/Curve edits are
+        // currently targeting Master rather than this channel.
+        if visuals.dark_mode {
+            egui::Color32::from_gray(62)
+        } else {
+            egui::Color32::from_gray(205)
+        }
+    } else if selected {
+        visuals.selection.bg_fill.gamma_multiply(0.72)
+    } else if hovered {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    }
+}
+
+#[cfg(test)]
+mod channel_row_visual_tests {
+    use super::{channel_row_fill, egui};
+
+    #[test]
+    fn master_context_uses_a_neutral_selected_channel_highlight() {
+        for visuals in [egui::Visuals::dark(), egui::Visuals::light()] {
+            let master_fill = channel_row_fill(&visuals, true, true, false);
+            assert_eq!(master_fill.r(), master_fill.g());
+            assert_eq!(master_fill.g(), master_fill.b());
+
+            let channel_fill = channel_row_fill(&visuals, true, false, false);
+            assert_eq!(channel_fill, visuals.selection.bg_fill.gamma_multiply(0.72));
+            assert_ne!(master_fill, channel_fill);
+        }
+    }
 }
 
 fn snapshot_row_with_actions(
