@@ -17,6 +17,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Narrow Curve extraction boundary
+        shell: pwsh
+        run: |
+          $path = '.github/scripts/apply_v020_ui_decomposition_2.py'
+          $text = Get-Content $path -Raw
+          $old = 'curve_end_marker = "fn build_project_file_metadata("'
+          $new = 'curve_end_marker = "fn mixer_ui("'
+          if (-not $text.Contains($old)) { throw 'Expected broad Curve boundary not found' }
+          $text = $text.Replace($old, $new)
+          Set-Content -Path $path -Value $text -NoNewline
       - name: Apply second UI decomposition
         run: python .github/scripts/apply_v020_ui_decomposition_2.py
       - name: Fix generated Recent assertion quoting
