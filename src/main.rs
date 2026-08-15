@@ -25,6 +25,7 @@ mod model;
 mod palette;
 mod path_safety;
 mod previous_shades;
+mod project_autosave;
 mod project_lifecycle;
 mod recovery;
 mod render;
@@ -62,7 +63,7 @@ use update::{UpdateManager, UpdateStatus};
 
 const VIEWPORT_OVERSCROLL: f32 = 180.0;
 const ERROR_TOAST_LIFETIME: Duration = Duration::from_secs(8);
-const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
+const RECOVERY_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(120);
 const HISTORY_COMMIT_DELAY: Duration = Duration::from_millis(300);
 const PREVIOUS_SHADE_TEXTURE_CACHE_LIMIT: usize = 64;
 const APP_WINDOW_TITLE: &str = concat!(
@@ -192,6 +193,7 @@ enum JobResult {
     Recover(Result<RecoveryPayload, String>),
     Save {
         path: PathBuf,
+        revision: u64,
         result: Result<(), String>,
     },
     InspectTiff(Result<tiff_inspect::TiffInspection, String>),
@@ -282,6 +284,12 @@ struct ShadeApp {
     toast: Option<ErrorToast>,
     status_message: String,
     project_dirty: bool,
+    project_revision: u64,
+    last_project_edit_at: Instant,
+    project_autosave_tx: mpsc::Sender<project_autosave::Completion>,
+    project_autosave_rx: mpsc::Receiver<project_autosave::Completion>,
+    project_autosave_busy: bool,
+    project_autosave_error: Option<String>,
     snapshot_rename_id: Option<u64>,
     snapshot_rename_buffer: String,
     pending_snapshot_action: Option<PendingSnapshotAction>,
@@ -311,6 +319,7 @@ impl ShadeApp {
         }
         let (render_tx, render_rx) = mpsc::channel();
         let (autosave_tx, autosave_rx) = mpsc::channel();
+        let (project_autosave_tx, project_autosave_rx) = mpsc::channel();
         let mut project = ShadeProject::default();
         project.channel_palette = settings.default_project_palette();
         let log = app_log::AppLog::default();
@@ -372,6 +381,12 @@ impl ShadeApp {
             toast: None,
             status_message: "Ready".to_owned(),
             project_dirty: false,
+            project_revision: 0,
+            last_project_edit_at: Instant::now(),
+            project_autosave_tx,
+            project_autosave_rx,
+            project_autosave_busy: false,
+            project_autosave_error: None,
             snapshot_rename_id: None,
             snapshot_rename_buffer: String::new(),
             pending_snapshot_action: None,
@@ -408,6 +423,37 @@ impl ShadeApp {
         self.status_message = message;
     }
 
+    fn mark_project_dirty(&mut self) {
+        self.project_dirty = true;
+        self.project_revision = self.project_revision.wrapping_add(1).max(1);
+        self.last_project_edit_at = Instant::now();
+        self.project_autosave_error = None;
+    }
+
+    fn mark_project_saved(&mut self) {
+        self.project_dirty = false;
+        self.last_project_edit_at = Instant::now();
+        self.project_autosave_error = None;
+    }
+
+    fn project_save_state_label(&self) -> (&'static str, bool) {
+        if self.project_autosave_busy {
+            ("Saving…", false)
+        } else if self.project_autosave_error.is_some() {
+            ("Autosave failed", true)
+        } else if self.project_path.is_none() {
+            if self.project_dirty && !self.faces.is_empty() {
+                ("Unsaved changes", false)
+            } else {
+                ("", false)
+            }
+        } else if self.project_dirty {
+            ("Unsaved changes", false)
+        } else {
+            ("Saved", false)
+        }
+    }
+
     fn new_project(&mut self) {
         self.request_project_transition(ProjectTransition::New, None);
     }
@@ -419,7 +465,7 @@ impl ShadeApp {
     ) {
         match self.lifecycle.request(
             transition,
-            self.job.is_some(),
+            self.job.is_some() || self.project_autosave_busy,
             self.export.queue.has_pending(),
             self.project_dirty,
             !self.faces.is_empty(),
@@ -489,7 +535,7 @@ impl ShadeApp {
         self.adjustment_scope = AdjustmentScope::All;
         self.viewport_recenter = true;
         self.fit_requested = true;
-        self.project_dirty = false;
+        self.mark_project_saved();
         self.snapshot_rename_id = None;
         self.snapshot_rename_buffer.clear();
         self.pending_snapshot_action = None;
@@ -734,6 +780,11 @@ impl ShadeApp {
     }
 
     fn begin_project_save(&mut self, path: PathBuf) -> bool {
+        if self.project_autosave_busy {
+            self.report_info("Project autosave is already in progress.");
+            return false;
+        }
+        let save_revision = self.project_revision;
         if self.job.is_some() || self.faces.is_empty() {
             return false;
         }
@@ -781,6 +832,7 @@ impl ShadeApp {
             Self::set_progress(&progress, Some(1.0), "Saving project", "Complete");
             JobResult::Save {
                 path: result_path,
+                revision: save_revision,
                 result,
             }
         });
@@ -954,7 +1006,7 @@ impl ShadeApp {
                     mark.folder.to_string_lossy().into_owned(),
                     unix_ms_now(),
                 );
-                self.project_dirty = true;
+                self.mark_project_dirty();
             }
             match completion.result {
                 Ok(_) => completed += 1,
@@ -1994,7 +2046,7 @@ impl ShadeApp {
         }
         let name = palette.name.clone();
         self.project.channel_palette = Some(palette);
-        self.project_dirty = true;
+        self.mark_project_dirty();
         self.report_info(format!("Channel palette: {name}"));
     }
 
@@ -2037,7 +2089,7 @@ impl ShadeApp {
                     self.solo_channel = None;
                     self.fit_requested = true;
                     self.viewport_recenter = true;
-                    self.project_dirty = true;
+                    self.mark_project_dirty();
                     self.history
                         .reset(&self.project.adjustments, "Faces changed");
                     self.history_pending_label = None;
@@ -2114,7 +2166,7 @@ impl ShadeApp {
                     self.adjustment_scope = AdjustmentScope::All;
                     self.fit_requested = true;
                     self.viewport_recenter = true;
-                    self.project_dirty = false;
+                    self.mark_project_saved();
                     self.export.remind_after_export = false;
                     self.export.show_snapshot_save_reminder = false;
                     self.remember_previous_shade(&payload.path);
@@ -2161,7 +2213,7 @@ impl ShadeApp {
                     self.adjustment_scope = AdjustmentScope::All;
                     self.fit_requested = true;
                     self.viewport_recenter = true;
-                    self.project_dirty = true;
+                    self.mark_project_dirty();
                     self.load_history_for_active_snapshot("Recovered project");
                     self.history_clear_backup = None;
                     self.history_pending_label = None;
@@ -2177,11 +2229,19 @@ impl ShadeApp {
                 }
                 Err(err) => self.report_error(format!("Recovery failed: {err}")),
             },
-            JobResult::Save { path, result } => match result {
+            JobResult::Save {
+                path,
+                revision,
+                result,
+            } => match result {
                 Ok(()) => {
                     self.project.name = project_name_for_path(&self.project.name, &path);
                     self.project_path = Some(path.clone());
-                    self.project_dirty = false;
+                    if self.project_revision == revision {
+                        self.mark_project_saved();
+                    } else {
+                        self.report_info("Project saved, but newer edits remain unsaved.");
+                    }
                     self.export.remind_after_export = false;
                     self.export.show_snapshot_save_reminder = false;
                     self.remember_previous_shade(&path);
@@ -2222,7 +2282,7 @@ impl ShadeApp {
                             mark.exported_at_unix_ms,
                         );
                     }
-                    self.project_dirty = true;
+                    self.mark_project_dirty();
                 }
                 match payload.result {
                     Ok(message) => self.report_info(message),
@@ -2240,7 +2300,7 @@ impl ShadeApp {
         for face in &mut self.faces {
             face.generation = face.generation.wrapping_add(1).max(1);
         }
-        self.project_dirty = true;
+        self.mark_project_dirty();
     }
 
     fn mark_current_preview_dirty(&mut self) {
@@ -2552,7 +2612,7 @@ impl ShadeApp {
         self.solo_channel = None;
         self.fit_requested = true;
         self.viewport_recenter = true;
-        self.project_dirty = true;
+        self.mark_project_dirty();
         self.report_info("Face removed from project (source TIFF was not deleted)");
     }
 
@@ -2656,7 +2716,7 @@ impl ShadeApp {
         let mut queue_requested = false;
         ui.horizontal(|ui| {
             ui.horizontal_wrapped(|ui| {
-                let enabled = self.job.is_none();
+                let enabled = self.job.is_none() && !self.project_autosave_busy;
                 ui.menu_button("File", |ui| {
                     if ui.add_enabled(enabled, egui::Button::new("New project")).clicked() {
                         self.new_project();
@@ -2707,6 +2767,16 @@ impl ShadeApp {
                 if ui.button("About").clicked() { self.show_about = true; }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (save_state, save_error) = self.project_save_state_label();
+                if !save_state.is_empty() {
+                    let text = egui::RichText::new(save_state).small();
+                    if save_error {
+                        ui.label(text.color(egui::Color32::LIGHT_RED))
+                            .on_hover_text(self.project_autosave_error.as_deref().unwrap_or("Autosave failed"));
+                    } else {
+                        ui.label(text);
+                    }
+                }
                 self.ui_operation_progress(ui);
                 if ui.small_button("Logs").clicked() { self.log_cache = self.log.read(); self.show_logs = true; }
                 self.ui_update_compact(ui);
@@ -3081,7 +3151,7 @@ impl ShadeApp {
             return false;
         }
         snapshot.history = persisted;
-        self.project_dirty = true;
+        self.mark_project_dirty();
         true
     }
 
@@ -3296,7 +3366,7 @@ impl ShadeApp {
             || self.autosave_busy
             || self.job.is_some()
             || self.faces.is_empty()
-            || self.last_autosave.elapsed() < AUTOSAVE_INTERVAL
+            || self.last_autosave.elapsed() < RECOVERY_AUTOSAVE_INTERVAL
         {
             return;
         }
@@ -3310,6 +3380,65 @@ impl ShadeApp {
         self.last_autosave = Instant::now();
         std::thread::spawn(move || {
             let _ = tx.send(recovery::write(&recovery_file));
+        });
+    }
+
+    fn poll_project_autosave(&mut self) {
+        while let Ok(completion) = self.project_autosave_rx.try_recv() {
+            self.project_autosave_busy = false;
+            match completion.result {
+                Ok(()) => {
+                    self.project_autosave_error = None;
+                    self.log
+                        .info(&format!("Project autosaved: {}", completion.path.display()));
+                    if self.project_revision == completion.revision {
+                        self.mark_project_saved();
+                    }
+                }
+                Err(err) => {
+                    self.project_autosave_error = Some(err.clone());
+                    self.log.error(&format!("Project autosave failed: {err}"));
+                }
+            }
+        }
+    }
+
+    fn maybe_project_autosave(&mut self) {
+        let eligibility = project_autosave::Eligibility {
+            dirty: self.project_dirty,
+            has_project_path: self.project_path.is_some(),
+            has_faces: !self.faces.is_empty(),
+            save_busy: self.project_autosave_busy,
+            other_operation_busy: self.job.is_some(),
+            transition_pending: self.lifecycle.pending.is_some()
+                || self.lifecycle.after_save.is_some(),
+            snapshot_choice_pending: self.pending_snapshot_action.is_some(),
+            snapshot_has_unupdated_changes: self.active_snapshot_has_unupdated_changes(),
+            quiet_for: self.last_project_edit_at.elapsed(),
+        };
+        if !project_autosave::should_start(eligibility) {
+            return;
+        }
+        let Some(path) = self.project_path.clone() else {
+            return;
+        };
+        let project = self.project.clone();
+        let face_paths = self
+            .faces
+            .iter()
+            .map(|face| face.path.clone())
+            .collect::<Vec<_>>();
+        let revision = self.project_revision;
+        let tx = self.project_autosave_tx.clone();
+        self.project_autosave_busy = true;
+        self.project_autosave_error = None;
+        std::thread::spawn(move || {
+            let result = project.save(&path, &face_paths);
+            let _ = tx.send(project_autosave::Completion {
+                revision,
+                path,
+                result,
+            });
         });
     }
 
@@ -3498,7 +3627,7 @@ impl ShadeApp {
             }
             self.load_history_for_active_snapshot("Snapshot created");
             self.history_clear_backup = None;
-            self.project_dirty = true;
+            self.mark_project_dirty();
             self.cache_current_snapshot_preview_if_ready();
         }
         if export_all {
@@ -3632,7 +3761,7 @@ impl ShadeApp {
             match self.project.rename_snapshot(active_id, &candidate) {
                 Ok(true) => {
                     self.snapshot_rename_buffer = candidate.trim().to_owned();
-                    self.project_dirty = true;
+                    self.mark_project_dirty();
                     self.report_info("Snapshot renamed");
                 }
                 Ok(false) => {}
@@ -3656,7 +3785,7 @@ impl ShadeApp {
             self.history
                 .reset(&self.project.adjustments, "Snapshot deleted");
             self.history_clear_backup = None;
-            self.project_dirty = true;
+            self.mark_project_dirty();
             self.report_info("Snapshot deleted");
         }
     }
@@ -3778,7 +3907,7 @@ impl ShadeApp {
             ui.small("Default: top-left, 1 cm margin. Point size is converted using the TIFF DPI.");
         });
         if changed {
-            self.project_dirty = true;
+            self.mark_project_dirty();
         }
     }
 
@@ -5236,7 +5365,7 @@ impl ShadeApp {
                     &self.color.profiles,
                 );
                 if project_relinked {
-                    self.project_dirty = true;
+                    self.mark_project_dirty();
                     self.invalidate_display_previews();
                 }
                 if monitor_relinked {
@@ -5764,7 +5893,7 @@ impl ShadeApp {
         }
 
         if changed {
-            self.project_dirty = true;
+            self.mark_project_dirty();
             self.invalidate_display_previews();
         }
         if display_settings_changed {
@@ -6167,6 +6296,7 @@ impl eframe::App for ShadeApp {
         self.poll_render(ui.ctx());
         self.sync_update_state();
         self.poll_autosave();
+        self.poll_project_autosave();
         self.handle_dropped_files(ui.ctx());
         workflow::handle_shortcuts(self, ui.ctx());
         if !self.show_previous_shades {
@@ -6176,6 +6306,7 @@ impl eframe::App for ShadeApp {
             data.insert_temp(egui::Id::new("shade-editor-curve-graph-focused"), false);
         });
         self.maybe_autosave();
+        self.maybe_project_autosave();
         self.handle_close_request(ui.ctx());
 
         egui::Panel::top("toolbar").show(ui, |ui| self.ui_toolbar(ui));
@@ -8073,5 +8204,17 @@ fn sanitize_filename(value: &str) -> String {
         "shade-project".to_owned()
     } else {
         filtered
+    }
+}
+
+#[cfg(test)]
+mod project_revision_tests {
+    #[test]
+    fn only_the_revision_that_was_serialized_may_clear_dirty_state() {
+        let saved_revision = 7_u64;
+        let current_revision_same = 7_u64;
+        let current_revision_newer = 8_u64;
+        assert_eq!(saved_revision, current_revision_same);
+        assert_ne!(saved_revision, current_revision_newer);
     }
 }
