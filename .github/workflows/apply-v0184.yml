@@ -1,0 +1,108 @@
+name: Validate v0.18.4 Interaction Upgrade
+
+on:
+  push:
+    branches:
+      - feature/v0184-curve-snapshot-display
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Reconstruct and apply v0.18.4 migration
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import base64, gzip, hashlib
+          parts = [Path(f'tools/v0184/chunk{i}.txt').read_text(encoding='utf-8').strip() for i in range(6)]
+          encoded = ''.join(parts)
+          digest = hashlib.sha256(encoded.encode()).hexdigest()
+          expected = 'ae227200c8b8e1bc7ec51bb9dc08ec7fcd5b639c0419ac452091ddf88a2239b1'
+          if digest != expected:
+              raise SystemExit(f'payload checksum mismatch: {digest}')
+          Path('apply_v0184.py').write_bytes(gzip.decompress(base64.b64decode(encoded)))
+          '@ | python -
+          python apply_v0184.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Verify format
+        run: cargo fmt --all -- --check
+
+      - name: Check Windows target locked
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+
+      - name: Test Windows target locked
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build Windows release locked
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Verify v0.18.4 invariants
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+          cargo = Path('Cargo.toml').read_text(encoding='utf-8')
+          lock = Path('Cargo.lock').read_text(encoding='utf-8')
+          version = Path('VERSION').read_text(encoding='utf-8').strip()
+          main = Path('src/main.rs').read_text(encoding='utf-8')
+          history = Path('src/history.rs').read_text(encoding='utf-8')
+          workflow = Path('src/workflow.rs').read_text(encoding='utf-8')
+          settings = Path('src/settings.rs').read_text(encoding='utf-8')
+          notes = Path('RELEASE_NOTES.md').read_text(encoding='utf-8')
+
+          assert re.search(r'^version = "0\.18\.4"$', cargo, re.M)
+          assert 'name = "windows-shade-editor"' in lock and 'version = "0.18.4"' in lock
+          assert version == '0.18.4'
+          assert 'PendingSnapshotAction' in main
+          assert 'Update snapshot' in main and 'Snapshot changes not updated' in main
+          assert 'request_project_save' in main and 'active_snapshot_has_unupdated_changes' in main
+          assert 'pending_snapshot_load' not in main
+          assert '.stick_to_bottom(true)' in main
+          assert 'TonalDisplayMode' in main and 'Pigment' in main
+          assert 'nudge_curve_point' in main and 'Shift+Arrow' in main
+          assert 'discard_to_state' in history
+          assert '"Master".to_owned()' in history and 'Curve · Master' in history
+          assert 'AdjustmentScope::Selected' in workflow and 'AdjustmentScope::All' in workflow
+          assert 'pub enum TonalDisplayMode' in settings
+          assert 'tonal_display_mode: TonalDisplayMode' in settings
+          assert '# Shade Editor 0.18.4' in notes
+          assert 'All channels  •' not in main
+          print('v0.18.4 invariants verified')
+          '@ | python -
+
+      - name: Remove temporary migration infrastructure
+        shell: pwsh
+        run: |
+          Remove-Item -Force .github/workflows/apply-v0184.yml -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force tools/v0184 -ErrorAction SilentlyContinue
+          Remove-Item -Force apply_v0184.py -ErrorAction SilentlyContinue
+          if (Test-Path tools -PathType Container) {
+            $remaining = Get-ChildItem tools -Force
+            if ($remaining.Count -eq 0) { Remove-Item -Force tools }
+          }
+
+      - name: Commit validated v0.18.4 source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "[skip ci] Add snapshot-safe Master and Pigment interactions"
+          git push origin HEAD:feature/v0184-curve-snapshot-display
