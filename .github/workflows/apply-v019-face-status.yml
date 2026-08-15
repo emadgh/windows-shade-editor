@@ -21,6 +21,8 @@ jobs:
         run: python .github/scripts/apply_v019_face_status.py
       - name: Apply compile fix
         run: python .github/scripts/fix_v019_face_status.py
+      - name: Update production acceptance guards
+        run: python .github/scripts/fix_v019_face_acceptance_test.py
       - name: Format
         run: cargo fmt --all
       - name: Format check
