@@ -19,6 +19,8 @@ jobs:
           components: rustfmt
       - name: Apply implementation
         run: python .github/scripts/apply_v019_queue_recent.py
+      - name: Fix metrics separator quoting
+        run: python .github/scripts/fix_v019_queue_metrics_quote.py
       - name: Format
         run: cargo fmt --all
       - name: Format check
