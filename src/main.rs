@@ -6737,6 +6737,16 @@ fn curve_editor_graph(
     }
 
     if graph_response.has_focus() {
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                graph_response.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
         let (left, right, up, down, shift) = ui.input(|input| {
             (
                 input.key_pressed(egui::Key::ArrowLeft),
@@ -6747,6 +6757,10 @@ fn curve_editor_graph(
             )
         });
         if left || right || up || down {
+            // Focus navigation is decided at the start of the frame, before this
+            // custom graph sees the key event. Cancel that pending movement so the
+            // first arrow press after selecting a point cannot escape the graph.
+            ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
             let units = if shift { 10 } else { 1 };
             let horizontal = if left {
                 -units
