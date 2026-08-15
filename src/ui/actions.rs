@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::workflow::*;
 use crate::*;
 use eframe::egui;
@@ -59,6 +61,21 @@ pub(crate) enum ExportQueueUiAction {
     Cancel(u64),
     Retry(u64),
     RevealFolder(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AdjustmentUiAction {
+    Undo,
+    Redo,
+    ClearHistory,
+    RestoreClearedHistory,
+    JumpHistory(usize),
+    SelectProjectPalette(palette::ChannelPalette),
+    ShowComposite,
+    SelectChannel(usize),
+    PersistSettings,
+    InvalidatePreviews,
+    QueueHistory(BTreeMap<String, model::ChannelAdjustment>),
 }
 
 impl ShadeApp {
@@ -257,6 +274,52 @@ impl ShadeApp {
             }
         }
     }
+
+    pub(crate) fn dispatch_adjustment_ui_action(
+        &mut self,
+        action: AdjustmentUiAction,
+        ctx: &egui::Context,
+    ) {
+        match action {
+            AdjustmentUiAction::Undo => self.undo_adjustment(ctx),
+            AdjustmentUiAction::Redo => self.redo_adjustment(ctx),
+            AdjustmentUiAction::ClearHistory => {
+                let scope = self.project.active_snapshot_id;
+                self.flush_history_now();
+                self.history_clear_backup = Some((scope, self.history.clone()));
+                self.history
+                    .reset(&self.project.adjustments, "Current state");
+                self.sync_history_to_active_snapshot();
+                self.report_info("History cleared - Undo clear is available once");
+            }
+            AdjustmentUiAction::RestoreClearedHistory => {
+                let scope = self.project.active_snapshot_id;
+                if let Some((backup_scope, backup)) = self.history_clear_backup.take() {
+                    if backup_scope == scope {
+                        self.history = backup;
+                        self.sync_history_to_active_snapshot();
+                        self.report_info("Cleared history restored");
+                    }
+                }
+            }
+            AdjustmentUiAction::JumpHistory(index) => {
+                self.flush_history_now();
+                if let Some(adjustments) = self.history.jump(index) {
+                    self.apply_history_adjustments(adjustments, "History state selected");
+                }
+            }
+            AdjustmentUiAction::SelectProjectPalette(palette) => {
+                self.select_project_palette(palette);
+            }
+            AdjustmentUiAction::ShowComposite => self.show_composite(),
+            AdjustmentUiAction::SelectChannel(index) => self.select_channel(index, true),
+            AdjustmentUiAction::PersistSettings => self.save_settings_quietly(),
+            AdjustmentUiAction::InvalidatePreviews => self.mark_all_previews_dirty(),
+            AdjustmentUiAction::QueueHistory(before) => {
+                self.queue_adjustment_history(&before);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,11 +352,33 @@ mod tests {
 
     #[test]
     fn export_queue_actions_preserve_job_and_folder_payloads() {
-        assert_eq!(ExportQueueUiAction::Retry(42), ExportQueueUiAction::Retry(42));
+        assert_eq!(
+            ExportQueueUiAction::Retry(42),
+            ExportQueueUiAction::Retry(42)
+        );
         let folder = PathBuf::from(r"C:\exports\batch-42");
         assert_eq!(
             ExportQueueUiAction::RevealFolder(folder.clone()),
             ExportQueueUiAction::RevealFolder(folder)
+        );
+    }
+
+    #[test]
+    fn adjustment_actions_preserve_history_and_palette_payloads() {
+        assert_eq!(
+            AdjustmentUiAction::JumpHistory(17),
+            AdjustmentUiAction::JumpHistory(17)
+        );
+        let palette = palette::builtin_cmyk();
+        assert_eq!(
+            AdjustmentUiAction::SelectProjectPalette(palette.clone()),
+            AdjustmentUiAction::SelectProjectPalette(palette)
+        );
+        let mut before = BTreeMap::new();
+        before.insert("Cyan".to_owned(), model::ChannelAdjustment::default());
+        assert_eq!(
+            AdjustmentUiAction::QueueHistory(before.clone()),
+            AdjustmentUiAction::QueueHistory(before)
         );
     }
 }

@@ -1,3 +1,11 @@
+# Shade Editor 0.20.2
+
+- Complete the typed UI-action architecture follow-up for high-value Adjustment surfaces.
+- Route Undo/Redo, history clear/restore/jump, palette/channel/composite selection, settings persistence, preview invalidation and adjustment-history commits through `AdjustmentUiAction`.
+- Keep Levels/Curve/Mixer value editing local to the Adjustment presentation layer; no framework rewrite or visual redesign.
+- Add architecture regression coverage so Adjustment presentation cannot directly regain history/render/settings orchestration calls.
+- Preserve revision-aware autosave, Snapshot history, render-generation invalidation and all existing adjustment behavior.
+
 # Shade Editor 0.20.1
 
 - Extract Project View transient state into a focused `ProjectViewState` instead of keeping query/sort/selection/preview/texture-cache fields directly on `ShadeApp`.

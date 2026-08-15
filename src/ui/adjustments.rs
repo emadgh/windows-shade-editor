@@ -1,3 +1,4 @@
+use super::actions::AdjustmentUiAction;
 use super::curve_editor::curves_ui;
 use crate::*;
 use eframe::egui;
@@ -18,14 +19,14 @@ impl ShadeApp {
                 .on_hover_text("Ctrl+Alt+Z")
                 .clicked()
             {
-                self.undo_adjustment(ui.ctx());
+                self.dispatch_adjustment_ui_action(AdjustmentUiAction::Undo, ui.ctx());
             }
             if ui
                 .add_enabled(self.history.can_redo(), egui::Button::new("Redo").small())
                 .on_hover_text("Ctrl+Shift+Z")
                 .clicked()
             {
-                self.redo_adjustment(ui.ctx());
+                self.dispatch_adjustment_ui_action(AdjustmentUiAction::Redo, ui.ctx());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if can_undo_clear {
@@ -48,20 +49,9 @@ impl ShadeApp {
         }
 
         if clear {
-            self.flush_history_now();
-            self.history_clear_backup = Some((scope, self.history.clone()));
-            self.history
-                .reset(&self.project.adjustments, "Current state");
-            self.sync_history_to_active_snapshot();
-            self.report_info("History cleared - Undo clear is available once");
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::ClearHistory, ui.ctx());
         } else if undo_clear {
-            if let Some((backup_scope, backup)) = self.history_clear_backup.take() {
-                if backup_scope == scope {
-                    self.history = backup;
-                    self.sync_history_to_active_snapshot();
-                    self.report_info("Cleared history restored");
-                }
-            }
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::RestoreClearedHistory, ui.ctx());
         }
 
         let rows = self
@@ -85,10 +75,7 @@ impl ShadeApp {
                 }
             });
         if let Some(index) = requested {
-            self.flush_history_now();
-            if let Some(adjustments) = self.history.jump(index) {
-                self.apply_history_adjustments(adjustments, "History state selected");
-            }
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::JumpHistory(index), ui.ctx());
         }
     }
 
@@ -144,7 +131,10 @@ impl ShadeApp {
                 });
             if let Some(palette) = requested_palette {
                 active_palette = Some(palette.clone());
-                self.select_project_palette(palette);
+                self.dispatch_adjustment_ui_action(
+                    AdjustmentUiAction::SelectProjectPalette(palette),
+                    ui.ctx(),
+                );
             }
         });
         if clickable_row(
@@ -157,7 +147,7 @@ impl ShadeApp {
         )
         .clicked()
         {
-            self.show_composite();
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::ShowComposite, ui.ctx());
         }
         ui.small(format!(
             "{} + {} extra",
@@ -218,11 +208,14 @@ impl ShadeApp {
             )
             .on_hover_text(hover);
             if response.clicked() {
-                self.select_channel(index, true);
+                self.dispatch_adjustment_ui_action(
+                    AdjustmentUiAction::SelectChannel(index),
+                    ui.ctx(),
+                );
             }
         }
         if self.solo_channel.is_some() && ui.small_button("Return to composite").clicked() {
-            self.show_composite();
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::ShowComposite, ui.ctx());
         }
 
         ui.separator();
@@ -236,14 +229,14 @@ impl ShadeApp {
             };
             if ui.small_button(label).clicked() {
                 self.settings.show_all_histograms = !self.settings.show_all_histograms;
-                self.save_settings_quietly();
+                self.dispatch_adjustment_ui_action(AdjustmentUiAction::PersistSettings, ui.ctx());
             }
             ui.separator();
             tonal_display_changed |=
                 tonal_display_mode_selector(ui, &mut self.settings.tonal_display_mode);
         });
         if tonal_display_changed {
-            self.save_settings_quietly();
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::PersistSettings, ui.ctx());
         }
         if self.settings.show_all_histograms {
             for (index, name) in channel_names.iter().enumerate() {
@@ -514,7 +507,7 @@ impl ShadeApp {
         }
         if settings_changed {
             self.settings.sanitize();
-            self.save_settings_quietly();
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::PersistSettings, ui.ctx());
         }
         changed
     }
@@ -582,7 +575,10 @@ impl ShadeApp {
                 };
                 if ui.small_button(layout_label).clicked() {
                     self.settings.adjustment_tabs = !self.settings.adjustment_tabs;
-                    self.save_settings_quietly();
+                    self.dispatch_adjustment_ui_action(
+                        AdjustmentUiAction::PersistSettings,
+                        ui.ctx(),
+                    );
                 }
                 ui.separator();
                 tonal_display_changed |=
@@ -590,12 +586,12 @@ impl ShadeApp {
             });
         });
         if tonal_display_changed {
-            self.save_settings_quietly();
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::PersistSettings, ui.ctx());
         }
         let quick_changed =
             self.ui_adjustment_quick_tools(ui, &channel_names, palette.as_ref(), &output_name);
         if quick_changed {
-            self.mark_all_previews_dirty();
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::InvalidatePreviews, ui.ctx());
         }
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -744,7 +740,7 @@ impl ShadeApp {
                             }
                         },
                     }
-                    self.mark_all_previews_dirty();
+                    self.dispatch_adjustment_ui_action(AdjustmentUiAction::InvalidatePreviews, ui.ctx());
                 }
                 let body_changed = match self.adjustment_scope {
                     AdjustmentScope::Selected => self.ui_selected_adjustment(
@@ -768,10 +764,13 @@ impl ShadeApp {
             })
             .inner;
         if changed {
-            self.mark_all_previews_dirty();
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::InvalidatePreviews, ui.ctx());
         }
         if self.project.adjustments != adjustments_before {
-            self.queue_adjustment_history(&adjustments_before);
+            self.dispatch_adjustment_ui_action(
+                AdjustmentUiAction::QueueHistory(adjustments_before),
+                ui.ctx(),
+            );
         }
     }
 
