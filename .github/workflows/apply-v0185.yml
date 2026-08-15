@@ -1,0 +1,92 @@
+name: Validate v0.18.5 Export Crash Hardening
+
+on:
+  push:
+    branches:
+      - fix/v0185-export-crash-tonal-toggle
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Apply v0.18.5 migration
+        run: python tools/apply_v0185.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Verify format
+        run: cargo fmt --all -- --check
+
+      - name: Check Windows target locked
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+
+      - name: Test Windows target locked
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build Windows release locked
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Verify crash and tonal invariants
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+          cargo = Path('Cargo.toml').read_text(encoding='utf-8')
+          main = Path('src/main.rs').read_text(encoding='utf-8')
+          queue = Path('src/export_queue.rs').read_text(encoding='utf-8')
+          export = Path('src/export.rs').read_text(encoding='utf-8')
+          settings = Path('src/settings.rs').read_text(encoding='utf-8')
+          worker = Path('src/worker_guard.rs').read_text(encoding='utf-8')
+          notes = Path('RELEASE_NOTES.md').read_text(encoding='utf-8')
+          assert re.search(r'^version = "0\.18\.5"$', cargo, re.M)
+          assert 'panic = "unwind"' in cargo and 'panic = "abort"' not in cargo
+          assert 'worker_guard::catch_result("Export worker"' in queue
+          assert 'worker_guard::catch_value("Preview render worker"' in main
+          assert 'JobResult::WorkerPanic' in main
+          assert 'app_log::install_panic_hook();' in main
+          assert '.join("export-spool")' in export
+          assert 'temporary_spool_path(_destination' in export
+          assert 'temporary_export_name_stays_short_and_spool_is_local' in export
+          assert 'queue_can_be_read_and_extended_while_an_item_is_processing' in queue
+          assert 'caught_worker_panic_becomes_an_error' in worker
+          assert 'Self::Light => "Pigment"' in settings
+          assert 'Self::Pigment => "Light"' in settings
+          assert 'button(format!("Mode: {current}"))' in main
+          assert '.selectable_value(mode, TonalDisplayMode::Light' not in main
+          assert 'Curve / Histogram direction' in main
+          assert '# Shade Editor 0.18.5' in notes
+          print('v0.18.5 invariants verified')
+          '@ | python -
+
+      - name: Remove temporary migration infrastructure
+        shell: pwsh
+        run: |
+          Remove-Item -Force .github/workflows/apply-v0185.yml -ErrorAction SilentlyContinue
+          Remove-Item -Force tools/apply_v0185.py -ErrorAction SilentlyContinue
+          if (Test-Path tools -PathType Container) {
+            $remaining = Get-ChildItem tools -Force
+            if ($remaining.Count -eq 0) { Remove-Item -Force tools }
+          }
+
+      - name: Commit validated v0.18.5 source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "[skip ci] Harden export workers and tonal display toggle"
+          git push origin HEAD:fix/v0185-export-crash-tonal-toggle
