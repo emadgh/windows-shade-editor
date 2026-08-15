@@ -1,3 +1,4 @@
+use super::curve_editor::curves_ui;
 use crate::*;
 use eframe::egui;
 
