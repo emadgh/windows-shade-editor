@@ -86,20 +86,24 @@ mod tests {
             );
         }
         for required in [
-            "tiled_contig_streaming_matches_reference_and_preserves_chunks",
-            "tiled_separate_streaming_matches_reference_and_preserves_chunks",
+            "streaming_identity_export_preserves_six_channels",
             "large_layout_selects_bigtiff_without_allocating_pixels",
             "identity_export_preserves_bigtiff_container",
         ] {
             assert!(
                 EXPORT_TESTS.contains(required),
-                "missing required transport test: {required}"
+                "missing required export transport test: {required}"
             );
         }
-        assert!(
-            TIFF_IO_TESTS.contains("region_stream_interleaves_planar_strips_without_full_decode"),
-            "missing planar-separate strip streaming coverage"
-        );
+        for required in [
+            "region_stream_compacts_edge_tiles_without_full_decode",
+            "region_stream_interleaves_planar_strips_without_full_decode",
+        ] {
+            assert!(
+                TIFF_IO_TESTS.contains(required),
+                "missing required tiled/planar streaming coverage: {required}"
+            );
+        }
     }
 
     #[test]
