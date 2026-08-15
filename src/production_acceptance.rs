@@ -114,7 +114,9 @@ mod tests {
             "load_relink_candidate",
             "find_named_file_recursive",
             "The active Face source TIFF is missing",
-            "Export all requires every Face source TIFF to be available",
+            "Export all requires every Accepted Face source TIFF to be available",
+            "status.is_rejected()",
+            "excluded {rejected_count} Rejected Face(s)",
         ] {
             assert!(
                 WORKFLOW_SRC.contains(required)

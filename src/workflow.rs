@@ -382,16 +382,48 @@ pub(super) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.separator();
     ui.heading("Faces");
+
+    let active_rejected = app
+        .project
+        .faces
+        .get(app.current_face)
+        .is_some_and(|face| face.status.is_rejected());
+    if active_rejected {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgba_unmultiplied(175, 35, 35, 56))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(225, 80, 80)))
+            .corner_radius(4)
+            .inner_margin(7)
+            .show(ui, |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(245, 120, 120),
+                    "REJECTED FACE",
+                );
+                ui.small("This Face was rejected because of a design/problem decision. It is kept for reference and Export All will skip it.");
+            });
+        ui.add_space(5.0);
+    }
+
     if app.faces.is_empty() {
         ui.label("Add TIFF files to create a shade project.");
     } else {
         let duplicate_counts = duplicate_face_counts(&app.faces);
-        let mut requested_face = None;
-        for (index, face) in app.faces.iter().enumerate() {
-            let label = app
-                .project
+        let mut display_indices = (0..app.faces.len()).collect::<Vec<_>>();
+        display_indices.sort_by_key(|index| {
+            app.project
                 .faces
-                .get(index)
+                .get(*index)
+                .is_some_and(|face| face.status.is_rejected())
+        });
+
+        let mut requested_face = None;
+        let mut requested_status = None;
+        let mut requested_delete = None;
+        for index in display_indices {
+            let face = &app.faces[index];
+            let project_face = app.project.faces.get(index);
+            let status = project_face.map(|item| item.status).unwrap_or_default();
+            let label = project_face
                 .map(|item| item.label.as_str())
                 .unwrap_or_else(|| {
                     face.path
@@ -404,20 +436,31 @@ pub(super) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                 .copied()
                 .unwrap_or(1);
             let mut display_label = label.to_owned();
+            if status.is_rejected() {
+                display_label.push_str("  [rejected]");
+            }
             if !face.available {
                 display_label.push_str("  [missing]");
             }
             if duplicate_count > 1 {
                 display_label.push_str(&format!("  [duplicate x{duplicate_count}]"));
             }
-            let accent = if !face.available {
-                Some(egui::Color32::from_rgb(225, 90, 90))
+            let accent = if status.is_rejected() || !face.available {
+                Some(egui::Color32::from_rgb(235, 95, 95))
             } else if duplicate_count > 1 {
                 Some(egui::Color32::from_rgb(235, 155, 70))
             } else {
                 None
             };
-            let hover = if !face.available {
+            let tint = status
+                .is_rejected()
+                .then_some(egui::Color32::from_rgba_unmultiplied(180, 35, 35, 52));
+            let hover = if status.is_rejected() {
+                format!(
+                    "Rejected Face — retained for reference and excluded from Export All. Source: {}",
+                    face.path.display()
+                )
+            } else if !face.available {
                 format!(
                     "Source TIFF is missing: {}. Use Locate file or Locate folder.",
                     face.path.display()
@@ -427,27 +470,69 @@ pub(super) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
             } else {
                 face.path.display().to_string()
             };
-            if clickable_row(
+            let response = clickable_row_tinted(
                 ui,
                 app.current_face == index,
                 &display_label,
                 None,
                 accent,
+                tint,
                 32.0,
             )
-            .on_hover_text(hover)
-            .clicked()
-            {
+            .on_hover_text(hover);
+            if response.clicked() {
                 requested_face = Some(index);
             }
+            response.context_menu(|ui| {
+                if status.is_rejected() {
+                    if ui.button("Mark Accepted").clicked() {
+                        requested_status = Some((index, model::FaceStatus::Accepted));
+                        ui.close();
+                    }
+                } else if ui.button("Mark Rejected").clicked() {
+                    requested_status = Some((index, model::FaceStatus::Rejected));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Delete from project").clicked() {
+                    requested_delete = Some(index);
+                    ui.close();
+                }
+            });
         }
-        if let Some(index) = requested_face {
+
+        if let Some((index, status)) = requested_status {
+            if let Some(face) = app.project.faces.get_mut(index) {
+                if face.status != status {
+                    face.status = status;
+                    app.project_dirty = true;
+                    app.report_info(match status {
+                        model::FaceStatus::Accepted => "Face marked Accepted — eligible for Export All",
+                        model::FaceStatus::Rejected => "Face marked Rejected — retained for reference and excluded from Export All",
+                    });
+                }
+            }
+        }
+        if let Some(index) = requested_delete {
+            app.current_face = index;
+            app.remove_current_face();
+        } else if let Some(index) = requested_face {
             app.current_face = index;
             app.selected_channel = 0;
             app.solo_channel = None;
             app.fit_requested = true;
             app.viewport_recenter = true;
             app.mark_current_preview_dirty();
+            if app
+                .project
+                .faces
+                .get(index)
+                .is_some_and(|face| face.status.is_rejected())
+            {
+                app.report_info(
+                    "Warning: selected Face is Rejected and is excluded from Export All",
+                );
+            }
         }
         ui.add_space(4.0);
         let active_missing = app
