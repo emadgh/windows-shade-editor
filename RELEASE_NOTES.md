@@ -1,3 +1,15 @@
+# Shade Editor 0.19.0
+
+- Centralize keyboard/focus ownership so Curve/editor shortcuts no longer leak into text fields or modal workflows; keep Curve Arrow/Shift+Arrow editing while adding Delete/Backspace midpoint removal and Home identity reset.
+- Add revision-safe smart `.shade` autosave after short edit inactivity for already-saved projects, while keeping the existing crash-recovery autosave as a separate layer and preserving Snapshot dirty guards.
+- Add application-internal adjustment Copy/Paste plus a default-collapsed Relative Presets panel with cumulative Warmer, Cooler, Darker/Richer, Lighter, Redder and More beige actions and editable custom per-channel presets.
+- Add persistent Accepted/Rejected Face workflow with right-click Accepted/Rejected/Delete actions, red Rejected treatment, selection warning, Rejected-last display grouping and Export All exclusion; direct rejected-Face export requires confirmation.
+- Harden Face removal against stale background preview completion by invalidating generations after index shifts.
+- Upgrade Export Queue QoL with persisted Pause/Resume for waiting work, Retry all failed, separate completed/failed clearing, finite progress sanitization, elapsed/ETA/approximate throughput and compact toolbar status.
+- Add `File > Recent projects` backed by Project View history while preserving the centralized Save/Discard/Cancel lifecycle guard.
+- Continue architecture decomposition with focused `input_router`, `adjustment_tools` and `project_autosave` modules instead of expanding the application shell with more cross-cutting logic.
+- Add regression coverage for focus routing, Curve point lifecycle, relative preset accumulation, adjustment clipboard constraints, legacy Face status/defaults, rejected export filtering, autosave eligibility/revision safety and queue state/progress behavior.
+
 # Shade Editor 0.18.6
 
 - Fix the reproducible Export Queue crash triggered by moving the pointer over the application while an item is Processing.

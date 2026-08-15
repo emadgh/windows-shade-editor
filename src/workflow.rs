@@ -510,7 +510,7 @@ pub(super) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
             if let Some(face) = app.project.faces.get_mut(index) {
                 if face.status != status {
                     face.status = status;
-                    app.project_dirty = true;
+                    app.mark_project_dirty();
                     app.report_info(match status {
                         model::FaceStatus::Accepted => "Face marked Accepted — eligible for Export All",
                         model::FaceStatus::Rejected => "Face marked Rejected — retained for reference and excluded from Export All",
