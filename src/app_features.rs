@@ -8,6 +8,11 @@ pub const MONITOR_PROFILE_LABEL: &str = "Monitor / Display ICC";
 #[cfg(test)]
 mod tests {
     const MAIN: &str = include_str!("main.rs");
+    const PROJECT_NAVIGATION_UI: &str = include_str!("ui/project_navigation.rs");
+
+    fn production_ui_contains(needle: &str) -> bool {
+        MAIN.contains(needle) || PROJECT_NAVIGATION_UI.contains(needle)
+    }
 
     #[test]
     fn required_production_backends_are_compiled_into_the_application() {
@@ -46,7 +51,7 @@ mod tests {
             super::MONITOR_PROFILE_LABEL,
         ] {
             assert!(
-                MAIN.contains(entry),
+                production_ui_contains(entry),
                 "missing production feature entry point: {entry}"
             );
         }
