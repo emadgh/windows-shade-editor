@@ -197,14 +197,7 @@ mod tests {
         ] {
             let mut lifecycle = ProjectLifecycleController::default();
             assert_eq!(
-                lifecycle.request(
-                    transition.clone(),
-                    false,
-                    true,
-                    false,
-                    false,
-                    false,
-                ),
+                lifecycle.request(transition.clone(), false, true, false, false, false,),
                 TransitionRequest::Execute(transition)
             );
         }
