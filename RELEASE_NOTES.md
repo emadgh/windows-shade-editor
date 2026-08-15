@@ -1,3 +1,9 @@
+# Shade Editor 0.18.6
+
+- Fix the reproducible Export Queue crash triggered by moving the pointer over the application while an item is Processing.
+- Replace the queue progress bar's infinite requested width with bounded finite UI geometry; this prevents invalid hit-test rectangles from reaching egui's pointer interaction path.
+- Sanitize non-finite queue progress values before rendering and add a regression test that exercises a second hover frame over the Processing progress bar.
+
 # Shade Editor 0.18.5
 
 - Harden Export Queue runtime stability: Release builds now unwind worker panics instead of aborting the entire process, export worker panics are converted into Failed queue rows, and panic details are written to the application log.
@@ -309,4 +315,3 @@ Snapshot export workflow and expanded Curve controls.
 ## Adjustment layout
 
 - In Stacked mode, Levels, Curve and Channel Mixer can each be collapsed/expanded independently.
-

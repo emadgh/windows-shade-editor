@@ -1135,14 +1135,14 @@ impl ShadeApp {
                                     });
 
                                     if *status == export_queue::ExportQueueStatus::Processing {
-                                        ui.add(
-                                            egui::ProgressBar::new(*progress)
-                                                .desired_width(f32::INFINITY)
-                                                .text(if detail.trim().is_empty() {
-                                                    "Processing".to_owned()
-                                                } else {
-                                                    detail.clone()
-                                                }),
+                                        export_queue_progress_bar(
+                                            ui,
+                                            *progress,
+                                            if detail.trim().is_empty() {
+                                                "Processing"
+                                            } else {
+                                                detail
+                                            },
                                         );
                                     } else {
                                         let detail = detail.trim();
@@ -7118,6 +7118,68 @@ fn channel_click_state(
     } else {
         // Clicking the already-selected channel toggles its monochrome solo preview on.
         (selected_channel, Some(clicked_channel))
+    }
+}
+
+fn export_queue_progress_bar(ui: &mut egui::Ui, progress: f32, detail: &str) -> egui::Response {
+    // ProgressBar already fills the available width by default, but keep the
+    // requested size explicit and finite. Passing f32::INFINITY here creates
+    // non-finite widget geometry; egui's pointer hit-test can then panic as
+    // soon as the mouse moves over the queue window.
+    let available_width = ui.available_width();
+    let width = if available_width.is_finite() {
+        available_width.max(1.0)
+    } else {
+        1.0
+    };
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ui.add(
+        egui::ProgressBar::new(progress)
+            .desired_width(width)
+            .text(detail),
+    )
+}
+
+#[cfg(test)]
+mod export_queue_ui_tests {
+    use super::{egui, export_queue_progress_bar};
+
+    #[test]
+    fn processing_progress_bar_has_finite_hit_geometry_during_hover() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 640.0));
+        let mut progress_rect = None;
+
+        let mut first_input = egui::RawInput::default();
+        first_input.screen_rect = Some(screen);
+        let _ = ctx.run_ui(first_input, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                progress_rect = Some(export_queue_progress_bar(ui, f32::NAN, "Processing").rect);
+                ui.small("C:\\exports\\sample.tif");
+            });
+        });
+
+        let progress_rect = progress_rect.expect("progress bar should be laid out");
+        assert!(progress_rect.min.x.is_finite());
+        assert!(progress_rect.min.y.is_finite());
+        assert!(progress_rect.max.x.is_finite());
+        assert!(progress_rect.max.y.is_finite());
+
+        let mut hover_input = egui::RawInput::default();
+        hover_input.screen_rect = Some(screen);
+        hover_input
+            .events
+            .push(egui::Event::PointerMoved(progress_rect.center()));
+        let _ = ctx.run_ui(hover_input, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                export_queue_progress_bar(ui, 0.5, "Processing");
+                ui.small("C:\\exports\\sample.tif");
+            });
+        });
     }
 }
 
