@@ -79,6 +79,8 @@ impl InstalledIccProfile {
 #[derive(Clone, Debug)]
 pub struct PreviewColorConfig {
     pub enabled: bool,
+    /// Legacy/manual source-intent value kept as a safe fallback for malformed
+    /// or non-ICC extended intent values. A valid source ICC header wins.
     pub intent: PreviewRenderingIntent,
     pub black_point_compensation: bool,
     pub assigned_profile_path: Option<PathBuf>,
@@ -218,7 +220,7 @@ impl PreviewColorStatus {
                     (proof_description.as_ref(), proofing_intent.as_ref())
                 {
                     format!(
-                        "{} ({source}) → printer/RIP soft proof '{}' → {monitor} · source {} intent · proof {} intent{bpc}{gamut}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
+                        "{} ({source}) → printer/RIP soft proof '{}' → {monitor} · source {} intent (automatic from source ICC header) · proof {} intent{bpc}{gamut}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
                         description,
                         proof,
                         intent.label(),
@@ -226,7 +228,7 @@ impl PreviewColorStatus {
                     )
                 } else {
                     format!(
-                        "{} ({source}) → {monitor} · {} intent{bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
+                        "{} ({source}) → {monitor} · {} intent (automatic from source ICC header){bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
                         description,
                         intent.label(),
                     )
@@ -254,6 +256,13 @@ impl PreviewColorStatus {
                 ..
             }
         )
+    }
+
+    pub fn source_rendering_intent(&self) -> Option<PreviewRenderingIntent> {
+        match self {
+            Self::Applied { intent, .. } => Some(*intent),
+            _ => None,
+        }
     }
 }
 
@@ -345,6 +354,12 @@ impl PreviewColorTransform {
             );
         }
 
+        // The ICC header carries the preferred source rendering intent. This is
+        // especially meaningful for embedded source profiles and matches how a
+        // color-managed host selects the source transform without making the
+        // operator guess between Perceptual/Relative/Saturation/Absolute.
+        let source_intent = preferred_profile_intent(&source, config.intent);
+        let intent = to_lcms_intent(source_intent);
         let description = profile_description(&source);
         let (destination, monitor_description) = if let Some(path) =
             config.monitor_profile_path.as_ref()
@@ -384,7 +399,6 @@ impl PreviewColorTransform {
             (Profile::new_srgb(), None)
         };
 
-        let intent = to_lcms_intent(config.intent);
         let bpc = config.black_point_compensation;
 
         let proof = if config.soft_proof_enabled {
@@ -476,7 +490,7 @@ impl PreviewColorTransform {
                 transform: Some(transform),
                 status: PreviewColorStatus::Applied {
                     description,
-                    intent: config.intent,
+                    intent: source_intent,
                     source: source_kind,
                     black_point_compensation: bpc,
                     proof_description: proof.as_ref().map(|(_, label)| label.clone()),
@@ -565,6 +579,25 @@ pub fn embedded_profile_description(metadata: &TiffMetadata) -> Option<String> {
     Profile::new_icc(icc)
         .ok()
         .map(|profile| profile_description(&profile))
+}
+
+pub fn embedded_profile_preferred_intent(
+    metadata: &TiffMetadata,
+) -> Option<PreviewRenderingIntent> {
+    let icc = metadata.icc_profile.as_deref()?;
+    let profile = Profile::new_icc(icc).ok()?;
+    from_lcms_intent(profile.header_rendering_intent())
+}
+
+pub fn file_profile_preferred_intent(path: &Path) -> Result<PreviewRenderingIntent, String> {
+    let profile = Profile::new_file(path)
+        .map_err(|err| format!("Cannot open ICC profile {}: {err}", path.display()))?;
+    from_lcms_intent(profile.header_rendering_intent()).ok_or_else(|| {
+        format!(
+            "ICC profile {} contains a non-standard rendering intent value",
+            path.display()
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -905,6 +938,23 @@ fn profile_class_label(class: ProfileClassSignature) -> String {
     }
 }
 
+fn from_lcms_intent(intent: Intent) -> Option<PreviewRenderingIntent> {
+    match intent {
+        Intent::Perceptual => Some(PreviewRenderingIntent::Perceptual),
+        Intent::RelativeColorimetric => Some(PreviewRenderingIntent::RelativeColorimetric),
+        Intent::Saturation => Some(PreviewRenderingIntent::Saturation),
+        Intent::AbsoluteColorimetric => Some(PreviewRenderingIntent::AbsoluteColorimetric),
+        _ => None,
+    }
+}
+
+fn preferred_profile_intent(
+    profile: &Profile,
+    fallback: PreviewRenderingIntent,
+) -> PreviewRenderingIntent {
+    from_lcms_intent(profile.header_rendering_intent()).unwrap_or(fallback)
+}
+
 fn to_lcms_intent(intent: PreviewRenderingIntent) -> Intent {
     match intent {
         PreviewRenderingIntent::Perceptual => Intent::Perceptual,
@@ -969,7 +1019,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut profile = Profile::new_srgb();
+        let profile = Profile::new_srgb();
         profile.save_profile_to_file(&path).unwrap();
         path
     }
@@ -1059,5 +1109,63 @@ mod tests {
                 .unwrap();
         assert_eq!(resolved, moved);
         let _ = fs::remove_file(resolved);
+    }
+
+    #[test]
+    fn all_standard_icc_header_intents_map_to_preview_intents() {
+        for (lcms, expected) in [
+            (Intent::Perceptual, PreviewRenderingIntent::Perceptual),
+            (
+                Intent::RelativeColorimetric,
+                PreviewRenderingIntent::RelativeColorimetric,
+            ),
+            (Intent::Saturation, PreviewRenderingIntent::Saturation),
+            (
+                Intent::AbsoluteColorimetric,
+                PreviewRenderingIntent::AbsoluteColorimetric,
+            ),
+        ] {
+            assert_eq!(from_lcms_intent(lcms), Some(expected));
+        }
+    }
+
+    #[test]
+    fn embedded_profile_header_intent_drives_source_transform() {
+        let mut profile = Profile::new_srgb();
+        profile.set_header_rendering_intent(Intent::RelativeColorimetric);
+        let bytes = profile.icc().unwrap();
+        let mut cfg = config();
+        cfg.intent = PreviewRenderingIntent::AbsoluteColorimetric;
+        let transform = PreviewColorTransform::new(&metadata(ColorModel::Rgb, Some(bytes)), cfg);
+        assert_eq!(
+            transform.status().source_rendering_intent(),
+            Some(PreviewRenderingIntent::RelativeColorimetric)
+        );
+    }
+
+    #[test]
+    fn assigned_profile_header_intent_drives_source_transform() {
+        let path = std::env::temp_dir().join(format!(
+            "shade-source-intent-{}-{}.icc",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut profile = Profile::new_srgb();
+        profile.set_header_rendering_intent(Intent::AbsoluteColorimetric);
+        profile.save_profile_to_file(&path).unwrap();
+        let inspected = inspect_profile(&path).unwrap();
+        let mut cfg = config();
+        cfg.intent = PreviewRenderingIntent::Perceptual;
+        cfg.assigned_profile_path = Some(path.clone());
+        cfg.assigned_profile_identity = Some(inspected.identity().clone());
+        let transform = PreviewColorTransform::new(&metadata(ColorModel::Rgb, None), cfg);
+        assert_eq!(
+            transform.status().source_rendering_intent(),
+            Some(PreviewRenderingIntent::AbsoluteColorimetric)
+        );
+        let _ = fs::remove_file(path);
     }
 }
