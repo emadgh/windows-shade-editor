@@ -1,0 +1,111 @@
+name: Patch source intent UI
+
+on:
+  push:
+    branches:
+      - fix/81-auto-source-rendering-intent
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/81-auto-source-rendering-intent
+          fetch-depth: 0
+
+      - name: Patch source intent UI and embedded preview fallback
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/main.rs")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "        let mut intent = self.project.preview_color.rendering_intent;\n",
+              "",
+              "source intent local",
+          )
+
+          replace_once(
+              '''                egui::ComboBox::from_label("Source rendering intent")
+                    .selected_text(intent.label())
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            PreviewRenderingIntent::Perceptual,
+                            PreviewRenderingIntent::RelativeColorimetric,
+                            PreviewRenderingIntent::Saturation,
+                            PreviewRenderingIntent::AbsoluteColorimetric,
+                        ] {
+                            ui.selectable_value(&mut intent, value, value.label());
+                        }
+                    });
+''',
+              '''                let source_intent_label = current_status
+                    .source_rendering_intent()
+                    .map(|value| value.label())
+                    .unwrap_or("Pending / unmanaged");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Source rendering intent:");
+                    ui.strong(source_intent_label);
+                    ui.small("Automatic from the active source ICC profile header.");
+                });
+''',
+              "source intent selector",
+          )
+
+          replace_once(
+              '''        if self.project.preview_color.rendering_intent != intent {
+            self.project.preview_color.rendering_intent = intent;
+            changed = true;
+        }
+''',
+              "",
+              "source intent persistence",
+          )
+
+          old_fallback = '''                    intent: PreviewRenderingIntent::Perceptual,
+                    black_point_compensation: false,
+                    assigned_profile_path: None,
+'''
+          if text.count(old_fallback) == 1:
+              text = text.replace(
+                  old_fallback,
+                  '''                    intent: color_management::embedded_profile_preferred_intent(&preview.metadata)
+                        .unwrap_or(PreviewRenderingIntent::Perceptual),
+                    black_point_compensation: false,
+                    assigned_profile_path: None,
+''',
+                  1,
+              )
+          elif text.count(old_fallback) != 0:
+              raise SystemExit(
+                  f"embedded preview fallback: expected zero or one match, found {text.count(old_fallback)}"
+              )
+
+          path.write_text(text, encoding="utf-8")
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          if git diff --quiet -- src/main.rs; then
+            echo "No source changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main.rs
+          git commit -m "fix: make source rendering intent automatic in UI (#81)"
+          git push origin HEAD:fix/81-auto-source-rendering-intent
