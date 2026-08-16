@@ -12,6 +12,7 @@ pub mod palette;
 pub mod production_acceptance;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
+pub mod separation_optimizer;
 #[path = "tiff_io.rs"]
 pub mod tiff_io;
 
