@@ -1,0 +1,102 @@
+name: Patch source intent UI v2
+
+on:
+  push:
+    branches: [fix/81-auto-source-rendering-intent]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: fix/81-auto-source-rendering-intent
+          fetch-depth: 0
+      - name: Patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/main.rs')
+          s = p.read_text(encoding='utf-8')
+          patches = [
+              (
+                  "        let mut intent = self.project.preview_color.rendering_intent;\n",
+                  "",
+                  "source intent local",
+              ),
+              (
+                  '''                egui::ComboBox::from_label("Source rendering intent")
+                    .selected_text(intent.label())
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            PreviewRenderingIntent::Perceptual,
+                            PreviewRenderingIntent::RelativeColorimetric,
+                            PreviewRenderingIntent::Saturation,
+                            PreviewRenderingIntent::AbsoluteColorimetric,
+                        ] {
+                            ui.selectable_value(&mut intent, value, value.label());
+                        }
+                    });
+''',
+                  '''                let source_intent_label = current_status
+                    .source_rendering_intent()
+                    .map(|value| value.label())
+                    .unwrap_or("Pending / unmanaged");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Source rendering intent:");
+                    ui.strong(source_intent_label);
+                    ui.small("Automatic from the active source ICC profile header.");
+                });
+''',
+                  "source intent selector",
+              ),
+              (
+                  '''        if self.project.preview_color.rendering_intent != intent {
+            self.project.preview_color.rendering_intent = intent;
+            changed = true;
+        }
+''',
+                  "",
+                  "source intent persistence",
+              ),
+          ]
+          for old, new, label in patches:
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 match, got {count}')
+              s = s.replace(old, new, 1)
+
+          old = '''                    intent: PreviewRenderingIntent::Perceptual,
+                    black_point_compensation: false,
+                    assigned_profile_path: None,
+'''
+          count = s.count(old)
+          if count == 1:
+              s = s.replace(
+                  old,
+                  '''                    intent: color_management::embedded_profile_preferred_intent(&preview.metadata)
+                        .unwrap_or(PreviewRenderingIntent::Perceptual),
+                    black_point_compensation: false,
+                    assigned_profile_path: None,
+''',
+                  1,
+              )
+          elif count > 1:
+              raise SystemExit(f'embedded fallback: expected at most 1 match, got {count}')
+          p.write_text(s, encoding='utf-8')
+          PY
+      - name: Commit and push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs
+          if git diff --cached --quiet; then
+            echo 'Nothing to commit'
+            exit 0
+          fi
+          git commit -m 'fix: make source rendering intent automatic in UI (#81)'
+          git push origin HEAD:fix/81-auto-source-rendering-intent
