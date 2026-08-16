@@ -65,27 +65,36 @@ jobs:
         if: github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'chore/version-0.21.0-build-identity'
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-          REPOSITORY: ${{ github.repository }}
         run: |
-          if (-not (git diff --quiet -- Cargo.lock)) {
-            $lock = Get-Content -Raw Cargo.lock
-            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($lock))
-            $headers = @{
-              Authorization = "Bearer $env:GH_TOKEN"
-              Accept = "application/vnd.github+json"
-              "X-GitHub-Api-Version" = "2022-11-28"
-            }
-            $current = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:REPOSITORY/contents/Cargo.lock?ref=$env:HEAD_BRANCH"
-            $body = @{
-              message = "chore(version): sync Cargo.lock to 0.21.0"
-              content = $encoded
-              sha = $current.sha
-              branch = $env:HEAD_BRANCH
-            } | ConvertTo-Json
-            Invoke-RestMethod -Method Put -Headers $headers -ContentType "application/json" -Body $body -Uri "https://api.github.com/repos/$env:REPOSITORY/contents/Cargo.lock" | Out-Null
+          git diff --quiet -- Cargo.lock
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Cargo.lock is already synchronized."
+            exit 0
           }
+
+          $generatedLock = Join-Path $env:RUNNER_TEMP "Cargo.lock.generated"
+          Copy-Item Cargo.lock $generatedLock
+
+          git fetch origin $env:HEAD_BRANCH
+          if ($LASTEXITCODE -ne 0) { throw "Cannot fetch PR head branch." }
+          git checkout -B $env:HEAD_BRANCH "origin/$env:HEAD_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw "Cannot checkout PR head branch." }
+
+          Copy-Item $generatedLock Cargo.lock -Force
+          git add Cargo.lock
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Generated Cargo.lock matches the PR branch."
+            exit 0
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(version): sync Cargo.lock to 0.21.0"
+          if ($LASTEXITCODE -ne 0) { throw "Cannot commit synchronized Cargo.lock." }
+          git push origin "HEAD:$env:HEAD_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw "Cannot push synchronized Cargo.lock." }
       - name: Prepare artifact
         shell: pwsh
         run: |
