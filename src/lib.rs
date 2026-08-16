@@ -2,6 +2,7 @@
 
 pub mod color_conversion;
 pub mod icc_conversion;
+pub mod nchannel_icc;
 #[path = "dpi.rs"]
 pub mod dpi;
 pub mod export;
