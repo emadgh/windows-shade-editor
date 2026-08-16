@@ -1,5 +1,6 @@
 pub(crate) mod actions;
 pub(crate) mod adjustments;
+pub(crate) mod color_conversion;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
 pub(crate) mod faces;
@@ -139,7 +140,7 @@ mod tests {
             "previous_shades_sort: previous_shades::PreviousShadesSort",
             "previous_shades_selected: Option<String>",
             "previous_shade_preview: Option<previous_shades::ShadeInspection>",
-            "previous_shade_preview_error: Option<String>",
+            "previous_shade_preview_error: Option<previous_shades::ShadeInspection>",
             "previous_shade_texture: Option<egui::TextureHandle>",
             "previous_shade_list_textures: BTreeMap<String, egui::TextureHandle>",
             "previous_shade_list_texture_lru: VecDeque<String>",
@@ -153,5 +154,15 @@ mod tests {
             main.contains("project_view: ui::project_view_state::ProjectViewState"),
             "ShadeApp must own one focused ProjectViewState"
         );
+    }
+
+    #[test]
+    fn color_conversion_ui_stays_decomposed_and_wired_through_status_bar() {
+        let status_bar = include_str!("status_bar.rs");
+        let conversion = include_str!("color_conversion.rs");
+        assert!(status_bar.contains("ui_color_conversion_status"));
+        assert!(status_bar.contains("ui_color_conversion_window"));
+        assert!(conversion.contains("build_conversion_preflight"));
+        assert!(!conversion.contains("K *= 2"));
     }
 }
