@@ -1,3 +1,22 @@
+# Shade Editor 0.21.2
+
+- Add dedicated per-Face Production Source ICC assignment, reassign and clear actions to the Color Conversion preflight UI.
+- Keep production Source ICC state separate from display-only preview, Soft Proof and monitor profile settings.
+- Persist only the external ICC path and stable description/SHA-256 identity; source pixels and ICC files remain unchanged.
+- Validate embedded and assigned source profiles for readability, source color-space compatibility and replacement-at-path identity mismatch.
+- Make assignments mark the Source project dirty so conversion can only capture the exact saved profile interpretation.
+- Preserve schema-v9 compatibility: legacy Face records default to no production assignment and use embedded ICC preflight.
+
+# Shade Editor 0.21.1
+
+- Add the non-destructive PNG RGB/Gray source decoder foundation with RGB8 normalization and native 16-bit precision.
+- Keep RGBA/Gray+Alpha opacity separate from printing channels and capture embedded ICC/sRGB metadata for later import wiring.
+
+# Shade Editor 0.21.0
+
+- Establish the Color Conversion architecture, preflight/UI foundation, production ICC transform layers, constrained Black-focused candidate selection, recipe identity and non-destructive output policy.
+- Enforce synchronized Cargo/VERSION/lockfile build identity and versioned Windows artifact metadata.
+
 # Shade Editor 0.20.9
 
 - Redesign Preferences into categorized pages with a fixed category sidebar on the right, avoiding one very tall settings page.

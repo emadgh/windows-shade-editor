@@ -1910,6 +1910,7 @@ impl ShadeApp {
                         path: item.path.to_string_lossy().into_owned(),
                         label,
                         status: model::FaceStatus::Accepted,
+                        production_source_profile: None,
                     });
                     self.faces.push(Self::make_runtime_face(item));
                 }

@@ -91,6 +91,18 @@ saved adjusted source samples
 
 Monitor ICC, gamut-warning display settings and soft-proof-only state are forbidden inputs to deterministic conversion recipes.
 
+### Production Source ICC assignment
+
+The production source interpretation is resolved per Source Face with this precedence:
+
+1. an explicit `FaceRef.production_source_profile` assignment, when present;
+2. otherwise the valid embedded ICC carried by the source image;
+3. otherwise production conversion is blocked until an assignment is made.
+
+An explicit assignment stores only the external profile path plus description/SHA-256 identity. It is an interpretation override, not a pixel conversion, and ICC payload bytes are never embedded in `.shade`. Reopening preflight verifies that the file still exists, its bytes match the stored identity, and its declared color space matches the source Face. Missing, moved, replaced, corrupt or wrong-space profiles block conversion with an actionable assignment/relink error.
+
+Production assignment is deliberately distinct from `PreviewColorSettings.assigned_profile_path`. Changing preview ICC, Soft Proof or monitor ICC cannot satisfy production preflight. Assigning, reassigning or clearing a production Source ICC marks the Source project dirty, so the saved-source gate captures the exact interpretation before conversion.
+
 ## Decision 6 — Three explicit conversion engine modes
 
 Every production conversion records exactly one engine mode:
@@ -204,6 +216,8 @@ It does **not** yet perform pixel conversion or write TIFFs. Those capabilities 
 `CONVERSION_RECIPE_SCHEMA_VERSION` is independent from the `.shade` schema version. Conversion recipes need their own semantic version boundary because optimizer/profile strategy semantics can change independently from the project container.
 
 When project role/provenance fields are eventually added to `ShadeProject`, they should be defaultable where backward-safe. A `.shade` schema bump is required if semantic compatibility cannot be preserved by defaults.
+
+Per-Face production Source ICC assignment was added to schema-v9 projects as a backward-safe optional `FaceRef` field with a Serde default. Legacy Face records deserialize with no assignment and continue to use embedded ICC preflight.
 
 ## Validation policy
 

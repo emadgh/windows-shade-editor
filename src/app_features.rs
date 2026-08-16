@@ -69,6 +69,9 @@ mod tests {
         assert!(STATUS_BAR_UI.contains("ui_color_conversion_status"));
         assert!(STATUS_BAR_UI.contains("ui_color_conversion_window"));
         assert!(COLOR_CONVERSION_UI.contains("build_conversion_preflight"));
+        assert!(COLOR_CONVERSION_UI.contains("Assign Production Source ICC"));
+        assert!(COLOR_CONVERSION_UI.contains("production_source_profile"));
+        assert!(COLOR_CONVERSION_UI.contains("inspect_production_source_profile"));
         assert!(COLOR_CONVERSION_UI.contains("RGB source — not production separated"));
     }
 

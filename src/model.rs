@@ -50,6 +50,19 @@ pub struct IccProfileIdentity {
     pub sha256: String,
 }
 
+/// Explicit production interpretation of one source Face's samples.
+///
+/// This is deliberately separate from `PreviewColorSettings`: assigning this
+/// profile does not transform source pixels and preview-only profile choices do
+/// not satisfy production-conversion preflight. ICC bytes remain external; the
+/// stable identity detects a missing or replaced profile before conversion.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProductionSourceProfileAssignment {
+    pub path: String,
+    pub identity: IccProfileIdentity,
+}
+
 /// Project-owned display-only color setup. It is serialized in `.shade`, but is
 /// never consumed by TIFF export and never changes source TIFF metadata/samples.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -168,6 +181,11 @@ pub struct FaceRef {
     pub label: String,
     #[serde(default)]
     pub status: FaceStatus,
+    /// Optional per-Face source-profile interpretation used only by production
+    /// color conversion. An embedded source ICC remains the default when this
+    /// explicit override is absent.
+    #[serde(default)]
+    pub production_source_profile: Option<ProductionSourceProfileAssignment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1087,6 +1105,7 @@ mod face_status_tests {
         let face: FaceRef = serde_json::from_str(r#"{"path":"face.tif","label":"Face 1"}"#)
             .expect("legacy FaceRef should deserialize");
         assert_eq!(face.status, FaceStatus::Accepted);
+        assert!(face.production_source_profile.is_none());
     }
 
     #[test]
@@ -1095,9 +1114,34 @@ mod face_status_tests {
             path: "face.tif".to_owned(),
             label: "Face 1".to_owned(),
             status: FaceStatus::Rejected,
+            production_source_profile: None,
         };
         let json = serde_json::to_string(&face).unwrap();
         let loaded: FaceRef = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.status, FaceStatus::Rejected);
+    }
+
+    #[test]
+    fn production_source_profile_assignment_round_trips_without_icc_bytes() {
+        let face = FaceRef {
+            path: "face.tif".to_owned(),
+            label: "Face 1".to_owned(),
+            status: FaceStatus::Accepted,
+            production_source_profile: Some(ProductionSourceProfileAssignment {
+                path: r"C:\Color\AdobeRGB.icc".to_owned(),
+                identity: IccProfileIdentity {
+                    description: "Adobe RGB (1998)".to_owned(),
+                    sha256: "abc123".to_owned(),
+                },
+            }),
+        };
+
+        let json = serde_json::to_string(&face).unwrap();
+        let loaded: FaceRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.production_source_profile,
+            face.production_source_profile
+        );
+        assert!(!json.contains("payload"));
     }
 }

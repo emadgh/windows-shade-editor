@@ -1,7 +1,6 @@
 use super::actions::NavigationUiAction;
 use crate::*;
 use eframe::egui;
-use sha2::{Digest, Sha256};
 use windows_shade_editor::conversion_preflight::{
     ConversionPreflightInput, ConversionPreflightReport, PreflightCode, PreflightSeverity,
     SourceImageFormat, SourceProfileState, TransparencyState, build_conversion_preflight,
@@ -21,7 +20,9 @@ struct CurrentConversionSource {
     color_model_label: &'static str,
     bit_depth: u8,
     channel_count: usize,
-    embedded_icc: bool,
+    profile_label: String,
+    production_profile_path: Option<String>,
+    has_assigned_profile: bool,
     snapshot_id: Option<u64>,
     save_gate: ConversionSaveGate,
     report: ConversionPreflightReport,
@@ -33,7 +34,9 @@ impl ShadeApp {
             return;
         };
 
-        let is_rgb = source.report.contains(PreflightCode::RgbNotProductionSeparated);
+        let is_rgb = source
+            .report
+            .contains(PreflightCode::RgbNotProductionSeparated);
         let supported_source = matches!(
             self.faces
                 .get(self.current_face)
@@ -77,6 +80,8 @@ impl ShadeApp {
         let mut open = true;
         let mut navigation_action = None;
         let mut open_preview_color_management = false;
+        let mut assign_production_profile = false;
+        let mut clear_production_profile = false;
 
         egui::Window::new("Production Color Conversion")
             .id(egui::Id::new("production-color-conversion-window"))
@@ -119,12 +124,8 @@ impl ShadeApp {
                         ui.label(source.channel_count.to_string());
                         ui.end_row();
 
-                        ui.strong("Source ICC");
-                        ui.label(if source.embedded_icc {
-                            "Embedded ICC"
-                        } else {
-                            "Missing production Source ICC"
-                        });
+                        ui.strong("Production Source ICC");
+                        ui.label(&source.profile_label);
                         ui.end_row();
 
                         ui.strong("Saved state");
@@ -140,6 +141,32 @@ impl ShadeApp {
                         );
                         ui.end_row();
                     });
+
+                ui.horizontal_wrapped(|ui| {
+                    let assign_label = if source.has_assigned_profile {
+                        "Reassign Production Source ICC..."
+                    } else {
+                        "Assign Production Source ICC..."
+                    };
+                    if ui.button(assign_label).clicked() {
+                        assign_production_profile = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            source.has_assigned_profile,
+                            egui::Button::new("Use embedded Source ICC"),
+                        )
+                        .on_hover_text(
+                            "Clear the explicit production assignment and return to the Face's embedded ICC.",
+                        )
+                        .clicked()
+                    {
+                        clear_production_profile = true;
+                    }
+                });
+                if let Some(path) = source.production_profile_path.as_deref() {
+                    ui.small(format!("Assigned profile path: {path}"));
+                }
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -178,11 +205,14 @@ impl ShadeApp {
                                 PreflightCode::MissingSourceProfile
                                 | PreflightCode::InvalidSourceProfile => {
                                     ui.horizontal_wrapped(|ui| {
+                                        if ui.button("Assign Production Source ICC...").clicked() {
+                                            assign_production_profile = true;
+                                        }
                                         if ui.button("Open Color Management / ICC Preview").clicked() {
                                             open_preview_color_management = true;
                                         }
                                         ui.small(
-                                            "Preview assignment is display-only. Dedicated production Source ICC assignment is the next conversion slice.",
+                                            "ICC Preview is display-only and never satisfies production Source ICC preflight.",
                                         );
                                     });
                                 }
@@ -235,6 +265,18 @@ impl ShadeApp {
         if open_preview_color_management {
             self.color.show = true;
         }
+        if assign_production_profile {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("ICC color profiles", &["icc", "icm"])
+                .set_title("Assign Production Source ICC")
+                .pick_file()
+            {
+                self.assign_production_source_profile(path);
+            }
+        }
+        if clear_production_profile {
+            self.clear_production_source_profile();
+        }
     }
 
     fn current_conversion_source(&self) -> Option<CurrentConversionSource> {
@@ -246,8 +288,9 @@ impl ShadeApp {
             has_saved_project_path: self.project_path.is_some(),
             has_unsaved_changes: self.project_dirty,
         });
-        let profile = embedded_profile_state(metadata);
-        let embedded_icc = metadata.icc_profile.is_some();
+        let face_ref = self.project.faces.get(self.current_face);
+        let (profile, profile_label, production_profile_path, has_assigned_profile) =
+            production_source_profile_state(metadata, face_ref);
         let report = build_conversion_preflight(&ConversionPreflightInput {
             format: SourceImageFormat::Tiff,
             color_model: source_model,
@@ -276,11 +319,67 @@ impl ShadeApp {
             color_model_label: metadata.color_model.title(),
             bit_depth: metadata.bit_depth,
             channel_count: metadata.samples_per_pixel,
-            embedded_icc,
+            profile_label,
+            production_profile_path,
+            has_assigned_profile,
             snapshot_id: self.project.active_snapshot_id,
             save_gate,
             report,
         })
+    }
+
+    fn assign_production_source_profile(&mut self, path: PathBuf) {
+        let Some(active_face) = self.faces.get(self.current_face) else {
+            return;
+        };
+        let source_model = active_face.preview.metadata.color_model;
+        let face_label = self
+            .project
+            .faces
+            .get(self.current_face)
+            .map(|face| face.label.clone())
+            .unwrap_or_else(|| format!("Face {}", self.current_face + 1));
+
+        match color_management::inspect_profile(&path) {
+            Ok(profile) if profile.compatible_with(source_model) => {
+                let assignment = model::ProductionSourceProfileAssignment {
+                    path: path.to_string_lossy().into_owned(),
+                    identity: profile.identity().clone(),
+                };
+                let Some(face) = self.project.faces.get_mut(self.current_face) else {
+                    self.report_error("Cannot bind the production Source ICC: Face metadata is missing.");
+                    return;
+                };
+                if face.production_source_profile.as_ref() != Some(&assignment) {
+                    face.production_source_profile = Some(assignment);
+                    self.mark_project_dirty();
+                    self.report_info(format!(
+                        "Assigned production Source ICC '{}' to {face_label}. Save the Source project before conversion.",
+                        profile.description
+                    ));
+                }
+            }
+            Ok(profile) => self.report_error(format!(
+                "Cannot assign '{}' for production conversion: profile color space {} does not match source {}.",
+                profile.description,
+                profile.color_space_label(),
+                source_model.title(),
+            )),
+            Err(err) => self.report_error(err),
+        }
+    }
+
+    fn clear_production_source_profile(&mut self) {
+        let Some(face) = self.project.faces.get_mut(self.current_face) else {
+            return;
+        };
+        if face.production_source_profile.take().is_some() {
+            let label = face.label.clone();
+            self.mark_project_dirty();
+            self.report_info(format!(
+                "Cleared the production Source ICC override for {label}. Embedded ICC preflight is active again."
+            ));
+        }
     }
 }
 
@@ -293,19 +392,64 @@ fn conversion_color_model(model: tiff_io::ColorModel) -> ConversionColorModel {
     }
 }
 
-fn embedded_profile_state(metadata: &tiff_io::TiffMetadata) -> SourceProfileState {
-    let Some(bytes) = metadata.icc_profile.as_ref() else {
-        return SourceProfileState::Missing;
-    };
-    if bytes.is_empty() {
-        return SourceProfileState::Invalid("Embedded ICC payload is empty.".to_owned());
+fn production_source_profile_state(
+    metadata: &tiff_io::TiffMetadata,
+    face: Option<&model::FaceRef>,
+) -> (SourceProfileState, String, Option<String>, bool) {
+    if let Some(assignment) = face.and_then(|face| face.production_source_profile.as_ref()) {
+        let path = PathBuf::from(&assignment.path);
+        return match color_management::inspect_production_source_profile(
+            &path,
+            &assignment.identity,
+            metadata.color_model,
+        ) {
+            Ok(profile) => (
+                SourceProfileState::Assigned(conversion_profile_identity(profile.identity())),
+                format!("Assigned: {}", profile.description),
+                Some(assignment.path.clone()),
+                true,
+            ),
+            Err(err) => (
+                SourceProfileState::Invalid(err),
+                format!(
+                    "Assigned profile invalid: {}",
+                    assignment.identity.description
+                ),
+                Some(assignment.path.clone()),
+                true,
+            ),
+        };
     }
 
-    let digest = Sha256::digest(bytes);
-    SourceProfileState::Embedded(ConversionIccProfileIdentity {
-        description: "Embedded ICC profile".to_owned(),
-        sha256: format!("{digest:x}"),
-    })
+    match color_management::production_embedded_profile_identity(metadata) {
+        Ok(Some(identity)) => (
+            SourceProfileState::Embedded(conversion_profile_identity(&identity)),
+            format!("Embedded: {}", identity.description),
+            None,
+            false,
+        ),
+        Ok(None) => (
+            SourceProfileState::Missing,
+            "Missing production Source ICC".to_owned(),
+            None,
+            false,
+        ),
+        Err(err) => (
+            SourceProfileState::Invalid(err),
+            "Embedded production Source ICC is invalid".to_owned(),
+            None,
+            false,
+        ),
+    }
+}
+
+fn conversion_profile_identity(
+    identity: &model::IccProfileIdentity,
+) -> ConversionIccProfileIdentity {
+    ConversionIccProfileIdentity {
+        description: identity.description.clone(),
+        sha256: identity.sha256.clone(),
+    }
 }
 
 fn severity_label(severity: PreflightSeverity) -> &'static str {
