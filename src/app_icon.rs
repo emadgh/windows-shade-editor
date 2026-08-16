@@ -6,7 +6,10 @@ const ICON_PNG_B64: &str = include_str!("../assets/shade-editor-icon.png.b64");
 
 fn rgba_image() -> Option<(Vec<u8>, u32, u32)> {
     let png_bytes = STANDARD.decode(ICON_PNG_B64.trim()).ok()?;
-    let decoder = png::Decoder::new(Cursor::new(png_bytes));
+    let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
+    // The committed icon is palette-optimized to keep repository size small.
+    // Expand palette/transparency data before converting the decoded pixels to RGBA.
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
     let mut buffer = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buffer).ok()?;
