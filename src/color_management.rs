@@ -1019,7 +1019,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let profile = Profile::new_srgb();
+        let mut profile = Profile::new_srgb();
         profile.save_profile_to_file(&path).unwrap();
         path
     }
