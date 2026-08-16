@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   patch:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -19,8 +18,9 @@ jobs:
           fetch-depth: 0
 
       - name: Patch source intent UI and embedded preview fallback
-        shell: python
+        shell: bash
         run: |
+          python - <<'PY'
           from pathlib import Path
 
           path = Path("src/main.rs")
@@ -80,7 +80,8 @@ jobs:
                     black_point_compensation: false,
                     assigned_profile_path: None,
 '''
-          if text.count(old_fallback) == 1:
+          fallback_count = text.count(old_fallback)
+          if fallback_count == 1:
               text = text.replace(
                   old_fallback,
                   '''                    intent: color_management::embedded_profile_preferred_intent(&preview.metadata)
@@ -90,12 +91,13 @@ jobs:
 ''',
                   1,
               )
-          elif text.count(old_fallback) != 0:
+          elif fallback_count != 0:
               raise SystemExit(
-                  f"embedded preview fallback: expected zero or one match, found {text.count(old_fallback)}"
+                  f"embedded preview fallback: expected zero or one match, found {fallback_count}"
               )
 
           path.write_text(text, encoding="utf-8")
+          PY
 
       - name: Commit patch
         shell: bash
