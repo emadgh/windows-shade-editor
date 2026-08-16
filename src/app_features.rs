@@ -2,6 +2,7 @@
 pub const EXPORT_QUEUE_LABEL: &str = "Export Queue";
 pub const TIFF_INSPECTOR_LABEL: &str = "Inspect TIFF...";
 pub const COLOR_MANAGEMENT_LABEL: &str = "Color Management / ICC Preview";
+pub const COLOR_CONVERSION_LABEL: &str = "Convert Color...";
 pub const SOFT_PROOF_LABEL: &str = "Printer / RIP Soft Proof";
 pub const MONITOR_PROFILE_LABEL: &str = "Monitor / Display ICC";
 
@@ -9,9 +10,14 @@ pub const MONITOR_PROFILE_LABEL: &str = "Monitor / Display ICC";
 mod tests {
     const MAIN: &str = include_str!("main.rs");
     const PROJECT_NAVIGATION_UI: &str = include_str!("ui/project_navigation.rs");
+    const STATUS_BAR_UI: &str = include_str!("ui/status_bar.rs");
+    const COLOR_CONVERSION_UI: &str = include_str!("ui/color_conversion.rs");
 
     fn production_ui_contains(needle: &str) -> bool {
-        MAIN.contains(needle) || PROJECT_NAVIGATION_UI.contains(needle)
+        MAIN.contains(needle)
+            || PROJECT_NAVIGATION_UI.contains(needle)
+            || STATUS_BAR_UI.contains(needle)
+            || COLOR_CONVERSION_UI.contains(needle)
     }
 
     #[test]
@@ -47,6 +53,7 @@ mod tests {
             "app_features::EXPORT_QUEUE_LABEL",
             "app_features::TIFF_INSPECTOR_LABEL",
             "Color Management / ICC Preview",
+            super::COLOR_CONVERSION_LABEL,
             super::SOFT_PROOF_LABEL,
             super::MONITOR_PROFILE_LABEL,
         ] {
@@ -55,6 +62,14 @@ mod tests {
                 "missing production feature entry point: {entry}"
             );
         }
+    }
+
+    #[test]
+    fn color_conversion_entry_remains_bound_to_shared_preflight_contract() {
+        assert!(STATUS_BAR_UI.contains("ui_color_conversion_status"));
+        assert!(STATUS_BAR_UI.contains("ui_color_conversion_window"));
+        assert!(COLOR_CONVERSION_UI.contains("build_conversion_preflight"));
+        assert!(COLOR_CONVERSION_UI.contains("RGB source — not production separated"));
     }
 
     #[test]
