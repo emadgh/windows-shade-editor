@@ -1,0 +1,329 @@
+name: Validate Issue 69 Curve and Levels UI
+
+on:
+  push:
+    branches:
+      - feat/69-curve-levels-ui
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/69-curve-levels-ui
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Apply Issue 69 production changes
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              if new in text:
+                  return text
+              if old not in text:
+                  raise SystemExit(f"{label}: expected source pattern not found")
+              return text.replace(old, new, 1)
+
+          # Version bump for this completed UI slice.
+          Path("VERSION").write_text("0.20.6\n", encoding="utf-8")
+          cargo = Path("Cargo.toml").read_text(encoding="utf-8")
+          cargo = cargo.replace('version = "0.20.5"', 'version = "0.20.6"', 1)
+          Path("Cargo.toml").write_text(cargo, encoding="utf-8")
+
+          p = Path("src/ui/curve_editor.rs")
+          s = p.read_text(encoding="utf-8")
+
+          helper_anchor = '''fn tonal_working_value(value: f32, mode: TonalDisplayMode) -> f32 {
+              // Light and Pigment are inverse presentation transforms. Pigment mirrors
+              // both axes while keeping all production adjustment math in working space.
+              tonal_display_value(value, mode)
+          }
+          '''
+          helper_new = helper_anchor + '''
+          fn curve_histogram_colors(
+              ui: &egui::Ui,
+              accent: Option<egui::Color32>,
+              neutral_histogram: bool,
+          ) -> (egui::Color32, egui::Color32) {
+              let before = ui.visuals().weak_text_color().gamma_multiply(0.72);
+              let after = if neutral_histogram {
+                  ui.visuals().weak_text_color()
+              } else {
+                  accent.unwrap_or(ui.visuals().selection.stroke.color)
+              };
+              (before, after)
+          }
+
+          fn curve_legend_dot(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
+              let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+              ui.painter().circle_filled(rect.center(), 3.5, color);
+              ui.small(label);
+          }
+          '''
+          s = replace_once(s, helper_anchor, helper_new, "Curve histogram helpers")
+
+          painter_old = '''    let painter = ui.painter_at(rect);
+              painter.rect_stroke(
+                  rect,
+                  2.0,
+                  ui.visuals().widgets.noninteractive.bg_stroke,
+                  egui::StrokeKind::Inside,
+              );
+          '''
+          painter_new = '''    let painter = ui.painter_at(rect);
+              // Match the Levels histogram surface: dark graph background with a subtle 4x4 grid.
+              painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+              let grid_color = ui
+                  .visuals()
+                  .widgets
+                  .noninteractive
+                  .bg_stroke
+                  .color
+                  .gamma_multiply(0.62);
+              for step in 1..4 {
+                  let fraction = step as f32 / 4.0;
+                  let x = egui::lerp(rect.x_range(), fraction);
+                  let y = egui::lerp(rect.y_range(), fraction);
+                  painter.line_segment(
+                      [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                      egui::Stroke::new(0.7, grid_color),
+                  );
+                  painter.line_segment(
+                      [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                      egui::Stroke::new(0.7, grid_color),
+                  );
+              }
+              painter.rect_stroke(
+                  rect,
+                  2.0,
+                  ui.visuals().widgets.noninteractive.bg_stroke,
+                  egui::StrokeKind::Inside,
+              );
+          '''
+          s = replace_once(s, painter_old, painter_new, "Curve background and grid")
+
+          hist_colors_old = '''        let before_color = ui.visuals().weak_text_color().gamma_multiply(0.20);
+                  let after_base = if neutral_histogram {
+                      ui.visuals().weak_text_color()
+                  } else {
+                      accent.unwrap_or(ui.visuals().selection.stroke.color)
+                  };
+                  let after_color = after_base.gamma_multiply(0.48);
+          '''
+          hist_colors_new = '''        let (before_base, after_base) =
+                      curve_histogram_colors(ui, accent, neutral_histogram);
+                  let before_color = before_base.gamma_multiply(0.32);
+                  let after_color = after_base.gamma_multiply(0.56);
+          '''
+          s = replace_once(s, hist_colors_old, hist_colors_new, "Curve histogram colors")
+
+          fields_old = '''    ui.small(selected.label());
+              let mut input_changed = false;
+              let mut output_changed = false;
+              ui.columns(2, |columns| {
+                  columns[0].label("Input");
+          '''
+          fields_new = '''    ui.strong(selected.label());
+              let mut input_changed = false;
+              let mut output_changed = false;
+              ui.columns(2, |columns| {
+                  columns[0].small("Input");
+          '''
+          s = replace_once(s, fields_old, fields_new, "Curve field labels input")
+          s = replace_once(
+              s,
+              '        columns[1].label("Output");',
+              '        columns[1].small("Output");',
+              "Curve field labels output",
+          )
+
+          graph_call_old = '''    with_accent(ui, accent, |ui| {
+                  let (graph_changed, selected) = curve_editor_graph(
+          '''
+          graph_call_new = '''    with_accent(ui, accent, |ui| {
+                  if histogram_before.is_some() || histogram_after.is_some() {
+                      let (before_color, after_color) =
+                          curve_histogram_colors(ui, accent, neutral_histogram);
+                      ui.horizontal(|ui| {
+                          ui.strong("Histogram");
+                          ui.small(format!("Mode: {}", display_mode.label()));
+                          ui.with_layout(
+                              egui::Layout::right_to_left(egui::Align::Center),
+                              |ui| {
+                                  curve_legend_dot(ui, after_color, "After");
+                                  curve_legend_dot(ui, before_color, "Before");
+                              },
+                          );
+                      });
+                  }
+                  let (graph_changed, selected) = curve_editor_graph(
+          '''
+          s = replace_once(s, graph_call_old, graph_call_new, "Curve Before/After header")
+
+          below_legend = '''        if histogram_before.is_some() && histogram_after.is_some() {
+                      ui.horizontal(|ui| {
+                          ui.colored_label(ui.visuals().weak_text_color(), "Before");
+                          let after_color = if neutral_histogram {
+                              ui.visuals().weak_text_color()
+                          } else {
+                              accent.unwrap_or(ui.visuals().selection.stroke.color)
+                          };
+                          ui.colored_label(after_color, "After");
+                      });
+                  }
+          '''
+          if below_legend not in s:
+              raise SystemExit("old Curve below-graph legend not found")
+          s = s.replace(below_legend, "", 1)
+
+          tutorial = '''            ui.add_space(4.0);
+                      ui.small("Double-click the Curve line to add the midpoint; double-click or press Delete/Backspace on the midpoint to remove it. Arrow keys move the selected point by 1; Shift+Arrow moves by 10; Home returns the selected point to the identity line. Input / Output stay 0-255 in both Light and Pigment display modes.");
+          '''
+          if tutorial not in s:
+              raise SystemExit("Curve tutorial text not found")
+          s = s.replace(tutorial, "", 1)
+          p.write_text(s, encoding="utf-8")
+
+          p = Path("src/ui/levels_mixer.rs")
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(
+              s,
+              '''        ui.horizontal(|ui| {
+                          ui.strong("Input Levels");
+                          ui.small("drag markers or edit 0–255 values");
+                      });
+          ''',
+              '''        ui.strong("Input Levels");
+          ''',
+              "Levels instructional subtitle",
+          )
+          midtone_text = '''        ui.add_space(4.0);
+                  ui.small(format!(
+                      "Midtone output at 50% input: {:.1}% · tonal axis follows {} mode",
+                      model::levels_gamma_mid_output(*levels) * 100.0,
+                      display_mode.label(),
+                  ));
+          '''
+          if midtone_text not in s:
+              raise SystemExit("Levels midtone tutorial text not found")
+          s = s.replace(midtone_text, "", 1)
+          mixer_text = '    ui.small("Mixer values are percentages. 100% = coefficient 1.0. Slider and keyboard edits use 1 percentage-point units.");\n'
+          if mixer_text not in s:
+              raise SystemExit("Mixer tutorial text not found")
+          s = s.replace(mixer_text, "", 1)
+          p.write_text(s, encoding="utf-8")
+
+          # Release notes document the visible behavior change.
+          p = Path("RELEASE_NOTES.md")
+          notes = p.read_text(encoding="utf-8")
+          if not notes.startswith("# Shade Editor 0.20.6"):
+              prefix = '''# Shade Editor 0.20.6
+
+          - Unify Curve and Levels visual language with a shared dark histogram surface and Before/After presentation.
+          - Add a Photoshop-like 4x4 grid to the square Curve editor.
+          - Restyle Curve Input/Output fields to match Levels controls.
+          - Remove persistent instructional prose from Levels, Mixer and Curve tool panels while preserving existing tooltips and interaction semantics.
+          - Preserve Curve math, Light/Pigment presentation, keyboard focus ownership and `.shade` compatibility.
+
+          '''
+              p.write_text(prefix + notes, encoding="utf-8")
+          '@ | Set-Content -Encoding utf8 issue69.py
+          python issue69.py
+          Remove-Item issue69.py
+
+      - name: Resolve lockfile
+        run: cargo check --target x86_64-pc-windows-msvc
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Locked Windows check
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+
+      - name: Full Release tests
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Release build
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Build and test native Shell extension
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist shell\bin mkdir shell\bin
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeProjectDataTests.exe shell\ShadeProjectDataTests.cpp shell\ShadeProjectData.cpp
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeProjectDataTests.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /LD /Fe:shell\bin\ShadeEditorShell.dll shell\ShadeEditorShell.cpp shell\ShadeProjectData.cpp /link ole32.lib shlwapi.lib windowscodecs.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeShellTests.exe shell\ShadeShellTests.cpp /link ole32.lib shlwapi.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeShellTests.exe shell\bin\ShadeEditorShell.dll
+          if errorlevel 1 exit /b 1
+
+      - name: Validate Shell schema and Issue 69 invariants
+        shell: pwsh
+        run: |
+          [xml](Get-Content -Raw shell/ShadeEditor.propdesc) | Out-Null
+          @'
+          from pathlib import Path
+
+          assert Path("VERSION").read_text().strip() == "0.20.6"
+          assert 'version = "0.20.6"' in Path("Cargo.toml").read_text()
+          curve = Path("src/ui/curve_editor.rs").read_text()
+          levels = Path("src/ui/levels_mixer.rs").read_text()
+          assert "painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);" in curve
+          assert "for step in 1..4" in curve
+          assert 'curve_legend_dot(ui, after_color, "After")' in curve
+          assert 'curve_legend_dot(ui, before_color, "Before")' in curve
+          assert 'columns[0].small("Input")' in curve
+          assert 'columns[1].small("Output")' in curve
+          assert "Double-click the Curve line" not in curve
+          assert "drag markers or edit 0–255 values" not in levels
+          assert "Midtone output at 50% input" not in levels
+          assert "Mixer values are percentages" not in levels
+          '@ | Set-Content -Encoding utf8 validate69.py
+          python validate69.py
+          Remove-Item validate69.py
+
+      - name: Commit validated production tree
+        shell: pwsh
+        run: |
+          Remove-Item .github/workflows/validate-issue69.yml
+          if (Test-Path shell/bin) { Remove-Item shell/bin -Recurse -Force }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(v0.20.6): unify Curve and Levels visual language (#69)"
+          git push origin HEAD:feat/69-curve-levels-ui
+
+      - name: Prepare validated executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          $exe = "target/x86_64-pc-windows-msvc/release/ShadeEditor.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  ShadeEditor.exe" | Set-Content -Encoding ascii -NoNewline artifact/ShadeEditor.exe.sha256
+          Copy-Item $exe artifact/ShadeEditor.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShadeEditor-v0.20.6-issue69-validated
+          path: artifact
