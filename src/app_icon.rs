@@ -5,7 +5,11 @@ use std::{io::Cursor, sync::Arc};
 const ICON_PNG_B64: &str = include_str!("../assets/shade-editor-icon.png.b64");
 
 fn rgba_image() -> Option<(Vec<u8>, u32, u32)> {
-    let png_bytes = STANDARD.decode(ICON_PNG_B64.trim()).ok()?;
+    let compact = ICON_PNG_B64
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>();
+    let png_bytes = STANDARD.decode(compact).ok()?;
     let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
     // The committed icon is palette-optimized to keep repository size small.
     // Expand palette/transparency data before converting the decoded pixels to RGBA.
