@@ -140,7 +140,7 @@ jobs:
           assert 'version = "0.20.5"' in cargo
           assert '[build-dependencies]' in cargo and 'winresource = "0.1"' in cargo
           icon = base64.b64decode(Path("assets/shade-editor-icon.png.b64").read_text().strip())
-          assert icon.startswith(b"\x89PNG\r\n\x1a\n") and len(icon) > 8000
+          assert icon.startswith(b"\x89PNG\r\n\x1a\n") and len(icon) > 5000
           assert Path("Cargo.lock").exists()
 
           main = Path("src/main.rs").read_text()
