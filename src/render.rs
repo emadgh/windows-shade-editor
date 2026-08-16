@@ -269,6 +269,17 @@ fn rgba_from_planes_impl(
                 push_rgb(&mut rgba, rgb);
             }
         }
+        ColorModel::Other if has_declared_spot_channels(face, planes.len()) => {
+            // A Photoshop Multichannel/Separated TIFF may consist entirely of
+            // printing inks and therefore has no RGB/CMYK base composite. Render
+            // declared Spot channels over paper white using their DisplayInfo
+            // color and Solidity rather than falling back to channel-1 grayscale.
+            for pixel in 0..pixel_count {
+                let mut rgb = [1.0, 1.0, 1.0];
+                composite_extra_channels(face, planes, pixel, &mut rgb);
+                push_rgb(&mut rgba, rgb);
+            }
+        }
         _ => {
             if let Some(first) = planes.first() {
                 for value in first.iter().take(pixel_count) {
@@ -282,6 +293,15 @@ fn rgba_from_planes_impl(
     rgba
 }
 
+fn has_declared_spot_channels(face: &PreviewFace, channel_count: usize) -> bool {
+    face.metadata
+        .channel_display_info
+        .iter()
+        .take(channel_count)
+        .flatten()
+        .any(|info| info.is_spot())
+}
+
 fn composite_extra_channels(
     face: &PreviewFace,
     planes: &[Vec<u16>],
@@ -289,9 +309,6 @@ fn composite_extra_channels(
     rgb: &mut [f32; 3],
 ) {
     let first_extra = face.metadata.base_channel_count.min(planes.len());
-    if first_extra >= planes.len() {
-        return;
-    }
 
     const DIAGNOSTIC_TINTS: [[f32; 3]; 8] = [
         [0.00, 0.90, 0.45],
@@ -304,35 +321,49 @@ fn composite_extra_channels(
         [0.95, 0.45, 0.05],
     ];
 
-    for channel_index in first_extra..planes.len() {
-        let plane = &planes[channel_index];
-        if pixel >= plane.len() {
-            continue;
-        }
-        let coverage =
-            tiff_io::extra_channel_preview_coverage(&face.metadata, channel_index, plane[pixel]);
-        if coverage <= 0.001 {
-            continue;
-        }
+    for channel_index in 0..planes.len() {
         let display = face
             .metadata
             .channel_display_info
             .get(channel_index)
             .and_then(|value| *value);
+        let is_extra = channel_index >= first_extra;
+        let is_declared_spot = display.is_some_and(|info| info.is_spot());
+        if !is_extra && !is_declared_spot {
+            continue;
+        }
+
+        let plane = &planes[channel_index];
+        if pixel >= plane.len() {
+            continue;
+        }
+        let coverage = if is_extra {
+            tiff_io::extra_channel_preview_coverage(&face.metadata, channel_index, plane[pixel])
+        } else {
+            // A declared Spot that sits inside a Multichannel base range is not
+            // polarity-normalized by tiff_io, so preserve Photoshop's raw Spot
+            // convention here: white = no ink, black = full ink.
+            1.0 - plane[pixel] as f32 / u16::MAX as f32
+        };
+        if coverage <= 0.001 {
+            continue;
+        }
+
         match display {
             Some(info) if info.is_spot() => {
-                let tint = info.rgb.unwrap_or(
-                    DIAGNOSTIC_TINTS[(channel_index - first_extra) % DIAGNOSTIC_TINTS.len()],
-                );
+                let tint = info
+                    .rgb
+                    .unwrap_or(DIAGNOSTIC_TINTS[channel_index % DIAGNOSTIC_TINTS.len()]);
                 blend_tint(rgb, tint, (coverage * info.solidity).clamp(0.0, 1.0));
             }
             Some(_) => {
                 // Known Alpha/protected display channels are not printing inks.
             }
-            None => {
+            None if is_extra => {
                 let tint = DIAGNOSTIC_TINTS[(channel_index - first_extra) % DIAGNOSTIC_TINTS.len()];
                 blend_tint(rgb, tint, (coverage * 0.72).clamp(0.0, 0.72));
             }
+            None => {}
         }
     }
 }
@@ -368,7 +399,7 @@ pub fn histogram(values: &[u16]) -> [u32; 256] {
 mod tests {
     use super::*;
     use crate::model::{ChannelAdjustment, Curve, Levels, MixerRow};
-    use crate::tiff_io::TiffMetadata;
+    use crate::tiff_io::{PhotoshopChannelDisplay, TiffMetadata};
     use std::collections::BTreeMap;
 
     fn face(values: Vec<u16>) -> PreviewFace {
@@ -446,6 +477,75 @@ mod tests {
         let (_, stats) = adjusted_planes_with_stats(&face, &project(adjustment));
         assert_eq!(stats[0].curve_white_count, 2);
     }
+
+    #[test]
+    fn multichannel_spot_preview_uses_display_color_and_solidity() {
+        let plane = vec![u16::MAX];
+        let face = PreviewFace {
+            metadata: TiffMetadata {
+                width: 1,
+                height: 1,
+                bit_depth: 16,
+                samples_per_pixel: 1,
+                base_channel_count: 0,
+                color_model: ColorModel::Other,
+                channel_names: vec!["Spot Blue".to_owned()],
+                channel_display_info: vec![Some(PhotoshopChannelDisplay {
+                    rgb: Some([0.0, 0.25, 1.0]),
+                    solidity: 0.5,
+                    kind: 2,
+                })],
+                compression: None,
+                predictor: None,
+                orientation: None,
+                icc_profile: None,
+                photoshop_resources: None,
+                photoshop_image_source_data: None,
+            },
+            width: 1,
+            height: 1,
+            channels: vec![plane.clone()],
+            histograms: vec![histogram(&plane)],
+        };
+
+        let rgba = rgba_from_planes(&face, &face.channels, None);
+        assert_eq!(rgba, vec![128, 159, 255, 255]);
+    }
+
+    #[test]
+    fn spot_declared_inside_multichannel_base_range_is_still_composited() {
+        let plane = vec![0u16];
+        let face = PreviewFace {
+            metadata: TiffMetadata {
+                width: 1,
+                height: 1,
+                bit_depth: 16,
+                samples_per_pixel: 1,
+                base_channel_count: 1,
+                color_model: ColorModel::Other,
+                channel_names: vec!["Spot Red".to_owned()],
+                channel_display_info: vec![Some(PhotoshopChannelDisplay {
+                    rgb: Some([1.0, 0.0, 0.0]),
+                    solidity: 0.4,
+                    kind: 2,
+                })],
+                compression: None,
+                predictor: None,
+                orientation: None,
+                icc_profile: None,
+                photoshop_resources: None,
+                photoshop_image_source_data: None,
+            },
+            width: 1,
+            height: 1,
+            channels: vec![plane.clone()],
+            histograms: vec![histogram(&plane)],
+        };
+
+        let rgba = rgba_from_planes(&face, &face.channels, None);
+        assert_eq!(rgba, vec![255, 153, 153, 255]);
+    }
+
     #[test]
     fn master_levels_and_curve_stack_without_overwriting_channel_controls() {
         let face = face(vec![32768]);
