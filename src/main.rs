@@ -3755,6 +3755,12 @@ impl ShadeApp {
         let color_status = face.color_status.clone();
         let embedded_original_status = face.embedded_original_status.clone();
         let texture = face.texture.clone();
+        let preview_is_updating = ui::preview_status::current_generation_is_rendering(
+            self.current_face,
+            face.generation,
+            face.rendered_generation,
+            self.render_busy,
+        );
         let original_texture = face.original_texture.clone();
         let embedded_original_texture = face.embedded_original_texture.clone();
         let (width_cm, height_cm) = physical_dimensions_cm(meta.width, meta.height, dpi_info);
@@ -3806,6 +3812,7 @@ impl ShadeApp {
             return;
         };
 
+        let preview_viewport_rect = ui.available_rect_before_wrap();
         let visible = ui.available_size().max(egui::vec2(1.0, 1.0));
         if self.fit_requested {
             let natural = texture.size_vec2();
@@ -3884,6 +3891,9 @@ impl ShadeApp {
                 }
             });
         let _ = output;
+        if preview_is_updating {
+            ui::preview_status::paint_updating_indicator(ui, preview_viewport_rect);
+        }
         if recenter {
             self.viewport_recenter = false;
         }

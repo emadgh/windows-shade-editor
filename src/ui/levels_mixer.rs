@@ -446,6 +446,25 @@ pub(crate) fn levels_ui(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MixerRowLayout {
+    label_width: f32,
+    slider_width: f32,
+    value_width: f32,
+}
+
+fn mixer_row_layout(available_width: f32, spacing: f32) -> MixerRowLayout {
+    let value_width = 58.0;
+    let label_width = (available_width * 0.22).clamp(72.0, 112.0);
+    let reserved = label_width + value_width + spacing * 2.0;
+    let slider_width = (available_width - reserved).max(72.0);
+    MixerRowLayout {
+        label_width,
+        slider_width,
+        value_width,
+    }
+}
+
 fn mixer_percent_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -457,30 +476,35 @@ fn mixer_percent_row(
     let mut percent = coefficient_to_percent(*value, min_percent, max_percent);
     let before = percent;
     with_accent(ui, color, |ui| {
-        ui.horizontal(|ui| {
-            if let Some(color) = color {
+        let row_width = ui.available_width().max(220.0);
+        let spacing = ui.spacing().item_spacing.x;
+        let layout = mixer_row_layout(row_width, spacing);
+        ui.allocate_ui_with_layout(
+            egui::vec2(row_width, 22.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let label_widget = if let Some(color) = color {
+                    egui::Label::new(egui::RichText::new(label).color(color)).truncate()
+                } else {
+                    egui::Label::new(label).truncate()
+                };
+                ui.add_sized([layout.label_width, 20.0], label_widget);
                 ui.add_sized(
-                    [86.0, 20.0],
-                    egui::Label::new(egui::RichText::new(label).color(color)),
+                    [layout.slider_width, 20.0],
+                    egui::Slider::new(&mut percent, min_percent..=max_percent)
+                        .step_by(1.0)
+                        .show_value(false)
+                        .trailing_fill(true),
                 );
-            } else {
-                ui.add_sized([86.0, 20.0], egui::Label::new(label));
-            }
-            let slider_width = (ui.available_width() - 58.0).max(54.0);
-            ui.add_sized(
-                [slider_width, 20.0],
-                egui::Slider::new(&mut percent, min_percent..=max_percent)
-                    .step_by(1.0)
-                    .show_value(false)
-                    .trailing_fill(true),
-            );
-            ui.add(
-                egui::DragValue::new(&mut percent)
-                    .range(min_percent..=max_percent)
-                    .speed(1.0)
-                    .suffix("%"),
-            );
-        });
+                ui.add_sized(
+                    [layout.value_width, 20.0],
+                    egui::DragValue::new(&mut percent)
+                        .range(min_percent..=max_percent)
+                        .speed(1.0)
+                        .suffix("%"),
+                );
+            },
+        );
     });
     if percent != before {
         *value = percent_to_coefficient(percent);
@@ -544,6 +568,16 @@ pub(crate) fn mixer_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixer_row_slider_expands_with_panel_width() {
+        let narrow = mixer_row_layout(280.0, 8.0);
+        let wide = mixer_row_layout(520.0, 8.0);
+        assert!(narrow.slider_width >= 72.0);
+        assert!(wide.slider_width > narrow.slider_width + 180.0);
+        assert_eq!(narrow.value_width, wide.value_width);
+        assert!(wide.label_width >= narrow.label_width);
+    }
 
     #[test]
     fn mixer_percent_round_trip_matches_normalized_storage() {
