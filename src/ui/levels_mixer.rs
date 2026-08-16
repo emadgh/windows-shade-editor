@@ -442,12 +442,6 @@ pub(crate) fn levels_ui(
             }
         });
 
-        ui.add_space(4.0);
-        ui.small(format!(
-            "Midtone output at 50% input: {:.1}% · tonal axis follows {} mode",
-            model::levels_gamma_mid_output(*levels) * 100.0,
-            display_mode.label(),
-        ));
         *levels != before
     })
 }
@@ -514,7 +508,6 @@ pub(crate) fn mixer_ui(
     } else {
         ui.label(format!("Output: {output_display}"));
     }
-    ui.small("Mixer values are percentages. 100% = coefficient 1.0. Slider and keyboard edits use 1 percentage-point units.");
     ui.add_space(4.0);
     let mut changed = false;
     for (index, name) in channel_names.iter().enumerate() {
