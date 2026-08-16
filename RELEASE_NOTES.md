@@ -1,3 +1,9 @@
+# Shade Editor 0.20.7
+
+- Make Channel Mixer sliders consume the available adjustment-panel width while preserving compact labels and percent fields.
+- Add a small non-interactive loading indicator over the current preview only while its exact render generation is being updated.
+- Keep the previously rendered preview fully sharp and unchanged during updates; no blur, dimming or interaction blocker is introduced.
+
 # Shade Editor 0.20.6
 
 - Unify Curve and Levels visual language with a shared dark histogram surface and Before/After presentation.
