@@ -252,6 +252,28 @@ fn histogram_quantile(histogram: &[u32; 256], quantile: f32) -> f32 {
     1.0
 }
 
+fn histogram_peak_density(histogram: &[u32; 256]) -> f32 {
+    let total = histogram_total(histogram) as f32;
+    if total <= 0.0 {
+        return 0.0;
+    }
+    histogram
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0) as f32
+        / total
+}
+
+fn histogram_bin_density(histogram: &[u32; 256], index: usize) -> f32 {
+    let total = histogram_total(histogram) as f32;
+    if total <= 0.0 {
+        0.0
+    } else {
+        histogram[index] as f32 / total
+    }
+}
+
 pub(crate) fn target_overlay_color(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         egui::Color32::from_rgb(255, 177, 66)
@@ -279,15 +301,15 @@ pub(crate) fn draw_histogram_with_target(
         egui::StrokeKind::Inside,
     );
 
-    let max_value = original
+    // Histograms can come from differently-sized images. Compare probability
+    // density rather than raw pixel counts so the target overlay keeps its true shape.
+    let max_density = original
         .into_iter()
-        .flat_map(|bins| bins.iter())
-        .chain(adjusted.into_iter().flat_map(|bins| bins.iter()))
-        .chain(target.into_iter().flat_map(|bins| bins.iter()))
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .max(1) as f32;
+        .chain(adjusted)
+        .chain(target)
+        .map(histogram_peak_density)
+        .fold(0.0_f32, f32::max)
+        .max(f32::EPSILON);
     let original_color = ui.visuals().weak_text_color();
     let adjusted_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
 
@@ -297,14 +319,14 @@ pub(crate) fn draw_histogram_with_target(
             super::curve_editor::tonal_display_value(index as f32 / 255.0, display_mode),
         );
         if let Some(bins) = original {
-            let h = bins[index] as f32 / max_value * rect.height();
+            let h = histogram_bin_density(bins, index) / max_density * rect.height();
             painter.line_segment(
                 [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
                 egui::Stroke::new(1.0, original_color),
             );
         }
         if let Some(bins) = adjusted {
-            let h = bins[index] as f32 / max_value * rect.height();
+            let h = histogram_bin_density(bins, index) / max_density * rect.height();
             painter.line_segment(
                 [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
                 egui::Stroke::new(1.0, adjusted_color),
@@ -319,7 +341,7 @@ pub(crate) fn draw_histogram_with_target(
                     rect.x_range(),
                     super::curve_editor::tonal_display_value(index as f32 / 255.0, display_mode),
                 );
-                let h = bins[index] as f32 / max_value * rect.height();
+                let h = histogram_bin_density(bins, index) / max_density * rect.height();
                 egui::pos2(x, rect.bottom() - h)
             })
             .collect::<Vec<_>>();
@@ -349,6 +371,14 @@ mod tests {
         let levels = fit_levels_from_histograms(&source, &source);
         assert!((levels.gamma - 1.0).abs() < 0.05);
         assert!((apply_levels(0.5, levels) - 0.5).abs() < 0.08);
+    }
+
+    #[test]
+    fn histogram_density_is_independent_of_pixel_count() {
+        let small = histogram(&[(32, 2), (128, 6), (220, 2)]);
+        let large = histogram(&[(32, 200), (128, 600), (220, 200)]);
+        assert!((histogram_peak_density(&small) - histogram_peak_density(&large)).abs() < 1e-6);
+        assert!((histogram_bin_density(&small, 128) - histogram_bin_density(&large, 128)).abs() < 1e-6);
     }
 
     #[test]
