@@ -6030,6 +6030,7 @@ fn draw_histogram(
     let desired = egui::vec2(ui.available_width().max(80.0), 105.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
     painter.rect_stroke(
         rect,
         2.0,
