@@ -53,7 +53,7 @@ mod tests {
             "app_features::EXPORT_QUEUE_LABEL",
             "app_features::TIFF_INSPECTOR_LABEL",
             "Color Management / ICC Preview",
-            super::COLOR_CONVERSION_LABEL,
+            "app_features::COLOR_CONVERSION_LABEL",
             super::SOFT_PROOF_LABEL,
             super::MONITOR_PROFILE_LABEL,
         ] {
