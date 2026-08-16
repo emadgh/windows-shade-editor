@@ -14,6 +14,7 @@ pub mod export;
 pub mod model;
 #[path = "palette.rs"]
 pub mod palette;
+pub mod png_source;
 pub mod production_acceptance;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
