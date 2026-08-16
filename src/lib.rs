@@ -2,6 +2,7 @@
 
 pub mod color_conversion;
 pub mod conversion_capabilities;
+pub mod conversion_preflight;
 pub mod conversion_workflow;
 pub mod icc_conversion;
 pub mod nchannel_icc;
