@@ -68,7 +68,9 @@ fn main() {
 
     let png_b64 = include_str!("assets/shade-editor-icon.png.b64");
     let png = decode_base64(png_b64).expect("decode embedded Shade Editor icon PNG");
-    let ico = png_as_ico(&png, 128, 128);
+    // The committed source icon is a verified 64×64 PNG; Windows can scale the
+    // embedded PNG icon cleanly for taskbar and small file-association views.
+    let ico = png_as_ico(&png, 64, 64);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let icon_path = out_dir.join("shade-editor.ico");
     fs::write(&icon_path, ico).expect("write generated Shade Editor ICO");
