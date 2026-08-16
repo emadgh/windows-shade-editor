@@ -28,6 +28,7 @@ impl ShadeApp {
                 ""
             };
             ui.label(format!("{}{}", self.status_message, dirty));
+            self.ui_color_conversion_status(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Fit").clicked() {
                     self.fit_requested = true;
@@ -45,5 +46,6 @@ impl ShadeApp {
                 }
             });
         });
+        self.ui_color_conversion_window(ui.ctx());
     }
 }
