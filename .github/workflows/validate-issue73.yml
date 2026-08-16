@@ -1,0 +1,70 @@
+name: Validate Issue 73 Dark Histogram Surfaces
+
+on:
+  push:
+    branches:
+      - feat/73-dark-channel-histograms
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/73-dark-channel-histograms
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply Issue 73 patch
+        run: python scripts/issue73_patch.py
+      - name: Resolve lockfile
+        run: cargo check --target x86_64-pc-windows-msvc
+      - name: Format
+        run: cargo fmt --all
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Locked Windows check
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+      - name: Full Release tests
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc
+      - name: Release build
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - name: Build and test native Shell extension
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist shell\bin mkdir shell\bin
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeProjectDataTests.exe shell\ShadeProjectDataTests.cpp shell\ShadeProjectData.cpp
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeProjectDataTests.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /LD /Fe:shell\bin\ShadeEditorShell.dll shell\ShadeEditorShell.cpp shell\ShadeProjectData.cpp /link ole32.lib shlwapi.lib windowscodecs.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeShellTests.exe shell\ShadeShellTests.cpp /link ole32.lib shlwapi.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeShellTests.exe shell\bin\ShadeEditorShell.dll
+          if errorlevel 1 exit /b 1
+      - name: Validate schema and Issue 73 invariants
+        shell: pwsh
+        run: |
+          [xml](Get-Content -Raw shell/ShadeEditor.propdesc) | Out-Null
+          $source = Get-Content -Raw src/main.rs
+          if (-not $source.Contains('painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);')) { throw 'dark histogram surface missing' }
+          if ((Get-Content -Raw VERSION).Trim() -ne '0.20.8') { throw 'VERSION mismatch' }
+      - name: Commit validated production files only
+        shell: pwsh
+        run: |
+          if (Test-Path shell/bin) { Remove-Item shell/bin -Recurse -Force }
+          Remove-Item *.obj -ErrorAction SilentlyContinue
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION Cargo.toml Cargo.lock RELEASE_NOTES.md src/main.rs
+          git commit -m "feat(v0.20.8): normalize standalone histogram surfaces (#73)"
+          git push origin HEAD:feat/73-dark-channel-histograms
