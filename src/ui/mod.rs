@@ -8,6 +8,7 @@ pub(crate) mod levels_mixer;
 pub(crate) mod preview_status;
 pub(crate) mod project_navigation;
 pub(crate) mod project_view_state;
+pub(crate) mod settings_panel;
 pub(crate) mod status_bar;
 
 #[cfg(test)]

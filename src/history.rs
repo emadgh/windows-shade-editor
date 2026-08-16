@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{
-    ChannelAdjustment, MASTER_ADJUSTMENT_KEY, MAX_SNAPSHOT_HISTORY_STATES,
+    ChannelAdjustment, DEFAULT_HISTORY_STEPS, MASTER_ADJUSTMENT_KEY, MAX_SNAPSHOT_HISTORY_STATES,
     SnapshotAdjustmentHistory, SnapshotHistoryState,
 };
 
@@ -11,10 +11,21 @@ pub struct HistoryEntry {
     pub adjustments: BTreeMap<String, ChannelAdjustment>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AdjustmentHistory {
     entries: Vec<HistoryEntry>,
     cursor: usize,
+    limit: usize,
+}
+
+impl Default for AdjustmentHistory {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+            limit: DEFAULT_HISTORY_STEPS,
+        }
+    }
 }
 
 impl AdjustmentHistory {
@@ -54,7 +65,11 @@ impl AdjustmentHistory {
             entries.drain(0..overflow);
         }
         let cursor = persisted.cursor.min(entries.len().saturating_sub(1));
-        Self { entries, cursor }
+        Self {
+            entries,
+            cursor,
+            limit: DEFAULT_HISTORY_STEPS,
+        }
     }
 
     pub fn to_persisted(&self) -> SnapshotAdjustmentHistory {
@@ -88,10 +103,7 @@ impl AdjustmentHistory {
             label: label.into(),
             adjustments: adjustments.clone(),
         });
-        if self.entries.len() > MAX_SNAPSHOT_HISTORY_STATES {
-            let overflow = self.entries.len() - MAX_SNAPSHOT_HISTORY_STATES;
-            self.entries.drain(0..overflow);
-        }
+        self.trim_to_limit();
         self.cursor = self.entries.len().saturating_sub(1);
         true
     }
@@ -138,6 +150,30 @@ impl AdjustmentHistory {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.clamp(1, MAX_SNAPSHOT_HISTORY_STATES);
+        self.trim_to_limit();
+    }
+
+    fn trim_to_limit(&mut self) {
+        if self.entries.len() <= self.limit {
+            return;
+        }
+        let start = (self.cursor + 1).saturating_sub(self.limit);
+        if start > 0 {
+            self.entries.drain(0..start);
+            self.cursor = self.cursor.saturating_sub(start);
+        }
+        if self.entries.len() > self.limit {
+            self.entries.truncate(self.limit);
+            self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+        }
     }
 
     pub fn current_matches(&self, adjustments: &BTreeMap<String, ChannelAdjustment>) -> bool {
@@ -269,8 +305,28 @@ mod tests {
         for index in 1..80 {
             history.record(&state(1.0 + index as f32 / 100.0), format!("State {index}"));
         }
-        assert_eq!(history.len(), MAX_SNAPSHOT_HISTORY_STATES);
-        assert_eq!(history.cursor(), MAX_SNAPSHOT_HISTORY_STATES - 1);
+        assert_eq!(history.len(), DEFAULT_HISTORY_STEPS);
+        assert_eq!(history.cursor(), DEFAULT_HISTORY_STEPS - 1);
+    }
+
+    #[test]
+    fn reducing_history_limit_preserves_current_state_and_future_cap() {
+        let mut history = AdjustmentHistory::default();
+        history.reset(&state(1.0), "Start");
+        for index in 1..12 {
+            history.record(&state(1.0 + index as f32 / 100.0), format!("State {index}"));
+        }
+        history.undo();
+        history.undo();
+        let current = history.entries()[history.cursor()].adjustments.clone();
+        history.set_limit(5);
+        assert_eq!(history.limit(), 5);
+        assert!(history.len() <= 5);
+        assert_eq!(history.entries()[history.cursor()].adjustments, current);
+        for index in 20..30 {
+            history.record(&state(1.0 + index as f32 / 100.0), format!("State {index}"));
+        }
+        assert_eq!(history.len(), 5);
     }
 
     #[test]

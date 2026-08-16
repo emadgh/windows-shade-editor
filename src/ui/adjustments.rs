@@ -43,7 +43,8 @@ impl ShadeApp {
         });
         if let Some(name) = self.project.active_snapshot_name() {
             ui.small(format!(
-                "Snapshot: {name} · up to 50 adjustment states are saved in this .shade file."
+                "Snapshot: {name} · up to {} adjustment states are saved in this .shade file.",
+                self.settings.history_steps
             ));
         } else {
             ui.small("Working adjustment history. Create/select a Snapshot to keep an independent saved history.");

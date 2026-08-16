@@ -267,6 +267,7 @@ struct ShadeApp {
     settings: AppSettings,
     updater: UpdateManager,
     show_settings: bool,
+    settings_view: ui::settings_panel::SettingsViewState,
     color: ColorManagementController,
     show_about: bool,
     show_logs: bool,
@@ -338,6 +339,7 @@ impl ShadeApp {
             }
         };
         let mut history = history::AdjustmentHistory::default();
+        history.set_limit(settings.history_steps);
         history.reset(&project.adjustments, "Start");
         let export_queue = export_queue::ExportQueue::load_persistent().unwrap_or_else(|err| {
             log.error(&err);
@@ -358,6 +360,7 @@ impl ShadeApp {
             settings,
             updater,
             show_settings: false,
+            settings_view: ui::settings_panel::SettingsViewState::default(),
             color: ColorManagementController::default(),
             show_about: false,
             show_logs: false,
@@ -522,6 +525,7 @@ impl ShadeApp {
         self.export.show_snapshot_save_reminder = false;
         self.history.reset(&self.project.adjustments, "New project");
         self.history_clear_backup = None;
+        self.history.set_limit(self.settings.history_steps);
         self.history_pending_label = None;
         self.history_pending_at = None;
         self.bump_project_session();
@@ -4544,291 +4548,7 @@ impl ShadeApp {
     }
 
     fn ui_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_settings {
-            return;
-        }
-        let mut open = self.show_settings;
-        let mut rebuild_previews_requested = false;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .resizable(true)
-            .default_size([640.0, 760.0])
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Application");
-                let mut changed = false;
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.auto_update,
-                        "Automatically check and download updates",
-                    )
-                    .changed();
-                let dark_changed = ui
-                    .checkbox(&mut self.settings.dark_mode, "Dark mode")
-                    .changed();
-                changed |= dark_changed;
-                ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.settings.max_preview_dimension, 600..=4000)
-                                .text("Preview max dimension"),
-                        )
-                        .changed();
-                    if ui
-                        .add_enabled(
-                            !self.faces.is_empty() && self.job.is_none(),
-                            egui::Button::new("Rebuild previews"),
-                        )
-                        .on_hover_text("Reload all current TIFF Faces using this preview size")
-                        .clicked()
-                    {
-                        rebuild_previews_requested = true;
-                    }
-                });
-                ui.small("The max dimension is used when TIFF previews are loaded. Use Rebuild previews to apply a changed value to Faces already open in this project.");
-                ui.separator();
-                ui.heading("Preview diagnostics");
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.show_clipping_warnings,
-                        "Show per-channel clipping warnings",
-                    )
-                    .changed();
-                ui.small("Clipping percentages are estimates from the loaded preview samples. Yellow starts at 0.10%; red at 1.00%. Full-resolution export data is not sampled or modified for these warnings.");
-                ui.small("ICC profile assignment is project-owned. Click the profile name beside the active Face metadata to open Color Management.");
-                ui.separator();
-                ui.heading("Export & storage");
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.lzw_compression,
-                        "Use LZW compression for exported TIFF files",
-                    )
-                    .changed();
-                ui.small("LZW is enabled by default. Disable it only when you specifically need to preserve a supported source compression mode.");
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.validate_after_export,
-                        "Validate TIFF after normal Export face / Export all",
-                    )
-                    .changed();
-                ui.small("When enabled, Shade Editor immediately re-decodes every exported TIFF and verifies channel layout/names, ICC/Photoshop resources, compression/predictor policy and complete strip decoding.");
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.export_all_test_code,
-                        "Write Test Code during Export all",
-                    )
-                    .changed();
-                ui.small("Off by default: Export all writes clean Face TIFFs without Test Code. Enable this only when every Face in Export all should receive the current Test Code configuration.");
-                ui.add_space(8.0);
-                ui.strong("Snapshot / Test export filename template");
-                changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.settings.snapshot_export_template)
-                            .desired_width(520.0),
-                    )
-                    .changed();
-                ui.small("Used only by Snapshot/Test exports. Tokens: {project}, {face}, {snapshot}, {testcode}, {source}, {date}. Export Face keeps its manual Save As filename, and Export All keeps the template in its own window.");
-                let old_default_dpi = self.settings.default_dpi;
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.settings.default_dpi, 72.0..=1200.0)
-                            .text("Default DPI")
-                            .suffix(" dpi"),
-                    )
-                    .changed();
-                ui.small("Used when a TIFF has no valid physical DPI. Default: 220. Exported TIFFs receive this DPI when the source does not provide one.");
-                let dpi_changed = (old_default_dpi - self.settings.default_dpi).abs() > f64::EPSILON;
-                if dpi_changed {
-                    for face in &mut self.faces {
-                        if face.dpi.used_default {
-                            face.dpi = dpi::DpiInfo::with_default(self.settings.default_dpi);
-                        }
-                    }
-                }
-                ui.separator();
-                ui.heading("Windows Explorer integration");
-                let shell_installer = Self::bundled_shell_script("Install-ShadeEditorShell.ps1");
-                let shell_uninstaller = Self::bundled_shell_script("Uninstall-ShadeEditorShell.ps1");
-                if let Some(installer) = shell_installer {
-                    ui.small(format!("Bundled Shell package: {}", installer.parent().unwrap_or_else(|| Path::new(".")).display()));
-                    ui.horizontal(|ui| {
-                        if ui.button("Install Shell integration").clicked() { self.launch_shell_script("Install-ShadeEditorShell.ps1", "installation"); }
-                        if shell_uninstaller.is_some() && ui.button("Uninstall Shell integration").clicked() { self.launch_shell_script("Uninstall-ShadeEditorShell.ps1", "removal"); }
-                    });
-                    ui.small("The installer may request administrator permission because Explorer COM/property handlers are registered machine-wide.");
-                } else {
-                    ui.colored_label(egui::Color32::YELLOW, "Bundled shell folder not found next to ShadeEditor.exe.");
-                    ui.small("Install the Shell package separately, or place the shell folder from the build package next to ShadeEditor.exe.");
-                }
-                ui.separator();
-                ui.heading("Editor layout");
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.sidebar_two_columns,
-                        "Use two-column tools sidebar",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.show_all_histograms,
-                        "Show a histogram for every channel",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.adjustment_tabs,
-                        "Use tabs for Levels / Mixer / Curve",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.compact_curve_controls,
-                        "Compact Curve editor (hide Input / Output fields)",
-                    )
-                    .changed();
-                ui.small("When enabled, Curve keeps only the draggable graph and hides the selected-point label, Input / Output fields, and helper text.");
-                ui.separator();
-                ui.heading("Color guides");
-                ui.horizontal(|ui| {
-                    ui.label("Curve / Histogram direction");
-                    changed |= tonal_display_mode_selector(ui, &mut self.settings.tonal_display_mode);
-                });
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.colorize_histograms,
-                        "Colorize histograms by channel",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.colorize_adjustments,
-                        "Colorize Levels / Mixer / Curve by channel",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.show_curve_histogram,
-                        "Show active histogram behind Curve",
-                    )
-                    .changed();
-                ui.separator();
-                ui.heading("Channel palettes");
-                ui.small("Palettes change only UI channel names/colors. TIFF channel names and separation order stay untouched. The active project palette is saved inside the .shade file.");
-                let palette_library = self.settings.palette_library();
-                let default_palette_name = if self.settings.default_palette_id == palette::AUTO_PALETTE_ID {
-                    "Automatic - CMYK/RGB from first Face".to_owned()
-                } else {
-                    palette_library
-                        .iter()
-                        .find(|palette| palette.id == self.settings.default_palette_id)
-                        .map(|palette| palette.name.clone())
-                        .unwrap_or_else(|| "Automatic - CMYK/RGB from first Face".to_owned())
-                };
-                egui::ComboBox::from_label("Default palette for new projects")
-                    .selected_text(default_palette_name)
-                    .show_ui(ui, |ui| {
-                        changed |= ui
-                            .selectable_value(
-                                &mut self.settings.default_palette_id,
-                                palette::AUTO_PALETTE_ID.to_owned(),
-                                "Automatic - CMYK/RGB from first Face",
-                            )
-                            .changed();
-                        for palette in &palette_library {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.settings.default_palette_id,
-                                    palette.id.clone(),
-                                    &palette.name,
-                                )
-                                .changed();
-                        }
-                    });
-
-                ui.label("Built-in palettes (read-only)");
-                for builtin in palette::builtin_palettes() {
-                    egui::CollapsingHeader::new(&builtin.name)
-                        .id_salt(format!("builtin-palette-{}", builtin.id))
-                        .show(ui, |ui| {
-                            for entry in &builtin.channels {
-                                palette_entry_readonly(ui, entry);
-                            }
-                        });
-                }
-
-                let mut delete_palette = None;
-                let mut add_channel_to = None;
-                let mut remove_channel = None;
-                for custom in &mut self.settings.custom_palettes {
-                    let custom_id = custom.id.clone();
-                    egui::CollapsingHeader::new(format!("Custom - {}", custom.name))
-                        .id_salt(format!("custom-palette-{custom_id}"))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Palette name");
-                                changed |= ui.text_edit_singleline(&mut custom.name).changed();
-                                if ui.small_button("Delete palette").clicked() {
-                                    delete_palette = Some(custom_id.clone());
-                                }
-                            });
-                            ui.add_space(3.0);
-                            for (index, entry) in custom.channels.iter_mut().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.label(format!("{}", index + 1));
-                                    changed |= ui
-                                        .add(egui::TextEdit::singleline(&mut entry.name).desired_width(130.0))
-                                        .changed();
-                                    changed |= ui.color_edit_button_srgb(&mut entry.color).changed();
-                                    if ui.small_button("-").on_hover_text("Remove channel slot").clicked() {
-                                        remove_channel = Some((custom_id.clone(), index));
-                                    }
-                                });
-                            }
-                            if ui.small_button("+ Channel slot").clicked() {
-                                add_channel_to = Some(custom_id.clone());
-                            }
-                        });
-                }
-                if let Some((id, index)) = remove_channel {
-                    if let Some(custom) = self.settings.custom_palettes.iter_mut().find(|item| item.id == id) {
-                        if index < custom.channels.len() {
-                            custom.channels.remove(index);
-                            changed = true;
-                        }
-                    }
-                }
-                if let Some(id) = add_channel_to {
-                    if let Some(custom) = self.settings.custom_palettes.iter_mut().find(|item| item.id == id) {
-                        let number = custom.channels.len() + 1;
-                        let color = palette::fallback_channel_color("Spot", number - 1);
-                        custom.channels.push(palette::ChannelPaletteEntry {
-                            name: format!("Ink {number}"),
-                            color,
-                        });
-                        changed = true;
-                    }
-                }
-                if let Some(id) = delete_palette {
-                    changed |= self.settings.delete_custom_palette(&id);
-                }
-                if ui.button("+ New custom palette").clicked() {
-                    self.settings.create_custom_palette();
-                    changed = true;
-                }
-                if dark_changed {
-                    apply_theme(ctx, self.settings.dark_mode);
-                }
-                if changed {
-                    if let Err(err) = self.settings.save() {
-                        self.report_error(err);
-                    }
-                }
-                });
-            });
-        self.show_settings = open;
-        if rebuild_previews_requested {
-            self.rebuild_previews();
-        }
+        self.ui_preferences_window(ctx);
     }
 
     fn ui_about_window(&mut self, ctx: &egui::Context) {
