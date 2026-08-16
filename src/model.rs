@@ -14,7 +14,9 @@ pub const TEST_CODE_ALL_CHANNELS: &str = "__all_channels__";
 /// It is intentionally stored beside per-channel adjustments so snapshots/history/export
 /// recipes preserve it without changing the .shade schema. TIFF channel names never use it.
 pub const MASTER_ADJUSTMENT_KEY: &str = "__shade_editor_master__";
-pub const MAX_SNAPSHOT_HISTORY_STATES: usize = 50;
+pub const MIN_HISTORY_STEPS: usize = 10;
+pub const DEFAULT_HISTORY_STEPS: usize = 50;
+pub const MAX_SNAPSHOT_HISTORY_STATES: usize = 200;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PreviewRenderingIntent {

@@ -1,3 +1,11 @@
+# Shade Editor 0.20.9
+
+- Redesign Preferences into categorized pages with a fixed category sidebar on the right, avoiding one very tall settings page.
+- Add persistent History Steps configuration with a safe 10–200 range and a default of 50.
+- Apply the configured history limit to live, loaded and cleared-history backup stacks; reducing the limit preserves the current state while trimming older entries.
+- Show the configured history depth in Snapshot History instead of a fixed 50-state message.
+- Preserve all existing Preferences options and legacy settings defaults.
+
 # Shade Editor 0.20.8
 
 - Match standalone Channels histogram graph backgrounds to the darker Levels and Curve surfaces.
