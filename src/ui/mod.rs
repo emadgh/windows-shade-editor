@@ -140,7 +140,7 @@ mod tests {
             "previous_shades_sort: previous_shades::PreviousShadesSort",
             "previous_shades_selected: Option<String>",
             "previous_shade_preview: Option<previous_shades::ShadeInspection>",
-            "previous_shade_preview_error: Option<previous_shades::ShadeInspection>",
+            "previous_shade_preview_error: Option<String>",
             "previous_shade_texture: Option<egui::TextureHandle>",
             "previous_shade_list_textures: BTreeMap<String, egui::TextureHandle>",
             "previous_shade_list_texture_lru: VecDeque<String>",
