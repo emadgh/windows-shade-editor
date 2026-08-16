@@ -1,0 +1,190 @@
+name: Validate Issue 65 hotfix
+
+on:
+  push:
+    branches:
+      - fix/v0205-build-and-ui-completion
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/v0205-build-and-ui-completion
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Complete app icon, About and Curve production wiring
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              if new in text:
+                  return text
+              if old not in text:
+                  raise SystemExit(f"{label}: expected source pattern not found")
+              return text.replace(old, new, 1)
+
+          p = Path("src/main.rs")
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(
+              s,
+              "mod adjustment_tools;",
+              "mod app_icon;\nmod adjustment_tools;",
+              "app_icon module",
+          )
+          s = replace_once(
+              s,
+              "egui::ViewportBuilder::default()\n            .with_title(APP_WINDOW_TITLE)",
+              "egui::ViewportBuilder::default()\n            .with_icon(app_icon::viewport_icon().expect(\"embedded Shade Editor icon\"))\n            .with_title(APP_WINDOW_TITLE)",
+              "native viewport icon",
+          )
+          about_old = '                ui.heading("Shade Editor");'
+          about_new = '''                if let Some(image) = app_icon::color_image() {
+                              let texture = ui.ctx().load_texture(
+                                  "shade-editor-about-icon",
+                                  image,
+                                  egui::TextureOptions::LINEAR,
+                              );
+                              ui.vertical_centered(|ui| {
+                                  ui.add(egui::Image::new((texture.id(), egui::vec2(72.0, 72.0))));
+                              });
+                              ui.add_space(6.0);
+                          }
+                          ui.heading("Shade Editor");'''
+          s = replace_once(s, about_old, about_new, "About icon")
+          p.write_text(s, encoding="utf-8")
+
+          p = Path("src/ui/curve_editor.rs")
+          s = p.read_text(encoding="utf-8")
+          curve_old = "    let desired = egui::vec2(ui.available_width().min(340.0).max(150.0), 210.0);"
+          curve_new = '''    // Match the Levels visual language: the histogram/curve plot is always square.
+              let side = ui.available_width().min(340.0).max(150.0);
+              let desired = egui::vec2(side, side);'''
+          s = replace_once(s, curve_old, curve_new, "square Curve plot")
+          p.write_text(s, encoding="utf-8")
+
+          p = Path("RELEASE_NOTES.md")
+          s = p.read_text(encoding="utf-8")
+          if not s.startswith("# Shade Editor 0.20.5"):
+              notes = '''# Shade Editor 0.20.5
+
+          - Integrate the approved Shade Editor icon into the Windows executable, native window and About dialog; `.shade` Explorer fallback icons continue to resolve through `ShadeEditor.exe,0` when thumbnails are unavailable or suppressed at small sizes.
+          - Make Levels input Black/Midtone/White and output Black/White markers mouse-draggable while retaining 0–255 numeric editing and Light/Pigment presentation.
+          - Compact Output Levels into a Photoshop-like single row with endpoint values and a draggable tonal gradient strip.
+          - Keep the Curve histogram/editor plot strictly 1:1 square and visually aligned with the Levels panel.
+          - Preserve `.shade` storage and production adjustment math.
+
+          '''
+              p.write_text(notes + s, encoding="utf-8")
+          '@ | Set-Content -Encoding utf8 fix65.py
+          python fix65.py
+          Remove-Item fix65.py
+
+      - name: Resolve lockfile
+        run: cargo check --target x86_64-pc-windows-msvc
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Locked Windows check
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+
+      - name: Full Release tests
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Release build
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Build and test native Shell extension
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist shell\bin mkdir shell\bin
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeProjectDataTests.exe shell\ShadeProjectDataTests.cpp shell\ShadeProjectData.cpp
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeProjectDataTests.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /LD /Fe:shell\bin\ShadeEditorShell.dll shell\ShadeEditorShell.cpp shell\ShadeProjectData.cpp /link ole32.lib shlwapi.lib windowscodecs.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeShellTests.exe shell\ShadeShellTests.cpp /link ole32.lib shlwapi.lib propsys.lib gdi32.lib
+          if errorlevel 1 exit /b 1
+          shell\bin\ShadeShellTests.exe shell\bin\ShadeEditorShell.dll
+          if errorlevel 1 exit /b 1
+
+      - name: Validate Shell schema and Issue 65 invariants
+        shell: pwsh
+        run: |
+          [xml](Get-Content -Raw shell/ShadeEditor.propdesc) | Out-Null
+          @'
+          from pathlib import Path
+          import base64
+
+          assert Path("VERSION").read_text().strip() == "0.20.5"
+          cargo = Path("Cargo.toml").read_text()
+          assert 'version = "0.20.5"' in cargo
+          assert '[build-dependencies]' in cargo and 'winresource = "0.1"' in cargo
+          icon = base64.b64decode(Path("assets/shade-editor-icon.png.b64").read_text().strip())
+          assert icon.startswith(b"\x89PNG\r\n\x1a\n") and len(icon) > 8000
+          assert Path("Cargo.lock").exists()
+
+          main = Path("src/main.rs").read_text()
+          assert "mod app_icon;" in main
+          assert "with_icon(app_icon::viewport_icon()" in main
+          assert "shade-editor-about-icon" in main
+
+          levels = Path("src/ui/levels_mixer.rs").read_text()
+          assert "input_levels_marker_strip" in levels
+          assert "output_levels_strip" in levels
+          assert 'ui.strong("Output Levels:")' in levels
+          assert "Sense::click_and_drag()" in levels
+
+          curve = Path("src/ui/curve_editor.rs").read_text()
+          assert "let desired = egui::vec2(side, side);" in curve
+          assert "histogram/curve plot is always square" in curve
+
+          installer = Path("shell/Install-ShadeEditorShell.ps1").read_text()
+          assert "DefaultIcon" in installer and "ShadeEditor.exe" in installer
+          '@ | Set-Content -Encoding utf8 validate65.py
+          python validate65.py
+          Remove-Item validate65.py
+
+      - name: Commit validated production tree and remove temporary workflow
+        shell: pwsh
+        run: |
+          Remove-Item .github/workflows/validate-fix65.yml
+          if (Test-Path shell/bin) { Remove-Item shell/bin -Recurse -Force }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(v0.20.5): complete icon and Levels/Curve production integration (#65)"
+          git push origin HEAD:fix/v0205-build-and-ui-completion
+
+      - name: Prepare validated build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          $exe = "target/x86_64-pc-windows-msvc/release/ShadeEditor.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  ShadeEditor.exe" | Set-Content -Encoding ascii -NoNewline artifact/ShadeEditor.exe.sha256
+          Copy-Item $exe artifact/ShadeEditor.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShadeEditor-v0.20.5-hotfix-validated
+          path: artifact
