@@ -75,31 +75,53 @@ impl ProductionCmykTransform {
         }
 
         let intent = to_lcms_intent(rendering_intent);
-        let flags = if black_point_compensation {
-            Flags::BLACKPOINT_COMPENSATION
-        } else {
-            Flags::empty()
-        };
-
         let transform = match source_model {
-            IccSourceModel::Rgb => make_transform::<[u16; 3], [u16; 4]>(
-                &source,
-                PixelFormat::RGB_16,
-                &target,
-                PixelFormat::CMYK_16,
-                intent,
-                flags,
-            )
-            .map(ProductionTransform::RgbToCmyk)?,
-            IccSourceModel::Cmyk => make_transform::<[u16; 4], [u16; 4]>(
-                &source,
-                PixelFormat::CMYK_16,
-                &target,
-                PixelFormat::CMYK_16,
-                intent,
-                flags,
-            )
-            .map(ProductionTransform::CmykToCmyk)?,
+            IccSourceModel::Rgb => {
+                let result = if black_point_compensation {
+                    Transform::new_flags(
+                        &source,
+                        PixelFormat::RGB_16,
+                        &target,
+                        PixelFormat::CMYK_16,
+                        intent,
+                        Flags::BLACKPOINT_COMPENSATION,
+                    )
+                } else {
+                    Transform::new(
+                        &source,
+                        PixelFormat::RGB_16,
+                        &target,
+                        PixelFormat::CMYK_16,
+                        intent,
+                    )
+                };
+                result
+                    .map(ProductionTransform::RgbToCmyk)
+                    .map_err(|err| format!("Cannot create production RGB→CMYK ICC transform: {err}"))?
+            }
+            IccSourceModel::Cmyk => {
+                let result = if black_point_compensation {
+                    Transform::new_flags(
+                        &source,
+                        PixelFormat::CMYK_16,
+                        &target,
+                        PixelFormat::CMYK_16,
+                        intent,
+                        Flags::BLACKPOINT_COMPENSATION,
+                    )
+                } else {
+                    Transform::new(
+                        &source,
+                        PixelFormat::CMYK_16,
+                        &target,
+                        PixelFormat::CMYK_16,
+                        intent,
+                    )
+                };
+                result
+                    .map(ProductionTransform::CmykToCmyk)
+                    .map_err(|err| format!("Cannot create production CMYK→CMYK ICC transform: {err}"))?
+            }
         };
 
         Ok(Self {
@@ -152,26 +174,6 @@ impl ProductionCmykTransform {
         transform.transform_pixels(source, destination);
         Ok(())
     }
-}
-
-fn make_transform<Input, Output>(
-    source: &Profile,
-    input_format: PixelFormat,
-    target: &Profile,
-    output_format: PixelFormat,
-    intent: Intent,
-    flags: Flags,
-) -> Result<Transform<Input, Output>, String>
-where
-    Input: Copy,
-    Output: Copy,
-{
-    let result = if flags.is_empty() {
-        Transform::new(source, input_format, target, output_format, intent)
-    } else {
-        Transform::new_flags(source, input_format, target, output_format, intent, flags)
-    };
-    result.map_err(|err| format!("Cannot create production ICC transform: {err}"))
 }
 
 fn validate_chunk_lengths(source_len: usize, destination_len: usize) -> Result<(), String> {
