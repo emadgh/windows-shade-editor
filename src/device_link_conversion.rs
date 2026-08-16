@@ -66,7 +66,7 @@ impl<const N: usize> ProductionDeviceLinkTransform<N> {
                         PixelFormat::RGB_16,
                         output_format,
                         intent,
-                        Flags::empty(),
+                        Flags::default(),
                     );
                 result
                     .map(DeviceLinkTransform::Rgb)
@@ -79,7 +79,7 @@ impl<const N: usize> ProductionDeviceLinkTransform<N> {
                         PixelFormat::CMYK_16,
                         output_format,
                         intent,
-                        Flags::empty(),
+                        Flags::default(),
                     );
                 result
                     .map(DeviceLinkTransform::Cmyk)
