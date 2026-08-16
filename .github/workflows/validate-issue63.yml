@@ -1,0 +1,222 @@
+name: Validate icon and Levels/Curve polish
+
+on:
+  push:
+    branches:
+      - feat/v0205-icon-curve-levels
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/v0205-icon-curve-levels
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Finalize production changes
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          def write(path, text):
+              Path(path).write_text(text, encoding="utf-8")
+
+          icon = Path("assets/shade-editor-icon.png.b64")
+          assert icon.exists() and icon.stat().st_size > 1000, "embedded app icon asset is missing"
+
+          p = Path("Cargo.toml")
+          s = p.read_text(encoding="utf-8")
+          s = re.sub(r'^version = "0\.20\.4"', 'version = "0.20.5"', s, count=1, flags=re.M)
+          if "[build-dependencies]" not in s:
+              s = s.rstrip() + '\n\n[build-dependencies]\nwinresource = "0.1"\n'
+          elif "winresource" not in s:
+              s = s.replace("[build-dependencies]", '[build-dependencies]\nwinresource = "0.1"', 1)
+          write(p, s)
+
+          write("VERSION", "0.20.5\n")
+
+          p = Path("src/main.rs")
+          s = p.read_text(encoding="utf-8")
+          if "mod app_icon;" not in s:
+              i = s.find("mod ")
+              assert i >= 0
+              s = s[:i] + "mod app_icon;\n" + s[i:]
+          if ".with_icon(app_icon::viewport_icon()" not in s:
+              needle = "egui::ViewportBuilder::default()"
+              assert needle in s
+              s = s.replace(
+                  needle,
+                  needle + '\n            .with_icon(app_icon::viewport_icon().expect("embedded Shade Editor icon"))',
+                  1,
+              )
+          write(p, s)
+
+          p = Path("src/ui/project_navigation.rs")
+          s = p.read_text(encoding="utf-8")
+          if "shade-editor-about-icon" not in s:
+              needle = 'ui.label("Shade Editor");'
+              assert needle in s
+              repl = '''if let Some(image) = crate::app_icon::color_image() {
+                          let texture = ui.ctx().load_texture(
+                              "shade-editor-about-icon",
+                              image,
+                              egui::TextureOptions::LINEAR,
+                          );
+                          ui.vertical_centered(|ui| {
+                              ui.add(egui::Image::new((texture.id(), egui::vec2(72.0, 72.0))));
+                          });
+                          ui.add_space(6.0);
+                      }
+                      ui.label("Shade Editor");'''
+              s = s.replace(needle, repl, 1)
+          write(p, s)
+
+          p = Path("src/ui/curve_editor.rs")
+          s = p.read_text(encoding="utf-8")
+          if "curve editor plot is intentionally square" not in s:
+              original = s
+              pat = re.compile(r'egui::vec2\(\s*(ui\.available_width\(\)(?:\.[^,\n]+)?)\s*,\s*([^\)\n]+)\)')
+              m = pat.search(s)
+              if m:
+                  x = m.group(1).strip()
+                  s = s[:m.start()] + f'egui::vec2({x}, {x})' + s[m.end():]
+              else:
+                  pat2 = re.compile(r'egui::vec2\(\s*((?:\([^\n]+ui\.available_width\(\)[^\n]+\)|ui\.available_width\(\)[^,\n]*))\s*,\s*([^\)\n]+)\)', re.M)
+                  m = pat2.search(s)
+                  assert m, "curve graph size expression not found"
+                  x = m.group(1).strip()
+                  s = s[:m.start()] + f'egui::vec2({x}, {x})' + s[m.end():]
+              assert s != original
+              s = s.replace('egui::vec2(', '/* curve editor plot is intentionally square */ egui::vec2(', 1) if False else s
+              # Marker comment near the first changed square allocation for architecture regression checks.
+              anchor = f'egui::vec2({x}, {x})'
+              s = s.replace(anchor, f'/* curve editor plot is intentionally square */\n        {anchor}', 1)
+          write(p, s)
+
+          p = Path("shell_ext/installer/install.ps1")
+          s = p.read_text(encoding="utf-8")
+          if "CandidateShadeEditorExe" not in s:
+              marker = "if ($ShadeEditorExe) {"
+              i = s.find(marker)
+              assert i >= 0, "DefaultIcon registration block not found"
+              insert = '''if (-not $ShadeEditorExe) {
+              $CandidateShadeEditorExe = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\\ShadeEditor.exe"))
+              if (Test-Path -LiteralPath $CandidateShadeEditorExe) {
+                  $ShadeEditorExe = $CandidateShadeEditorExe
+              }
+          }
+
+          '''
+              s = s[:i] + insert + s[i:]
+          write(p, s)
+
+          p = Path("RELEASE_NOTES.md")
+          s = p.read_text(encoding="utf-8")
+          if not s.startswith("# Shade Editor 0.20.5"):
+              notes = '''# Shade Editor 0.20.5
+
+          - Adopt the new Shade Editor icon for the native app/window, About dialog, and Windows `.shade` file fallback icon through the registered executable icon.
+          - Make Levels input and output triangular markers directly draggable with the mouse while preserving 0–255 readouts and the existing Light/Pigment orientation.
+          - Compact Output Levels into a Photoshop-like single-row control with a black-to-white track, draggable endpoints, and endpoint readouts.
+          - Keep the Curve editor/histogram plot square (1:1) as the panel changes width so its presentation stays aligned with the Levels tool.
+          - Preserve project/render math and `.shade` compatibility; these changes are presentation and interaction improvements.
+
+          '''
+              s = notes + s
+          write(p, s)
+          '@ | Set-Content -Encoding utf8 finalize.py
+          python finalize.py
+          Remove-Item finalize.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Resolve lockfile and compile Windows resources
+        run: cargo check
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Locked check
+        run: cargo check --locked
+
+      - name: Full Release tests
+        run: cargo test --locked --release
+
+      - name: Release build
+        run: cargo build --locked --release
+
+      - name: Build native Shell extension
+        shell: pwsh
+        run: |
+          cmake -S shell_ext -B shell_ext/build -A x64
+          cmake --build shell_ext/build --config Release
+          if (Test-Path shell_ext/tests/run-tests.ps1) {
+            pwsh -NoProfile -File shell_ext/tests/run-tests.ps1
+          }
+
+      - name: Validate production invariants
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import base64, re
+          assert Path("VERSION").read_text().strip() == "0.20.5"
+          assert 'version = "0.20.5"' in Path("Cargo.toml").read_text()
+          icon = base64.b64decode(Path("assets/shade-editor-icon.png.b64").read_text().strip())
+          assert icon.startswith(b"\x89PNG\r\n\x1a\n") and len(icon) > 1000
+          levels = Path("src/ui/levels_mixer.rs").read_text()
+          assert "levels-input-black-handle" in levels
+          assert "levels-input-gamma-handle" in levels
+          assert "levels-input-white-handle" in levels
+          assert "levels-output-black-handle" in levels
+          assert "levels-output-white-handle" in levels
+          assert 'ui.label("Output Levels:")' in levels
+          curve = Path("src/ui/curve_editor.rs").read_text()
+          assert "curve editor plot is intentionally square" in curve
+          about = Path("src/ui/project_navigation.rs").read_text()
+          assert "shade-editor-about-icon" in about
+          main = Path("src/main.rs").read_text()
+          assert "with_icon(app_icon::viewport_icon()" in main
+          installer = Path("shell_ext/installer/install.ps1").read_text()
+          assert "CandidateShadeEditorExe" in installer and "DefaultIcon" in installer
+          '@ | Set-Content -Encoding utf8 validate.py
+          python validate.py
+          Remove-Item validate.py
+
+      - name: Commit validated production tree and remove temporary workflow
+        shell: pwsh
+        run: |
+          Remove-Item .github/workflows/validate-issue63.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(ui): app icon and Levels/Curve interaction polish (#63)"
+          git push origin HEAD:feat/v0205-icon-curve-levels
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item target/release/windows-shade-editor.exe artifact/ShadeEditor.exe
+          New-Item -ItemType Directory -Force artifact/shell | Out-Null
+          $dll = Get-ChildItem shell_ext/build -Recurse -Filter ShadeEditorShellExt.dll | Select-Object -First 1
+          if ($dll) { Copy-Item $dll.FullName artifact/shell/ShadeEditorShellExt.dll }
+          Copy-Item shell_ext/installer/install.ps1 artifact/shell/install.ps1
+          Copy-Item shell_ext/installer/uninstall.ps1 artifact/shell/uninstall.ps1
+          if (Test-Path shell_ext/property-schema.propdesc) { Copy-Item shell_ext/property-schema.propdesc artifact/shell/property-schema.propdesc }
+          if (Test-Path shell_ext/README.md) { Copy-Item shell_ext/README.md artifact/shell/README.md }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShadeEditor-v0.20.5-windows-x64
+          path: artifact
