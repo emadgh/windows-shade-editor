@@ -1,0 +1,403 @@
+use super::curve_editor::tonal_display_value;
+use crate::model::{self, ChannelAdjustment};
+use crate::palette::ChannelPalette;
+use crate::settings::TonalDisplayMode;
+use crate::{channel_color, channel_display_name, with_accent};
+use eframe::egui;
+
+const LEVEL_SAMPLE_MAX: f32 = 255.0;
+const INPUT_BLACK_MAX_SAMPLE: i32 = 250;
+const INPUT_WHITE_MIN_SAMPLE: i32 = 5;
+const INPUT_MIN_GAP_SAMPLES: i32 = 3;
+
+fn level_to_sample(value: f32) -> i32 {
+    (value.clamp(0.0, 1.0) * LEVEL_SAMPLE_MAX).round() as i32
+}
+
+fn sample_to_level(value: i32) -> f32 {
+    (value as f32 / LEVEL_SAMPLE_MAX).clamp(0.0, 1.0)
+}
+
+fn coefficient_to_percent(value: f32, min: i32, max: i32) -> i32 {
+    (value * 100.0).round().clamp(min as f32, max as f32) as i32
+}
+
+fn percent_to_coefficient(value: i32) -> f32 {
+    value as f32 / 100.0
+}
+
+fn gamma_marker_fraction(gamma: f32) -> f32 {
+    let gamma = gamma.clamp(0.1, 4.0);
+    if gamma <= 1.0 {
+        0.5 * (gamma / 0.1).ln() / 10.0_f32.ln()
+    } else {
+        0.5 + 0.5 * gamma.ln() / 4.0_f32.ln()
+    }
+}
+
+fn legend_dot(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+    ui.small(label);
+}
+
+fn draw_levels_histogram(
+    ui: &mut egui::Ui,
+    before: Option<&[u32; 256]>,
+    after: Option<&[u32; 256]>,
+    accent: Option<egui::Color32>,
+    display_mode: TonalDisplayMode,
+) {
+    let before_color = ui.visuals().weak_text_color().gamma_multiply(0.72);
+    let after_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
+    ui.horizontal(|ui| {
+        ui.strong("Histogram");
+        ui.small(format!("Mode: {}", display_mode.label()));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            legend_dot(ui, after_color, "After");
+            legend_dot(ui, before_color, "Before");
+        });
+    });
+
+    let width = ui.available_width().max(120.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 118.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    painter.rect_stroke(
+        rect,
+        3.0,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    for step in 1..4 {
+        let x = egui::lerp(rect.x_range(), step as f32 / 4.0);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(0.5, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
+    }
+    let max_value = before
+        .into_iter()
+        .flat_map(|bins| bins.iter())
+        .chain(after.into_iter().flat_map(|bins| bins.iter()))
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32;
+    for index in 0..256 {
+        let x = egui::lerp(
+            rect.x_range(),
+            tonal_display_value(index as f32 / 255.0, display_mode),
+        );
+        if let Some(bins) = before {
+            let h = bins[index] as f32 / max_value * rect.height();
+            painter.line_segment(
+                [
+                    egui::pos2(x, rect.bottom()),
+                    egui::pos2(x, rect.bottom() - h),
+                ],
+                egui::Stroke::new(1.0, before_color),
+            );
+        }
+        if let Some(bins) = after {
+            let h = bins[index] as f32 / max_value * rect.height();
+            painter.line_segment(
+                [
+                    egui::pos2(x, rect.bottom()),
+                    egui::pos2(x, rect.bottom() - h),
+                ],
+                egui::Stroke::new(1.15, after_color),
+            );
+        }
+    }
+}
+
+fn paint_triangle(
+    painter: &egui::Painter,
+    x: f32,
+    top: f32,
+    fill: egui::Color32,
+    stroke: egui::Color32,
+) {
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(x, top),
+            egui::pos2(x - 5.0, top + 8.0),
+            egui::pos2(x + 5.0, top + 8.0),
+        ],
+        fill,
+        egui::Stroke::new(1.0, stroke),
+    ));
+}
+
+fn draw_levels_marker_strip(
+    ui: &mut egui::Ui,
+    levels: model::Levels,
+    display_mode: TonalDisplayMode,
+) {
+    let width = ui.available_width().max(120.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let y = rect.top() + 2.0;
+    painter.line_segment(
+        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+    let black_display = tonal_display_value(levels.input_black, display_mode);
+    let white_display = tonal_display_value(levels.input_white, display_mode);
+    let gamma_working = egui::lerp(
+        levels.input_black..=levels.input_white,
+        gamma_marker_fraction(levels.gamma),
+    );
+    let gamma_display = tonal_display_value(gamma_working, display_mode);
+    let stroke = ui.visuals().widgets.noninteractive.fg_stroke.color;
+    paint_triangle(
+        painter,
+        egui::lerp(rect.x_range(), black_display),
+        y + 2.0,
+        egui::Color32::BLACK,
+        stroke,
+    );
+    paint_triangle(
+        painter,
+        egui::lerp(rect.x_range(), gamma_display),
+        y + 2.0,
+        ui.visuals().weak_text_color(),
+        stroke,
+    );
+    paint_triangle(
+        painter,
+        egui::lerp(rect.x_range(), white_display),
+        y + 2.0,
+        egui::Color32::WHITE,
+        stroke,
+    );
+}
+
+pub(crate) fn levels_ui(
+    ui: &mut egui::Ui,
+    adjustment: &mut ChannelAdjustment,
+    histogram_before: Option<&[u32; 256]>,
+    histogram_after: Option<&[u32; 256]>,
+    accent: Option<egui::Color32>,
+    display_mode: TonalDisplayMode,
+) -> bool {
+    with_accent(ui, accent, |ui| {
+        draw_levels_histogram(ui, histogram_before, histogram_after, accent, display_mode);
+        ui.add_space(5.0);
+        let levels = &mut adjustment.levels;
+        let before = *levels;
+
+        ui.horizontal(|ui| {
+            ui.strong("Input Levels");
+            ui.small("0–255 sample scale");
+        });
+        draw_levels_marker_strip(ui, *levels, display_mode);
+
+        let mut black = level_to_sample(levels.input_black);
+        let mut gamma = levels.gamma;
+        let mut white = level_to_sample(levels.input_white);
+        let mut black_changed = false;
+        let mut white_changed = false;
+        ui.columns(3, |columns| {
+            columns[0].small("Black");
+            black_changed = columns[0]
+                .add(
+                    egui::DragValue::new(&mut black)
+                        .range(0..=INPUT_BLACK_MAX_SAMPLE)
+                        .speed(1.0),
+                )
+                .changed();
+            columns[1].small("Midtone / Gamma");
+            columns[1].add(
+                egui::DragValue::new(&mut gamma)
+                    .range(0.1..=4.0)
+                    .speed(0.01),
+            );
+            columns[2].small("White");
+            white_changed = columns[2]
+                .add(
+                    egui::DragValue::new(&mut white)
+                        .range(INPUT_WHITE_MIN_SAMPLE..=255)
+                        .speed(1.0),
+                )
+                .changed();
+        });
+        black = black.clamp(0, INPUT_BLACK_MAX_SAMPLE);
+        white = white.clamp(INPUT_WHITE_MIN_SAMPLE, 255);
+        if white - black < INPUT_MIN_GAP_SAMPLES {
+            if black_changed && !white_changed {
+                black = (white - INPUT_MIN_GAP_SAMPLES).max(0);
+            } else {
+                white = (black + INPUT_MIN_GAP_SAMPLES).min(255);
+            }
+        }
+        levels.input_black = sample_to_level(black);
+        levels.gamma = gamma.clamp(0.1, 4.0);
+        levels.input_white = sample_to_level(white);
+
+        ui.add_space(7.0);
+        ui.horizontal(|ui| {
+            ui.strong("Output Levels");
+            ui.small("0–255 sample scale");
+        });
+        let mut output_black = level_to_sample(levels.output_black);
+        let mut output_white = level_to_sample(levels.output_white);
+        ui.columns(2, |columns| {
+            columns[0].small("Black output");
+            columns[0].add(
+                egui::DragValue::new(&mut output_black)
+                    .range(0..=255)
+                    .speed(1.0),
+            );
+            columns[1].small("White output");
+            columns[1].add(
+                egui::DragValue::new(&mut output_white)
+                    .range(0..=255)
+                    .speed(1.0),
+            );
+        });
+        levels.output_black = sample_to_level(output_black);
+        levels.output_white = sample_to_level(output_white);
+        ui.add_space(4.0);
+        ui.small(format!(
+            "Midtone output at 50% input: {:.1}% · tonal axis follows {} mode",
+            model::levels_gamma_mid_output(*levels) * 100.0,
+            display_mode.label(),
+        ));
+        *levels != before
+    })
+}
+
+fn mixer_percent_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    min_percent: i32,
+    max_percent: i32,
+    color: Option<egui::Color32>,
+) -> bool {
+    let mut percent = coefficient_to_percent(*value, min_percent, max_percent);
+    let before = percent;
+    with_accent(ui, color, |ui| {
+        ui.horizontal(|ui| {
+            if let Some(color) = color {
+                ui.add_sized(
+                    [86.0, 20.0],
+                    egui::Label::new(egui::RichText::new(label).color(color)),
+                );
+            } else {
+                ui.add_sized([86.0, 20.0], egui::Label::new(label));
+            }
+            let slider_width = (ui.available_width() - 58.0).max(54.0);
+            ui.add_sized(
+                [slider_width, 20.0],
+                egui::Slider::new(&mut percent, min_percent..=max_percent)
+                    .step_by(1.0)
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+            ui.add(
+                egui::DragValue::new(&mut percent)
+                    .range(min_percent..=max_percent)
+                    .speed(1.0)
+                    .suffix("%"),
+            );
+        });
+    });
+    if percent != before {
+        *value = percent_to_coefficient(percent);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn mixer_ui(
+    ui: &mut egui::Ui,
+    adjustment: &mut ChannelAdjustment,
+    output_name: &str,
+    channel_names: &[String],
+    accent: Option<egui::Color32>,
+    palette: Option<&ChannelPalette>,
+) -> bool {
+    let output_index = channel_names
+        .iter()
+        .position(|name| name == output_name)
+        .unwrap_or(0);
+    let output_display = channel_display_name(palette, output_name, output_index);
+    if let Some(color) = accent {
+        ui.colored_label(color, format!("Output: {output_display}"));
+    } else {
+        ui.label(format!("Output: {output_display}"));
+    }
+    ui.small("Mixer values are percentages. 100% = coefficient 1.0. Slider and keyboard edits use 1 percentage-point units.");
+    ui.add_space(4.0);
+    let mut changed = false;
+    for (index, name) in channel_names.iter().enumerate() {
+        let default = if name == output_name { 1.0 } else { 0.0 };
+        let coefficient = adjustment
+            .mixer
+            .coefficients
+            .entry(name.clone())
+            .or_insert(default);
+        let row_color = accent.map(|_| channel_color(palette, name, index));
+        changed |= mixer_percent_row(
+            ui,
+            channel_display_name(palette, name, index),
+            coefficient,
+            -200,
+            200,
+            row_color,
+        );
+    }
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(5.0);
+    changed |= mixer_percent_row(
+        ui,
+        "Constant",
+        &mut adjustment.mixer.constant,
+        -100,
+        100,
+        accent,
+    );
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixer_percent_round_trip_matches_normalized_storage() {
+        for (coefficient, expected) in [
+            (-2.0, -200),
+            (-0.25, -25),
+            (0.0, 0),
+            (0.05, 5),
+            (0.9, 90),
+            (1.0, 100),
+            (2.0, 200),
+        ] {
+            let percent = coefficient_to_percent(coefficient, -200, 200);
+            assert_eq!(percent, expected);
+            assert!((percent_to_coefficient(percent) - coefficient).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn level_sample_scale_round_trips_endpoints_and_midpoint() {
+        for value in [0.0, 0.5, 1.0] {
+            let round_trip = sample_to_level(level_to_sample(value));
+            assert!((round_trip - value).abs() <= 1.0 / 255.0);
+        }
+    }
+
+    #[test]
+    fn gamma_marker_keeps_one_at_visual_midpoint() {
+        assert!((gamma_marker_fraction(1.0) - 0.5).abs() < 0.0001);
+        assert!(gamma_marker_fraction(0.1) <= 0.001);
+        assert!(gamma_marker_fraction(4.0) >= 0.999);
+    }
+}

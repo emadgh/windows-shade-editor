@@ -4,6 +4,7 @@ pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
 pub(crate) mod faces;
 pub(crate) mod input_router;
+pub(crate) mod levels_mixer;
 pub(crate) mod project_navigation;
 pub(crate) mod project_view_state;
 pub(crate) mod status_bar;

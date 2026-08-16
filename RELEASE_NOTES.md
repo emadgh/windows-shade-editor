@@ -1,3 +1,10 @@
+# Shade Editor 0.20.4
+
+- Redesign Levels around a Photoshop-style workflow with an in-panel Before/After histogram, compact Input Levels (Black/Midtone/White), Output Levels, and 0–255 sample readouts.
+- Make the Levels histogram and tonal marker strip follow the existing Light/Pigment presentation mode without changing production adjustment math.
+- Show Channel Mixer coefficients and Constant as integer percentages while preserving normalized float storage in `.shade` projects and render recipes.
+- Quantize Mixer slider/readout interaction to 1 percentage-point units for precise editing instead of coarse decimal jumps.
+- Move the focused Levels/Mixer presentation helpers into `src/ui/levels_mixer.rs` and add conversion/scale regression tests.
 # Shade Editor 0.20.3
 
 - Allow opening or creating another `.shade` project while the Export Queue is waiting or processing.
