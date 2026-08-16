@@ -2,6 +2,7 @@
 
 pub mod color_conversion;
 pub mod conversion_capabilities;
+pub mod conversion_workflow;
 #[path = "dpi.rs"]
 pub mod dpi;
 pub mod export;
