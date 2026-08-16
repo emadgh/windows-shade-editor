@@ -3575,14 +3575,16 @@ impl ShadeApp {
             "Master Levels and Master Curve are independent Master controls. They stack with per-channel edits and never overwrite them. Mixer output rows remain channel-specific.",
         );
 
-        let master_histogram_before = self
+        let master_levels_histogram_before = aggregate_histograms(histograms_before);
+        let master_levels_histogram_after = aggregate_histograms(histograms_after);
+        let master_curve_histogram_before = self
             .settings
             .show_curve_histogram
-            .then(|| aggregate_histograms(histograms_before));
-        let master_histogram_after = self
+            .then_some(master_levels_histogram_before);
+        let master_curve_histogram_after = self
             .settings
             .show_curve_histogram
-            .then(|| aggregate_histograms(histograms_after));
+            .then_some(master_levels_histogram_after);
 
         if self.settings.adjustment_tabs {
             let reset_tool = adjustment_tab_bar(ui, &mut self.tool);
@@ -3597,12 +3599,18 @@ impl ShadeApp {
                 changed = true;
             }
             changed |= match self.tool {
-                ToolPanel::Levels => master_levels_ui(ui, &mut self.project.adjustments),
+                ToolPanel::Levels => master_levels_ui(
+                    ui,
+                    &mut self.project.adjustments,
+                    Some(&master_levels_histogram_before),
+                    Some(&master_levels_histogram_after),
+                    tonal_display_mode,
+                ),
                 ToolPanel::Curves => master_curve_ui(
                     ui,
                     &mut self.project.adjustments,
-                    master_histogram_before.as_ref(),
-                    master_histogram_after.as_ref(),
+                    master_curve_histogram_before.as_ref(),
+                    master_curve_histogram_after.as_ref(),
                     tonal_display_mode,
                     compact_curve_controls,
                 ),
@@ -3617,7 +3625,13 @@ impl ShadeApp {
         } else {
             let (body_changed, reset) =
                 adjustment_foldout(ui, "master-levels-section", "Master Levels", true, |ui| {
-                    master_levels_ui(ui, &mut self.project.adjustments)
+                    master_levels_ui(
+                        ui,
+                        &mut self.project.adjustments,
+                        Some(&master_levels_histogram_before),
+                        Some(&master_levels_histogram_after),
+                        tonal_display_mode,
+                    )
                 });
             changed |= body_changed.unwrap_or(false);
             if reset {
@@ -3653,8 +3667,8 @@ impl ShadeApp {
                     master_curve_ui(
                         ui,
                         &mut self.project.adjustments,
-                        master_histogram_before.as_ref(),
-                        master_histogram_after.as_ref(),
+                        master_curve_histogram_before.as_ref(),
+                        master_curve_histogram_after.as_ref(),
                         tonal_display_mode,
                         compact_curve_controls,
                     )
@@ -5235,105 +5249,25 @@ fn reset_all_mixers(
     }
 }
 
-fn levels_ui(
-    ui: &mut egui::Ui,
-    adjustment: &mut ChannelAdjustment,
-    accent: Option<egui::Color32>,
-) -> bool {
-    with_accent(ui, accent, |ui| {
-        let levels = &mut adjustment.levels;
-        let mut changed = false;
-        changed |= ui
-            .add(egui::Slider::new(&mut levels.input_black, 0.0..=0.98).text("Input black"))
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut levels.gamma, 0.1..=4.0)
-                    .logarithmic(true)
-                    .text("Gamma (relative)"),
-            )
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut levels.input_white, 0.02..=1.0).text("Input white"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut levels.output_black, 0.0..=1.0).text("Output black"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut levels.output_white, 0.0..=1.0).text("Output white"))
-            .changed();
-        if levels.input_white <= levels.input_black {
-            levels.input_white = (levels.input_black + 0.01).min(1.0);
-            changed = true;
-        }
-        ui.small(format!(
-            "Gamma midpoint output: {:.3}",
-            model::levels_gamma_mid_output(*levels)
-        ));
-        changed
-    })
-}
-
-fn mixer_ui(
-    ui: &mut egui::Ui,
-    adjustment: &mut ChannelAdjustment,
-    output_name: &str,
-    channel_names: &[String],
-    accent: Option<egui::Color32>,
-    palette: Option<&ChannelPalette>,
-) -> bool {
-    with_accent(ui, accent, |ui| {
-        let output_index = channel_names
-            .iter()
-            .position(|name| name == output_name)
-            .unwrap_or(0);
-        let output_display = channel_display_name(palette, output_name, output_index);
-        if let Some(color) = accent {
-            ui.colored_label(color, format!("Output: {output_display}"));
-        } else {
-            ui.label(format!("Output: {output_display}"));
-        }
-        let mut changed = false;
-        for (index, name) in channel_names.iter().enumerate() {
-            let default = if name == output_name { 1.0 } else { 0.0 };
-            let coefficient = adjustment
-                .mixer
-                .coefficients
-                .entry(name.clone())
-                .or_insert(default);
-            let row_accent = accent.map(|_| channel_color(palette, name, index));
-            changed |= with_accent(ui, row_accent, |ui| {
-                let mut slider = egui::Slider::new(coefficient, -2.0..=2.0)
-                    .text(channel_display_name(palette, name, index))
-                    .trailing_fill(true);
-                if let Some(color) = row_accent {
-                    slider = slider.text_color(color);
-                }
-                ui.add(slider).changed()
-            });
-        }
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(6.0);
-        let mut constant_slider = egui::Slider::new(&mut adjustment.mixer.constant, -1.0..=1.0)
-            .text("Constant")
-            .trailing_fill(true);
-        if let Some(color) = accent {
-            constant_slider = constant_slider.text_color(color);
-        }
-        changed |= ui.add(constant_slider).changed();
-        changed
-    })
-}
 fn master_levels_ui(
     ui: &mut egui::Ui,
     adjustments: &mut BTreeMap<String, ChannelAdjustment>,
+    histogram_before: Option<&[u32; 256]>,
+    histogram_after: Option<&[u32; 256]>,
+    display_mode: TonalDisplayMode,
 ) -> bool {
     let mut draft = adjustments
         .get(MASTER_ADJUSTMENT_KEY)
         .cloned()
         .unwrap_or_default();
-    if !levels_ui(ui, &mut draft, None) {
+    if !ui::levels_mixer::levels_ui(
+        ui,
+        &mut draft,
+        histogram_before,
+        histogram_after,
+        None,
+        display_mode,
+    ) {
         return false;
     }
     adjustments
@@ -5399,7 +5333,14 @@ fn all_mixers_ui(
         ui.collapsing(format!("Output - {display}"), |ui| {
             let adjustment = adjustments.entry(output_name.clone()).or_default();
             let accent = colorize.then(|| channel_color(palette, output_name, index));
-            changed |= mixer_ui(ui, adjustment, output_name, channel_names, accent, palette);
+            changed |= ui::levels_mixer::mixer_ui(
+                ui,
+                adjustment,
+                output_name,
+                channel_names,
+                accent,
+                palette,
+            );
         });
     }
     changed

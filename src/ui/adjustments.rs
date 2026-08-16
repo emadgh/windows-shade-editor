@@ -1,5 +1,6 @@
 use super::actions::AdjustmentUiAction;
 use super::curve_editor::curves_ui;
+use super::levels_mixer::{levels_ui, mixer_ui};
 use crate::*;
 use eframe::egui;
 
@@ -804,7 +805,14 @@ impl ShadeApp {
                     changed = true;
                 }
                 changed |= match self.tool {
-                    ToolPanel::Levels => levels_ui(ui, adjustment, accent),
+                    ToolPanel::Levels => levels_ui(
+                        ui,
+                        adjustment,
+                        histogram_before,
+                        histogram_after,
+                        accent,
+                        tonal_display_mode,
+                    ),
                     ToolPanel::Curves => curves_ui(
                         ui,
                         adjustment,
@@ -825,7 +833,16 @@ impl ShadeApp {
                     format!("selected-levels-{output_name}"),
                     "Levels",
                     true,
-                    |ui| levels_ui(ui, adjustment, accent),
+                    |ui| {
+                        levels_ui(
+                            ui,
+                            adjustment,
+                            histogram_before,
+                            histogram_after,
+                            accent,
+                            tonal_display_mode,
+                        )
+                    },
                 );
                 changed |= body_changed.unwrap_or(false);
                 if reset {
