@@ -1,6 +1,7 @@
 use super::actions::AdjustmentUiAction;
 use super::curve_editor::curves_ui;
 use super::levels_mixer::{levels_ui, mixer_ui};
+use super::match_color;
 use crate::*;
 use eframe::egui;
 
@@ -99,6 +100,8 @@ impl ShadeApp {
         let base_count = face.preview.metadata.base_channel_count;
         let color_model = face.preview.metadata.color_model;
         let photoshop_display = face.preview.metadata.channel_display_info.clone();
+        let mut match_target = match_color::target_snapshot();
+        let mut target_overlay_visible = match_color::overlay_visible();
         if channel_names.is_empty() {
             return;
         }
@@ -222,6 +225,7 @@ impl ShadeApp {
 
         ui.separator();
         let mut tonal_display_changed = false;
+        let mut clear_match_target = false;
         ui.horizontal(|ui| {
             ui.strong("Histogram");
             let label = if self.settings.show_all_histograms {
@@ -236,7 +240,34 @@ impl ShadeApp {
             ui.separator();
             tonal_display_changed |=
                 tonal_display_mode_selector(ui, &mut self.settings.tonal_display_mode);
+            if let Some(target_name) = match_target.as_ref().map(|target| target.display_name()) {
+                ui.separator();
+                let toggle_label = if target_overlay_visible { "◉" } else { "○" };
+                if ui
+                    .small_button(toggle_label)
+                    .on_hover_text(format!(
+                        "Show/hide Match Color target histogram overlay ({target_name})"
+                    ))
+                    .clicked()
+                {
+                    target_overlay_visible = !target_overlay_visible;
+                    match_color::set_overlay_visible(target_overlay_visible);
+                }
+                if target_overlay_visible {
+                    ui.colored_label(match_color::target_overlay_color(ui), "Target");
+                }
+                clear_match_target = ui
+                    .small_button("×")
+                    .on_hover_text("Clear Match Color target. Applied Levels are kept.")
+                    .clicked();
+            }
         });
+        if clear_match_target {
+            match_color::clear_target();
+            match_target = None;
+            target_overlay_visible = false;
+            self.report_info("Cleared Match Color target; applied Levels were kept.");
+        }
         if tonal_display_changed {
             self.dispatch_adjustment_ui_action(AdjustmentUiAction::PersistSettings, ui.ctx());
         }
@@ -252,10 +283,18 @@ impl ShadeApp {
                 });
                 let display = channel_display_name(active_palette.as_ref(), name, index);
                 ui.colored_label(accent.unwrap_or(ui.visuals().text_color()), display);
-                draw_histogram(
+                let target_histogram = if target_overlay_visible {
+                    match_target
+                        .as_ref()
+                        .and_then(|target| target.histograms.get(index))
+                } else {
+                    None
+                };
+                match_color::draw_histogram_with_target(
                     ui,
                     original_histograms.get(index),
                     adjusted_histograms.get(index),
+                    target_histogram,
                     accent,
                     self.settings.tonal_display_mode,
                 );
@@ -273,10 +312,18 @@ impl ShadeApp {
             let display =
                 channel_display_name(active_palette.as_ref(), &channel_names[index], index);
             ui.strong(format!("Histogram - {display}"));
-            draw_histogram(
+            let target_histogram = if target_overlay_visible {
+                match_target
+                    .as_ref()
+                    .and_then(|target| target.histograms.get(index))
+            } else {
+                None
+            };
+            match_color::draw_histogram_with_target(
                 ui,
                 original_histograms.get(index),
                 adjusted_histograms.get(index),
+                target_histogram,
                 accent,
                 self.settings.tonal_display_mode,
             );
@@ -287,6 +334,7 @@ impl ShadeApp {
         &mut self,
         ui: &mut egui::Ui,
         channel_names: &[String],
+        source_histograms: &[[u32; 256]],
         palette: Option<&ChannelPalette>,
         output_name: &str,
     ) -> bool {
@@ -314,6 +362,52 @@ impl ShadeApp {
                 .cloned()
                 .unwrap_or_default()
         };
+
+        let existing_match_target = match_color::target_snapshot();
+        let mut match_requested = false;
+        ui.horizontal_wrapped(|ui| {
+            match_requested = ui
+                .button("Match Color")
+                .on_hover_text(
+                    "Histogram-match all source channels to a target TIFF using editable Levels. Source-only extra channels are set to zero; target-only extra channels are ignored.",
+                )
+                .clicked();
+            if let Some(target) = existing_match_target.as_ref() {
+                ui.small(format!("Target: {}", target.display_name()))
+                    .on_hover_text(target.path.display().to_string());
+            } else {
+                ui.small("Choose a target TIFF");
+            }
+        });
+        if match_requested {
+            let target_result = if let Some(target) = existing_match_target.clone() {
+                Ok(Some(target))
+            } else {
+                match_color::choose_target(self.settings.max_preview_dimension)
+            };
+            match target_result {
+                Ok(Some(target)) => {
+                    let report = match_color::apply_histogram_match_levels(
+                        &mut self.project.adjustments,
+                        channel_names,
+                        source_histograms,
+                        &target,
+                    );
+                    changed |= report.changed;
+                    self.tool = ToolPanel::Levels;
+                    self.adjustment_scope = AdjustmentScope::Selected;
+                    self.report_info(format!(
+                        "Match Color: {} matched to {} · {} source-only set to zero · {} target-only ignored",
+                        report.matched_channels,
+                        target.display_name(),
+                        report.zeroed_source_only_channels,
+                        report.ignored_target_only_channels,
+                    ));
+                }
+                Ok(None) => {}
+                Err(err) => self.report_error(err),
+            }
+        }
 
         egui::CollapsingHeader::new("Quick relative adjustments / Presets")
             .id_salt("relative-adjustment-presets")
@@ -590,8 +684,13 @@ impl ShadeApp {
         if tonal_display_changed {
             self.dispatch_adjustment_ui_action(AdjustmentUiAction::PersistSettings, ui.ctx());
         }
-        let quick_changed =
-            self.ui_adjustment_quick_tools(ui, &channel_names, palette.as_ref(), &output_name);
+        let quick_changed = self.ui_adjustment_quick_tools(
+            ui,
+            &channel_names,
+            &all_original_histograms,
+            palette.as_ref(),
+            &output_name,
+        );
         if quick_changed {
             self.dispatch_adjustment_ui_action(AdjustmentUiAction::InvalidatePreviews, ui.ctx());
         }
