@@ -5,6 +5,7 @@ pub mod conversion_capabilities;
 pub mod conversion_workflow;
 pub mod icc_conversion;
 pub mod nchannel_icc;
+pub mod png_source;
 #[path = "dpi.rs"]
 pub mod dpi;
 pub mod export;
