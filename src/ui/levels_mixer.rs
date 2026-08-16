@@ -10,12 +10,23 @@ const INPUT_BLACK_MAX_SAMPLE: i32 = 250;
 const INPUT_WHITE_MIN_SAMPLE: i32 = 5;
 const INPUT_MIN_GAP_SAMPLES: i32 = 3;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LevelMarker {
+    Black,
+    Gamma,
+    White,
+}
+
 fn level_to_sample(value: f32) -> i32 {
     (value.clamp(0.0, 1.0) * LEVEL_SAMPLE_MAX).round() as i32
 }
 
 fn sample_to_level(value: i32) -> f32 {
     (value as f32 / LEVEL_SAMPLE_MAX).clamp(0.0, 1.0)
+}
+
+fn quantize_level(value: f32) -> f32 {
+    sample_to_level(level_to_sample(value))
 }
 
 fn coefficient_to_percent(value: f32, min: i32, max: i32) -> i32 {
@@ -33,6 +44,20 @@ fn gamma_marker_fraction(gamma: f32) -> f32 {
     } else {
         0.5 + 0.5 * gamma.ln() / 4.0_f32.ln()
     }
+}
+
+fn gamma_from_marker_fraction(fraction: f32) -> f32 {
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction <= 0.5 {
+        0.1 * 10.0_f32.powf(fraction * 2.0)
+    } else {
+        4.0_f32.powf((fraction - 0.5) * 2.0)
+    }
+    .clamp(0.1, 4.0)
+}
+
+fn display_to_working(value: f32, mode: TonalDisplayMode) -> f32 {
+    tonal_display_value(value, mode)
 }
 
 fn legend_dot(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
@@ -130,48 +155,202 @@ fn paint_triangle(
     ));
 }
 
-fn draw_levels_marker_strip(
-    ui: &mut egui::Ui,
+fn input_marker_positions(
     levels: model::Levels,
     display_mode: TonalDisplayMode,
+) -> [(LevelMarker, f32); 3] {
+    let gamma_working = egui::lerp(
+        levels.input_black..=levels.input_white,
+        gamma_marker_fraction(levels.gamma),
+    );
+    [
+        (
+            LevelMarker::Black,
+            tonal_display_value(levels.input_black, display_mode),
+        ),
+        (
+            LevelMarker::Gamma,
+            tonal_display_value(gamma_working, display_mode),
+        ),
+        (
+            LevelMarker::White,
+            tonal_display_value(levels.input_white, display_mode),
+        ),
+    ]
+}
+
+fn apply_input_marker_drag(
+    levels: &mut model::Levels,
+    marker: LevelMarker,
+    display_fraction: f32,
+    display_mode: TonalDisplayMode,
 ) {
+    let working = quantize_level(display_to_working(display_fraction, display_mode));
+    let gap = INPUT_MIN_GAP_SAMPLES as f32 / 255.0;
+    match marker {
+        LevelMarker::Black => {
+            levels.input_black = working.clamp(0.0, (levels.input_white - gap).max(0.0));
+        }
+        LevelMarker::White => {
+            levels.input_white = working.clamp((levels.input_black + gap).min(1.0), 1.0);
+        }
+        LevelMarker::Gamma => {
+            let span = (levels.input_white - levels.input_black).max(gap);
+            let fraction = ((working - levels.input_black) / span).clamp(0.0, 1.0);
+            levels.gamma = gamma_from_marker_fraction(fraction);
+        }
+    }
+}
+
+fn input_levels_marker_strip(
+    ui: &mut egui::Ui,
+    levels: &mut model::Levels,
+    display_mode: TonalDisplayMode,
+) -> bool {
+    let before = *levels;
     let width = ui.available_width().max(120.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
+    let graph_id = ui.make_persistent_id("levels-input-marker-strip");
+
+    for (marker, display) in input_marker_positions(*levels, display_mode) {
+        let x = egui::lerp(rect.x_range(), display);
+        let hit = egui::Rect::from_center_size(
+            egui::pos2(x, rect.top() + 9.0),
+            egui::vec2(24.0, 22.0),
+        );
+        let response = ui.interact(hit, graph_id.with(marker), egui::Sense::click_and_drag());
+        if response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let display_fraction =
+                    ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                apply_input_marker_drag(levels, marker, display_fraction, display_mode);
+            }
+        }
+    }
+
     let painter = ui.painter();
     let y = rect.top() + 2.0;
     painter.line_segment(
         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
-    let black_display = tonal_display_value(levels.input_black, display_mode);
-    let white_display = tonal_display_value(levels.input_white, display_mode);
-    let gamma_working = egui::lerp(
-        levels.input_black..=levels.input_white,
-        gamma_marker_fraction(levels.gamma),
-    );
-    let gamma_display = tonal_display_value(gamma_working, display_mode);
     let stroke = ui.visuals().widgets.noninteractive.fg_stroke.color;
-    paint_triangle(
-        painter,
-        egui::lerp(rect.x_range(), black_display),
-        y + 2.0,
-        egui::Color32::BLACK,
-        stroke,
+    for (marker, display) in input_marker_positions(*levels, display_mode) {
+        let fill = match marker {
+            LevelMarker::Black => egui::Color32::BLACK,
+            LevelMarker::Gamma => ui.visuals().weak_text_color(),
+            LevelMarker::White => egui::Color32::WHITE,
+        };
+        paint_triangle(
+            painter,
+            egui::lerp(rect.x_range(), display),
+            y + 2.0,
+            fill,
+            stroke,
+        );
+    }
+    *levels != before
+}
+
+fn paint_output_gradient(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    display_mode: TonalDisplayMode,
+) {
+    let steps = 64;
+    for step in 0..steps {
+        let x0 = egui::lerp(rect.x_range(), step as f32 / steps as f32);
+        let x1 = egui::lerp(rect.x_range(), (step + 1) as f32 / steps as f32);
+        let display = (step as f32 + 0.5) / steps as f32;
+        let working = display_to_working(display, display_mode);
+        let gray = (working * 255.0).round() as u8;
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+            0.0,
+            egui::Color32::from_gray(gray),
+        );
+    }
+}
+
+fn output_levels_strip(
+    ui: &mut egui::Ui,
+    levels: &mut model::Levels,
+    display_mode: TonalDisplayMode,
+    width: f32,
+) -> bool {
+    let before = *levels;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(80.0), 22.0), egui::Sense::hover());
+    let id = ui.make_persistent_id("levels-output-marker-strip");
+    let positions = [
+        (
+            LevelMarker::Black,
+            tonal_display_value(levels.output_black, display_mode),
+        ),
+        (
+            LevelMarker::White,
+            tonal_display_value(levels.output_white, display_mode),
+        ),
+    ];
+
+    for (marker, display) in positions {
+        let x = egui::lerp(rect.x_range(), display);
+        let hit = egui::Rect::from_center_size(
+            egui::pos2(x, rect.bottom() - 6.0),
+            egui::vec2(24.0, 22.0),
+        );
+        let response = ui.interact(hit, id.with(marker), egui::Sense::click_and_drag());
+        if response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let display_fraction =
+                    ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let working = quantize_level(display_to_working(display_fraction, display_mode));
+                match marker {
+                    LevelMarker::Black => levels.output_black = working,
+                    LevelMarker::White => levels.output_white = working,
+                    LevelMarker::Gamma => {}
+                }
+            }
+        }
+    }
+
+    let painter = ui.painter();
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top() + 1.0),
+        egui::pos2(rect.right(), rect.top() + 12.0),
     );
-    paint_triangle(
-        painter,
-        egui::lerp(rect.x_range(), gamma_display),
-        y + 2.0,
-        ui.visuals().weak_text_color(),
-        stroke,
+    paint_output_gradient(painter, bar, display_mode);
+    painter.rect_stroke(
+        bar,
+        0.0,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
     );
-    paint_triangle(
-        painter,
-        egui::lerp(rect.x_range(), white_display),
-        y + 2.0,
-        egui::Color32::WHITE,
-        stroke,
-    );
+    let stroke = ui.visuals().widgets.noninteractive.fg_stroke.color;
+    for (marker, display) in [
+        (
+            LevelMarker::Black,
+            tonal_display_value(levels.output_black, display_mode),
+        ),
+        (
+            LevelMarker::White,
+            tonal_display_value(levels.output_white, display_mode),
+        ),
+    ] {
+        let fill = if marker == LevelMarker::Black {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        };
+        paint_triangle(
+            painter,
+            egui::lerp(rect.x_range(), display),
+            rect.top() + 13.0,
+            fill,
+            stroke,
+        );
+    }
+
+    *levels != before
 }
 
 pub(crate) fn levels_ui(
@@ -190,9 +369,9 @@ pub(crate) fn levels_ui(
 
         ui.horizontal(|ui| {
             ui.strong("Input Levels");
-            ui.small("0–255 sample scale");
+            ui.small("drag markers or edit 0–255 values");
         });
-        draw_levels_marker_strip(ui, *levels, display_mode);
+        input_levels_marker_strip(ui, levels, display_mode);
 
         let mut black = level_to_sample(levels.input_black);
         let mut gamma = levels.gamma;
@@ -238,27 +417,35 @@ pub(crate) fn levels_ui(
 
         ui.add_space(7.0);
         ui.horizontal(|ui| {
-            ui.strong("Output Levels");
-            ui.small("0–255 sample scale");
+            ui.strong("Output Levels:");
+            let mut output_black = level_to_sample(levels.output_black);
+            let mut output_white = level_to_sample(levels.output_white);
+            if ui
+                .add_sized(
+                    [44.0, 20.0],
+                    egui::DragValue::new(&mut output_black)
+                        .range(0..=255)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                levels.output_black = sample_to_level(output_black);
+            }
+            let strip_width = (ui.available_width() - 52.0).max(84.0);
+            output_levels_strip(ui, levels, display_mode, strip_width);
+            if ui
+                .add_sized(
+                    [44.0, 20.0],
+                    egui::DragValue::new(&mut output_white)
+                        .range(0..=255)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                levels.output_white = sample_to_level(output_white);
+            }
         });
-        let mut output_black = level_to_sample(levels.output_black);
-        let mut output_white = level_to_sample(levels.output_white);
-        ui.columns(2, |columns| {
-            columns[0].small("Black output");
-            columns[0].add(
-                egui::DragValue::new(&mut output_black)
-                    .range(0..=255)
-                    .speed(1.0),
-            );
-            columns[1].small("White output");
-            columns[1].add(
-                egui::DragValue::new(&mut output_white)
-                    .range(0..=255)
-                    .speed(1.0),
-            );
-        });
-        levels.output_black = sample_to_level(output_black);
-        levels.output_white = sample_to_level(output_white);
+
         ui.add_space(4.0);
         ui.small(format!(
             "Midtone output at 50% input: {:.1}% · tonal axis follows {} mode",
@@ -395,9 +582,24 @@ mod tests {
     }
 
     #[test]
-    fn gamma_marker_keeps_one_at_visual_midpoint() {
-        assert!((gamma_marker_fraction(1.0) - 0.5).abs() < 0.0001);
-        assert!(gamma_marker_fraction(0.1) <= 0.001);
-        assert!(gamma_marker_fraction(4.0) >= 0.999);
+    fn gamma_marker_round_trip_is_stable() {
+        for gamma in [0.1, 0.25, 0.5, 1.0, 2.0, 4.0] {
+            let round_trip = gamma_from_marker_fraction(gamma_marker_fraction(gamma));
+            assert!((round_trip - gamma).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn dragged_input_markers_quantize_to_sample_units_and_keep_gap() {
+        let mut levels = model::Levels::default();
+        apply_input_marker_drag(
+            &mut levels,
+            LevelMarker::Black,
+            0.8,
+            TonalDisplayMode::Light,
+        );
+        assert!(levels.input_white - levels.input_black >= INPUT_MIN_GAP_SAMPLES as f32 / 255.0);
+        let sample = level_to_sample(levels.input_black);
+        assert!((levels.input_black - sample_to_level(sample)).abs() < 0.0001);
     }
 }
