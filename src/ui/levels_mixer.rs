@@ -214,15 +214,12 @@ fn input_levels_marker_strip(
 
     for (marker, display) in input_marker_positions(*levels, display_mode) {
         let x = egui::lerp(rect.x_range(), display);
-        let hit = egui::Rect::from_center_size(
-            egui::pos2(x, rect.top() + 9.0),
-            egui::vec2(24.0, 22.0),
-        );
+        let hit =
+            egui::Rect::from_center_size(egui::pos2(x, rect.top() + 9.0), egui::vec2(24.0, 22.0));
         let response = ui.interact(hit, graph_id.with(marker), egui::Sense::click_and_drag());
         if response.dragged() {
             if let Some(pointer) = response.interact_pointer_pos() {
-                let display_fraction =
-                    ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let display_fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
                 apply_input_marker_drag(levels, marker, display_fraction, display_mode);
             }
         }
@@ -301,8 +298,7 @@ fn output_levels_strip(
         let response = ui.interact(hit, id.with(marker), egui::Sense::click_and_drag());
         if response.dragged() {
             if let Some(pointer) = response.interact_pointer_pos() {
-                let display_fraction =
-                    ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let display_fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
                 let working = quantize_level(display_to_working(display_fraction, display_mode));
                 match marker {
                     LevelMarker::Black => levels.output_black = working,

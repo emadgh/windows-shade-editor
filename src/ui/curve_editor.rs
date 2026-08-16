@@ -137,7 +137,9 @@ fn curve_editor_graph(
     neutral_histogram: bool,
     display_mode: TonalDisplayMode,
 ) -> (bool, CurvePointKind) {
-    let desired = egui::vec2(ui.available_width().min(340.0).max(150.0), 210.0);
+    // Match the Levels visual language: the histogram/curve plot is always square.
+    let side = ui.available_width().min(340.0).max(150.0);
+    let desired = egui::vec2(side, side);
     let (rect, graph_response) = ui.allocate_exact_size(desired, egui::Sense::click());
     let graph_id = ui.make_persistent_id("three-point-curve-editor");
     let selection_id = graph_id.with("selected-point");

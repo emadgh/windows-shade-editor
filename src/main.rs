@@ -13,6 +13,7 @@ impl ContextKeyboardCompat for eframe::egui::Context {
 mod adjustment_tools;
 mod app_controllers;
 mod app_features;
+mod app_icon;
 mod app_log;
 mod color_management;
 mod dpi;
@@ -88,6 +89,7 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
+            .with_icon(app_icon::viewport_icon().expect("embedded Shade Editor icon"))
             .with_title(APP_WINDOW_TITLE)
             .with_inner_size([1550.0, 920.0])
             .with_min_inner_size([1100.0, 700.0]),
@@ -3722,6 +3724,17 @@ impl ShadeApp {
         let Some(face) = self.faces.get(self.current_face) else {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
+                    if let Some(image) = app_icon::color_image() {
+                        let texture = ui.ctx().load_texture(
+                            "shade-editor-about-icon",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        ui.vertical_centered(|ui| {
+                            ui.add(egui::Image::new((texture.id(), egui::vec2(72.0, 72.0))));
+                        });
+                        ui.add_space(6.0);
+                    }
                     ui.heading("Shade Editor");
                     ui.label("Open a .shade project or add TIFF faces.");
                     if ui.button("Add TIFF faces").clicked() {

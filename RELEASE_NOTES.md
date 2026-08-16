@@ -1,3 +1,11 @@
+# Shade Editor 0.20.5
+
+- Integrate the approved Shade Editor icon into the Windows executable, native window and About dialog; `.shade` Explorer fallback icons resolve through `ShadeEditor.exe,0` when project thumbnails are unavailable or suppressed at small sizes.
+- Make Levels input Black/Midtone/White and output Black/White markers mouse-draggable while retaining 0–255 numeric editing and Light/Pigment presentation.
+- Compact Output Levels into a Photoshop-like single row with endpoint values and a draggable tonal gradient strip.
+- Keep the Curve histogram/editor plot strictly 1:1 square and visually aligned with the Levels panel.
+- Preserve `.shade` storage and production adjustment math.
+
 # Shade Editor 0.20.4
 
 - Redesign Levels around a Photoshop-style workflow with an in-panel Before/After histogram, compact Input Levels (Black/Midtone/White), Output Levels, and 0–255 sample readouts.
