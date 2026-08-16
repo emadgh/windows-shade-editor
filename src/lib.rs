@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 pub mod color_conversion;
+pub mod conversion_preflight;
 #[path = "dpi.rs"]
 pub mod dpi;
 pub mod export;
