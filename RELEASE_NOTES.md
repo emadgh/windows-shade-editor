@@ -1,3 +1,11 @@
+# Shade Editor 0.20.6
+
+- Unify Curve and Levels visual language with a shared dark histogram surface and Before/After presentation.
+- Add a Photoshop-like 4x4 grid to the square Curve editor.
+- Restyle Curve Input/Output fields to match Levels controls.
+- Remove persistent instructional prose from Levels, Mixer and Curve tool panels while preserving existing tooltips and interaction semantics.
+- Preserve Curve math, Light/Pigment presentation, keyboard focus ownership and `.shade` compatibility.
+
 # Shade Editor 0.20.5
 
 - Integrate the approved Shade Editor icon into the Windows executable, native window and About dialog; `.shade` Explorer fallback icons resolve through `ShadeEditor.exe,0` when project thumbnails are unavailable or suppressed at small sizes.

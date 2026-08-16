@@ -4,6 +4,7 @@
 *.ilk
 *.exp
 *.lib
+*.obj
 .DS_Store
 Thumbs.db
 .vscode/

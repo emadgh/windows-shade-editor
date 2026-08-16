@@ -71,6 +71,26 @@ fn tonal_working_value(value: f32, mode: TonalDisplayMode) -> f32 {
     tonal_display_value(value, mode)
 }
 
+fn curve_histogram_colors(
+    ui: &egui::Ui,
+    accent: Option<egui::Color32>,
+    neutral_histogram: bool,
+) -> (egui::Color32, egui::Color32) {
+    let before = ui.visuals().weak_text_color().gamma_multiply(0.72);
+    let after = if neutral_histogram {
+        ui.visuals().weak_text_color()
+    } else {
+        accent.unwrap_or(ui.visuals().selection.stroke.color)
+    };
+    (before, after)
+}
+
+fn curve_legend_dot(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+    ui.small(label);
+}
+
 fn curve_point_screen(
     rect: egui::Rect,
     input: f32,
@@ -280,6 +300,28 @@ fn curve_editor_graph(
     }
 
     let painter = ui.painter_at(rect);
+    // Match the Levels histogram surface: dark graph background with a subtle 4x4 grid.
+    painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    let grid_color = ui
+        .visuals()
+        .widgets
+        .noninteractive
+        .bg_stroke
+        .color
+        .gamma_multiply(0.62);
+    for step in 1..4 {
+        let fraction = step as f32 / 4.0;
+        let x = egui::lerp(rect.x_range(), fraction);
+        let y = egui::lerp(rect.y_range(), fraction);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(0.7, grid_color),
+        );
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(0.7, grid_color),
+        );
+    }
     painter.rect_stroke(
         rect,
         2.0,
@@ -295,13 +337,9 @@ fn curve_editor_graph(
             .max()
             .unwrap_or(1)
             .max(1) as f32;
-        let before_color = ui.visuals().weak_text_color().gamma_multiply(0.20);
-        let after_base = if neutral_histogram {
-            ui.visuals().weak_text_color()
-        } else {
-            accent.unwrap_or(ui.visuals().selection.stroke.color)
-        };
-        let after_color = after_base.gamma_multiply(0.48);
+        let (before_base, after_base) = curve_histogram_colors(ui, accent, neutral_histogram);
+        let before_color = before_base.gamma_multiply(0.32);
+        let after_color = after_base.gamma_multiply(0.56);
         for (bins, color) in [
             (histogram_before, before_color),
             (histogram_after, after_color),
@@ -375,11 +413,11 @@ fn curve_point_fields(
     let (input, output) = curve_point_xy(*curve, selected);
     let mut input_value = (tonal_display_value(input, display_mode) * 255.0).round() as i32;
     let mut output_value = (tonal_display_value(output, display_mode) * 255.0).round() as i32;
-    ui.small(selected.label());
+    ui.strong(selected.label());
     let mut input_changed = false;
     let mut output_changed = false;
     ui.columns(2, |columns| {
-        columns[0].label("Input");
+        columns[0].small("Input");
         input_changed = columns[0]
             .add(
                 egui::DragValue::new(&mut input_value)
@@ -387,7 +425,7 @@ fn curve_point_fields(
                     .speed(1),
             )
             .changed();
-        columns[1].label("Output");
+        columns[1].small("Output");
         output_changed = columns[1]
             .add(
                 egui::DragValue::new(&mut output_value)
@@ -420,6 +458,17 @@ pub(crate) fn curves_ui(
     neutral_histogram: bool,
 ) -> bool {
     with_accent(ui, accent, |ui| {
+        if histogram_before.is_some() || histogram_after.is_some() {
+            let (before_color, after_color) = curve_histogram_colors(ui, accent, neutral_histogram);
+            ui.horizontal(|ui| {
+                ui.strong("Histogram");
+                ui.small(format!("Mode: {}", display_mode.label()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    curve_legend_dot(ui, after_color, "After");
+                    curve_legend_dot(ui, before_color, "Before");
+                });
+            });
+        }
         let (graph_changed, selected) = curve_editor_graph(
             ui,
             &mut adjustment.curve,
@@ -429,23 +478,10 @@ pub(crate) fn curves_ui(
             neutral_histogram,
             display_mode,
         );
-        if histogram_before.is_some() && histogram_after.is_some() {
-            ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().weak_text_color(), "Before");
-                let after_color = if neutral_histogram {
-                    ui.visuals().weak_text_color()
-                } else {
-                    accent.unwrap_or(ui.visuals().selection.stroke.color)
-                };
-                ui.colored_label(after_color, "After");
-            });
-        }
         let mut changed = graph_changed;
         if !compact_controls {
             ui.add_space(6.0);
             changed |= curve_point_fields(ui, &mut adjustment.curve, selected, display_mode);
-            ui.add_space(4.0);
-            ui.small("Double-click the Curve line to add the midpoint; double-click or press Delete/Backspace on the midpoint to remove it. Arrow keys move the selected point by 1; Shift+Arrow moves by 10; Home returns the selected point to the identity line. Input / Output stay 0-255 in both Light and Pigment display modes.");
         }
         changed
     })
