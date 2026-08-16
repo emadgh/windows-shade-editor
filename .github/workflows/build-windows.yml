@@ -18,6 +18,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Validate version identity
+        shell: pwsh
+        run: |
+          $cargoMatch = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"$' | Select-Object -First 1
+          if (-not $cargoMatch) { throw "Cannot read package version from Cargo.toml" }
+          $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
+
+          $fileVersion = (Get-Content -Raw VERSION).Trim()
+
+          $lockText = Get-Content -Raw Cargo.lock
+          $lockVersion = $null
+          $packageBlocks = [regex]::Matches($lockText, '(?ms)^\[\[package\]\]\s*(.*?)(?=^\[\[package\]\]|\z)')
+          foreach ($block in $packageBlocks) {
+            if ($block.Value -match '(?m)^name = "windows-shade-editor"\s*$') {
+              $versionMatch = [regex]::Match($block.Value, '(?m)^version = "([^"]+)"\s*$')
+              if ($versionMatch.Success) {
+                $lockVersion = $versionMatch.Groups[1].Value
+                break
+              }
+            }
+          }
+          if (-not $lockVersion) { throw "Cannot read root package version from Cargo.lock" }
+
+          if ($cargoVersion -ne $fileVersion -or $cargoVersion -ne $lockVersion) {
+            throw "Version mismatch: Cargo.toml=$cargoVersion VERSION=$fileVersion Cargo.lock=$lockVersion"
+          }
+          "SHADE_VERSION=$cargoVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Check
         run: cargo check --locked --target x86_64-pc-windows-msvc
       - name: Test
@@ -54,6 +81,12 @@ jobs:
           "$hash  ShadeEditor.exe" | Set-Content -Encoding ascii -NoNewline "target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256"
           Copy-Item $exe artifact/ShadeEditor.exe
           Copy-Item target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256 artifact/ShadeEditor.exe.sha256
+          Copy-Item VERSION artifact/VERSION
+          @(
+            "Shade Editor $env:SHADE_VERSION"
+            "Commit: $env:GITHUB_SHA"
+            "ShadeEditor.exe SHA-256: $hash"
+          ) | Set-Content -Encoding ascii artifact/build-info.txt
           Copy-Item README.md artifact/README.md
           Copy-Item LICENSE artifact/LICENSE
           New-Item -ItemType Directory -Force artifact/Shell | Out-Null
@@ -66,5 +99,5 @@ jobs:
           "$shellHash  ShadeEditorShell.dll" | Set-Content -Encoding ascii -NoNewline artifact/Shell/ShadeEditorShell.dll.sha256
       - uses: actions/upload-artifact@v4
         with:
-          name: ShadeEditor-win-x64
+          name: ShadeEditor-v${{ env.SHADE_VERSION }}-win-x64
           path: artifact
