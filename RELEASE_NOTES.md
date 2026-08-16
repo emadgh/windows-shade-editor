@@ -1,3 +1,8 @@
+# Shade Editor 0.20.8
+
+- Match standalone Channels histogram graph backgrounds to the darker Levels and Curve surfaces.
+- Preserve histogram dimensions, Light/Pigment presentation and channel accent behavior.
+
 # Shade Editor 0.20.7
 
 - Make Channel Mixer sliders consume the available adjustment-panel width while preserving compact labels and percent fields.
