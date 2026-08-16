@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 pub mod color_conversion;
+pub mod conversion_analytics;
 pub mod conversion_capabilities;
 pub mod conversion_workflow;
 #[path = "dpi.rs"]
