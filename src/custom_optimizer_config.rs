@@ -8,8 +8,63 @@ pub const CUSTOM_OPTIMIZER_MAX_CHANNELS: usize = 12;
 pub enum CustomOptimizerSolverMethod {
     /// Deterministic low-discrepancy device-space search followed by bounded
     /// beam refinement and pair-transfer moves. The `v1` suffix is part of the
-    /// serialized method identity and must change if search semantics change.
+    /// serialized method identity and must never be reinterpreted.
     BoundedHaltonBeamV1,
+    /// V2 preserves the V1 search/constraint semantics and adds an explicit
+    /// continuity preference only inside the existing color-equivalence window.
+    BoundedHaltonBeamContinuityV2,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuityDistanceMetric {
+    NormalizedL1,
+    NormalizedL2,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContinuityPreferenceConfig {
+    /// Weight applied to normalized ink-vector distance. Zero disables every
+    /// continuity preference and must reproduce V1 candidate ordering.
+    pub weight: f32,
+    pub distance_metric: ContinuityDistanceMetric,
+    /// Preferred maximum normalized jump for any single channel. This is a
+    /// ranking preference, never a replacement for target/channel hard limits.
+    pub max_normalized_channel_jump: f32,
+    /// Additional ranking penalty when the dominant channel changes relative to
+    /// the explicit reference separation.
+    pub dominant_channel_switch_penalty: f32,
+}
+
+impl ContinuityPreferenceConfig {
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if !self.weight.is_finite() || !(0.0..=100.0).contains(&self.weight) {
+            errors.push("Continuity weight must be finite and in 0..=100.".to_owned());
+        }
+        if !self.max_normalized_channel_jump.is_finite()
+            || !(0.0..=1.0).contains(&self.max_normalized_channel_jump)
+        {
+            errors.push(
+                "Continuity max_normalized_channel_jump must be finite and in 0..=1."
+                    .to_owned(),
+            );
+        }
+        if !self.dominant_channel_switch_penalty.is_finite()
+            || !(0.0..=100.0).contains(&self.dominant_channel_switch_penalty)
+        {
+            errors.push(
+                "Continuity dominant_channel_switch_penalty must be finite and in 0..=100."
+                    .to_owned(),
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -30,6 +85,10 @@ pub struct CustomOptimizerSolverConfig {
     /// feasible color in a search stage are colorimetrically equivalent for
     /// production-preference ranking. Zero means strict minimum-DeltaE ranking.
     pub preference_delta_e00: f32,
+    /// Present only for the explicitly versioned V2 method. `skip_serializing_if`
+    /// preserves the historical V1 JSON identity when this field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_preference: Option<ContinuityPreferenceConfig>,
 }
 
 impl Default for CustomOptimizerSolverConfig {
@@ -43,6 +102,7 @@ impl Default for CustomOptimizerSolverConfig {
             initial_step_fraction: 0.18,
             step_decay: 0.5,
             preference_delta_e00: 0.10,
+            continuity_preference: None,
         }
     }
 }
@@ -81,7 +141,8 @@ impl CustomOptimizerSolverConfig {
         }
         if !self.step_decay.is_finite() || !(0.1..=0.95).contains(&self.step_decay) {
             errors.push(
-                "Custom Optimizer step_decay must be finite and in 0.1..=0.95.".to_owned(),
+                "Custom Optimizer step_decay must be finite and in 0.1..=0.95."
+                    .to_owned(),
             );
         }
         if !self.preference_delta_e00.is_finite()
@@ -91,6 +152,23 @@ impl CustomOptimizerSolverConfig {
                 "Custom Optimizer preference_delta_e00 must be finite and in 0..=1.0."
                     .to_owned(),
             );
+        }
+
+        match (self.method, self.continuity_preference) {
+            (CustomOptimizerSolverMethod::BoundedHaltonBeamV1, Some(_)) => errors.push(
+                "BoundedHaltonBeamV1 must not carry continuity_preference; use the versioned V2 method."
+                    .to_owned(),
+            ),
+            (CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2, None) => errors.push(
+                "BoundedHaltonBeamContinuityV2 requires an explicit continuity_preference block."
+                    .to_owned(),
+            ),
+            (CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2, Some(policy)) => {
+                if let Err(policy_errors) = policy.validate() {
+                    errors.extend(policy_errors);
+                }
+            }
+            (CustomOptimizerSolverMethod::BoundedHaltonBeamV1, None) => {}
         }
 
         if errors.is_empty() {
@@ -105,6 +183,15 @@ impl CustomOptimizerSolverConfig {
 mod tests {
     use super::*;
 
+    fn continuity(weight: f32) -> ContinuityPreferenceConfig {
+        ContinuityPreferenceConfig {
+            weight,
+            distance_metric: ContinuityDistanceMetric::NormalizedL2,
+            max_normalized_channel_jump: 0.20,
+            dominant_channel_switch_penalty: 0.25,
+        }
+    }
+
     #[test]
     fn default_config_is_valid_for_supported_nchannel_targets() {
         for channel_count in [1usize, 4, 8, 12] {
@@ -113,10 +200,46 @@ mod tests {
     }
 
     #[test]
-    fn method_identity_is_explicitly_versioned_in_json() {
+    fn v1_json_identity_remains_explicit_and_omits_continuity_block() {
         let json = serde_json::to_string(&CustomOptimizerSolverConfig::default()).unwrap();
         assert!(json.contains("bounded_halton_beam_v1"));
         assert!(json.contains("\"schema_version\":1"));
+        assert!(!json.contains("continuity_preference"));
+    }
+
+    #[test]
+    fn v2_requires_explicit_valid_continuity_policy() {
+        let missing = CustomOptimizerSolverConfig {
+            method: CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2,
+            ..CustomOptimizerSolverConfig::default()
+        };
+        assert!(missing.validate(4).is_err());
+
+        let valid = CustomOptimizerSolverConfig {
+            method: CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2,
+            continuity_preference: Some(continuity(1.0)),
+            ..CustomOptimizerSolverConfig::default()
+        };
+        assert!(valid.validate(4).is_ok());
+    }
+
+    #[test]
+    fn v1_rejects_continuity_policy_instead_of_reinterpreting_old_method() {
+        let invalid = CustomOptimizerSolverConfig {
+            continuity_preference: Some(continuity(1.0)),
+            ..CustomOptimizerSolverConfig::default()
+        };
+        assert!(invalid.validate(4).is_err());
+    }
+
+    #[test]
+    fn zero_continuity_weight_is_valid_for_exact_v1_ordering_mode() {
+        let config = CustomOptimizerSolverConfig {
+            method: CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2,
+            continuity_preference: Some(continuity(0.0)),
+            ..CustomOptimizerSolverConfig::default()
+        };
+        assert!(config.validate(4).is_ok());
     }
 
     #[test]
@@ -126,5 +249,17 @@ mod tests {
         config.preference_delta_e00 = f32::NAN;
         assert!(config.validate(4).is_err());
         assert!(CustomOptimizerSolverConfig::default().validate(13).is_err());
+
+        let invalid_policy = CustomOptimizerSolverConfig {
+            method: CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2,
+            continuity_preference: Some(ContinuityPreferenceConfig {
+                weight: f32::NAN,
+                distance_metric: ContinuityDistanceMetric::NormalizedL1,
+                max_normalized_channel_jump: 1.1,
+                dominant_channel_switch_penalty: -1.0,
+            }),
+            ..CustomOptimizerSolverConfig::default()
+        };
+        assert!(invalid_policy.validate(4).is_err());
     }
 }
