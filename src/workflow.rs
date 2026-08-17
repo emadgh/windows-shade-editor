@@ -451,6 +451,7 @@ fn missing_face_preview(expected: Option<&model::FaceFileMetadata>) -> PreviewFa
         color_model: expected
             .map(|m| color_model_from_cached(&m.color_model))
             .unwrap_or(tiff_io::ColorModel::Other),
+        non_cmyk_separated: false,
         channel_names: names,
         channel_display_info: vec![None; samples_per_pixel],
         compression: None,

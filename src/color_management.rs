@@ -1061,6 +1061,7 @@ mod tests {
             samples_per_pixel: base,
             base_channel_count: base,
             color_model: model,
+            non_cmyk_separated: false,
             channel_names: (0..base).map(|index| format!("C{index}")).collect(),
             channel_display_info: vec![None; base],
             compression: None,

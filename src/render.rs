@@ -411,6 +411,7 @@ mod tests {
                 samples_per_pixel: 1,
                 base_channel_count: 1,
                 color_model: ColorModel::Gray,
+                non_cmyk_separated: false,
                 channel_names: vec!["Ink".to_owned()],
                 channel_display_info: vec![None],
                 compression: None,
@@ -489,6 +490,7 @@ mod tests {
                 samples_per_pixel: 1,
                 base_channel_count: 0,
                 color_model: ColorModel::Other,
+                non_cmyk_separated: false,
                 channel_names: vec!["Spot Blue".to_owned()],
                 channel_display_info: vec![Some(PhotoshopChannelDisplay {
                     rgb: Some([0.0, 0.25, 1.0]),
@@ -523,6 +525,7 @@ mod tests {
                 samples_per_pixel: 1,
                 base_channel_count: 1,
                 color_model: ColorModel::Other,
+                non_cmyk_separated: false,
                 channel_names: vec!["Spot Red".to_owned()],
                 channel_display_info: vec![Some(PhotoshopChannelDisplay {
                     rgb: Some([1.0, 0.0, 0.0]),

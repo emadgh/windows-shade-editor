@@ -1,3 +1,12 @@
+# Shade Editor 0.21.11
+
+- Encode non-CMYK 5C–12C conversion output as a true TIFF Separated N-ink device space with `InkSet=2`, all N inks as base samples and no misleading `ExtraSamples`.
+- Reopen declared N-ink TIFF/BigTIFF output as Multichannel with exact `NumberOfInks`, authoritative raw `InkNames`, N base channels and direct 0=no ink coverage instead of canonicalizing the first four inks to CMYK.
+- Strictly reject ambiguous non-CMYK Separated declarations when sample count, per-ink bit depth, InkSet, NumberOfInks, InkNames or ExtraSamples disagree.
+- Extend the TIFF Inspector with an explicit CMYK-process versus non-CMYK N-ink representation report.
+- Add 5C 8-bit, 7C 16-bit and forced N-ink BigTIFF round trips covering exact samples, names, topology, direct polarity, LZW and absent ExtraSamples.
+- Keep Photoshop Spot DisplayInfo generation separate from true N-ink transport; Spot metadata may only be added with its required Spot sample-polarity contract and external Photoshop/RIP evidence.
+
 # Shade Editor 0.21.10
 
 - LZW-compress all production color-conversion TIFF/BigTIFF output and verify the staged Compression tag before atomic commit.

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use tiff::encoder::{Compression, TiffEncoder, TiffValue, colortype};
-use tiff::tags::{ExtraSamples, Tag, Type};
+use tiff::tags::{PhotometricInterpretation, SampleFormat, Tag, Type};
 
 use crate::{dpi, safe_fs, tiff_io};
 
@@ -79,6 +79,50 @@ impl Drop for ConversionSpool {
 }
 
 struct TiffAsciiBytes<'a>(&'a [u8]);
+
+struct Separated8<const N: usize>;
+
+impl<const N: usize> colortype::ColorType for Separated8<N> {
+    type Inner = u8;
+    const TIFF_VALUE: PhotometricInterpretation = PhotometricInterpretation::CMYK;
+    const BITS_PER_SAMPLE: &'static [u16] = &[8; N];
+    const SAMPLE_FORMAT: &'static [SampleFormat] = &[SampleFormat::Uint; N];
+
+    fn horizontal_predict(row: &[Self::Inner], result: &mut Vec<Self::Inner>) {
+        if row.len() < N {
+            return;
+        }
+        result.extend_from_slice(&row[..N]);
+        result.extend(
+            row.iter()
+                .copied()
+                .zip(row[N..].iter().copied())
+                .map(|(previous, current)| current.wrapping_sub(previous)),
+        );
+    }
+}
+
+struct Separated16<const N: usize>;
+
+impl<const N: usize> colortype::ColorType for Separated16<N> {
+    type Inner = u16;
+    const TIFF_VALUE: PhotometricInterpretation = PhotometricInterpretation::CMYK;
+    const BITS_PER_SAMPLE: &'static [u16] = &[16; N];
+    const SAMPLE_FORMAT: &'static [SampleFormat] = &[SampleFormat::Uint; N];
+
+    fn horizontal_predict(row: &[Self::Inner], result: &mut Vec<Self::Inner>) {
+        if row.len() < N {
+            return;
+        }
+        result.extend_from_slice(&row[..N]);
+        result.extend(
+            row.iter()
+                .copied()
+                .zip(row[N..].iter().copied())
+                .map(|(previous, current)| current.wrapping_sub(previous)),
+        );
+    }
+}
 
 impl TiffValue for TiffAsciiBytes<'_> {
     const BYTE_LEN: u8 = 1;
@@ -221,9 +265,33 @@ where
     W: std::io::Write + std::io::Seek,
     K: tiff::encoder::TiffKind,
 {
+    match spec.channel_names.len() {
+        4 => write_u8_image::<_, _, colortype::CMYK8>(encoder, spec, samples),
+        5 => write_u8_image::<_, _, Separated8<5>>(encoder, spec, samples),
+        6 => write_u8_image::<_, _, Separated8<6>>(encoder, spec, samples),
+        7 => write_u8_image::<_, _, Separated8<7>>(encoder, spec, samples),
+        8 => write_u8_image::<_, _, Separated8<8>>(encoder, spec, samples),
+        9 => write_u8_image::<_, _, Separated8<9>>(encoder, spec, samples),
+        10 => write_u8_image::<_, _, Separated8<10>>(encoder, spec, samples),
+        11 => write_u8_image::<_, _, Separated8<11>>(encoder, spec, samples),
+        12 => write_u8_image::<_, _, Separated8<12>>(encoder, spec, samples),
+        _ => Err("Unsupported conversion TIFF channel count.".to_owned()),
+    }
+}
+
+fn write_u8_image<W, K, C>(
+    encoder: TiffEncoder<W, K>,
+    spec: &ConversionTiffSpec<'_>,
+    samples: &[u8],
+) -> Result<(), String>
+where
+    W: std::io::Write + std::io::Seek,
+    K: tiff::encoder::TiffKind,
+    C: colortype::ColorType<Inner = u8>,
+{
     let mut encoder = encoder.with_compression(Compression::Lzw);
     let mut image = encoder
-        .new_image::<colortype::CMYK8>(spec.width, spec.height)
+        .new_image::<C>(spec.width, spec.height)
         .map_err(|err| format!("Cannot create 8-bit separated TIFF image: {err}"))?;
     configure_image(&mut image, spec)?;
     image
@@ -240,9 +308,33 @@ where
     W: std::io::Write + std::io::Seek,
     K: tiff::encoder::TiffKind,
 {
+    match spec.channel_names.len() {
+        4 => write_u16_image::<_, _, colortype::CMYK16>(encoder, spec, samples),
+        5 => write_u16_image::<_, _, Separated16<5>>(encoder, spec, samples),
+        6 => write_u16_image::<_, _, Separated16<6>>(encoder, spec, samples),
+        7 => write_u16_image::<_, _, Separated16<7>>(encoder, spec, samples),
+        8 => write_u16_image::<_, _, Separated16<8>>(encoder, spec, samples),
+        9 => write_u16_image::<_, _, Separated16<9>>(encoder, spec, samples),
+        10 => write_u16_image::<_, _, Separated16<10>>(encoder, spec, samples),
+        11 => write_u16_image::<_, _, Separated16<11>>(encoder, spec, samples),
+        12 => write_u16_image::<_, _, Separated16<12>>(encoder, spec, samples),
+        _ => Err("Unsupported conversion TIFF channel count.".to_owned()),
+    }
+}
+
+fn write_u16_image<W, K, C>(
+    encoder: TiffEncoder<W, K>,
+    spec: &ConversionTiffSpec<'_>,
+    samples: &[u16],
+) -> Result<(), String>
+where
+    W: std::io::Write + std::io::Seek,
+    K: tiff::encoder::TiffKind,
+    C: colortype::ColorType<Inner = u16>,
+{
     let mut encoder = encoder.with_compression(Compression::Lzw);
     let mut image = encoder
-        .new_image::<colortype::CMYK16>(spec.width, spec.height)
+        .new_image::<C>(spec.width, spec.height)
         .map_err(|err| format!("Cannot create 16-bit separated TIFF image: {err}"))?;
     configure_image(&mut image, spec)?;
     image
@@ -260,12 +352,6 @@ where
     K: tiff::encoder::TiffKind,
 {
     let channel_count = spec.channel_names.len();
-    if channel_count > 4 {
-        let extras = vec![ExtraSamples::Unspecified; channel_count - 4];
-        image
-            .extra_samples(&extras)
-            .map_err(|err| format!("Cannot configure N-channel samples: {err}"))?;
-    }
     image
         .rows_per_strip(spec.rows_per_strip.min(spec.height).max(1))
         .map_err(|err| format!("Cannot configure conversion strip size: {err}"))?;
@@ -822,6 +908,9 @@ mod tests {
 
         let stream = tiff_io::stream_info(&destination).unwrap();
         assert_eq!(stream.metadata.samples_per_pixel, 7);
+        assert_eq!(stream.metadata.base_channel_count, 7);
+        assert_eq!(stream.metadata.color_model, tiff_io::ColorModel::Other);
+        assert_eq!(stream.metadata.channel_names, names);
         assert_eq!(stream.metadata.bit_depth, 16);
         assert_eq!(
             stream.metadata.icc_profile.as_deref(),
@@ -843,6 +932,7 @@ mod tests {
             decoder.get_tag_unsigned::<u16>(Tag::Unknown(334)).unwrap(),
             7
         );
+        assert!(decoder.get_tag_u16_vec(Tag::ExtraSamples).is_err());
         let raw = fs::read(&destination).unwrap();
         let expected_ink_names = b"Blue\0Brown\0Beige\0Black\0Yellow\0Pink\0Green\0";
         assert!(
@@ -854,7 +944,51 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().contains(&spool_label));
-        assert!(!leaked, "successful conversion must remove its local output spool");
+        assert!(
+            !leaked,
+            "successful conversion must remove its local output spool"
+        );
+        let _ = fs::remove_file(destination);
+    }
+
+    #[test]
+    fn five_channel_u8_round_trips_as_direct_coverage_base_inks() {
+        let destination = temp_path("5c-direct-coverage");
+        let names = ["Blue", "Brown", "Beige", "Black", "Yellow"].map(str::to_owned);
+        let profile = profile_bytes();
+        let spec = ConversionTiffSpec {
+            width: 2,
+            height: 1,
+            channel_names: &names,
+            target_icc: Some(&profile),
+            dpi_x: 220.0,
+            dpi_y: 220.0,
+            orientation: Some(1),
+            rows_per_strip: 1,
+            force_bigtiff: false,
+            replace_existing: true,
+        };
+        let raw = [0u8, 32, 64, 128, 255, 255, 128, 64, 32, 0];
+        write_conversion_tiff_u8_atomic(&destination, &spec, |_, _, samples| {
+            samples.copy_from_slice(&raw);
+            Ok(())
+        })
+        .unwrap();
+
+        let decoded = tiff_io::decode_full(&destination).unwrap();
+        assert_eq!(decoded.metadata.color_model, tiff_io::ColorModel::Other);
+        assert_eq!(decoded.metadata.base_channel_count, 5);
+        assert_eq!(decoded.metadata.samples_per_pixel, 5);
+        assert_eq!(decoded.metadata.channel_names, names);
+        assert_eq!(
+            decoded.samples,
+            raw.into_iter()
+                .map(|sample| u16::from(sample) * 257)
+                .collect::<Vec<_>>()
+        );
+        let file = File::open(&destination).unwrap();
+        let mut decoder = Decoder::new(file).unwrap();
+        assert!(decoder.get_tag_u16_vec(Tag::ExtraSamples).is_err());
         let _ = fs::remove_file(destination);
     }
 
@@ -1041,7 +1175,7 @@ mod tests {
     #[test]
     fn forced_bigtiff_round_trips_ink_names_without_large_allocation() {
         let destination = temp_path("forced-bigtiff");
-        let names = ["Cyan", "Magenta", "Yellow", "Black"].map(str::to_owned);
+        let names = ["Blue", "Brown", "Beige", "Black", "Yellow"].map(str::to_owned);
         let profile = profile_bytes();
         let spec = ConversionTiffSpec {
             width: 1,
@@ -1057,7 +1191,7 @@ mod tests {
         };
 
         write_conversion_tiff_u8_atomic(&destination, &spec, |_, _, samples| {
-            samples.copy_from_slice(&[1, 2, 3, 4]);
+            samples.copy_from_slice(&[1, 2, 3, 4, 5]);
             Ok(())
         })
         .unwrap();
@@ -1065,9 +1199,13 @@ mod tests {
         assert_eq!(&fs::read(&destination).unwrap()[2..4], &[43, 0]);
         assert_lzw(&destination);
         assert_eq!(
-            read_ascii_tag_bytes(&destination, 333, 26).unwrap(),
-            b"Cyan\0Magenta\0Yellow\0Black\0"
+            read_ascii_tag_bytes(&destination, 333, 30).unwrap(),
+            b"Blue\0Brown\0Beige\0Black\0Yellow\0"
         );
+        let metadata = tiff_io::stream_info(&destination).unwrap().metadata;
+        assert_eq!(metadata.color_model, tiff_io::ColorModel::Other);
+        assert_eq!(metadata.base_channel_count, 5);
+        assert_eq!(metadata.channel_names, names);
         let _ = fs::remove_file(destination);
     }
 }
