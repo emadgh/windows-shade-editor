@@ -352,6 +352,20 @@ mod tests {
     }
 
     #[test]
+    fn real_cmyk_devicelink_declares_direct_input_and_output_topology() {
+        let profile = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0).unwrap();
+        let facts =
+            profile_facts(&profile, ConversionEngineMode::DeviceLink, ColorModel::Cmyk).unwrap();
+        assert_eq!(facts.source_space, Some(ColorSpaceSignature::CmykData));
+        assert_eq!(facts.output_space, ColorSpaceSignature::CmykData);
+        assert_eq!(facts.output_channel_count, 4);
+
+        let error = profile_facts(&profile, ConversionEngineMode::DeviceLink, ColorModel::Rgb)
+            .expect_err("CMYK DeviceLink must reject RGB source topology");
+        assert!(error.contains("does not match"));
+    }
+
+    #[test]
     fn unsupported_output_channel_counts_are_rejected() {
         assert!(validate_output_channels(ColorSpaceSignature::CmykData, 4).is_ok());
         assert!(validate_output_channels(ColorSpaceSignature::Sig4colorData, 4).is_err());

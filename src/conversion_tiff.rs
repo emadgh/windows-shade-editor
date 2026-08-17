@@ -31,7 +31,10 @@ pub struct ConversionTiffSpec<'a> {
     pub width: u32,
     pub height: u32,
     pub channel_names: &'a [String],
-    pub target_icc: &'a [u8],
+    /// Output-device ICC bytes to embed. Standard Output ICC conversion
+    /// requires this. Direct DeviceLink output leaves it absent because a
+    /// LinkClass profile is a transform, not an output characterization.
+    pub target_icc: Option<&'a [u8]>,
     pub dpi_x: f64,
     pub dpi_y: f64,
     pub orientation: Option<u16>,
@@ -214,10 +217,12 @@ where
             .write_tag(Tag::Orientation, orientation)
             .map_err(|err| format!("Cannot write conversion orientation: {err}"))?;
     }
-    image
-        .encoder()
-        .write_tag(Tag::IccProfile, spec.target_icc)
-        .map_err(|err| format!("Cannot embed target ICC: {err}"))?;
+    if let Some(target_icc) = spec.target_icc {
+        image
+            .encoder()
+            .write_tag(Tag::IccProfile, target_icc)
+            .map_err(|err| format!("Cannot embed target ICC: {err}"))?;
+    }
     image
         .encoder()
         .write_tag(
@@ -315,8 +320,10 @@ fn validate_spec(
             return Err(format!("Duplicate conversion channel name '{trimmed}'."));
         }
     }
-    if spec.target_icc.is_empty() {
-        return Err("Conversion TIFF requires target ICC payload bytes.".to_owned());
+    if spec.target_icc.is_some_and(<[u8]>::is_empty) {
+        return Err(
+            "Conversion TIFF target ICC must be absent or contain payload bytes.".to_owned(),
+        );
     }
     if !spec.dpi_x.is_finite() || !spec.dpi_y.is_finite() || spec.dpi_x <= 0.0 || spec.dpi_y <= 0.0
     {
@@ -358,7 +365,7 @@ fn verify_staged(
     {
         return Err("Staged conversion TIFF topology verification failed.".to_owned());
     }
-    if metadata.icc_profile.as_deref() != Some(spec.target_icc) {
+    if metadata.icc_profile.as_deref() != spec.target_icc {
         return Err("Staged conversion TIFF target ICC verification failed.".to_owned());
     }
     let file = File::open(staged)
@@ -585,7 +592,7 @@ mod tests {
             width: 3,
             height: 2,
             channel_names: &names,
-            target_icc: &profile,
+            target_icc: Some(&profile),
             dpi_x: 220.0,
             dpi_y: 220.0,
             orientation: Some(1),
@@ -642,7 +649,7 @@ mod tests {
             width: 2,
             height: 1,
             channel_names: &names,
-            target_icc: &profile,
+            target_icc: Some(&profile),
             dpi_x: 300.0,
             dpi_y: 300.0,
             orientation: Some(1),
@@ -674,6 +681,35 @@ mod tests {
     }
 
     #[test]
+    fn devicelink_output_round_trips_without_mislabeling_link_as_output_icc() {
+        let destination = temp_path("devicelink-no-output-icc");
+        let names = ["Cyan", "Magenta", "Yellow", "Black"].map(str::to_owned);
+        let spec = ConversionTiffSpec {
+            width: 1,
+            height: 1,
+            channel_names: &names,
+            target_icc: None,
+            dpi_x: 220.0,
+            dpi_y: 220.0,
+            orientation: Some(1),
+            rows_per_strip: 1,
+            force_bigtiff: false,
+            replace_existing: true,
+        };
+
+        write_conversion_tiff_u16_atomic(&destination, &spec, |_, _, samples| {
+            samples.copy_from_slice(&[10_000, 20_000, 30_000, 40_000]);
+            Ok(())
+        })
+        .unwrap();
+
+        let decoded = tiff_io::decode_full(&destination).unwrap();
+        assert_eq!(decoded.metadata.icc_profile, None);
+        assert_eq!(decoded.samples, vec![10_000, 20_000, 30_000, 40_000]);
+        let _ = fs::remove_file(destination);
+    }
+
+    #[test]
     fn failed_render_never_replaces_existing_destination() {
         let destination = temp_path("failure");
         fs::write(&destination, b"existing-production").unwrap();
@@ -683,7 +719,7 @@ mod tests {
             width: 2,
             height: 2,
             channel_names: &names,
-            target_icc: &profile,
+            target_icc: Some(&profile),
             dpi_x: 220.0,
             dpi_y: 220.0,
             orientation: None,
@@ -713,7 +749,7 @@ mod tests {
             width: 1,
             height: 1,
             channel_names: &names,
-            target_icc: &profile,
+            target_icc: Some(&profile),
             dpi_x: 220.0,
             dpi_y: 220.0,
             orientation: None,
@@ -743,7 +779,7 @@ mod tests {
             width: 1,
             height: 1,
             channel_names: &names,
-            target_icc: &profile,
+            target_icc: Some(&profile),
             dpi_x: 220.0,
             dpi_y: 220.0,
             orientation: None,
@@ -763,7 +799,7 @@ mod tests {
             width: 100_000,
             height: 100_000,
             channel_names: &names,
-            target_icc: &profile,
+            target_icc: Some(&profile),
             dpi_x: 220.0,
             dpi_y: 220.0,
             orientation: None,
@@ -783,7 +819,7 @@ mod tests {
             width: 1,
             height: 1,
             channel_names: &names,
-            target_icc: &profile,
+            target_icc: Some(&profile),
             dpi_x: 220.0,
             dpi_y: 220.0,
             orientation: None,

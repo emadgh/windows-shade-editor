@@ -1,3 +1,12 @@
+# Shade Editor 0.21.9
+
+- Execute verified ICC DeviceLink recipes directly through a single-profile LittleCMS chain for CMYK or 5C-12C production output, without inserting preview state or a separate Source ICC into the encoded link.
+- Revalidate the captured Source ICC for provenance and the DeviceLink payload/path with SHA-256 immediately before queued execution.
+- Enable valid DeviceLink recipes in the persistent Production Conversion Queue with the existing bounded spool, 8/16-bit writer, cancellation and recovery transaction boundaries.
+- Keep DeviceLink intent, BPC and separation behavior fixed by the link; the runtime does not pretend those controls remain adjustable.
+- Do not embed a LinkClass transform as an output-device ICC in the TIFF; Standard ICC output still requires and verifies its exact embedded Output ICC.
+- Add real, deterministic LittleCMS CMYK DeviceLink fixtures for direct execution, input/class rejection, ink-limit behavior, worker dispatch and no-false-ICC TIFF transport.
+
 # Shade Editor 0.21.8
 
 - Wire valid Standard Output ICC Target Setup directly into an immutable background capture and persistent Production Conversion Queue.

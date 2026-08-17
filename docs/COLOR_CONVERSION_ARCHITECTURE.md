@@ -247,15 +247,17 @@ After TIFF and Production-project commit, the worker re-hashes the Source `.shad
 
 Export and conversion workers are independently persistent but are not started concurrently, avoiding competing full-resolution disk/CPU pressure.
 
-## Standard ICC raster backend
+## Standard ICC and DeviceLink raster backend
 
-`FilesystemIccConversionBackend` executes the transaction for standard Output ICC recipes. Immediately before work begins it reopens and hashes the complete source file, the embedded or explicitly assigned Source ICC, and the target ICC. A changed input fails the captured job instead of silently changing its color meaning.
+`FilesystemIccConversionBackend` executes the transaction for standard Output ICC and direct DeviceLink recipes. Immediately before work begins it reopens and hashes the complete source file, the embedded or explicitly assigned Source ICC, and the target ICC/DeviceLink. A changed input fails the captured job instead of silently changing its color meaning.
 
 The backend currently accepts streamable TIFF sources containing exactly three RGB or four CMYK samples. It decodes one strip/tile region at a time, applies the frozen saved Source adjustment recipe, and writes row-major 16-bit samples into a uniquely created local mmap spool. The read-only spool lets the atomic output writer request bounded row strips even when the input is tiled, without retaining a second full-resolution image in RAM.
 
-LittleCMS then converts each requested strip to CMYK or a typed 5C-12C target. The writer emits 8-bit or 16-bit output, embeds the revalidated target profile, preserves DPI/orientation and authoritative target channel order, validates and atomically commits the TIFF, and returns its full SHA-256 before the transaction saves the clean Production project.
+For Standard ICC, LittleCMS combines the Source ICC and Output ICC with the captured intent/BPC policy. For DeviceLink, LittleCMS executes the single LinkClass profile directly: Source ICC remains a verified provenance/interpretation input but is not inserted into the already-encoded link, and intent/BPC remain fixed by that link. Each path converts requested strips to CMYK or a typed 5C-12C target.
 
-This backend deliberately rejects DeviceLink and Custom Optimizer recipes, RGB/CMYK sources with Spot or extra samples, and non-streamable TIFF input. Those paths require dedicated semantics rather than an implicit fallback. Deterministic real Output-ICC fixtures, LZW, Photoshop-specific spot metadata and external Photoshop/RIP validation remain release gates.
+The writer emits 8-bit or 16-bit output, preserves DPI/orientation and authoritative target channel order, validates and atomically commits the TIFF, and returns its full SHA-256 before the transaction saves the clean Production project. Standard ICC output embeds and verifies its revalidated Output ICC. DeviceLink output deliberately omits the ICC tag because a LinkClass transform is not an output-device characterization; the exact DeviceLink identity remains in serialized conversion provenance.
+
+This backend deliberately rejects Custom Optimizer recipes, RGB/CMYK sources with Spot or extra samples, and non-streamable TIFF input. Those paths require dedicated semantics rather than an implicit fallback. Deterministic real RGB→CMYK and N-channel Output-ICC fixtures, LZW, Photoshop-specific spot metadata and external Photoshop/RIP validation remain release gates.
 
 ## Serialization policy
 
