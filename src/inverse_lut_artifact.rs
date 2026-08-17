@@ -91,12 +91,17 @@ pub fn publish_inverse_lut_artifact_if_absent(
 }
 
 pub fn load_inverse_lut_artifact(path: &Path) -> Result<VerifiedInverseLutArtifact, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|err| format!("Cannot inspect inverse LUT artifact {}: {err}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|err| {
+        format!(
+            "Cannot inspect inverse LUT artifact {}: {err}",
+            path.display()
+        )
+    })?;
     if metadata.len() < FIXED_PREFIX_BYTES || metadata.len() > MAX_INVERSE_LUT_ARTIFACT_BYTES {
         return Err(format!(
             "Inverse LUT artifact {} has invalid bounded size {} bytes.",
-            path.display(), metadata.len()
+            path.display(),
+            metadata.len()
         ));
     }
 
@@ -104,7 +109,9 @@ pub fn load_inverse_lut_artifact(path: &Path) -> Result<VerifiedInverseLutArtifa
         .map_err(|err| format!("Cannot open inverse LUT artifact {}: {err}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut magic = [0u8; 8];
-    reader.read_exact(&mut magic).map_err(|err| err.to_string())?;
+    reader
+        .read_exact(&mut magic)
+        .map_err(|err| err.to_string())?;
     if magic != ARTIFACT_MAGIC {
         return Err("Invalid inverse LUT artifact magic.".to_owned());
     }
@@ -116,13 +123,15 @@ pub fn load_inverse_lut_artifact(path: &Path) -> Result<VerifiedInverseLutArtifa
     }
     let header_len = read_u32_le(&mut reader)? as usize;
     if header_len == 0 || header_len > MAX_INVERSE_LUT_ARTIFACT_HEADER_BYTES {
-        return Err(format!("Invalid inverse LUT artifact header length {header_len}."));
+        return Err(format!(
+            "Invalid inverse LUT artifact header length {header_len}."
+        ));
     }
 
     let mut header_bytes = vec![0u8; header_len];
-    reader.read_exact(&mut header_bytes).map_err(|err| {
-        format!("Cannot read inverse LUT artifact header: {err}")
-    })?;
+    reader
+        .read_exact(&mut header_bytes)
+        .map_err(|err| format!("Cannot read inverse LUT artifact header: {err}"))?;
     let header: InverseLutArtifactHeader = serde_json::from_slice(&header_bytes)
         .map_err(|err| format!("Cannot parse inverse LUT artifact header: {err}"))?;
     validate_header(&header, header_len, metadata.len())?;
@@ -136,10 +145,13 @@ pub fn load_inverse_lut_artifact(path: &Path) -> Result<VerifiedInverseLutArtifa
     let mut validity = Vec::with_capacity(node_count);
     for node in 0..node_count {
         let mut byte = [0u8; 1];
-        reader.read_exact(&mut byte)
+        reader
+            .read_exact(&mut byte)
             .map_err(|err| format!("Cannot read inverse LUT validity node {node}: {err}"))?;
         if byte[0] > 1 {
-            return Err(format!("Inverse LUT validity node {node} is not canonical 0/1."));
+            return Err(format!(
+                "Inverse LUT validity node {node} is not canonical 0/1."
+            ));
         }
         hasher.update(byte);
         validity.push(byte[0] == 1);
@@ -148,7 +160,8 @@ pub fn load_inverse_lut_artifact(path: &Path) -> Result<VerifiedInverseLutArtifa
     let mut coverages = Vec::with_capacity(coverage_values);
     for index in 0..coverage_values {
         let mut bytes = [0u8; 4];
-        reader.read_exact(&mut bytes)
+        reader
+            .read_exact(&mut bytes)
             .map_err(|err| format!("Cannot read inverse LUT coverage {index}: {err}"))?;
         hasher.update(bytes);
         let value = f32::from_bits(u32::from_le_bytes(bytes));
@@ -189,7 +202,8 @@ fn prepare_header(
         .map_err(|_| "Inverse LUT channel count does not fit u16.".to_owned())?;
     if validity.len() as u64 != node_count {
         return Err(format!(
-            "Inverse LUT validity length mismatch: expected {node_count}, got {}.", validity.len()
+            "Inverse LUT validity length mismatch: expected {node_count}, got {}.",
+            validity.len()
         ));
     }
     let coverage_values = node_count
@@ -197,7 +211,8 @@ fn prepare_header(
         .ok_or_else(|| "Inverse LUT coverage count overflowed u64.".to_owned())?;
     if coverages.len() as u64 != coverage_values {
         return Err(format!(
-            "Inverse LUT coverage length mismatch: expected {coverage_values}, got {}.", coverages.len()
+            "Inverse LUT coverage length mismatch: expected {coverage_values}, got {}.",
+            coverages.len()
         ));
     }
 
@@ -235,27 +250,49 @@ fn write_prepared(
     }
     let expected_len = expected_file_len(header, header_bytes.len())?;
     if expected_len > MAX_INVERSE_LUT_ARTIFACT_BYTES {
-        return Err(format!("Inverse LUT artifact would be {expected_len} bytes; bounded maximum is {MAX_INVERSE_LUT_ARTIFACT_BYTES}."));
+        return Err(format!(
+            "Inverse LUT artifact would be {expected_len} bytes; bounded maximum is {MAX_INVERSE_LUT_ARTIFACT_BYTES}."
+        ));
     }
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("Cannot create inverse LUT folder {}: {err}", parent.display()))?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "Cannot create inverse LUT folder {}: {err}",
+            parent.display()
+        )
+    })?;
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(path)
-        .map_err(|err| format!("Cannot create inverse LUT artifact {}: {err}", path.display()))?;
+        .map_err(|err| {
+            format!(
+                "Cannot create inverse LUT artifact {}: {err}",
+                path.display()
+            )
+        })?;
     let mut writer = BufWriter::new(file);
-    writer.write_all(&ARTIFACT_MAGIC).map_err(|err| err.to_string())?;
-    writer.write_all(&INVERSE_LUT_ARTIFACT_FORMAT_VERSION.to_le_bytes()).map_err(|err| err.to_string())?;
-    writer.write_all(&(header_bytes.len() as u32).to_le_bytes()).map_err(|err| err.to_string())?;
-    writer.write_all(&header_bytes).map_err(|err| err.to_string())?;
+    writer
+        .write_all(&ARTIFACT_MAGIC)
+        .map_err(|err| err.to_string())?;
+    writer
+        .write_all(&INVERSE_LUT_ARTIFACT_FORMAT_VERSION.to_le_bytes())
+        .map_err(|err| err.to_string())?;
+    writer
+        .write_all(&(header_bytes.len() as u32).to_le_bytes())
+        .map_err(|err| err.to_string())?;
+    writer
+        .write_all(&header_bytes)
+        .map_err(|err| err.to_string())?;
     for valid in validity {
-        writer.write_all(&[u8::from(*valid)]).map_err(|err| err.to_string())?;
+        writer
+            .write_all(&[u8::from(*valid)])
+            .map_err(|err| err.to_string())?;
     }
     for (index, value) in coverages.iter().copied().enumerate() {
-        writer.write_all(&canonical_coverage_bytes(value, index)?)
+        writer
+            .write_all(&canonical_coverage_bytes(value, index)?)
             .map_err(|err| err.to_string())?;
     }
     writer.flush().map_err(|err| err.to_string())?;
@@ -270,11 +307,18 @@ fn write_prepared(
     Ok(())
 }
 
-fn validate_header(header: &InverseLutArtifactHeader, header_len: usize, file_len: u64) -> Result<(), String> {
+fn validate_header(
+    header: &InverseLutArtifactHeader,
+    header_len: usize,
+    file_len: u64,
+) -> Result<(), String> {
     if header.format_version != INVERSE_LUT_ARTIFACT_FORMAT_VERSION {
         return Err("Inverse LUT header format version does not match binary prefix.".to_owned());
     }
-    header.identity.validate().map_err(|errors| errors.join("\n"))?;
+    header
+        .identity
+        .validate()
+        .map_err(|errors| errors.join("\n"))?;
     let expected_identity_id = header.identity.content_id()?;
     if header.identity_content_id != expected_identity_id {
         return Err(format!(
@@ -283,15 +327,25 @@ fn validate_header(header: &InverseLutArtifactHeader, header_len: usize, file_le
         ));
     }
     if !is_bare_sha256(&header.payload_sha256) {
-        return Err("Inverse LUT payload_sha256 must be canonical lowercase 64-character hex.".to_owned());
+        return Err(
+            "Inverse LUT payload_sha256 must be canonical lowercase 64-character hex.".to_owned(),
+        );
     }
-    let expected_nodes = header.identity.build_policy.grid.node_count()
+    let expected_nodes = header
+        .identity
+        .build_policy
+        .grid
+        .node_count()
         .ok_or_else(|| "Inverse LUT identity node count overflowed.".to_owned())?;
     if header.node_count != expected_nodes || header.validity_bytes != expected_nodes {
-        return Err("Inverse LUT header node/validity counts do not match identity grid.".to_owned());
+        return Err(
+            "Inverse LUT header node/validity counts do not match identity grid.".to_owned(),
+        );
     }
     if usize::from(header.channel_count) != header.identity.channel_names.len() {
-        return Err("Inverse LUT header channel count does not match identity topology.".to_owned());
+        return Err(
+            "Inverse LUT header channel count does not match identity topology.".to_owned(),
+        );
     }
     let expected_values = expected_nodes
         .checked_mul(u64::from(header.channel_count))
@@ -318,7 +372,9 @@ fn expected_file_len(header: &InverseLutArtifactHeader, header_len: usize) -> Re
 
 fn canonical_coverage_bytes(value: f32, index: usize) -> Result<[u8; 4], String> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(format!("Inverse LUT coverage {index} must be finite and in 0..=1."));
+        return Err(format!(
+            "Inverse LUT coverage {index} must be finite and in 0..=1."
+        ));
     }
     let canonical = if value == 0.0 { 0.0 } else { value };
     Ok(canonical.to_bits().to_le_bytes())
@@ -326,10 +382,14 @@ fn canonical_coverage_bytes(value: f32, index: usize) -> Result<[u8; 4], String>
 
 fn validate_stored_coverage(value: f32, bytes: [u8; 4], index: usize) -> Result<(), String> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(format!("Stored inverse LUT coverage {index} is not finite normalized data."));
+        return Err(format!(
+            "Stored inverse LUT coverage {index} is not finite normalized data."
+        ));
     }
     if value == 0.0 && u32::from_le_bytes(bytes) != 0 {
-        return Err(format!("Stored inverse LUT coverage {index} uses non-canonical negative zero."));
+        return Err(format!(
+            "Stored inverse LUT coverage {index} uses non-canonical negative zero."
+        ));
     }
     Ok(())
 }
@@ -339,28 +399,46 @@ fn verify_existing_matches(path: &Path, expected: &InverseLutArtifactHeader) -> 
     verify_loaded_matches(&loaded, expected)
 }
 
-fn verify_loaded_matches(loaded: &VerifiedInverseLutArtifact, expected: &InverseLutArtifactHeader) -> Result<(), String> {
+fn verify_loaded_matches(
+    loaded: &VerifiedInverseLutArtifact,
+    expected: &InverseLutArtifactHeader,
+) -> Result<(), String> {
     if loaded.identity_content_id != expected.identity_content_id
         || loaded.payload_sha256 != expected.payload_sha256
         || loaded.identity != expected.identity
     {
-        return Err("Existing inverse LUT cache object does not exactly match requested identity/payload.".to_owned());
+        return Err(
+            "Existing inverse LUT cache object does not exactly match requested identity/payload."
+                .to_owned(),
+        );
     }
     Ok(())
 }
 
 fn unique_staged_path(destination: &Path) -> Result<PathBuf, String> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("Cannot create inverse LUT cache folder {}: {err}", parent.display()))?;
-    let file_name = destination.file_name().and_then(|value| value.to_str()).unwrap_or("inverse-lut");
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "Cannot create inverse LUT cache folder {}: {err}",
+            parent.display()
+        )
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("inverse-lut");
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     for _ in 0..64 {
         let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(".{file_name}.{}.{}.{}.tmp", std::process::id(), timestamp, sequence));
+        let path = parent.join(format!(
+            ".{file_name}.{}.{}.{}.tmp",
+            std::process::id(),
+            timestamp,
+            sequence
+        ));
         if !path.exists() {
             return Ok(path);
         }
@@ -370,7 +448,9 @@ fn unique_staged_path(destination: &Path) -> Result<PathBuf, String> {
 
 fn read_u32_le<R: Read>(reader: &mut R) -> Result<u32, String> {
     let mut bytes = [0u8; 4];
-    reader.read_exact(&mut bytes).map_err(|err| err.to_string())?;
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|err| err.to_string())?;
     Ok(u32::from_le_bytes(bytes))
 }
 

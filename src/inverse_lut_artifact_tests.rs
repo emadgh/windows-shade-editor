@@ -3,15 +3,15 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::inverse_lut_artifact::{
-    load_inverse_lut_artifact, publish_inverse_lut_artifact_if_absent,
-    write_inverse_lut_artifact, InverseLutPublishOutcome,
+    InverseLutPublishOutcome, load_inverse_lut_artifact, publish_inverse_lut_artifact_if_absent,
+    write_inverse_lut_artifact,
 };
 use crate::inverse_lut_identity::{
+    INVERSE_LUT_BUILD_POLICY_SCHEMA_VERSION, INVERSE_LUT_IDENTITY_SCHEMA_VERSION,
     InverseLutBuildPolicy, InverseLutContinuityFieldMethod, InverseLutForwardModelIdentity,
     InverseLutForwardModelMethod, InverseLutIdentityRecord, InverseLutInterpolationMethod,
     InverseLutLocalForwardModelConfigIdentity, InverseLutNumericalPrecision,
     InverseLutOutputQuantization, InverseLutValidityEncoding, LabGridSpec,
-    INVERSE_LUT_BUILD_POLICY_SCHEMA_VERSION, INVERSE_LUT_IDENTITY_SCHEMA_VERSION,
 };
 
 fn identity(bit_depth: u8) -> InverseLutIdentityRecord {
@@ -143,7 +143,10 @@ fn header_identity_content_id_tampering_fails_closed() {
 
     let mut bytes = fs::read(&path).unwrap();
     let needle = b"\"identity_content_id\":\"sha256:";
-    let start = bytes.windows(needle.len()).position(|window| window == needle).unwrap();
+    let start = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .unwrap();
     let hex = start + needle.len();
     bytes[hex] = if bytes[hex] == b'0' { b'1' } else { b'0' };
     fs::write(&path, bytes).unwrap();
