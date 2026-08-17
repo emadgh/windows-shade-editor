@@ -1,8 +1,7 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
-
 use crate::color_conversion::{ConversionTargetDefinition, SeparationStrategy};
+pub use crate::custom_optimizer_config::CustomOptimizerSolverConfig as InverseSolverConfig;
 use crate::device_characterization::{DeviceForwardModel, LabColor};
 use crate::separation_optimizer::{
     CandidateEvaluation, CandidateScoringWeights, SeparationCandidate, characterize_candidate,
@@ -10,38 +9,6 @@ use crate::separation_optimizer::{
 };
 
 const HALTON_PRIMES: [u32; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub struct InverseSolverConfig {
-    /// Deterministic low-discrepancy samples used for broad device-space search.
-    pub initial_samples: usize,
-    /// Number of best candidates retained between refinement rounds.
-    pub beam_width: usize,
-    /// Number of local coordinate/pair-transfer refinement passes.
-    pub refinement_rounds: usize,
-    /// First local step as a fraction of each channel's allowed coverage range.
-    pub initial_step_fraction: f32,
-    /// Multiplicative step reduction after every refinement round.
-    pub step_decay: f32,
-    /// Candidate color differences within this CIEDE2000 distance from the
-    /// best feasible color found in the current search stage are treated as
-    /// colorimetrically equivalent for production-preference ranking.
-    /// Set to 0 for strict minimum-DeltaE ranking.
-    pub preference_delta_e00: f32,
-}
-
-impl Default for InverseSolverConfig {
-    fn default() -> Self {
-        Self {
-            initial_samples: 384,
-            beam_width: 24,
-            refinement_rounds: 4,
-            initial_step_fraction: 0.18,
-            step_decay: 0.5,
-            preference_delta_e00: 0.10,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InverseSolverStats {
@@ -96,10 +63,9 @@ pub fn solve_inverse_separation(
     config: InverseSolverConfig,
 ) -> Result<InverseSolveResult, InverseSolveError> {
     validate_identity(target, model)?;
-    let config_errors = validate_config(config, target.channels.len());
-    if !config_errors.is_empty() {
-        return Err(InverseSolveError::InvalidConfiguration(config_errors));
-    }
+    config
+        .validate(target.channels.len())
+        .map_err(InverseSolveError::InvalidConfiguration)?;
 
     let maxima = channel_maxima(target, strategy);
     let total_limit = effective_total_ink_limit(target.total_ink_limit, strategy.total_ink_limit);
@@ -248,42 +214,6 @@ fn validate_identity(
         });
     }
     Ok(())
-}
-
-fn validate_config(config: InverseSolverConfig, channel_count: usize) -> Vec<String> {
-    let mut errors = Vec::new();
-    if !(1..=HALTON_PRIMES.len()).contains(&channel_count) {
-        errors.push(format!(
-            "Reference inverse solver supports 1..={} channels, got {channel_count}.",
-            HALTON_PRIMES.len()
-        ));
-    }
-    if !(32..=16_384).contains(&config.initial_samples) {
-        errors.push("Inverse solver initial_samples must be in 32..=16384.".to_owned());
-    }
-    if !(4..=256).contains(&config.beam_width) {
-        errors.push("Inverse solver beam_width must be in 4..=256.".to_owned());
-    }
-    if config.refinement_rounds > 8 {
-        errors.push("Inverse solver refinement_rounds must be <= 8.".to_owned());
-    }
-    if !config.initial_step_fraction.is_finite()
-        || !(0.005..=0.5).contains(&config.initial_step_fraction)
-    {
-        errors.push("Inverse solver initial_step_fraction must be in 0.005..=0.5.".to_owned());
-    }
-    if !config.step_decay.is_finite() || !(0.1..=0.95).contains(&config.step_decay) {
-        errors.push("Inverse solver step_decay must be in 0.1..=0.95.".to_owned());
-    }
-    if !config.preference_delta_e00.is_finite()
-        || !(0.0..=1.0).contains(&config.preference_delta_e00)
-    {
-        errors.push(
-            "Inverse solver preference_delta_e00 must be finite and in 0..=1.0."
-                .to_owned(),
-        );
-    }
-    errors
 }
 
 fn channel_maxima(
@@ -586,6 +516,7 @@ mod tests {
             initial_step_fraction: 0.16,
             step_decay: 0.5,
             preference_delta_e00: 0.10,
+            ..InverseSolverConfig::default()
         }
     }
 

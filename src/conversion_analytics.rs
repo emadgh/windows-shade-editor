@@ -462,6 +462,7 @@ mod tests {
                 total_ink_limit: Some(1.4),
                 max_delta_e00: Some(2.0),
             },
+            custom_optimizer_solver: Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default()),
         }
     }
 

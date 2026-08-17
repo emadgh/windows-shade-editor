@@ -349,6 +349,8 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: false,
             strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: (engine_mode == ConversionEngineMode::CustomOptimizer)
+                                .then(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default),
         }
     }
 

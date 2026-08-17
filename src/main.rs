@@ -16,6 +16,7 @@ mod app_features;
 mod app_icon;
 mod app_log;
 mod color_conversion;
+mod custom_optimizer_config;
 mod color_management;
 mod conversion_tiff;
 mod dpi;

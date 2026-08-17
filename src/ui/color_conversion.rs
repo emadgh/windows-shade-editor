@@ -1139,6 +1139,8 @@ fn build_target_setup_review(
         black_point_compensation: state.engine_mode == ConversionEngineMode::Icc
             && state.black_point_compensation,
         strategy: SeparationStrategy::default(),
+        custom_optimizer_solver: (state.engine_mode == ConversionEngineMode::CustomOptimizer)
+                            .then(windows_shade_editor::custom_optimizer_config::CustomOptimizerSolverConfig::default),
     };
     if let Err(recipe_errors) = recipe.validate() {
         errors.extend(recipe_errors);
