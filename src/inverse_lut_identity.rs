@@ -319,10 +319,10 @@ impl InverseLutIdentityRecord {
     /// Construct a content-addressable identity from the actual validated local
     /// forward model and exact conversion recipe.
     ///
-    /// Positive-weight V2 continuity is deliberately rejected for now: a static
-    /// Lab->inks grid cannot discard the explicit reference dependency. #179 must
-    /// define and validate a versioned offline continuity-field construction
-    /// method before such a LUT can receive a production identity.
+    /// Positive-weight V2 continuity is eligible only when the build policy binds
+    /// the versioned offline Jacobi continuity-field method and seed rule. V1 and
+    /// zero-weight V2 remain single-valued independent-node LUT constructions and
+    /// therefore require `IndependentNodeSolvesV1`.
     pub fn from_local_model(
         recipe: &ConversionRecipe,
         model: &ValidatedLocalForwardModel,

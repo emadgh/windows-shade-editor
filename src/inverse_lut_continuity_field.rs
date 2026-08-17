@@ -113,7 +113,7 @@ pub struct JacobiFieldResult {
     pub diagnostics: Vec<JacobiIterationDiagnostic>,
 }
 
-/// Prototype deterministic field smoother for #179.
+/// Versioned deterministic six-neighbor Jacobi continuity-field construction.
 ///
 /// Every iteration computes all references from one immutable previous snapshot,
 /// then solves every node into a separate next snapshot. Consequently a correct,
@@ -261,7 +261,7 @@ fn build_references(
         let (l, a, b) = shape.coordinates(index);
         let mut neighbor_sum = vec![0.0f64; channel_count];
         let mut neighbor_count = 0u32;
-        // Fixed axis/sign accumulation order is part of the prototype numerical
+        // Fixed axis/sign accumulation order is part of the versioned numerical
         // contract: L-, L+, a-, a+, b-, b+.
         for neighbor in [
             l.checked_sub(1).map(|value| shape.index(value, a, b)),
