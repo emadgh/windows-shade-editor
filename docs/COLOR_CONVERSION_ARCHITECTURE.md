@@ -225,7 +225,7 @@ It does **not** itself perform pixel conversion. Transform execution and output 
 
 Output is first written beside the destination, then re-opened to verify dimensions, precision, sample count, target ICC and ink tags. Only a verified and synced staged file reaches the atomic replacement boundary; render or verification failure leaves an existing production file untouched.
 
-The bounded callback path currently writes uncompressed strips because the encoder's compressed path requires a complete image slice. LZW therefore requires a later local mmap/spool stage. Photoshop Image Resources/DisplayInfo generation, external Photoshop/RIP round trips and representative >4 GiB BigTIFF validation remain mandatory before claiming production interchange compatibility.
+The encoder's compressed path requires a complete image slice, so the writer renders callback strips into a uniquely-created local disk spool and memory-maps that file read-only for final LZW encoding. This keeps transformation memory bounded without allocating a second full-resolution N-channel image, verifies Compression=5 in the staged TIFF and removes the spool on success or failure. Photoshop Image Resources/DisplayInfo generation, external Photoshop/RIP round trips and representative >4 GiB BigTIFF validation remain mandatory before claiming production interchange compatibility.
 
 ## Worker transaction boundary
 
@@ -257,7 +257,7 @@ For Standard ICC, LittleCMS combines the Source ICC and Output ICC with the capt
 
 The writer emits 8-bit or 16-bit output, preserves DPI/orientation and authoritative target channel order, validates and atomically commits the TIFF, and returns its full SHA-256 before the transaction saves the clean Production project. Standard ICC output embeds and verifies its revalidated Output ICC. DeviceLink output deliberately omits the ICC tag because a LinkClass transform is not an output-device characterization; the exact DeviceLink identity remains in serialized conversion provenance.
 
-This backend deliberately rejects Custom Optimizer recipes, RGB/CMYK sources with Spot or extra samples, and non-streamable TIFF input. Those paths require dedicated semantics rather than an implicit fallback. Deterministic real RGB→CMYK and N-channel Output-ICC fixtures, LZW, Photoshop-specific spot metadata and external Photoshop/RIP validation remain release gates.
+This backend deliberately rejects Custom Optimizer recipes, RGB/CMYK sources with Spot or extra samples, and non-streamable TIFF input. Those paths require dedicated semantics rather than an implicit fallback. Deterministic real RGB→CMYK and N-channel Output-ICC fixtures, Photoshop-specific spot metadata and external Photoshop/RIP validation remain release gates.
 
 ## Serialization policy
 

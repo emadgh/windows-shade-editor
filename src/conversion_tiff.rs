@@ -1,15 +1,82 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use tiff::encoder::{Compression, TiffEncoder, TiffValue, colortype};
 use tiff::tags::{ExtraSamples, Tag, Type};
 
 use crate::{dpi, safe_fs, tiff_io};
 
 const CLASSIC_TIFF_SAFE_RAW_BYTES: u64 = 4_000_000_000;
+static CONVERSION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct ConversionSpool {
+    path: PathBuf,
+}
+
+impl ConversionSpool {
+    fn create(destination: &Path, byte_len: u64) -> Result<(Self, File), String> {
+        let root = local_conversion_spool_root();
+        fs::create_dir_all(&root).map_err(|err| {
+            format!(
+                "Cannot create local conversion spool folder {}: {err}",
+                root.display()
+            )
+        })?;
+        let label = spool_label(destination);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for _ in 0..64 {
+            let sequence = CONVERSION_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = root.join(format!(
+                "shade-conversion-spool-{label}-{}-{timestamp}-{sequence}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    if let Err(err) = file.set_len(byte_len) {
+                        drop(file);
+                        let _ = fs::remove_file(&path);
+                        return Err(format!("Cannot size conversion output spool: {err}"));
+                    }
+                    return Ok((Self { path }, file));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(format!("Cannot create conversion output spool: {err}")),
+            }
+        }
+        Err("Cannot allocate a unique conversion output spool path.".to_owned())
+    }
+
+    fn map_read_only(&self) -> Result<Mmap, String> {
+        let file = File::open(&self.path)
+            .map_err(|err| format!("Cannot reopen conversion output spool: {err}"))?;
+        // SAFETY: rendering has completed, the writable mapping has been
+        // flushed and dropped, and this mapping is never mutated.
+        unsafe {
+            MmapOptions::new()
+                .map(&file)
+                .map_err(|err| format!("Cannot map conversion output spool: {err}"))
+        }
+    }
+}
+
+impl Drop for ConversionSpool {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 struct TiffAsciiBytes<'a>(&'a [u8]);
 
@@ -108,17 +175,19 @@ fn write_u8<F>(staged: &Path, spec: &ConversionTiffSpec<'_>, render_strip: F) ->
 where
     F: FnMut(u32, u32, &mut [u8]) -> Result<(), String>,
 {
+    let spool = render_u8_spool(staged, spec, render_strip)?;
+    let mmap = spool.map_read_only()?;
     let file = File::create(staged)
         .map_err(|err| format!("Cannot create staged conversion TIFF: {err}"))?;
     let writer = BufWriter::new(file);
     if should_write_bigtiff(spec, 8) {
         let encoder = TiffEncoder::new_big(writer)
             .map_err(|err| format!("Cannot initialize conversion BigTIFF: {err}"))?;
-        write_u8_with_encoder(encoder, spec, render_strip)
+        write_u8_with_encoder(encoder, spec, &mmap)
     } else {
         let encoder = TiffEncoder::new(writer)
             .map_err(|err| format!("Cannot initialize conversion TIFF: {err}"))?;
-        write_u8_with_encoder(encoder, spec, render_strip)
+        write_u8_with_encoder(encoder, spec, &mmap)
     }
 }
 
@@ -126,64 +195,59 @@ fn write_u16<F>(staged: &Path, spec: &ConversionTiffSpec<'_>, render_strip: F) -
 where
     F: FnMut(u32, u32, &mut [u16]) -> Result<(), String>,
 {
+    let spool = render_u16_spool(staged, spec, render_strip)?;
+    let mmap = spool.map_read_only()?;
+    let samples = mmap_as_u16(&mmap)?;
     let file = File::create(staged)
         .map_err(|err| format!("Cannot create staged conversion TIFF: {err}"))?;
     let writer = BufWriter::new(file);
     if should_write_bigtiff(spec, 16) {
         let encoder = TiffEncoder::new_big(writer)
             .map_err(|err| format!("Cannot initialize conversion BigTIFF: {err}"))?;
-        write_u16_with_encoder(encoder, spec, render_strip)
+        write_u16_with_encoder(encoder, spec, samples)
     } else {
         let encoder = TiffEncoder::new(writer)
             .map_err(|err| format!("Cannot initialize conversion TIFF: {err}"))?;
-        write_u16_with_encoder(encoder, spec, render_strip)
+        write_u16_with_encoder(encoder, spec, samples)
     }
 }
 
-fn write_u8_with_encoder<W, K, F>(
+fn write_u8_with_encoder<W, K>(
     encoder: TiffEncoder<W, K>,
     spec: &ConversionTiffSpec<'_>,
-    mut render_strip: F,
+    samples: &[u8],
 ) -> Result<(), String>
 where
     W: std::io::Write + std::io::Seek,
     K: tiff::encoder::TiffKind,
-    F: FnMut(u32, u32, &mut [u8]) -> Result<(), String>,
 {
-    // image-tiff only activates compressed writers through `write_data`, which
-    // requires the complete sample slice. The conversion path deliberately uses
-    // bounded strip callbacks, so this first writer uses uncompressed strips.
-    // A later local mmap spool may add LZW without regressing bounded RAM.
-    let mut encoder = encoder.with_compression(Compression::Uncompressed);
+    let mut encoder = encoder.with_compression(Compression::Lzw);
     let mut image = encoder
         .new_image::<colortype::CMYK8>(spec.width, spec.height)
         .map_err(|err| format!("Cannot create 8-bit separated TIFF image: {err}"))?;
     configure_image(&mut image, spec)?;
-    write_strips(&mut image, spec, &mut render_strip)?;
     image
-        .finish()
-        .map_err(|err| format!("Cannot finish 8-bit conversion TIFF: {err}"))
+        .write_data(samples)
+        .map_err(|err| format!("Cannot write LZW 8-bit conversion TIFF: {err}"))
 }
 
-fn write_u16_with_encoder<W, K, F>(
+fn write_u16_with_encoder<W, K>(
     encoder: TiffEncoder<W, K>,
     spec: &ConversionTiffSpec<'_>,
-    mut render_strip: F,
+    samples: &[u16],
 ) -> Result<(), String>
 where
     W: std::io::Write + std::io::Seek,
     K: tiff::encoder::TiffKind,
-    F: FnMut(u32, u32, &mut [u16]) -> Result<(), String>,
 {
-    let mut encoder = encoder.with_compression(Compression::Uncompressed);
+    let mut encoder = encoder.with_compression(Compression::Lzw);
     let mut image = encoder
         .new_image::<colortype::CMYK16>(spec.width, spec.height)
         .map_err(|err| format!("Cannot create 16-bit separated TIFF image: {err}"))?;
     configure_image(&mut image, spec)?;
-    write_strips(&mut image, spec, &mut render_strip)?;
     image
-        .finish()
-        .map_err(|err| format!("Cannot finish 16-bit conversion TIFF: {err}"))
+        .write_data(samples)
+        .map_err(|err| format!("Cannot write LZW 16-bit conversion TIFF: {err}"))
 }
 
 fn configure_image<W, C, K>(
@@ -254,46 +318,148 @@ where
     Ok(())
 }
 
-fn write_strips<W, C, K, F>(
-    image: &mut tiff::encoder::ImageEncoder<'_, W, C, K>,
+fn render_u8_spool<F>(
+    destination: &Path,
     spec: &ConversionTiffSpec<'_>,
-    render_strip: &mut F,
-) -> Result<(), String>
+    mut render_strip: F,
+) -> Result<ConversionSpool, String>
 where
-    W: std::io::Write + std::io::Seek,
-    C: tiff::encoder::colortype::ColorType,
-    [C::Inner]: tiff::encoder::TiffValue,
-    K: tiff::encoder::TiffKind,
-    F: FnMut(u32, u32, &mut [C::Inner]) -> Result<(), String>,
-    C::Inner: Default + Clone,
+    F: FnMut(u32, u32, &mut [u8]) -> Result<(), String>,
 {
+    let (row_samples, total_samples, byte_len) = spool_layout(spec, 1)?;
+    let (spool, file) = ConversionSpool::create(destination, byte_len)?;
+    // SAFETY: the newly-created file is exclusively owned by this writer and
+    // has already been extended to the exact checked sample length.
+    let mut mmap = unsafe {
+        MmapOptions::new()
+            .map_mut(&file)
+            .map_err(|err| format!("Cannot map writable conversion output spool: {err}"))?
+    };
+    let mut start_row = 0u32;
+    while start_row < spec.height {
+        let row_count = spec
+            .rows_per_strip
+            .min(spec.height.saturating_sub(start_row));
+        let start = usize::try_from(start_row)
+            .ok()
+            .and_then(|row| row.checked_mul(row_samples))
+            .ok_or_else(|| "Conversion output spool offset overflow.".to_owned())?;
+        let sample_count = usize::try_from(row_count)
+            .ok()
+            .and_then(|rows| rows.checked_mul(row_samples))
+            .ok_or_else(|| "Conversion output strip size overflow.".to_owned())?;
+        let end = start
+            .checked_add(sample_count)
+            .filter(|end| *end <= total_samples)
+            .ok_or_else(|| "Conversion output spool range overflow.".to_owned())?;
+        render_strip(start_row, row_count, &mut mmap[start..end])?;
+        start_row += row_count;
+    }
+    mmap.flush()
+        .map_err(|err| format!("Cannot flush conversion output spool: {err}"))?;
+    drop(mmap);
+    file.sync_all()
+        .map_err(|err| format!("Cannot sync conversion output spool: {err}"))?;
+    Ok(spool)
+}
+
+fn render_u16_spool<F>(
+    destination: &Path,
+    spec: &ConversionTiffSpec<'_>,
+    mut render_strip: F,
+) -> Result<ConversionSpool, String>
+where
+    F: FnMut(u32, u32, &mut [u16]) -> Result<(), String>,
+{
+    let (row_samples, total_samples, byte_len) = spool_layout(spec, 2)?;
+    let (spool, file) = ConversionSpool::create(destination, byte_len)?;
+    // SAFETY: the newly-created file is exclusively owned by this writer and
+    // has already been extended to the exact checked sample length.
+    let mut mmap = unsafe {
+        MmapOptions::new()
+            .map_mut(&file)
+            .map_err(|err| format!("Cannot map writable conversion output spool: {err}"))?
+    };
+    let samples = mmap_mut_as_u16(&mut mmap)?;
+    let mut start_row = 0u32;
+    while start_row < spec.height {
+        let row_count = spec
+            .rows_per_strip
+            .min(spec.height.saturating_sub(start_row));
+        let start = usize::try_from(start_row)
+            .ok()
+            .and_then(|row| row.checked_mul(row_samples))
+            .ok_or_else(|| "Conversion output spool offset overflow.".to_owned())?;
+        let sample_count = usize::try_from(row_count)
+            .ok()
+            .and_then(|rows| rows.checked_mul(row_samples))
+            .ok_or_else(|| "Conversion output strip size overflow.".to_owned())?;
+        let end = start
+            .checked_add(sample_count)
+            .filter(|end| *end <= total_samples)
+            .ok_or_else(|| "Conversion output spool range overflow.".to_owned())?;
+        render_strip(start_row, row_count, &mut samples[start..end])?;
+        start_row += row_count;
+    }
+    mmap.flush()
+        .map_err(|err| format!("Cannot flush conversion output spool: {err}"))?;
+    drop(mmap);
+    file.sync_all()
+        .map_err(|err| format!("Cannot sync conversion output spool: {err}"))?;
+    Ok(spool)
+}
+
+fn spool_layout(
+    spec: &ConversionTiffSpec<'_>,
+    bytes_per_sample: u64,
+) -> Result<(usize, usize, u64), String> {
     let row_samples = usize::try_from(spec.width)
         .ok()
         .and_then(|width| width.checked_mul(spec.channel_names.len()))
         .ok_or_else(|| "Conversion TIFF row is too large.".to_owned())?;
-    let mut start_row = 0u32;
-    while image.next_strip_sample_count() > 0 {
-        let sample_count = usize::try_from(image.next_strip_sample_count())
-            .map_err(|_| "Conversion strip sample count is too large.".to_owned())?;
-        if sample_count % row_samples != 0 {
-            return Err("Conversion strip does not contain complete rows.".to_owned());
-        }
-        let row_count = u32::try_from(sample_count / row_samples)
-            .map_err(|_| "Conversion strip row count is too large.".to_owned())?;
-        let mut samples = vec![C::Inner::default(); sample_count];
-        render_strip(start_row, row_count, &mut samples)?;
-        image
-            .write_strip(&samples)
-            .map_err(|err| format!("Cannot write conversion TIFF strip: {err}"))?;
-        start_row = start_row.saturating_add(row_count);
+    let total_samples = usize::try_from(spec.height)
+        .ok()
+        .and_then(|height| height.checked_mul(row_samples))
+        .ok_or_else(|| "Conversion TIFF sample count is too large.".to_owned())?;
+    let byte_len = u64::try_from(total_samples)
+        .ok()
+        .and_then(|samples| samples.checked_mul(bytes_per_sample))
+        .ok_or_else(|| "Conversion output spool byte size overflow.".to_owned())?;
+    Ok((row_samples, total_samples, byte_len))
+}
+
+fn mmap_mut_as_u16(mmap: &mut MmapMut) -> Result<&mut [u16], String> {
+    if mmap.len() % std::mem::size_of::<u16>() != 0 {
+        return Err("16-bit conversion output spool has an odd byte length.".to_owned());
     }
-    if start_row != spec.height {
-        return Err(format!(
-            "Conversion TIFF wrote {start_row} rows; expected {}.",
-            spec.height
-        ));
+    if (mmap.as_ptr() as usize) % std::mem::align_of::<u16>() != 0 {
+        return Err("16-bit conversion output spool is not aligned for u16 samples.".to_owned());
     }
-    Ok(())
+    // SAFETY: length and alignment are checked above. The mutable mapping is
+    // exclusively borrowed for the returned slice lifetime.
+    Ok(unsafe {
+        std::slice::from_raw_parts_mut(
+            mmap.as_mut_ptr().cast::<u16>(),
+            mmap.len() / std::mem::size_of::<u16>(),
+        )
+    })
+}
+
+fn mmap_as_u16(mmap: &Mmap) -> Result<&[u16], String> {
+    if mmap.len() % std::mem::size_of::<u16>() != 0 {
+        return Err("16-bit conversion output spool has an odd byte length.".to_owned());
+    }
+    if (mmap.as_ptr() as usize) % std::mem::align_of::<u16>() != 0 {
+        return Err("16-bit conversion output spool is not aligned for u16 samples.".to_owned());
+    }
+    // SAFETY: length and alignment are checked above. The read-only mapping is
+    // never mutated while the returned slice is alive.
+    Ok(unsafe {
+        std::slice::from_raw_parts(
+            mmap.as_ptr().cast::<u16>(),
+            mmap.len() / std::mem::size_of::<u16>(),
+        )
+    })
 }
 
 fn validate_spec(
@@ -364,6 +530,9 @@ fn verify_staged(
         || metadata.bit_depth != bit_depth
     {
         return Err("Staged conversion TIFF topology verification failed.".to_owned());
+    }
+    if metadata.compression != Some(5) {
+        return Err("Staged conversion TIFF LZW verification failed.".to_owned());
     }
     if metadata.icc_profile.as_deref() != spec.target_icc {
         return Err("Staged conversion TIFF target ICC verification failed.".to_owned());
@@ -553,6 +722,36 @@ fn should_write_bigtiff(spec: &ConversionTiffSpec<'_>, bit_depth: u8) -> bool {
             .is_none_or(|bytes| bytes >= CLASSIC_TIFF_SAFE_RAW_BYTES)
 }
 
+fn local_conversion_spool_root() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ShadeEditor")
+        .join("conversion-output-spool")
+}
+
+fn spool_label(destination: &Path) -> String {
+    let label = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect::<String>();
+    if label.is_empty() {
+        "output".to_owned()
+    } else {
+        label
+    }
+}
+
 fn staged_path(destination: &Path) -> Result<PathBuf, String> {
     let file_name = destination
         .file_name()
@@ -582,6 +781,15 @@ mod tests {
         lcms2::Profile::new_srgb().icc().unwrap()
     }
 
+    fn assert_lzw(path: &Path) {
+        let file = File::open(path).unwrap();
+        let mut decoder = Decoder::new(file).unwrap();
+        assert_eq!(
+            decoder.get_tag_unsigned::<u16>(Tag::Compression).unwrap(),
+            5
+        );
+    }
+
     #[test]
     fn seven_channel_tiff_round_trips_topology_names_icc_and_samples() {
         let destination = temp_path("7c");
@@ -601,13 +809,16 @@ mod tests {
             replace_existing: true,
         };
 
-        write_conversion_tiff_u16_atomic(&destination, &spec, |start, _, samples| {
+        let mut render_calls = Vec::new();
+        write_conversion_tiff_u16_atomic(&destination, &spec, |start, rows, samples| {
+            render_calls.push((start, rows, samples.len()));
             for (index, sample) in samples.iter_mut().enumerate() {
                 *sample = (start as u16) * 1000 + index as u16;
             }
             Ok(())
         })
         .unwrap();
+        assert_eq!(render_calls, vec![(0, 1, 21), (1, 1, 21)]);
 
         let stream = tiff_io::stream_info(&destination).unwrap();
         assert_eq!(stream.metadata.samples_per_pixel, 7);
@@ -620,6 +831,7 @@ mod tests {
         assert_eq!(decoded.samples.len(), 3 * 2 * 7);
         assert_eq!(decoded.samples[0], 0);
         assert_eq!(decoded.samples[3 * 7], 1000);
+        assert_lzw(&destination);
 
         let file = File::open(&destination).unwrap();
         let mut decoder = Decoder::new(file).unwrap();
@@ -637,6 +849,12 @@ mod tests {
             raw.windows(expected_ink_names.len())
                 .any(|window| window == expected_ink_names)
         );
+        let spool_label = spool_label(&staged_path(&destination).unwrap());
+        let leaked = fs::read_dir(local_conversion_spool_root())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(&spool_label));
+        assert!(!leaked, "successful conversion must remove its local output spool");
         let _ = fs::remove_file(destination);
     }
 
@@ -671,6 +889,7 @@ mod tests {
             decoded.samples,
             vec![257, 514, 771, 1028, 1285, 1542, 1799, 2056]
         );
+        assert_lzw(&destination);
         let file = File::open(&destination).unwrap();
         let mut decoder = Decoder::new(file).unwrap();
         assert_eq!(
@@ -736,6 +955,15 @@ mod tests {
         assert!(error.contains("simulated"));
         assert_eq!(fs::read(&destination).unwrap(), b"existing-production");
         assert!(!staged_path(&destination).unwrap().exists());
+        let spool_label = spool_label(&staged_path(&destination).unwrap());
+        let leaked = fs::read_dir(local_conversion_spool_root())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(&spool_label));
+        assert!(
+            !leaked,
+            "failed conversion must remove its local output spool"
+        );
         let _ = fs::remove_file(destination);
     }
 
@@ -835,6 +1063,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(&fs::read(&destination).unwrap()[2..4], &[43, 0]);
+        assert_lzw(&destination);
         assert_eq!(
             read_ascii_tag_bytes(&destination, 333, 26).unwrap(),
             b"Cyan\0Magenta\0Yellow\0Black\0"
