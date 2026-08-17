@@ -49,4 +49,8 @@ mod inverse_lut_artifact_tests;
 #[cfg(test)]
 mod inverse_lut_continuity_field_tests;
 #[cfg(test)]
+mod inverse_lut_continuity_path_validation_tests;
+#[cfg(test)]
+mod inverse_lut_continuity_sensitivity_tests;
+#[cfg(test)]
 mod tiff_conformance_tests;
