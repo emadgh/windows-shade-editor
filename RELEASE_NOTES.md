@@ -1,3 +1,11 @@
+# Shade Editor 0.21.5
+
+- Add an atomic bounded-memory TIFF/BigTIFF writer for CMYK and 5–12-channel conversion output at 8-bit or 16-bit precision.
+- Embed the exact target ICC and write standard `InkSet`, `InkNames`, `NumberOfInks`, DPI, orientation and output-topology tags.
+- Validate staged dimensions, bit depth, channel count, target ICC and ink topology before committing beside the destination through the existing atomic-replacement boundary.
+- Preserve an existing production destination when rendering or staged verification fails, and reject invalid or ambiguous channel names before writing.
+- Use uncompressed strips in the bounded callback path for now; LZW requires a local mmap/spool stage, while Photoshop Image Resources/DisplayInfo and real Photoshop/RIP acceptance remain pending validation work.
+
 # Shade Editor 0.21.4
 
 - Persist backward-safe `standalone`, `source` and `production` project roles in schema-v9 `.shade` files.

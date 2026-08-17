@@ -106,6 +106,23 @@ pub fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
     })
 }
 
+/// Atomically commit a fully written and validated staged file. The staged file
+/// must be beside the destination so the final rename cannot cross volumes.
+pub fn commit_staged_file(staged: &Path, destination: &Path) -> Result<(), String> {
+    if staged.parent() != destination.parent() {
+        return Err("Atomic commit requires the staged file beside its destination.".to_owned());
+    }
+    if !staged.is_file() {
+        return Err(format!("Staged file is missing: {}", staged.display()));
+    }
+    OpenOptions::new()
+        .write(true)
+        .open(staged)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| format!("Cannot sync staged file {}: {err}", staged.display()))?;
+    replace_path(staged, destination)
+}
+
 #[cfg(windows)]
 fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
     let source_wide = wide_path(source);
@@ -187,6 +204,22 @@ mod tests {
 
         assert_eq!(fs::read(&target).unwrap(), b"first-save");
         assert!(!backup.exists());
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn staged_file_commit_replaces_destination_atomically() {
+        let folder = temp_folder("staged-commit");
+        fs::create_dir_all(&folder).unwrap();
+        let destination = folder.join("output.tif");
+        let staged = folder.join("output.tif.conversion.tmp");
+        fs::write(&destination, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+
+        commit_staged_file(&staged, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(!staged.exists());
         let _ = fs::remove_dir_all(folder);
     }
 }

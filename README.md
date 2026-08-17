@@ -16,6 +16,7 @@ Shade Editor keeps source TIFF Faces immutable and stores non-destructive shade 
 - Per-Face **Production Source ICC assignment** is stored separately from preview settings, hash-verified, color-space checked and consumed by Color Conversion preflight without changing source pixels.
 - Production **Target Setup** validates Output ICC/DeviceLink class, exact profile identity, CMYK/5C–12C topology, authoritative channel order, output precision and a non-destructive TIFF destination before a recipe can become ready.
 - Schema-v9 projects can persist explicit Source/Production roles, reciprocal project links and exact per-Face conversion provenance; legacy projects remain Standalone by default.
+- The conversion backend can stage and verify bounded-memory 8/16-bit CMYK or 5C–12C TIFF/BigTIFF output with target ICC and standard ink-topology tags before an atomic destination commit. Its current strip path is uncompressed; Photoshop-specific spot metadata and real RIP acceptance are still validation gates.
 - True printer/RIP **Soft Proof** using an output-device ICC proofing transform; proof settings remain preview-only.
 - Hold the middle mouse button over the viewport for a cached original-source preview using only the TIFF embedded ICC; right mouse remains the current-color-management BEFORE preview.
 - Searchable installed Windows ICC/ICM profile list, keyboard navigation, rendering intent and optional black-point compensation.
@@ -110,6 +111,7 @@ src/
 ├─ model.rs             .shade schema and adjustment/project model
 ├─ color_management.rs  ICC preview transform and Windows ICC catalog
 ├─ tiff_io.rs           TIFF decode/channel/Photoshop metadata discovery
+├─ conversion_tiff.rs   Atomic CMYK/N-channel conversion TIFF writer
 ├─ render.rs            Non-destructive preview render pipeline
 ├─ export.rs            Full-resolution TIFF export
 ├─ validation.rs        Production round-trip validation

@@ -26,6 +26,7 @@ mod tests {
             "mod export_queue;",
             "mod tiff_inspect;",
             "mod color_management;",
+            "mod conversion_tiff;",
             "mod production_project;",
             "mod project_lifecycle;",
         ] {
