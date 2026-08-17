@@ -72,6 +72,10 @@ mod tests {
         assert!(COLOR_CONVERSION_UI.contains("Assign Production Source ICC"));
         assert!(COLOR_CONVERSION_UI.contains("production_source_profile"));
         assert!(COLOR_CONVERSION_UI.contains("inspect_production_source_profile"));
+        assert!(COLOR_CONVERSION_UI.contains("Continue to Target Setup"));
+        assert!(COLOR_CONVERSION_UI.contains("Select Output ICC"));
+        assert!(COLOR_CONVERSION_UI.contains("verify_production_target_profile"));
+        assert!(COLOR_CONVERSION_UI.contains("build_target_setup_review"));
         assert!(COLOR_CONVERSION_UI.contains("RGB source — not production separated"));
     }
 

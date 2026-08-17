@@ -180,7 +180,9 @@ mod tests {
                 .collect(),
             bit_depth: 16,
             output_profile_identity: None,
+            output_profile_path: None,
             device_link_identity: None,
+            device_link_path: None,
             characterization_id: Some("fixture".to_owned()),
             total_ink_limit: Some(1.5),
         }

@@ -103,6 +103,14 @@ An explicit assignment stores only the external profile path plus description/SH
 
 Production assignment is deliberately distinct from `PreviewColorSettings.assigned_profile_path`. Changing preview ICC, Soft Proof or monitor ICC cannot satisfy production preflight. Assigning, reassigning or clearing a production Source ICC marks the Source project dirty, so the saved-source gate captures the exact interpretation before conversion.
 
+### Production Target Setup
+
+After Source preflight is ready, Target Setup binds the conversion to one exact external Output ICC or DeviceLink plus its SHA-256 identity. Standard ICC mode accepts only Output/printer profiles. DeviceLink mode accepts only Link-class profiles and additionally verifies that the link input space matches the active RGB/CMYK Source Face.
+
+The currently executable production topology contract is CMYK or 5C–12C. Four-channel output must be the standard ICC CMYK space; an arbitrary generic four-color signature is not silently treated as CMYK. For CMYK, canonical Cyan/Magenta/Yellow/Black order is authoritative. For N-channel profiles, the ICC Colorant Table/Colorant Table Out order is authoritative when complete. If the profile lacks complete colorant names, Target Setup generates placeholders but blocks recipe readiness until the operator enters and explicitly confirms the real RIP/ink order.
+
+Target Setup also captures 8/16-bit output precision, rendering intent and BPC only when the selected engine supports those controls, and a TIFF-only destination. The current UI resolves collisions to a deterministic versioned filename by default or records explicit transactional-replacement intent. It never writes pixels itself. The conversion worker must re-open and hash-verify the target profile immediately before execution and must commit through the transactional output boundary.
+
 ## Decision 6 — Three explicit conversion engine modes
 
 Every production conversion records exactly one engine mode:

@@ -22,9 +22,9 @@ Implemented: printer/RIP proof-device transforms using a selected Output-class I
 
 ## Color Conversion scope
 
-Implemented foundations: Source/Production architecture contracts, saved-source gate, shared production preflight, separate per-Face Production Source ICC assignment, RGB→CMYK and CMYK→CMYK LittleCMS transforms, typed 5C–12C ICC transforms, capability/preset compatibility, constrained Black-focused candidate ranking, deterministic recipe identity, non-destructive output-path policy and PNG source decoding.
+Implemented foundations: Source/Production architecture contracts, saved-source gate, shared production preflight, separate per-Face Production Source ICC assignment, Output ICC/DeviceLink Target Setup with verified profile identity/topology/channel order, safe TIFF destination binding, RGB→CMYK and CMYK→CMYK LittleCMS transforms, typed 5C–12C ICC transforms, capability/preset compatibility, constrained Black-focused candidate ranking, deterministic recipe identity, non-destructive output-path policy and PNG source decoding.
 
-Next production path: target profile/DeviceLink selection, destination binding, transactional conversion worker, N-channel TIFF semantics/writer, Production project provenance and real Photoshop/RIP validation. Custom N-ink candidate generation remains blocked on characterized target data; channel display colors are not a device model.
+Next production path: transactional conversion worker, DeviceLink execution, N-channel TIFF semantics/writer, Production project provenance and real Photoshop/RIP validation. Reusable target presets and Custom N-ink candidate generation remain pending; the custom path is blocked on characterized target data because channel display colors are not a device model.
 
 ## Native Windows integration
 

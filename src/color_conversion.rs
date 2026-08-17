@@ -62,9 +62,16 @@ pub struct ConversionTargetDefinition {
     /// ICC output profile used by the normal output-transform path.
     #[serde(default)]
     pub output_profile_identity: Option<IccProfileIdentity>,
+    /// External ICC path used by the worker. The payload remains outside the
+    /// recipe and is verified against `output_profile_identity` before use.
+    #[serde(default)]
+    pub output_profile_path: Option<String>,
     /// DeviceLink profile used by a precomputed device-to-device separation path.
     #[serde(default)]
     pub device_link_identity: Option<IccProfileIdentity>,
+    /// External DeviceLink path, identity-verified before conversion.
+    #[serde(default)]
+    pub device_link_path: Option<String>,
     /// Versioned identifier for measured target characterization consumed by
     /// Shade Editor's future custom N-ink optimizer.
     #[serde(default)]
@@ -173,12 +180,22 @@ impl ConversionRecipe {
                             .to_owned(),
                     );
                 }
+                if !has_profile_path(self.target.output_profile_path.as_deref()) {
+                    errors.push(
+                        "ICC conversion requires the external target profile path.".to_owned(),
+                    );
+                }
             }
             ConversionEngineMode::DeviceLink => {
                 if !has_profile_hash(self.target.device_link_identity.as_ref()) {
                     errors.push(
                         "DeviceLink conversion requires a DeviceLink profile with a stable hash."
                             .to_owned(),
+                    );
+                }
+                if !has_profile_path(self.target.device_link_path.as_deref()) {
+                    errors.push(
+                        "DeviceLink conversion requires the external DeviceLink path.".to_owned(),
                     );
                 }
             }
@@ -300,6 +317,10 @@ fn has_profile_hash(identity: Option<&IccProfileIdentity>) -> bool {
     identity.is_some_and(|identity| !identity.sha256.trim().is_empty())
 }
 
+fn has_profile_path(path: Option<&str>) -> bool {
+    path.is_some_and(|path| !path.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,7 +346,9 @@ mod tests {
                 .collect(),
             bit_depth: 16,
             output_profile_identity: Some(profile("Ceramic 7C", "target-hash")),
+            output_profile_path: Some(r"C:\Color\Ceramic-7C.icc".to_owned()),
             device_link_identity: None,
+            device_link_path: None,
             characterization_id: Some("ceramic-7c-measurement-v1".to_owned()),
             total_ink_limit: Some(1.8),
         }
@@ -395,6 +418,24 @@ mod tests {
 
         let errors = recipe.validate().expect_err("duplicate channel must fail");
         assert!(errors.iter().any(|error| error.contains("Duplicate target channel")));
+    }
+
+    #[test]
+    fn icc_recipe_requires_identity_verified_external_target_path() {
+        let mut target = seven_channel_target();
+        target.output_profile_path = None;
+        let recipe = ConversionRecipe {
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::Icc,
+            source_profile_identity: profile("sRGB", "source-hash"),
+            target,
+            rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
+            black_point_compensation: true,
+            strategy: SeparationStrategy::default(),
+        };
+
+        let errors = recipe.validate().expect_err("target path must be reproducible");
+        assert!(errors.iter().any(|error| error.contains("external target profile path")));
     }
 
     #[test]

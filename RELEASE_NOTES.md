@@ -1,3 +1,12 @@
+# Shade Editor 0.21.3
+
+- Enable the Source-preflight transition into a dedicated production Target Setup stage.
+- Inspect and hash-verify Output ICC and DeviceLink profiles, including profile class, DeviceLink input compatibility and CMYK/5C–12C output topology.
+- Read authoritative N-channel names from ICC colorant tables and require explicit operator confirmation when the selected profile does not provide them.
+- Expose truthful ICC versus DeviceLink intent/BPC capabilities, 8/16-bit output precision and deterministic recipe review.
+- Wire safe TIFF destination selection, source-path rejection, versioned collision handling and explicit transactional-replacement intent without writing raster output yet.
+- Persist external target profile paths beside stable identities in deterministic recipes so the future worker can revalidate exact bytes before conversion.
+
 # Shade Editor 0.21.2
 
 - Add dedicated per-Face Production Source ICC assignment, reassign and clear actions to the Color Conversion preflight UI.
