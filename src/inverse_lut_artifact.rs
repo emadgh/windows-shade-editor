@@ -166,6 +166,12 @@ pub fn load_inverse_lut_artifact(path: &Path) -> Result<VerifiedInverseLutArtifa
         hasher.update(bytes);
         let value = f32::from_bits(u32::from_le_bytes(bytes));
         validate_stored_coverage(value, bytes, index)?;
+        let node_index = index / usize::from(header.channel_count);
+        if !validity[node_index] && value != 0.0 {
+            return Err(format!(
+                "Stored inverse LUT invalid node {node_index} contains non-zero coverage at value {index}."
+            ));
+        }
         coverages.push(value);
     }
 
@@ -214,6 +220,24 @@ fn prepare_header(
             "Inverse LUT coverage length mismatch: expected {coverage_values}, got {}.",
             coverages.len()
         ));
+    }
+    let channel_count_usize = usize::from(channel_count);
+    for (node_index, valid) in validity.iter().copied().enumerate() {
+        if valid {
+            continue;
+        }
+        let start = node_index * channel_count_usize;
+        for (channel_index, value) in coverages[start..start + channel_count_usize]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if value != 0.0 {
+                return Err(format!(
+                    "Inverse LUT invalid node {node_index} channel {channel_index} must store canonical zero coverage."
+                ));
+            }
+        }
     }
 
     let mut hasher = Sha256::new();

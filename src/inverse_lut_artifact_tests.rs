@@ -59,7 +59,12 @@ fn payload() -> (Vec<bool>, Vec<f32>) {
     let mut coverages = Vec::new();
     for node in 0..8 {
         for channel in 0..4 {
-            coverages.push(((node * 4 + channel) as f32 / 31.0).clamp(0.0, 1.0));
+            let value = if validity[node] {
+                ((node * 4 + channel) as f32 / 31.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            coverages.push(value);
         }
     }
     (validity, coverages)
@@ -195,6 +200,12 @@ fn lengths_non_finite_values_and_negative_zero_are_canonicalized_or_rejected() {
     assert!(write_inverse_lut_artifact(&path, &identity, &validity[..7], &coverages).is_err());
     coverages[0] = f32::NAN;
     assert!(write_inverse_lut_artifact(&path, &identity, &validity, &coverages).is_err());
+
+    let (_, mut invalid_node_payload) = payload();
+    invalid_node_payload[2 * 4] = 0.25;
+    assert!(
+        write_inverse_lut_artifact(&path, &identity, &validity, &invalid_node_payload).is_err()
+    );
 
     let (_, mut positive_zero) = payload();
     let mut negative_zero = positive_zero.clone();
