@@ -665,6 +665,75 @@ pub fn profile_identity(path: &Path) -> Result<IccProfileIdentity, String> {
     inspect_profile(path).map(|profile| profile.identity)
 }
 
+/// Inspect an embedded ICC for production source interpretation.
+///
+/// Unlike preview fallback behavior, production conversion requires a valid
+/// profile whose declared color space matches the source samples and whose
+/// bytes can be captured by a stable identity hash.
+pub fn production_embedded_profile_identity(
+    metadata: &TiffMetadata,
+) -> Result<Option<IccProfileIdentity>, String> {
+    let Some(bytes) = metadata.icc_profile.as_deref() else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Err("Embedded production Source ICC payload is empty.".to_owned());
+    }
+    let profile = Profile::new_icc(bytes)
+        .map_err(|err| format!("Cannot open embedded production Source ICC: {err}"))?;
+    let Some(expected) = expected_color_space(metadata.color_model) else {
+        return Err(format!(
+            "{} source data is not supported by production Source ICC assignment.",
+            metadata.color_model.title()
+        ));
+    };
+    if profile.color_space() != expected {
+        return Err(format!(
+            "Embedded Source ICC color space {} does not match source {}.",
+            color_space_label(profile.color_space()),
+            metadata.color_model.title()
+        ));
+    }
+    Ok(Some(IccProfileIdentity {
+        description: profile_description(&profile),
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+    }))
+}
+
+/// Reopen and verify an explicitly assigned production Source ICC.
+///
+/// The identity check detects replacement at the stored path. Assignment is an
+/// interpretation override only; this function never transforms source pixels.
+pub fn inspect_production_source_profile(
+    path: &Path,
+    expected_identity: &IccProfileIdentity,
+    source_model: ColorModel,
+) -> Result<InstalledIccProfile, String> {
+    let profile = inspect_profile(path)?;
+    if !profile.compatible_with(source_model) {
+        return Err(format!(
+            "Assigned production Source ICC '{}' declares {} but the source Face is {}.",
+            profile.description,
+            profile.color_space_label(),
+            source_model.title()
+        ));
+    }
+    if expected_identity.sha256.trim().is_empty() {
+        return Err(
+            "Assigned production Source ICC has no stored SHA-256 identity. Reassign the profile."
+                .to_owned(),
+        );
+    }
+    if !profile.matches_identity(expected_identity) {
+        return Err(format!(
+            "Assigned production Source ICC at {} no longer matches stored profile '{}'. Reassign or relink the profile before conversion.",
+            path.display(),
+            expected_identity.description
+        ));
+    }
+    Ok(profile)
+}
+
 fn verify_profile_identity(
     path: &Path,
     expected: Option<&IccProfileIdentity>,
@@ -723,6 +792,16 @@ pub fn relink_project_profiles(
         project.preview_color.proof_profile_identity.as_ref(),
         profiles,
     );
+    for face in &mut project.faces {
+        let Some(assignment) = face.production_source_profile.as_mut() else {
+            continue;
+        };
+        let mut stored_path = Some(assignment.path.clone());
+        if relink_path(&mut stored_path, Some(&assignment.identity), profiles) {
+            assignment.path = stored_path.unwrap_or_default();
+            changed = true;
+        }
+    }
     changed
 }
 
@@ -1109,6 +1188,75 @@ mod tests {
                 .unwrap();
         assert_eq!(resolved, moved);
         let _ = fs::remove_file(resolved);
+    }
+
+    #[test]
+    fn production_embedded_profile_requires_matching_source_space() {
+        let profile = Profile::new_srgb();
+        let bytes = profile.icc().unwrap();
+        let identity =
+            production_embedded_profile_identity(&metadata(ColorModel::Rgb, Some(bytes.clone())))
+                .unwrap()
+                .unwrap();
+        assert!(!identity.description.is_empty());
+        assert_eq!(identity.sha256.len(), 64);
+
+        let error = production_embedded_profile_identity(&metadata(ColorModel::Cmyk, Some(bytes)))
+            .unwrap_err();
+        assert!(error.contains("does not match source CMYK"));
+    }
+
+    #[test]
+    fn production_assignment_detects_replaced_profile_identity() {
+        let path = temp_profile("production-assignment");
+        let inspected = inspect_profile(&path).unwrap();
+        assert!(
+            inspect_production_source_profile(&path, inspected.identity(), ColorModel::Rgb,)
+                .is_ok()
+        );
+
+        let wrong_identity = IccProfileIdentity {
+            description: "Different profile".to_owned(),
+            sha256: "00".repeat(32),
+        };
+        let error =
+            inspect_production_source_profile(&path, &wrong_identity, ColorModel::Rgb).unwrap_err();
+        assert!(error.contains("no longer matches"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_assignment_relinks_by_identity_with_other_project_profiles() {
+        let original = temp_profile("production-relink-a");
+        let moved = original.with_file_name(format!(
+            "shade-production-relink-b-{}.icc",
+            std::process::id()
+        ));
+        fs::copy(&original, &moved).unwrap();
+        let identity = inspect_profile(&original).unwrap().identity().clone();
+        let moved_profile = inspect_profile(&moved).unwrap();
+        fs::remove_file(&original).unwrap();
+
+        let mut project = ShadeProject::default();
+        project.faces.push(crate::model::FaceRef {
+            path: "face.tif".to_owned(),
+            label: "Face 1".to_owned(),
+            status: crate::model::FaceStatus::Accepted,
+            production_source_profile: Some(crate::model::ProductionSourceProfileAssignment {
+                path: original.to_string_lossy().into_owned(),
+                identity,
+            }),
+        });
+
+        assert!(relink_project_profiles(&mut project, &[moved_profile]));
+        assert_eq!(
+            project.faces[0]
+                .production_source_profile
+                .as_ref()
+                .map(|assignment| assignment.path.as_str()),
+            moved.to_str()
+        );
+        let _ = fs::remove_file(moved);
     }
 
     #[test]

@@ -269,6 +269,7 @@ struct ShadeApp {
     show_settings: bool,
     settings_view: ui::settings_panel::SettingsViewState,
     color: ColorManagementController,
+    color_conversion: ui::color_conversion::ColorConversionUiState,
     show_about: bool,
     show_logs: bool,
     previous_shades: previous_shades::PreviousShadesStore,
@@ -362,6 +363,7 @@ impl ShadeApp {
             show_settings: false,
             settings_view: ui::settings_panel::SettingsViewState::default(),
             color: ColorManagementController::default(),
+            color_conversion: ui::color_conversion::ColorConversionUiState::default(),
             show_about: false,
             show_logs: false,
             previous_shades,
@@ -1910,6 +1912,7 @@ impl ShadeApp {
                         path: item.path.to_string_lossy().into_owned(),
                         label,
                         status: model::FaceStatus::Accepted,
+                        production_source_profile: None,
                     });
                     self.faces.push(Self::make_runtime_face(item));
                 }

@@ -91,6 +91,26 @@ saved adjusted source samples
 
 Monitor ICC, gamut-warning display settings and soft-proof-only state are forbidden inputs to deterministic conversion recipes.
 
+### Production Source ICC assignment
+
+The production source interpretation is resolved per Source Face with this precedence:
+
+1. an explicit `FaceRef.production_source_profile` assignment, when present;
+2. otherwise the valid embedded ICC carried by the source image;
+3. otherwise production conversion is blocked until an assignment is made.
+
+An explicit assignment stores only the external profile path plus description/SHA-256 identity. It is an interpretation override, not a pixel conversion, and ICC payload bytes are never embedded in `.shade`. Reopening preflight verifies that the file still exists, its bytes match the stored identity, and its declared color space matches the source Face. Missing, moved, replaced, corrupt or wrong-space profiles block conversion with an actionable assignment/relink error.
+
+Production assignment is deliberately distinct from `PreviewColorSettings.assigned_profile_path`. Changing preview ICC, Soft Proof or monitor ICC cannot satisfy production preflight. Assigning, reassigning or clearing a production Source ICC marks the Source project dirty, so the saved-source gate captures the exact interpretation before conversion.
+
+### Production Target Setup
+
+After Source preflight is ready, Target Setup binds the conversion to one exact external Output ICC or DeviceLink plus its SHA-256 identity. Standard ICC mode accepts only Output/printer profiles. DeviceLink mode accepts only Link-class profiles and additionally verifies that the link input space matches the active RGB/CMYK Source Face.
+
+The currently executable production topology contract is CMYK or 5C–12C. Four-channel output must be the standard ICC CMYK space; an arbitrary generic four-color signature is not silently treated as CMYK. For CMYK, canonical Cyan/Magenta/Yellow/Black order is authoritative. For N-channel profiles, the ICC Colorant Table/Colorant Table Out order is authoritative when complete. If the profile lacks complete colorant names, Target Setup generates placeholders but blocks recipe readiness until the operator enters and explicitly confirms the real RIP/ink order.
+
+Target Setup also captures 8/16-bit output precision, rendering intent and BPC only when the selected engine supports those controls, and a TIFF-only destination. The current UI resolves collisions to a deterministic versioned filename by default or records explicit transactional-replacement intent. It never writes pixels itself. The conversion worker must re-open and hash-verify the target profile immediately before execution and must commit through the transactional output boundary.
+
 ## Decision 6 — Three explicit conversion engine modes
 
 Every production conversion records exactly one engine mode:
@@ -204,6 +224,8 @@ It does **not** yet perform pixel conversion or write TIFFs. Those capabilities 
 `CONVERSION_RECIPE_SCHEMA_VERSION` is independent from the `.shade` schema version. Conversion recipes need their own semantic version boundary because optimizer/profile strategy semantics can change independently from the project container.
 
 When project role/provenance fields are eventually added to `ShadeProject`, they should be defaultable where backward-safe. A `.shade` schema bump is required if semantic compatibility cannot be preserved by defaults.
+
+Per-Face production Source ICC assignment was added to schema-v9 projects as a backward-safe optional `FaceRef` field with a Serde default. Legacy Face records deserialize with no assignment and continue to use embedded ICC preflight.
 
 ## Validation policy
 

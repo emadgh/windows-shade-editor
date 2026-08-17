@@ -20,6 +20,12 @@ Implemented now: embedded ICC preview, project-owned temporary ICC assignment, r
 
 Implemented: printer/RIP proof-device transforms using a selected Output-class ICC. Still deferred: monitor-profile output transforms and production-specific gamut-alarm UX. Validate proof appearance against the real RIP/printer workflow before treating the screen as a contractual press match.
 
+## Color Conversion scope
+
+Implemented foundations: Source/Production architecture contracts, saved-source gate, shared production preflight, separate per-Face Production Source ICC assignment, Output ICC/DeviceLink Target Setup with verified profile identity/topology/channel order, safe TIFF destination binding, RGB→CMYK and CMYK→CMYK LittleCMS transforms, typed 5C–12C ICC transforms, capability/preset compatibility, constrained Black-focused candidate ranking, deterministic recipe identity, non-destructive output-path policy and PNG source decoding.
+
+Next production path: transactional conversion worker, DeviceLink execution, N-channel TIFF semantics/writer, Production project provenance and real Photoshop/RIP validation. Reusable target presets and Custom N-ink candidate generation remain pending; the custom path is blocked on characterized target data because channel display colors are not a device model.
+
 ## Native Windows integration
 
 - Validate `.shade` thumbnail/property handler install, Explorer cache/indexing, file association, upgrade and removal on a clean workstation.
