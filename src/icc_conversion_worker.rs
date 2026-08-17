@@ -859,6 +859,7 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::AbsoluteColorimetric,
             black_point_compensation: true,
             strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
         };
         let transform = RuntimeProductionTransform::new(
             IccSourceModel::Cmyk,

@@ -26,6 +26,7 @@ mod tests {
     use crate::color_conversion::{
         ConversionEngineMode, ConversionRenderingIntent, ConversionTargetDefinition,
         SeparationStrategy, TargetChannelDefinition, CONVERSION_RECIPE_SCHEMA_VERSION,
+        LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION,
     };
     use crate::model::IccProfileIdentity;
 
@@ -77,6 +78,7 @@ mod tests {
                 total_ink_limit: Some(1.4),
                 max_delta_e00: Some(2.0),
             },
+            custom_optimizer_solver: Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default()),
         }
     }
 
@@ -111,4 +113,72 @@ mod tests {
         let hash = recipe_sha256(&recipe).unwrap();
         assert!(recipe_matches_hash(&recipe, &hash.to_uppercase()).unwrap());
     }
+
+    fn legacy_icc_recipe() -> ConversionRecipe {
+        let mut legacy = recipe();
+        legacy.schema_version = LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION;
+        legacy.engine_mode = ConversionEngineMode::Icc;
+        legacy.target.output_profile_identity = Some(identity("Legacy output", "legacy-output-hash"));
+        legacy.target.output_profile_path = Some(r"C:\Color\Legacy.icc".to_owned());
+        legacy.target.device_link_identity = None;
+        legacy.target.device_link_path = None;
+        legacy.custom_optimizer_solver = None;
+        legacy
+    }
+
+    #[test]
+    fn legacy_icc_json_round_trip_preserves_recipe_hash_and_omits_solver_field() {
+        let legacy = legacy_icc_recipe();
+        legacy.validate().expect("legacy ICC recipe remains valid");
+        let before = recipe_sha256(&legacy).unwrap();
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("custom_optimizer_solver"));
+        let restored: ConversionRecipe = serde_json::from_str(&json).unwrap();
+        restored.validate().expect("restored legacy ICC recipe remains valid");
+        assert_eq!(before, recipe_sha256(&restored).unwrap());
+    }
+
+    #[test]
+    fn legacy_custom_optimizer_deserializes_but_fails_closed_without_solver_provenance() {
+        let mut legacy = recipe();
+        legacy.schema_version = LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION;
+        legacy.custom_optimizer_solver = None;
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("custom_optimizer_solver"));
+        let restored: ConversionRecipe = serde_json::from_str(&json).unwrap();
+        let errors = restored.validate().expect_err("legacy optimizer must be recaptured");
+        assert!(errors.iter().any(|error| error.contains("solver provenance")));
+    }
+
+    #[test]
+    fn schema_v2_custom_optimizer_requires_explicit_solver_config() {
+        let mut missing = recipe();
+        missing.custom_optimizer_solver = None;
+        let errors = missing.validate().expect_err("schema-v2 optimizer needs solver config");
+        assert!(errors.iter().any(|error| error.contains("requires explicit solver")));
+    }
+
+    #[test]
+    fn solver_policy_change_changes_recipe_identity() {
+        let first = recipe();
+        let mut second = first.clone();
+        second
+            .custom_optimizer_solver
+            .as_mut()
+            .expect("custom optimizer config")
+            .initial_samples += 32;
+        assert_ne!(recipe_sha256(&first).unwrap(), recipe_sha256(&second).unwrap());
+    }
+
+    #[test]
+    fn icc_recipe_rejects_custom_optimizer_solver_state() {
+        let mut invalid = legacy_icc_recipe();
+        invalid.schema_version = CONVERSION_RECIPE_SCHEMA_VERSION;
+        invalid.custom_optimizer_solver = Some(
+            crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+        );
+        let errors = invalid.validate().expect_err("ICC must not carry optimizer solver state");
+        assert!(errors.iter().any(|error| error.contains("ICC recipes must not carry")));
+    }
+
 }

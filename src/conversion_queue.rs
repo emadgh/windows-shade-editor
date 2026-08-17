@@ -725,6 +725,7 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
             strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
         };
         ConversionJobCapture::capture(
             &ShadeProject::default(),
@@ -826,4 +827,25 @@ mod tests {
         assert!(commit_source_project_link(&captured, &completed).is_err());
         let _ = fs::remove_file(source_path);
     }
+
+    #[test]
+    fn legacy_icc_capture_round_trip_preserves_stored_recipe_hash() {
+        let mut original = capture(r"C:\Production\Legacy.tif");
+        original.conversion_recipe.schema_version =
+            crate::color_conversion::LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION;
+        original.conversion_recipe.custom_optimizer_solver = None;
+        original.conversion_recipe_sha256 =
+            crate::conversion_recipe::recipe_sha256(&original.conversion_recipe).unwrap();
+        original.validate().expect("legacy ICC capture is valid");
+        let expected = original.conversion_recipe_sha256.clone();
+        let json = serde_json::to_vec(&original).unwrap();
+        let restored: ConversionJobCapture = serde_json::from_slice(&json).unwrap();
+        restored.validate().expect("restored legacy ICC capture is valid");
+        assert_eq!(restored.conversion_recipe_sha256, expected);
+        assert_eq!(
+            crate::conversion_recipe::recipe_sha256(&restored.conversion_recipe).unwrap(),
+            expected
+        );
+    }
+
 }

@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::custom_optimizer_config::CustomOptimizerSolverConfig;
 use crate::model::IccProfileIdentity;
 
-pub const CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 1;
+pub const LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 1;
+pub const CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 2;
 
 /// Project role for the source/production derivation workflow.
 ///
@@ -142,6 +144,11 @@ pub struct ConversionRecipe {
     pub black_point_compensation: bool,
     #[serde(default)]
     pub strategy: SeparationStrategy,
+    /// Exact Custom Optimizer search method and numerical policy. Omitted
+    /// for ICC/DeviceLink so legacy non-optimizer JSON remains byte-stable
+    /// after deserialize/serialize round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_optimizer_solver: Option<CustomOptimizerSolverConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,10 +172,15 @@ impl ConversionRecipe {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        if self.schema_version != CONVERSION_RECIPE_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION | CONVERSION_RECIPE_SCHEMA_VERSION
+        ) {
             errors.push(format!(
-                "Unsupported conversion recipe schema {} (expected {}).",
-                self.schema_version, CONVERSION_RECIPE_SCHEMA_VERSION
+                "Unsupported conversion recipe schema {} (supported: {} and {}).",
+                self.schema_version,
+                LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION,
+                CONVERSION_RECIPE_SCHEMA_VERSION
             ));
         }
         if self.source_profile_identity.sha256.trim().is_empty() {
@@ -180,6 +192,12 @@ impl ConversionRecipe {
 
         match self.engine_mode {
             ConversionEngineMode::Icc => {
+                if self.custom_optimizer_solver.is_some() {
+                    errors.push(
+                        "ICC recipes must not carry Custom Optimizer solver configuration."
+                            .to_owned(),
+                    );
+                }
                 if !has_profile_hash(self.target.output_profile_identity.as_ref()) {
                     errors.push(
                         "ICC conversion requires a target output profile with a stable hash."
@@ -193,6 +211,12 @@ impl ConversionRecipe {
                 }
             }
             ConversionEngineMode::DeviceLink => {
+                if self.custom_optimizer_solver.is_some() {
+                    errors.push(
+                        "DeviceLink recipes must not carry Custom Optimizer solver configuration."
+                            .to_owned(),
+                    );
+                }
                 if !has_profile_hash(self.target.device_link_identity.as_ref()) {
                     errors.push(
                         "DeviceLink conversion requires a DeviceLink profile with a stable hash."
@@ -216,6 +240,26 @@ impl ConversionRecipe {
                         "Custom N-ink optimization requires a versioned target characterization."
                             .to_owned(),
                     );
+                }
+                if self.schema_version == LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION {
+                    errors.push(
+                        "Legacy Custom Optimizer recipe schema 1 has no solver provenance; recapture it as schema 2 before production execution."
+                            .to_owned(),
+                    );
+                }
+                match self.custom_optimizer_solver.as_ref() {
+                    Some(config) => {
+                        if let Err(config_errors) = config.validate(self.target.channels.len()) {
+                            errors.extend(config_errors);
+                        }
+                    }
+                    None if self.schema_version == CONVERSION_RECIPE_SCHEMA_VERSION => {
+                        errors.push(
+                            "Custom Optimizer recipe schema 2 requires explicit solver method/configuration."
+                                .to_owned(),
+                        );
+                    }
+                    None => {}
                 }
             }
         }
@@ -395,6 +439,7 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
             strategy,
+            custom_optimizer_solver: Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default()),
         };
 
         assert!(recipe.validate().is_ok());
@@ -420,6 +465,7 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::Perceptual,
             black_point_compensation: false,
             strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
         };
 
         let errors = recipe.validate().expect_err("duplicate channel must fail");
@@ -438,6 +484,7 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
             strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
         };
 
         let errors = recipe.validate().expect_err("target path must be reproducible");
@@ -456,6 +503,7 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::Perceptual,
             black_point_compensation: false,
             strategy,
+            custom_optimizer_solver: None,
         };
 
         let errors = recipe.validate().expect_err("unknown ink bias must fail");
@@ -474,6 +522,7 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::Perceptual,
             black_point_compensation: false,
             strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default()),
         };
 
         let errors = recipe

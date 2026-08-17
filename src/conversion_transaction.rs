@@ -456,6 +456,7 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
             strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
         }
     }
 

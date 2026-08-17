@@ -154,6 +154,7 @@ mod tests {
                 rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
                 black_point_compensation: true,
                 strategy: SeparationStrategy::default(),
+                custom_optimizer_solver: None,
             },
             output_path: output.display().to_string(),
             output_sha256: "output-hash".to_owned(),

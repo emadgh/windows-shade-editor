@@ -12,6 +12,7 @@ pub mod conversion_recipe;
 pub mod conversion_tiff;
 pub mod conversion_transaction;
 pub mod conversion_workflow;
+pub mod custom_optimizer_config;
 pub mod device_characterization;
 pub mod device_characterization_model;
 pub mod device_characterization_package;
