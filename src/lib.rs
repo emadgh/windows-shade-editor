@@ -19,6 +19,7 @@ pub mod devicelink_conversion;
 pub mod export_recipe;
 pub mod icc_conversion;
 pub mod icc_conversion_worker;
+pub mod inverse_separation_solver;
 pub mod nchannel_icc;
 #[path = "dpi.rs"]
 pub mod dpi;
