@@ -1,0 +1,55 @@
+name: Sync preset Cargo.lock
+
+on:
+  push:
+    branches:
+      - codex/color-conversion-presets-current
+
+permissions:
+  contents: write
+
+jobs:
+  sync-lock:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/color-conversion-presets-current
+          persist-credentials: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Let Cargo regenerate only the root package version
+        shell: pwsh
+        run: cargo check
+
+      - name: Verify Cargo.lock diff is version-only
+        shell: pwsh
+        run: |
+          $patch = @(git diff --unified=0 -- Cargo.lock)
+          $removed = @($patch | Where-Object { $_ -eq '-version = "0.21.13"' }).Count
+          $added = @($patch | Where-Object { $_ -eq '+version = "0.21.14"' }).Count
+          $other = @($patch | Where-Object {
+            ($_ -match '^[+-]') -and
+            ($_ -notmatch '^--- ') -and
+            ($_ -notmatch '^\+\+\+ ') -and
+            ($_ -ne '-version = "0.21.13"') -and
+            ($_ -ne '+version = "0.21.14"')
+          })
+          if ($removed -ne 1 -or $added -ne 1 -or $other.Count -ne 0) {
+            Write-Host ($patch -join "`n")
+            throw "Cargo.lock changed beyond the expected root package version bump."
+          }
+
+      - name: Commit regenerated Cargo.lock
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          if (git diff --cached --quiet) {
+            throw "Cargo did not update Cargo.lock."
+          }
+          git commit -m "chore(version): regenerate Cargo.lock for 0.21.14"
+          git push origin HEAD:codex/color-conversion-presets-current
