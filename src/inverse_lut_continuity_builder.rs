@@ -2,8 +2,8 @@ use crate::color_conversion::{ConversionTargetDefinition, SeparationStrategy};
 use crate::custom_optimizer_config::{CustomOptimizerSolverConfig, CustomOptimizerSolverMethod};
 use crate::device_characterization::{DeviceForwardModel, LabColor};
 use crate::inverse_lut_continuity_field::{
-    ContinuityFieldNode, JacobiFieldResult, JacobiGridShape, JacobiSixNeighborPolicy,
-    JACOBI_SIX_NEIGHBOR_POLICY_SCHEMA_VERSION, build_jacobi_six_neighbor_field,
+    ContinuityFieldNode, JACOBI_SIX_NEIGHBOR_POLICY_SCHEMA_VERSION, JacobiFieldResult,
+    JacobiGridShape, JacobiSixNeighborPolicy, build_jacobi_six_neighbor_field,
 };
 use crate::inverse_lut_identity::{
     InverseLutContinuityFieldMethod, InverseLutContinuitySeedMethod, LabGridSpec,
@@ -51,17 +51,18 @@ pub enum JacobiContinuityBuildError {
 pub fn lab_grid_points(
     grid: LabGridSpec,
 ) -> Result<(JacobiGridShape, Vec<LabColor>), JacobiContinuityBuildError> {
-    grid.validate().map_err(JacobiContinuityBuildError::InvalidGrid)?;
+    grid.validate()
+        .map_err(JacobiContinuityBuildError::InvalidGrid)?;
     let shape = JacobiGridShape {
         l: usize::from(grid.l_samples),
         a: usize::from(grid.a_samples),
         b: usize::from(grid.b_samples),
     };
-    let node_count = shape
-        .node_count()
-        .ok_or_else(|| JacobiContinuityBuildError::InvalidGrid(vec![
+    let node_count = shape.node_count().ok_or_else(|| {
+        JacobiContinuityBuildError::InvalidGrid(vec![
             "Jacobi Lab grid node count overflowed usize.".to_owned(),
-        ]))?;
+        ])
+    })?;
     let mut points = Vec::with_capacity(node_count);
     for l_index in 0..shape.l {
         let l = sample_axis(grid.l_min, grid.l_max, l_index, shape.l);
@@ -98,7 +99,8 @@ pub fn build_positive_v2_jacobi_field(
     solver_config: CustomOptimizerSolverConfig,
     field_method: InverseLutContinuityFieldMethod,
 ) -> Result<BuiltJacobiContinuityField, JacobiContinuityBuildError> {
-    grid.validate().map_err(JacobiContinuityBuildError::InvalidGrid)?;
+    grid.validate()
+        .map_err(JacobiContinuityBuildError::InvalidGrid)?;
     field_method
         .validate_for_grid(&grid)
         .map_err(JacobiContinuityBuildError::InvalidFieldPolicy)?;
@@ -123,7 +125,10 @@ pub fn build_positive_v2_jacobi_field(
     }
     let continuity = match (solver_config.method, solver_config.continuity_preference) {
         (CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2, Some(policy))
-            if policy.weight > 0.0 => policy,
+            if policy.weight > 0.0 =>
+        {
+            policy
+        }
         _ => return Err(JacobiContinuityBuildError::RequiresPositiveContinuityV2),
     };
     debug_assert!(continuity.weight > 0.0);
@@ -143,14 +148,7 @@ pub fn build_positive_v2_jacobi_field(
     };
 
     for (index, lab) in labs.iter().copied().enumerate() {
-        match solve_inverse_separation(
-            target,
-            strategy,
-            weights,
-            model,
-            lab,
-            seed_config,
-        ) {
+        match solve_inverse_separation(target, strategy, weights, model, lab, seed_config) {
             Ok(result) => {
                 initial.push(ContinuityFieldNode::valid(result.candidate.coverages));
                 stats.seed_supported_nodes = stats
@@ -226,9 +224,7 @@ fn sample_axis(minimum: f64, maximum: f64, index: usize, samples: usize) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_optimizer_config::{
-        ContinuityDistanceMetric, ContinuityPreferenceConfig,
-    };
+    use crate::custom_optimizer_config::{ContinuityDistanceMetric, ContinuityPreferenceConfig};
     use crate::inverse_lut_identity::{
         INVERSE_LUT_JACOBI_FIELD_METHOD_MAX_ITERATIONS, InverseLutContinuityFieldMethod,
         InverseLutContinuitySeedMethod,
@@ -253,11 +249,46 @@ mod tests {
         let (shape, points) = lab_grid_points(grid()).unwrap();
         assert_eq!(shape, JacobiGridShape { l: 3, a: 2, b: 2 });
         assert_eq!(points.len(), 12);
-        assert_eq!(points[0], LabColor { l: 0.0, a: -1.0, b: -2.0 });
-        assert_eq!(points[1], LabColor { l: 0.0, a: -1.0, b: 2.0 });
-        assert_eq!(points[2], LabColor { l: 0.0, a: 1.0, b: -2.0 });
-        assert_eq!(points[4], LabColor { l: 50.0, a: -1.0, b: -2.0 });
-        assert_eq!(points[11], LabColor { l: 100.0, a: 1.0, b: 2.0 });
+        assert_eq!(
+            points[0],
+            LabColor {
+                l: 0.0,
+                a: -1.0,
+                b: -2.0
+            }
+        );
+        assert_eq!(
+            points[1],
+            LabColor {
+                l: 0.0,
+                a: -1.0,
+                b: 2.0
+            }
+        );
+        assert_eq!(
+            points[2],
+            LabColor {
+                l: 0.0,
+                a: 1.0,
+                b: -2.0
+            }
+        );
+        assert_eq!(
+            points[4],
+            LabColor {
+                l: 50.0,
+                a: -1.0,
+                b: -2.0
+            }
+        );
+        assert_eq!(
+            points[11],
+            LabColor {
+                l: 100.0,
+                a: 1.0,
+                b: 2.0
+            }
+        );
     }
 
     #[test]
@@ -279,7 +310,10 @@ mod tests {
             ..CustomOptimizerSolverConfig::default()
         };
         let seed = independent_seed_config(source);
-        assert_eq!(seed.method, CustomOptimizerSolverMethod::BoundedHaltonBeamV1);
+        assert_eq!(
+            seed.method,
+            CustomOptimizerSolverMethod::BoundedHaltonBeamV1
+        );
         assert_eq!(seed.continuity_preference, None);
         assert_eq!(seed.initial_samples, source.initial_samples);
         assert_eq!(seed.beam_width, source.beam_width);

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const JACOBI_SIX_NEIGHBOR_POLICY_SCHEMA_VERSION: u32 = 1;
-pub const MAX_JACOBI_ITERATIONS: u16 = 64;
+pub const MAX_JACOBI_ITERATIONS: u16 =
+    crate::inverse_lut_identity::INVERSE_LUT_JACOBI_FIELD_METHOD_MAX_ITERATIONS;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
