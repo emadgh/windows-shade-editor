@@ -472,7 +472,7 @@ impl ShadeApp {
             TransitionRequest::BlockedByExportQueue => {
                 self.export.show_queue = true;
                 self.report_info(
-                    "Finish or cancel the active Export/Conversion Queue before changing projects or exiting.",
+                    "Finish or cancel the active Export/Conversion Queue before exiting Shade Editor.",
                 );
             }
             TransitionRequest::AwaitingConfirmation => {}
