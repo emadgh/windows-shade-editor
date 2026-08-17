@@ -1422,7 +1422,7 @@ dependencies = [
 name = "num_enum"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+checksum = "5d0bca838442ec1e132ff6bf4bdac1c944a3fcdc1cae65f70a4a2a1ac3b401d2d1f"
 dependencies = [
  "num_enum_derive",
  "rustversion",
@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "windows-shade-editor"
-version = "0.21.11"
+version = "0.21.12"
 dependencies = [
  "base64",
  "chrono",
