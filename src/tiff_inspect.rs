@@ -12,7 +12,6 @@ use crate::tiff_io::{self, ChunkStorage};
 const MAX_INSPECTED_IFDS: usize = 1024;
 const MAX_PHOTOSHOP_RESOURCE_ENTRIES: usize = 512;
 const TIFF_TAG_INK_SET: Tag = Tag::Unknown(332);
-const TIFF_TAG_INK_NAMES: Tag = Tag::Unknown(333);
 const TIFF_TAG_NUMBER_OF_INKS: Tag = Tag::Unknown(334);
 
 #[derive(Clone, Debug)]
@@ -42,11 +41,7 @@ pub fn inspect(path: &Path, default_dpi: f64) -> Result<TiffInspection, String> 
     let tile_length = tag_u64(&mut decoder, Tag::TileLength);
     let ink_set = tag_u16(&mut decoder, TIFF_TAG_INK_SET);
     let number_of_inks = tag_u64(&mut decoder, TIFF_TAG_NUMBER_OF_INKS);
-    let ink_names = decoder
-        .get_tag_ascii_string(TIFF_TAG_INK_NAMES)
-        .ok()
-        .map(parse_ink_names)
-        .unwrap_or_default();
+    let ink_names = tiff_io::declared_ink_names(path)?;
     let extra_samples = tag_u64_vec(&mut decoder, Tag::ExtraSamples)
         .into_iter()
         .map(|value| value as u16)
@@ -139,6 +134,19 @@ pub fn inspect(path: &Path, default_dpi: f64) -> Result<TiffInspection, String> 
     line!("SamplesPerPixel: {}", metadata.samples_per_pixel);
     line!("Base color model: {}", metadata.color_model.title());
     line!("Base channel count: {}", metadata.base_channel_count);
+    if photometric == Some(5) {
+        line!(
+            "Separated representation: {}",
+            if metadata.non_cmyk_separated {
+                format!(
+                    "Non-CMYK N-ink ({} direct-coverage base inks)",
+                    metadata.base_channel_count
+                )
+            } else {
+                "CMYK process base".to_owned()
+            }
+        );
+    }
     line!(
         "ExtraSamples: {}",
         if extra_samples.is_empty() {
@@ -322,15 +330,6 @@ fn count_ifds(path: &Path) -> Result<usize, String> {
         count += 1;
     }
     Ok(count)
-}
-
-fn parse_ink_names(value: String) -> Vec<String> {
-    value
-        .split('\0')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -600,6 +599,7 @@ fn format_bytes(bytes: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversion_tiff::{ConversionTiffSpec, write_conversion_tiff_u8_atomic};
 
     #[test]
     fn common_tag_labels_are_human_readable() {
@@ -624,10 +624,40 @@ mod tests {
     }
 
     #[test]
-    fn ink_names_split_nul_separated_values() {
-        assert_eq!(
-            parse_ink_names("Cyan\0Spot Red\0".into()),
-            vec!["Cyan", "Spot Red"]
-        );
+    fn inspector_reports_true_non_cmyk_n_ink_representation() {
+        let path = std::env::temp_dir().join(format!(
+            "shade-inspect-nink-{}-{}.tif",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let names = ["Blue", "Brown", "Beige", "Black", "Yellow"].map(str::to_owned);
+        let spec = ConversionTiffSpec {
+            width: 1,
+            height: 1,
+            channel_names: &names,
+            target_icc: None,
+            dpi_x: 220.0,
+            dpi_y: 220.0,
+            orientation: Some(1),
+            rows_per_strip: 1,
+            force_bigtiff: false,
+            replace_existing: true,
+        };
+        write_conversion_tiff_u8_atomic(&path, &spec, |_, _, samples| {
+            samples.copy_from_slice(&[1, 2, 3, 4, 5]);
+            Ok(())
+        })
+        .unwrap();
+
+        let report = inspect(&path, 220.0).unwrap().report;
+        assert!(report.contains("Base color model: Multichannel"));
+        assert!(report.contains("Base channel count: 5"));
+        assert!(report.contains("Non-CMYK N-ink (5 direct-coverage base inks)"));
+        assert!(report.contains("InkNames: Blue | Brown | Beige | Black | Yellow"));
+        assert!(report.contains("ExtraSamples: None"));
+        let _ = fs::remove_file(path);
     }
 }

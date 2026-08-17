@@ -1362,6 +1362,7 @@ mod streaming_tests {
             samples_per_pixel: names.len(),
             base_channel_count,
             color_model: ColorModel::Cmyk,
+            non_cmyk_separated: false,
             channel_names: names.to_vec(),
             channel_display_info,
             compression: None,

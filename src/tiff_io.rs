@@ -52,6 +52,10 @@ pub struct TiffMetadata {
     pub samples_per_pixel: usize,
     pub base_channel_count: usize,
     pub color_model: ColorModel,
+    /// True only for a validated Photometric=Separated, InkSet=2 declaration
+    /// where every sample is a direct-coverage device ink rather than a
+    /// CMYK base or Photoshop Spot/alpha ExtraSample.
+    pub non_cmyk_separated: bool,
     pub channel_names: Vec<String>,
     /// Per-channel Photoshop display metadata. Base channels normally contain
     /// None; extra channels may contain Spot/Alpha DisplayInfo resource 1077.
@@ -292,11 +296,14 @@ fn open_multiband_decoder(path: &Path) -> Result<Decoder<PatchedReader<BufReader
 }
 
 pub fn decode_full(path: &Path) -> Result<DecodedImage, String> {
+    let declared_ink_names = declared_ink_names(path)?;
     let mut metadata_decoder = open_decoder(path)?;
-    let (metadata, planar_configuration) = read_metadata(&mut metadata_decoder)?;
+    let (metadata, planar_configuration) =
+        read_metadata(&mut metadata_decoder, &declared_ink_names)?;
 
-    let needs_multiband_workaround = metadata.samples_per_pixel > metadata.base_channel_count
-        && matches!(metadata.color_model, ColorModel::Rgb | ColorModel::Cmyk);
+    let needs_multiband_workaround = (metadata.samples_per_pixel > metadata.base_channel_count
+        && matches!(metadata.color_model, ColorModel::Rgb | ColorModel::Cmyk))
+        || metadata.non_cmyk_separated;
 
     let samples = if needs_multiband_workaround {
         // Do not let image-tiff's RGB/CMYK readout discard Photoshop spot
@@ -368,8 +375,9 @@ fn decode_samples<R: Read + Seek>(
 }
 
 pub fn stream_info(path: &Path) -> Result<StreamInfo, String> {
+    let declared_ink_names = declared_ink_names(path)?;
     let mut decoder = open_decoder(path)?;
-    let (metadata, planar_configuration) = read_metadata(&mut decoder)?;
+    let (metadata, planar_configuration) = read_metadata(&mut decoder, &declared_ink_names)?;
     let tagged_rows_per_strip = decoder
         .find_tag_unsigned::<u32>(Tag::RowsPerStrip)
         .ok()
@@ -492,12 +500,13 @@ where
         return Ok(());
     }
 
-    let needs_multiband_workaround = info.metadata.samples_per_pixel
+    let needs_multiband_workaround = (info.metadata.samples_per_pixel
         > info.metadata.base_channel_count
         && matches!(
             info.metadata.color_model,
             ColorModel::Rgb | ColorModel::Cmyk
-        );
+        ))
+        || info.metadata.non_cmyk_separated;
     if needs_multiband_workaround {
         let decoder = open_multiband_decoder(path)?;
         stream_decoder_regions(decoder, info, &mut callback)
@@ -742,36 +751,89 @@ pub fn load_preview(path: &Path, max_dimension: u32) -> Result<PreviewFace, Stri
     })
 }
 
-fn read_metadata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(TiffMetadata, u16), String> {
+fn read_metadata<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
+    declared_ink_names: &[String],
+) -> Result<(TiffMetadata, u16), String> {
     let (width, height) = decoder
         .dimensions()
         .map_err(|err| format!("Cannot read TIFF dimensions: {err}"))?;
-    let color_type = decoder
-        .colortype()
-        .map_err(|err| format!("Cannot read TIFF color type: {err}"))?;
+    let tagged_samples_per_pixel = decoder
+        .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)
+        .map_err(|err| format!("Cannot read TIFF SamplesPerPixel: {err}"))?
+        .map(usize::from);
+    let photometric = decoder
+        .find_tag_unsigned::<u16>(Tag::PhotometricInterpretation)
+        .ok()
+        .flatten();
+    let ink_set = decoder
+        .find_tag_unsigned::<u16>(Tag::Unknown(332))
+        .ok()
+        .flatten();
+    let number_of_inks = decoder
+        .find_tag_unsigned::<u16>(Tag::Unknown(334))
+        .ok()
+        .flatten()
+        .map(usize::from);
+    let extra_samples = decoder
+        .find_tag_unsigned_vec::<u16>(Tag::ExtraSamples)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let nchannel_candidate = photometric == Some(5) && ink_set == Some(2);
+    let color_type = if nchannel_candidate {
+        let samples = tagged_samples_per_pixel
+            .ok_or_else(|| "Non-CMYK Separated TIFF must declare SamplesPerPixel.".to_owned())?;
+        let bits = decoder
+            .find_tag_unsigned_vec::<u16>(Tag::BitsPerSample)
+            .map_err(|err| format!("Cannot read TIFF BitsPerSample: {err}"))?
+            .ok_or_else(|| "Non-CMYK Separated TIFF must declare BitsPerSample.".to_owned())?;
+        let bit_depth = bits
+            .first()
+            .copied()
+            .ok_or_else(|| "Non-CMYK Separated TIFF has an empty BitsPerSample tag.".to_owned())?;
+        if bits.len() != samples || bits.iter().any(|value| *value != bit_depth) {
+            return Err(
+                "Non-CMYK Separated TIFF must declare one consistent BitsPerSample value per ink."
+                    .to_owned(),
+            );
+        }
+        ColorType::Multiband {
+            bit_depth: u8::try_from(bit_depth)
+                .map_err(|_| "TIFF bit depth is too large.".to_owned())?,
+            num_samples: u16::try_from(samples)
+                .map_err(|_| "TIFF channel count is too large.".to_owned())?,
+        }
+    } else {
+        decoder
+            .colortype()
+            .map_err(|err| format!("Cannot read TIFF color type: {err}"))?
+    };
     let bit_depth = color_type.bit_depth();
     if !matches!(bit_depth, 8 | 16) {
         return Err(format!(
             "Shade Editor currently supports 8-bit and 16-bit TIFF only; file is {bit_depth}-bit."
         ));
     }
-
-    let samples_per_pixel = decoder
-        .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)
-        .map_err(|err| format!("Cannot read TIFF SamplesPerPixel: {err}"))?
-        .map(usize::from)
-        .unwrap_or_else(|| usize::from(color_type.num_samples()));
+    let samples_per_pixel =
+        tagged_samples_per_pixel.unwrap_or_else(|| usize::from(color_type.num_samples()));
     if samples_per_pixel == 0 || samples_per_pixel > 56 {
         return Err(format!(
             "Unsupported TIFF channel count: {samples_per_pixel}."
         ));
     }
-
-    let photometric = decoder
-        .find_tag_unsigned::<u16>(Tag::PhotometricInterpretation)
-        .ok()
-        .flatten();
-    let (color_model, base_channel_count) = infer_color_model(&color_type, photometric);
+    let declared_nchannel = validate_nchannel_separated_declaration(
+        photometric,
+        samples_per_pixel,
+        ink_set,
+        number_of_inks,
+        declared_ink_names,
+        &extra_samples,
+    )?;
+    let non_cmyk_separated = declared_nchannel.is_some();
+    let (color_model, base_channel_count) = declared_nchannel
+        .map(|count| (ColorModel::Other, count))
+        .unwrap_or_else(|| infer_color_model(&color_type, photometric));
     if samples_per_pixel < base_channel_count {
         return Err(format!(
             "TIFF SamplesPerPixel ({samples_per_pixel}) is smaller than its {} base channel count ({base_channel_count}).",
@@ -809,6 +871,7 @@ fn read_metadata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(TiffMetada
         color_model,
         base_channel_count,
         samples_per_pixel,
+        declared_ink_names,
         photoshop_resources.as_deref(),
     );
     let channel_display_info = photoshop_resources
@@ -826,6 +889,7 @@ fn read_metadata<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<(TiffMetada
             samples_per_pixel,
             base_channel_count,
             color_model,
+            non_cmyk_separated,
             channel_names,
             channel_display_info,
             compression,
@@ -857,10 +921,182 @@ fn infer_color_model(color_type: &ColorType, photometric: Option<u16>) -> (Color
     }
 }
 
+fn validate_nchannel_separated_declaration(
+    photometric: Option<u16>,
+    samples_per_pixel: usize,
+    ink_set: Option<u16>,
+    number_of_inks: Option<usize>,
+    ink_names: &[String],
+    extra_samples: &[u16],
+) -> Result<Option<usize>, String> {
+    if photometric != Some(5) || ink_set != Some(2) {
+        return Ok(None);
+    }
+    let number_of_inks = number_of_inks.ok_or_else(|| {
+        "Non-CMYK Separated TIFF must declare NumberOfInks when InkSet=2.".to_owned()
+    })?;
+    if number_of_inks != samples_per_pixel {
+        return Err(format!(
+            "Non-CMYK Separated TIFF declares NumberOfInks={number_of_inks} but SamplesPerPixel={samples_per_pixel}."
+        ));
+    }
+    if !extra_samples.is_empty() {
+        return Err(
+            "Non-CMYK Separated TIFF must store every declared ink as a base sample, not ExtraSamples."
+                .to_owned(),
+        );
+    }
+    if ink_names.len() != number_of_inks {
+        return Err(format!(
+            "Non-CMYK Separated TIFF declares {number_of_inks} inks but InkNames contains {} names.",
+            ink_names.len()
+        ));
+    }
+    Ok(Some(number_of_inks))
+}
+
 fn locate_photometric_patch(path: &Path) -> Result<PhotometricPatch, String> {
     let file = File::open(path).map_err(|err| format!("Cannot inspect TIFF IFD: {err}"))?;
     let mut reader = BufReader::new(file);
     locate_photometric_patch_in(&mut reader)
+}
+
+pub(crate) fn declared_ink_names(path: &Path) -> Result<Vec<String>, String> {
+    let Some(bytes) = read_raw_ascii_tag(path, 333)? else {
+        return Ok(Vec::new());
+    };
+    if bytes.is_empty() || !bytes.ends_with(&[0]) || !bytes.is_ascii() {
+        return Err("TIFF InkNames must be non-empty NUL-terminated ASCII.".to_owned());
+    }
+    let names = bytes[..bytes.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|name| {
+            std::str::from_utf8(name)
+                .map(str::trim)
+                .map(str::to_owned)
+                .map_err(|_| "TIFF InkNames contains invalid ASCII.".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if names.iter().any(String::is_empty) {
+        return Err("TIFF InkNames contains an empty ink name.".to_owned());
+    }
+    Ok(names)
+}
+
+fn read_raw_ascii_tag(path: &Path, wanted_tag: u16) -> Result<Option<Vec<u8>>, String> {
+    let mut file = File::open(path).map_err(|err| format!("Cannot inspect TIFF tags: {err}"))?;
+    let mut signature = [0u8; 4];
+    file.read_exact(&mut signature)
+        .map_err(|err| format!("Cannot read TIFF header: {err}"))?;
+    let endian = match &signature[..2] {
+        b"II" => TiffEndian::Little,
+        b"MM" => TiffEndian::Big,
+        _ => return Err("Invalid TIFF byte-order signature.".to_owned()),
+    };
+    let magic = endian.u16([signature[2], signature[3]]);
+    let (first_ifd, big_tiff) = match magic {
+        42 => {
+            let mut offset = [0u8; 4];
+            file.read_exact(&mut offset)
+                .map_err(|err| format!("Cannot read TIFF first IFD offset: {err}"))?;
+            (u64::from(endian.u32(offset)), false)
+        }
+        43 => {
+            let mut rest = [0u8; 12];
+            file.read_exact(&mut rest)
+                .map_err(|err| format!("Cannot read BigTIFF header: {err}"))?;
+            if endian.u16([rest[0], rest[1]]) != 8 || endian.u16([rest[2], rest[3]]) != 0 {
+                return Err("Unsupported BigTIFF header layout.".to_owned());
+            }
+            let mut offset = [0u8; 8];
+            offset.copy_from_slice(&rest[4..12]);
+            (endian.u64(offset), true)
+        }
+        _ => return Err(format!("Unexpected TIFF magic value {magic}.")),
+    };
+    file.seek(SeekFrom::Start(first_ifd))
+        .map_err(|err| format!("Cannot seek TIFF first IFD: {err}"))?;
+
+    if big_tiff {
+        let mut count = [0u8; 8];
+        file.read_exact(&mut count)
+            .map_err(|err| format!("Cannot read BigTIFF IFD entry count: {err}"))?;
+        let entry_count = endian.u64(count);
+        if entry_count > 65_535 {
+            return Err("BigTIFF IFD contains an unreasonable number of entries.".to_owned());
+        }
+        for _ in 0..entry_count {
+            let mut entry = [0u8; 20];
+            file.read_exact(&mut entry)
+                .map_err(|err| format!("Cannot read BigTIFF IFD entry: {err}"))?;
+            if endian.u16([entry[0], entry[1]]) != wanted_tag {
+                continue;
+            }
+            let mut count = [0u8; 8];
+            count.copy_from_slice(&entry[4..12]);
+            return read_ascii_entry(
+                &mut file,
+                endian,
+                endian.u16([entry[2], entry[3]]),
+                endian.u64(count),
+                &entry[12..20],
+            )
+            .map(Some);
+        }
+    } else {
+        let mut count = [0u8; 2];
+        file.read_exact(&mut count)
+            .map_err(|err| format!("Cannot read TIFF IFD entry count: {err}"))?;
+        for _ in 0..endian.u16(count) {
+            let mut entry = [0u8; 12];
+            file.read_exact(&mut entry)
+                .map_err(|err| format!("Cannot read TIFF IFD entry: {err}"))?;
+            if endian.u16([entry[0], entry[1]]) != wanted_tag {
+                continue;
+            }
+            let count = u64::from(endian.u32([entry[4], entry[5], entry[6], entry[7]]));
+            return read_ascii_entry(
+                &mut file,
+                endian,
+                endian.u16([entry[2], entry[3]]),
+                count,
+                &entry[8..12],
+            )
+            .map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn read_ascii_entry(
+    file: &mut File,
+    endian: TiffEndian,
+    field_type: u16,
+    count: u64,
+    inline_or_offset: &[u8],
+) -> Result<Vec<u8>, String> {
+    if field_type != 2 {
+        return Err("TIFF InkNames must use the ASCII field type.".to_owned());
+    }
+    if count == 0 || count > 1_048_576 {
+        return Err("TIFF InkNames has an invalid or excessive byte count.".to_owned());
+    }
+    let count =
+        usize::try_from(count).map_err(|_| "TIFF InkNames byte count is too large.".to_owned())?;
+    if count <= inline_or_offset.len() {
+        return Ok(inline_or_offset[..count].to_vec());
+    }
+    let offset = if inline_or_offset.len() == 4 {
+        u64::from(endian.u32(inline_or_offset.try_into().unwrap()))
+    } else {
+        endian.u64(inline_or_offset.try_into().unwrap())
+    };
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|err| format!("Cannot seek TIFF InkNames: {err}"))?;
+    let mut payload = vec![0u8; count];
+    file.read_exact(&mut payload)
+        .map_err(|err| format!("Cannot read TIFF InkNames: {err}"))?;
+    Ok(payload)
 }
 
 fn locate_photometric_patch_in<R: Read + Seek>(reader: &mut R) -> Result<PhotometricPatch, String> {
@@ -1030,8 +1266,12 @@ fn channel_names(
     model: ColorModel,
     base_count: usize,
     total_count: usize,
+    declared_ink_names: &[String],
     photoshop: Option<&[u8]>,
 ) -> Vec<String> {
+    if model == ColorModel::Other && declared_ink_names.len() == total_count {
+        return declared_ink_names.to_vec();
+    }
     let mut names: Vec<String> = match model {
         ColorModel::Rgb => ["Red", "Green", "Blue"]
             .into_iter()
@@ -1535,7 +1775,7 @@ mod tests {
 
     #[test]
     fn names_all_photoshop_extra_channels() {
-        let names = channel_names(ColorModel::Cmyk, 4, 6, None);
+        let names = channel_names(ColorModel::Cmyk, 4, 6, &[], None);
         assert_eq!(names.len(), 6);
         assert_eq!(names[0], "Cyan");
         assert_eq!(names[4], "Spot/Alpha 1");
@@ -1550,6 +1790,46 @@ mod tests {
         };
         assert_eq!(infer_color_model(&fake, Some(2)), (ColorModel::Rgb, 3));
         assert_eq!(infer_color_model(&fake, Some(5)), (ColorModel::Cmyk, 4));
+    }
+
+    #[test]
+    fn valid_non_cmyk_separated_declaration_uses_every_sample_as_a_base_ink() {
+        let names = (1..=7)
+            .map(|index| format!("Ink {index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_nchannel_separated_declaration(Some(5), 7, Some(2), Some(7), &names, &[])
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(channel_names(ColorModel::Other, 7, 7, &names, None), names);
+    }
+
+    #[test]
+    fn ambiguous_non_cmyk_separated_declarations_are_rejected() {
+        let names = (1..=7)
+            .map(|index| format!("Ink {index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            validate_nchannel_separated_declaration(Some(5), 7, Some(2), None, &names, &[])
+                .unwrap_err()
+                .contains("NumberOfInks")
+        );
+        assert!(
+            validate_nchannel_separated_declaration(Some(5), 7, Some(2), Some(6), &names, &[])
+                .unwrap_err()
+                .contains("SamplesPerPixel")
+        );
+        assert!(
+            validate_nchannel_separated_declaration(Some(5), 7, Some(2), Some(7), &names[..6], &[])
+                .unwrap_err()
+                .contains("InkNames")
+        );
+        assert!(
+            validate_nchannel_separated_declaration(Some(5), 7, Some(2), Some(7), &names, &[0])
+                .unwrap_err()
+                .contains("ExtraSamples")
+        );
     }
 
     #[test]
@@ -1642,6 +1922,7 @@ mod spot_polarity_tests {
             samples_per_pixel: 5,
             base_channel_count: 4,
             color_model: ColorModel::Cmyk,
+            non_cmyk_separated: false,
             channel_names: vec![
                 "Cyan".to_owned(),
                 "Magenta".to_owned(),
