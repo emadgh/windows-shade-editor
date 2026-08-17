@@ -16,6 +16,16 @@ pub enum OutputPathError {
     MissingFileName,
 }
 
+impl std::fmt::Display for OutputPathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SameAsSource => "Conversion output cannot replace the source file.",
+            Self::UnsupportedExtension => "Conversion output must use .tif or .tiff.",
+            Self::MissingFileName => "Conversion output must include a file name.",
+        })
+    }
+}
+
 /// Validate the non-destructive conversion boundary.
 ///
 /// Production conversion output is TIFF/BigTIFF and can never be the source path.

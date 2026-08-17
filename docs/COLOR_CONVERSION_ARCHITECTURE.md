@@ -227,6 +227,14 @@ Output is first written beside the destination, then re-opened to verify dimensi
 
 The bounded callback path currently writes uncompressed strips because the encoder's compressed path requires a complete image slice. LZW therefore requires a later local mmap/spool stage. Photoshop Image Resources/DisplayInfo generation, external Photoshop/RIP round trips and representative >4 GiB BigTIFF validation remain mandatory before claiming production interchange compatibility.
 
+## Worker transaction boundary
+
+`ConversionJobCapture` freezes the saved source adjustment recipe, source project/Face/Snapshot identity, full source-file SHA-256, conversion recipe plus its SHA-256, output destination and Production-project destination. A queued worker must serialize this capture and must not reread mutable UI settings when it starts.
+
+The transaction reports distinct decode, source-adjustment, conversion, metadata, staged-write, validation, TIFF-commit and Production-project-save phases. Cancellation is honored until the atomic TIFF commit point. Once a validated TIFF is committed, the small Production-project save boundary is completed even if cancellation arrives, because rolling back or deleting a durable production file would violate recovery guarantees.
+
+If project construction or saving fails after TIFF commit, the transaction returns a structured recovery result containing the committed output identity and, when construction succeeded, the clean Production project payload. It never silently deletes the committed TIFF. Persistent queue integration and the real raster backend remain separate work under #100.
+
 ## Serialization policy
 
 `CONVERSION_RECIPE_SCHEMA_VERSION` is independent from the `.shade` schema version. Conversion recipes need their own semantic version boundary because optimizer/profile strategy semantics can change independently from the project container.

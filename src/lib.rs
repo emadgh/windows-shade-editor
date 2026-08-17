@@ -6,7 +6,9 @@ pub mod conversion_output;
 pub mod conversion_preflight;
 pub mod conversion_recipe;
 pub mod conversion_tiff;
+pub mod conversion_transaction;
 pub mod conversion_workflow;
+pub mod export_recipe;
 pub mod icc_conversion;
 pub mod nchannel_icc;
 #[path = "dpi.rs"]
