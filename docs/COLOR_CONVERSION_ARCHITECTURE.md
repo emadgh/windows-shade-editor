@@ -217,7 +217,15 @@ Incompatible conversion produces a new Production project/target rather than con
 - source reference and production provenance structures;
 - validation of profile/characterization prerequisites and ink-strategy references.
 
-It does **not** yet perform pixel conversion or write TIFFs. Those capabilities remain separate implementation stages under #87, #91 and #95.
+It does **not** itself perform pixel conversion. Transform execution and output transport remain separate implementation stages under #87, #91 and #95.
+
+## Conversion TIFF writer
+
+`src/conversion_tiff.rs` provides the output boundary for 8/16-bit CMYK and 5C–12C conversion samples. It requests one strip at a time from the conversion worker, selects classic TIFF or BigTIFF from the estimated raw size (or an explicit override), embeds the exact target ICC and writes `InkSet`, NUL-separated `InkNames`, `NumberOfInks`, DPI, orientation and extra-sample topology.
+
+Output is first written beside the destination, then re-opened to verify dimensions, precision, sample count, target ICC and ink tags. Only a verified and synced staged file reaches the atomic replacement boundary; render or verification failure leaves an existing production file untouched.
+
+The bounded callback path currently writes uncompressed strips because the encoder's compressed path requires a complete image slice. LZW therefore requires a later local mmap/spool stage. Photoshop Image Resources/DisplayInfo generation, external Photoshop/RIP round trips and representative >4 GiB BigTIFF validation remain mandatory before claiming production interchange compatibility.
 
 ## Serialization policy
 

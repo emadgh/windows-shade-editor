@@ -22,9 +22,9 @@ Implemented: printer/RIP proof-device transforms using a selected Output-class I
 
 ## Color Conversion scope
 
-Implemented foundations: Source/Production architecture contracts and persisted lineage/provenance, saved-source gate, shared production preflight, separate per-Face Production Source ICC assignment, Output ICC/DeviceLink Target Setup with verified profile identity/topology/channel order, safe TIFF destination binding, RGB→CMYK and CMYK→CMYK LittleCMS transforms, typed 5C–12C ICC transforms, capability/preset compatibility, constrained Black-focused candidate ranking, deterministic recipe identity, non-destructive output-path policy and PNG source decoding.
+Implemented foundations: Source/Production architecture contracts and persisted lineage/provenance, saved-source gate, shared production preflight, separate per-Face Production Source ICC assignment, Output ICC/DeviceLink Target Setup with verified profile identity/topology/channel order, safe TIFF destination binding, RGB→CMYK and CMYK→CMYK LittleCMS transforms, typed 5C–12C ICC transforms, capability/preset compatibility, constrained Black-focused candidate ranking, deterministic recipe identity, non-destructive output-path policy, PNG source decoding and an atomic bounded-strip CMYK/5C–12C TIFF writer with target ICC and standard ink tags.
 
-Next production path: transactional conversion worker, DeviceLink execution, N-channel TIFF semantics/writer and real Photoshop/RIP validation. Production-project construction and reciprocal-link helpers are ready for the worker. Reusable target presets and Custom N-ink candidate generation remain pending; the custom path is blocked on characterized target data because channel display colors are not a device model.
+Next production path: connect the transactional conversion worker, execute DeviceLink recipes, add Photoshop Image Resources/DisplayInfo, add LZW through a local mmap/spool boundary, and run real Photoshop/RIP validation. Production-project construction, reciprocal-link helpers and the verified TIFF commit boundary are ready for orchestration. Reusable target presets and Custom N-ink candidate generation remain pending; the custom path is blocked on characterized target data because channel display colors are not a device model.
 
 ## Native Windows integration
 

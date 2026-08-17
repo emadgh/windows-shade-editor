@@ -17,6 +17,7 @@ mod app_icon;
 mod app_log;
 mod color_conversion;
 mod color_management;
+mod conversion_tiff;
 mod dpi;
 mod export;
 mod export_batch;

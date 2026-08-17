@@ -5,6 +5,7 @@ pub mod conversion_capabilities;
 pub mod conversion_output;
 pub mod conversion_preflight;
 pub mod conversion_recipe;
+pub mod conversion_tiff;
 pub mod conversion_workflow;
 pub mod icc_conversion;
 pub mod nchannel_icc;
