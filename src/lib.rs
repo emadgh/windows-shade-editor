@@ -43,4 +43,6 @@ pub mod separation_optimizer;
 pub mod tiff_io;
 
 #[cfg(test)]
+mod inverse_lut_artifact_tests;
+#[cfg(test)]
 mod tiff_conformance_tests;
