@@ -21,7 +21,14 @@ pub struct SeparationCandidate {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CandidateEvaluation {
+    /// Full weighted objective retained for diagnostics/backward-compatible ranking.
     pub score: f32,
+    /// Color-only contribution to `score`.
+    pub color_error_score: f32,
+    /// Non-color production preference contribution: total ink, per-ink bias,
+    /// and neutral-Black preference. The inverse solver may rank this component
+    /// only inside its explicit color-equivalence window.
+    pub preference_score: f32,
     pub total_ink: f32,
     pub black_coverage: Option<f32>,
 }
@@ -212,23 +219,26 @@ pub fn evaluate_candidate(
         })
         .collect::<BTreeMap<_, _>>();
 
-    let mut score = candidate.delta_e00.max(0.0) * weights.color_error;
-    score += total_ink * weights.total_ink;
+    let color_error_score = candidate.delta_e00.max(0.0) * weights.color_error;
+    let mut preference_score = total_ink * weights.total_ink;
     for (_name, (index, bias)) in bias_map {
-        score -= bias * candidate.coverages[index] * weights.ink_preference;
+        preference_score -= bias * candidate.coverages[index] * weights.ink_preference;
     }
 
     if candidate.chroma <= strategy.neutral_chroma_threshold {
         if let Some(coverage) = black_coverage {
             let usable_black = coverage.min(strategy.black_max.max(0.0));
-            score -= usable_black
+            preference_score -= usable_black
                 * strategy.black_generation_strength.clamp(0.0, 1.0)
                 * weights.neutral_black;
         }
     }
+    let score = color_error_score + preference_score;
 
     Ok(CandidateEvaluation {
         score,
+        color_error_score,
+        preference_score,
         total_ink,
         black_coverage,
     })
