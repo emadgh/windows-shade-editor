@@ -2,6 +2,9 @@ use std::collections::BTreeSet;
 
 use crate::color_conversion::{ConversionTargetDefinition, SeparationStrategy};
 pub use crate::custom_optimizer_config::CustomOptimizerSolverConfig as InverseSolverConfig;
+use crate::custom_optimizer_config::{
+    ContinuityDistanceMetric, ContinuityPreferenceConfig, CustomOptimizerSolverMethod,
+};
 use crate::device_characterization::{DeviceForwardModel, LabColor};
 use crate::separation_optimizer::{
     CandidateEvaluation, CandidateScoringWeights, SeparationCandidate, characterize_candidate,
@@ -30,8 +33,23 @@ pub struct InverseSolveResult {
 pub enum InverseSolveError {
     InvalidConfiguration(Vec<String>),
     MissingTargetCharacterization,
-    CharacterizationIdentityMismatch { target: String, model: String },
-    ChannelTopologyMismatch { target: Vec<String>, model: Vec<String> },
+    CharacterizationIdentityMismatch {
+        target: String,
+        model: String,
+    },
+    ChannelTopologyMismatch {
+        target: Vec<String>,
+        model: Vec<String>,
+    },
+    MissingContinuityReference,
+    ContinuityReferenceTopologyMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidContinuityReference {
+        channel_index: usize,
+    },
+    ContinuityReferenceTotalInkExceeded,
     NoFeasibleCandidate,
 }
 
@@ -62,6 +80,30 @@ pub fn solve_inverse_separation(
     target_lab: LabColor,
     config: InverseSolverConfig,
 ) -> Result<InverseSolveResult, InverseSolveError> {
+    solve_inverse_separation_with_reference(
+        target, strategy, weights, model, target_lab, config, None,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ContinuityContext<'a> {
+    policy: ContinuityPreferenceConfig,
+    reference_coverages: &'a [f32],
+}
+
+/// V2 entry point with an explicit neighboring/reference separation.
+///
+/// V1 ignores this reference by contract. V2 with zero continuity weight also
+/// bypasses all continuity logic so its candidate ordering is identical to V1.
+pub fn solve_inverse_separation_with_reference(
+    target: &ConversionTargetDefinition,
+    strategy: &SeparationStrategy,
+    weights: CandidateScoringWeights,
+    model: &dyn DeviceForwardModel,
+    target_lab: LabColor,
+    config: InverseSolverConfig,
+    reference_coverages: Option<&[f32]>,
+) -> Result<InverseSolveResult, InverseSolveError> {
     validate_identity(target, model)?;
     config
         .validate(target.channels.len())
@@ -69,6 +111,7 @@ pub fn solve_inverse_separation(
 
     let maxima = channel_maxima(target, strategy);
     let total_limit = effective_total_ink_limit(target.total_ink_limit, strategy.total_ink_limit);
+    let continuity = continuity_context(&config, reference_coverages, &maxima, total_limit)?;
     let mut stats = InverseSolverStats::default();
     let mut seen = BTreeSet::new();
     let mut ranked = Vec::new();
@@ -110,7 +153,13 @@ pub fn solve_inverse_separation(
         );
     }
 
-    retain_best(&mut ranked, config.beam_width, config.preference_delta_e00);
+    retain_best(
+        &mut ranked,
+        config.beam_width,
+        config.preference_delta_e00,
+        &maxima,
+        continuity,
+    );
     if ranked.is_empty() {
         return Err(InverseSolveError::NoFeasibleCandidate);
     }
@@ -173,17 +222,72 @@ pub fn solve_inverse_separation(
             }
         }
 
-        retain_best(&mut expanded, config.beam_width, config.preference_delta_e00);
+        retain_best(
+            &mut expanded,
+            config.beam_width,
+            config.preference_delta_e00,
+            &maxima,
+            continuity,
+        );
         ranked = expanded;
         step_fraction *= config.step_decay;
     }
 
-    let best = ranked.into_iter().next().ok_or(InverseSolveError::NoFeasibleCandidate)?;
+    let best = ranked
+        .into_iter()
+        .next()
+        .ok_or(InverseSolveError::NoFeasibleCandidate)?;
     Ok(InverseSolveResult {
         candidate: best.candidate,
         evaluation: best.evaluation,
         stats,
     })
+}
+
+fn continuity_context<'a>(
+    config: &InverseSolverConfig,
+    reference_coverages: Option<&'a [f32]>,
+    maxima: &[f32],
+    total_limit: Option<f32>,
+) -> Result<Option<ContinuityContext<'a>>, InverseSolveError> {
+    if config.method != CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2 {
+        return Ok(None);
+    }
+    let policy = config
+        .continuity_preference
+        .expect("validated V2 config must include continuity policy");
+    if policy.weight == 0.0 {
+        return Ok(None);
+    }
+
+    let reference_coverages =
+        reference_coverages.ok_or(InverseSolveError::MissingContinuityReference)?;
+    if reference_coverages.len() != maxima.len() {
+        return Err(InverseSolveError::ContinuityReferenceTopologyMismatch {
+            expected: maxima.len(),
+            actual: reference_coverages.len(),
+        });
+    }
+    for (channel_index, (value, maximum)) in reference_coverages
+        .iter()
+        .copied()
+        .zip(maxima.iter().copied())
+        .enumerate()
+    {
+        if !value.is_finite() || value < 0.0 || value > maximum + 1.0e-6 {
+            return Err(InverseSolveError::InvalidContinuityReference { channel_index });
+        }
+    }
+    if let Some(limit) = total_limit {
+        if reference_coverages.iter().copied().sum::<f32>() > limit + 1.0e-6 {
+            return Err(InverseSolveError::ContinuityReferenceTotalInkExceeded);
+        }
+    }
+
+    Ok(Some(ContinuityContext {
+        policy,
+        reference_coverages,
+    }))
 }
 
 fn validate_identity(
@@ -216,10 +320,7 @@ fn validate_identity(
     Ok(())
 }
 
-fn channel_maxima(
-    target: &ConversionTargetDefinition,
-    strategy: &SeparationStrategy,
-) -> Vec<f32> {
+fn channel_maxima(target: &ConversionTargetDefinition, strategy: &SeparationStrategy) -> Vec<f32> {
     target
         .channels
         .iter()
@@ -256,7 +357,11 @@ fn canonical_seeds(
     }
 
     if let Some(black_name) = strategy.black_channel.as_deref() {
-        if let Some(index) = target.channels.iter().position(|channel| channel.name == black_name) {
+        if let Some(index) = target
+            .channels
+            .iter()
+            .position(|channel| channel.name == black_name)
+        {
             let mut black_seed = vec![0.0; maxima.len()];
             black_seed[index] = maxima[index] * 0.75;
             fit_total_limit(&mut black_seed, total_limit);
@@ -266,7 +371,11 @@ fn canonical_seeds(
 
     let mut bias_seed = Vec::with_capacity(maxima.len());
     for (index, channel) in target.channels.iter().enumerate() {
-        let bias = strategy.per_ink_bias.get(&channel.name).copied().unwrap_or(0.0);
+        let bias = strategy
+            .per_ink_bias
+            .get(&channel.name)
+            .copied()
+            .unwrap_or(0.0);
         let fraction = (0.5 + 0.35 * bias).clamp(0.05, 0.95);
         bias_seed.push(maxima[index] * fraction);
     }
@@ -329,6 +438,8 @@ fn retain_best(
     ranked: &mut Vec<RankedCandidate>,
     beam_width: usize,
     preference_delta_e00: f32,
+    maxima: &[f32],
+    continuity: Option<ContinuityContext<'_>>,
 ) {
     if ranked.is_empty() {
         return;
@@ -340,16 +451,103 @@ fn retain_best(
         .expect("non-empty candidate list");
     let preference_ceiling = best_delta_e00 + preference_delta_e00;
     ranked.retain(|candidate| candidate.candidate.delta_e00 <= preference_ceiling);
-    ranked.sort_by(|left, right| {
-        left.evaluation
-            .preference_score
-            .total_cmp(&right.evaluation.preference_score)
-            .then_with(|| left.candidate.delta_e00.total_cmp(&right.candidate.delta_e00))
-            .then_with(|| left.evaluation.total_ink.total_cmp(&right.evaluation.total_ink))
-            .then_with(|| left.balance_penalty.total_cmp(&right.balance_penalty))
-            .then_with(|| left.key.cmp(&right.key))
-    });
+
+    if let Some(context) = continuity {
+        ranked.sort_by(|left, right| {
+            let left_score = left.evaluation.preference_score
+                + context.policy.weight * continuity_rank_score(left, maxima, context);
+            let right_score = right.evaluation.preference_score
+                + context.policy.weight * continuity_rank_score(right, maxima, context);
+            left_score
+                .total_cmp(&right_score)
+                .then_with(|| {
+                    left.candidate
+                        .delta_e00
+                        .total_cmp(&right.candidate.delta_e00)
+                })
+                .then_with(|| {
+                    left.evaluation
+                        .total_ink
+                        .total_cmp(&right.evaluation.total_ink)
+                })
+                .then_with(|| left.balance_penalty.total_cmp(&right.balance_penalty))
+                .then_with(|| left.key.cmp(&right.key))
+        });
+    } else {
+        // Keep the historical V1 comparator byte-for-byte in semantic ordering.
+        ranked.sort_by(|left, right| {
+            left.evaluation
+                .preference_score
+                .total_cmp(&right.evaluation.preference_score)
+                .then_with(|| {
+                    left.candidate
+                        .delta_e00
+                        .total_cmp(&right.candidate.delta_e00)
+                })
+                .then_with(|| {
+                    left.evaluation
+                        .total_ink
+                        .total_cmp(&right.evaluation.total_ink)
+                })
+                .then_with(|| left.balance_penalty.total_cmp(&right.balance_penalty))
+                .then_with(|| left.key.cmp(&right.key))
+        });
+    }
     ranked.truncate(beam_width);
+}
+
+fn continuity_rank_score(
+    candidate: &RankedCandidate,
+    maxima: &[f32],
+    context: ContinuityContext<'_>,
+) -> f32 {
+    let mut l1 = 0.0f32;
+    let mut l2_squared = 0.0f32;
+    let mut max_jump = 0.0f32;
+    for ((coverage, reference), maximum) in candidate
+        .candidate
+        .coverages
+        .iter()
+        .copied()
+        .zip(context.reference_coverages.iter().copied())
+        .zip(maxima.iter().copied())
+    {
+        let normalized = if maximum > f32::EPSILON {
+            ((coverage - reference).abs() / maximum).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        l1 += normalized;
+        l2_squared += normalized * normalized;
+        max_jump = max_jump.max(normalized);
+    }
+
+    let distance = match context.policy.distance_metric {
+        ContinuityDistanceMetric::NormalizedL1 => l1,
+        ContinuityDistanceMetric::NormalizedL2 => l2_squared.sqrt(),
+    };
+    let cap_excess = (max_jump - context.policy.max_normalized_channel_jump).max(0.0);
+    let dominant_switch_penalty = if dominant_channel(&candidate.candidate.coverages)
+        != dominant_channel(context.reference_coverages)
+    {
+        context.policy.dominant_channel_switch_penalty
+    } else {
+        0.0
+    };
+
+    distance + cap_excess + dominant_switch_penalty
+}
+
+fn dominant_channel(coverages: &[f32]) -> Option<usize> {
+    let mut best_index = None;
+    let mut best_value = f32::EPSILON;
+    for (index, value) in coverages.iter().copied().enumerate() {
+        if value > best_value {
+            best_value = value;
+            best_index = Some(index);
+        }
+    }
+    best_index
 }
 
 fn quantized_key(coverages: &[f32]) -> Vec<u16> {
@@ -452,7 +650,10 @@ mod tests {
             if coverages.len() != 4 {
                 return Err("fixture topology mismatch".to_owned());
             }
-            if coverages.iter().any(|value| !value.is_finite() || !(0.0..=0.8).contains(value)) {
+            if coverages
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=0.8).contains(value))
+            {
                 return Err("fixture coverage outside measured domain".to_owned());
             }
             let chromatic = coverages[..3]
@@ -667,6 +868,163 @@ mod tests {
 
         assert!(avoided.candidate.delta_e00 <= 1.5);
         assert!(avoided.candidate.coverages[0] + 0.05 < normal.candidate.coverages[0]);
+    }
+
+    fn continuity_config(weight: f32) -> InverseSolverConfig {
+        InverseSolverConfig {
+            method: CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2,
+            continuity_preference: Some(ContinuityPreferenceConfig {
+                weight,
+                distance_metric: ContinuityDistanceMetric::NormalizedL1,
+                max_normalized_channel_jump: 0.20,
+                dominant_channel_switch_penalty: 0.25,
+            }),
+            ..config()
+        }
+    }
+
+    fn normalized_l1_to_reference(coverages: &[f32], reference: &[f32]) -> f32 {
+        coverages
+            .iter()
+            .copied()
+            .zip(reference.iter().copied())
+            .map(|(left, right)| (left - right).abs() / 0.8)
+            .sum()
+    }
+
+    #[test]
+    fn zero_continuity_weight_reproduces_v1_without_reference() {
+        let model = DegenerateFourInkModel::new(1.0);
+        let strategy = SeparationStrategy {
+            max_delta_e00: Some(1.5),
+            ..SeparationStrategy::default()
+        };
+        let baseline = solve_inverse_separation(
+            &target(),
+            &strategy,
+            weights(0.2, 0.0, 0.0),
+            &model,
+            target_lab(),
+            config(),
+        )
+        .unwrap();
+        let continuity = solve_inverse_separation_with_reference(
+            &target(),
+            &strategy,
+            weights(0.2, 0.0, 0.0),
+            &model,
+            target_lab(),
+            continuity_config(0.0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(baseline, continuity);
+    }
+
+    #[test]
+    fn positive_continuity_weight_requires_explicit_valid_reference() {
+        let model = DegenerateFourInkModel::new(1.0);
+        let strategy = SeparationStrategy::default();
+        let missing = solve_inverse_separation_with_reference(
+            &target(),
+            &strategy,
+            weights(0.0, 0.0, 0.0),
+            &model,
+            target_lab(),
+            continuity_config(1.0),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(missing, InverseSolveError::MissingContinuityReference);
+
+        let topology = solve_inverse_separation_with_reference(
+            &target(),
+            &strategy,
+            weights(0.0, 0.0, 0.0),
+            &model,
+            target_lab(),
+            continuity_config(1.0),
+            Some(&[0.2, 0.2]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            topology,
+            InverseSolveError::ContinuityReferenceTopologyMismatch { .. }
+        ));
+
+        let total_ink = solve_inverse_separation_with_reference(
+            &target(),
+            &strategy,
+            weights(0.0, 0.0, 0.0),
+            &model,
+            target_lab(),
+            continuity_config(1.0),
+            Some(&[0.8, 0.8, 0.8, 0.8]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            total_ink,
+            InverseSolveError::ContinuityReferenceTotalInkExceeded
+        );
+    }
+
+    #[test]
+    fn continuity_prefers_nearby_equivalent_separation_without_relaxing_color_limit() {
+        let model = DegenerateFourInkModel::new(1.0);
+        let strategy = SeparationStrategy {
+            max_delta_e00: Some(1.5),
+            ..SeparationStrategy::default()
+        };
+        let mut baseline_config = config();
+        baseline_config.preference_delta_e00 = 0.5;
+        let baseline = solve_inverse_separation(
+            &target(),
+            &strategy,
+            weights(0.0, 0.0, 0.0),
+            &model,
+            target_lab(),
+            baseline_config,
+        )
+        .unwrap();
+
+        let reference = [0.5, 0.0, 0.0, 0.0];
+        let mut continuity = continuity_config(50.0);
+        continuity.preference_delta_e00 = 0.5;
+        continuity
+            .continuity_preference
+            .as_mut()
+            .unwrap()
+            .max_normalized_channel_jump = 1.0;
+        continuity
+            .continuity_preference
+            .as_mut()
+            .unwrap()
+            .dominant_channel_switch_penalty = 0.0;
+        let selected = solve_inverse_separation_with_reference(
+            &target(),
+            &strategy,
+            weights(0.0, 0.0, 0.0),
+            &model,
+            target_lab(),
+            continuity,
+            Some(&reference),
+        )
+        .unwrap();
+
+        assert!(selected.candidate.delta_e00 <= 1.5);
+        assert!(selected.evaluation.total_ink <= 1.5);
+        assert!(
+            selected
+                .candidate
+                .coverages
+                .iter()
+                .all(|value| *value <= 0.8)
+        );
+        assert!(
+            normalized_l1_to_reference(&selected.candidate.coverages, &reference)
+                < normalized_l1_to_reference(&baseline.candidate.coverages, &reference)
+        );
     }
 
     #[test]
