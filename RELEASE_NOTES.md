@@ -1,3 +1,11 @@
+# Shade Editor 0.21.6
+
+- Add a serialization-safe immutable conversion-job capture containing the exact saved source adjustment recipe, source-file SHA-256, conversion recipe/hash and output/project destinations.
+- Define explicit decode, source-adjustment, conversion, metadata, staged-write, validation, output-commit and Production-project-save progress phases.
+- Enforce cancellation before the TIFF commit point while completing the small project-save boundary if cancellation arrives after a durable TIFF commit.
+- Return structured recovery state when a committed production TIFF cannot yet be linked by a saved Production `.shade`, preserving the output and clean project payload for retry.
+- Add failure-point tests for tampered recipes, early cancellation, worker failure, post-commit cancellation and Production-project save failure; pixel backend and persistent queue integration remain follow-up work.
+
 # Shade Editor 0.21.5
 
 - Add an atomic bounded-memory TIFF/BigTIFF writer for CMYK and 5–12-channel conversion output at 8-bit or 16-bit precision.
