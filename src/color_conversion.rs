@@ -20,6 +20,12 @@ pub enum ProjectRole {
     Production,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkedProjectRef {
+    pub role: ProjectRole,
+    pub path: String,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversionEngineMode {

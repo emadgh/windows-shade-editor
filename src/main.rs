@@ -15,6 +15,7 @@ mod app_controllers;
 mod app_features;
 mod app_icon;
 mod app_log;
+mod color_conversion;
 mod color_management;
 mod dpi;
 mod export;

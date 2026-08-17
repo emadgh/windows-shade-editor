@@ -1,3 +1,11 @@
+# Shade Editor 0.21.4
+
+- Persist backward-safe `standalone`, `source` and `production` project roles in schema-v9 `.shade` files.
+- Store linked Source/Production project references and per-Face conversion provenance without embedding ICC payloads.
+- Add an independently testable Production-project builder that creates clean target-ink adjustments instead of copying source RGB/CMYK adjustments or Snapshots.
+- Keep Production TIFF commit and `.shade` creation as separate recovery boundaries so a committed TIFF remains recoverable if project saving later fails.
+- Upsert the reciprocal Production link only after the caller completes the Production transaction; legacy projects without lineage fields continue to deserialize as standalone.
+
 # Shade Editor 0.21.3
 
 - Enable the Source-preflight transition into a dedicated production Target Setup stage.
