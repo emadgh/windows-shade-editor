@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,7 @@ use crate::conversion_output::validate_conversion_output_path;
 use crate::conversion_recipe::recipe_sha256;
 use crate::export_recipe::ExportRecipe;
 use crate::model::ShadeProject;
-use crate::production_project::{build_production_project, ProductionProjectSpec};
+use crate::production_project::{ProductionProjectSpec, build_production_project};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversionPhase {
@@ -66,11 +66,21 @@ impl ConversionProgress {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturedSourceProfile {
+    /// Re-open and hash the ICC payload embedded in the captured source TIFF.
+    Embedded,
+    /// Re-open and hash an explicitly assigned external production Source ICC.
+    External { path: PathBuf },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversionJobCapture {
     pub source_project_path: PathBuf,
     pub source_face_path: PathBuf,
     pub source_snapshot_id: Option<u64>,
     pub source_file_sha256: String,
+    pub source_profile: CapturedSourceProfile,
     pub source_recipe: ExportRecipe,
     pub conversion_recipe: ConversionRecipe,
     pub conversion_recipe_sha256: String,
@@ -87,6 +97,7 @@ impl ConversionJobCapture {
         source_face_path: PathBuf,
         source_snapshot_id: Option<u64>,
         source_file_sha256: String,
+        source_profile: CapturedSourceProfile,
         conversion_recipe: ConversionRecipe,
         output_tiff_path: PathBuf,
         production_project_path: PathBuf,
@@ -99,6 +110,7 @@ impl ConversionJobCapture {
             source_face_path,
             source_snapshot_id,
             source_file_sha256,
+            source_profile,
             source_recipe: ExportRecipe::from_project(source_project),
             conversion_recipe,
             conversion_recipe_sha256,
@@ -121,6 +133,12 @@ impl ConversionJobCapture {
         }
         if !has_sha256(&self.source_file_sha256) {
             return Err("Conversion capture requires a full source-file SHA-256.".to_owned());
+        }
+        if matches!(
+            &self.source_profile,
+            CapturedSourceProfile::External { path } if path.as_os_str().is_empty()
+        ) {
+            return Err("Assigned production Source ICC path cannot be empty.".to_owned());
         }
         self.conversion_recipe.validate().map_err(|errors| {
             format!("Invalid captured conversion recipe: {}", errors.join(" "))
@@ -382,8 +400,8 @@ fn paths_match(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::color_conversion::{
-        ConversionEngineMode, ConversionRenderingIntent, ConversionTargetDefinition,
-        SeparationStrategy, TargetChannelDefinition, CONVERSION_RECIPE_SCHEMA_VERSION,
+        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionEngineMode, ConversionRenderingIntent,
+        ConversionTargetDefinition, SeparationStrategy, TargetChannelDefinition,
     };
     use crate::model::{ChannelAdjustment, IccProfileIdentity};
 
@@ -436,6 +454,7 @@ mod tests {
             PathBuf::from(r"C:\Design\Face.tif"),
             Some(7),
             HASH_A.to_owned(),
+            CapturedSourceProfile::Embedded,
             recipe(),
             PathBuf::from(r"C:\Production\Face_CMYK.tif"),
             PathBuf::from(r"C:\Production\Job.shade"),
@@ -519,6 +538,7 @@ mod tests {
             PathBuf::from(r"C:\Design\Face.tif"),
             None,
             HASH_A.to_owned(),
+            CapturedSourceProfile::Embedded,
             recipe(),
             PathBuf::from(r"C:\Production\Face.tif"),
             PathBuf::from(r"C:\Production\Job.shade"),

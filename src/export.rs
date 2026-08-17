@@ -414,7 +414,11 @@ where
     result
 }
 
-fn adjusted_strip(input: &[u16], metadata: &TiffMetadata, project: &ShadeProject) -> Vec<u16> {
+pub(crate) fn adjusted_strip(
+    input: &[u16],
+    metadata: &TiffMetadata,
+    project: &ShadeProject,
+) -> Vec<u16> {
     let channels = metadata.samples_per_pixel;
     let names = &metadata.channel_names;
     let pixel_count = input.len() / channels.max(1);
