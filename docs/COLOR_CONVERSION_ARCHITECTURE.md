@@ -233,7 +233,17 @@ The bounded callback path currently writes uncompressed strips because the encod
 
 The transaction reports distinct decode, source-adjustment, conversion, metadata, staged-write, validation, TIFF-commit and Production-project-save phases. Cancellation is honored until the atomic TIFF commit point. Once a validated TIFF is committed, the small Production-project save boundary is completed even if cancellation arrives, because rolling back or deleting a durable production file would violate recovery guarantees.
 
-If project construction or saving fails after TIFF commit, the transaction returns a structured recovery result containing the committed output identity and, when construction succeeded, the clean Production project payload. It never silently deletes the committed TIFF. Persistent queue integration and the real raster backend remain separate work under #100.
+If project construction or saving fails after TIFF commit, the transaction returns a structured recovery result containing the committed output identity and, when construction succeeded, the clean Production project payload. It never silently deletes the committed TIFF. Persistent queue integration remains separate work under #100.
+
+## Standard ICC raster backend
+
+`FilesystemIccConversionBackend` executes the transaction for standard Output ICC recipes. Immediately before work begins it reopens and hashes the complete source file, the embedded or explicitly assigned Source ICC, and the target ICC. A changed input fails the captured job instead of silently changing its color meaning.
+
+The backend currently accepts streamable TIFF sources containing exactly three RGB or four CMYK samples. It decodes one strip/tile region at a time, applies the frozen saved Source adjustment recipe, and writes row-major 16-bit samples into a uniquely created local mmap spool. The read-only spool lets the atomic output writer request bounded row strips even when the input is tiled, without retaining a second full-resolution image in RAM.
+
+LittleCMS then converts each requested strip to CMYK or a typed 5C-12C target. The writer emits 8-bit or 16-bit output, embeds the revalidated target profile, preserves DPI/orientation and authoritative target channel order, validates and atomically commits the TIFF, and returns its full SHA-256 before the transaction saves the clean Production project.
+
+This backend deliberately rejects DeviceLink and Custom Optimizer recipes, RGB/CMYK sources with Spot or extra samples, and non-streamable TIFF input. Those paths require dedicated semantics rather than an implicit fallback. Persistent queue/UI orchestration, deterministic real Output-ICC fixtures, LZW, Photoshop-specific spot metadata and external Photoshop/RIP validation remain release gates.
 
 ## Serialization policy
 

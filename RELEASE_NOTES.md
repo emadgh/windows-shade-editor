@@ -1,3 +1,11 @@
+# Shade Editor 0.21.7
+
+- Add the filesystem-backed production ICC raster backend for standard Output ICC recipes from pure RGB or CMYK TIFF sources into CMYK or 5C-12C output.
+- Revalidate the complete source file, Source ICC and target ICC SHA-256 identities immediately before conversion so queued work cannot silently consume replaced inputs.
+- Render the exact saved source adjustment recipe into a local mmap-backed 16-bit spool, then transform and write one bounded output strip at a time without a second full-resolution RAM image.
+- Support 8-bit and 16-bit atomic production output, preserve target channel order/ICC plus source DPI/orientation, hash the committed TIFF and save the clean Production project through the recoverable transaction boundary.
+- Keep DeviceLink, Custom Optimizer, sources with Spot/extra samples, non-streamable inputs, persistent queue/UI wiring, LZW and real Photoshop/RIP fixtures as explicit follow-up gates.
+
 # Shade Editor 0.21.6
 
 - Add a serialization-safe immutable conversion-job capture containing the exact saved source adjustment recipe, source-file SHA-256, conversion recipe/hash and output/project destinations.

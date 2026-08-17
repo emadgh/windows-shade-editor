@@ -10,6 +10,7 @@ pub mod conversion_transaction;
 pub mod conversion_workflow;
 pub mod export_recipe;
 pub mod icc_conversion;
+pub mod icc_conversion_worker;
 pub mod nchannel_icc;
 #[path = "dpi.rs"]
 pub mod dpi;
