@@ -25,6 +25,7 @@ pub mod gradient_continuity;
 pub mod gradient_validation;
 pub mod icc_conversion;
 pub mod icc_conversion_worker;
+pub mod inverse_lut_artifact;
 pub mod inverse_lut_identity;
 pub mod inverse_separation_solver;
 pub mod model;
@@ -41,5 +42,7 @@ pub mod separation_optimizer;
 #[path = "tiff_io.rs"]
 pub mod tiff_io;
 
+#[cfg(test)]
+mod inverse_lut_artifact_tests;
 #[cfg(test)]
 mod tiff_conformance_tests;
