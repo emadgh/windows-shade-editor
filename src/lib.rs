@@ -22,6 +22,7 @@ pub mod gradient_continuity;
 pub mod gradient_validation;
 pub mod icc_conversion;
 pub mod icc_conversion_worker;
+pub mod inverse_lut_identity;
 pub mod inverse_separation_solver;
 pub mod nchannel_icc;
 #[path = "dpi.rs"]
