@@ -163,7 +163,7 @@ fn open_profile(profile: RuntimeIccProfile<'_>, role: &str) -> Result<Profile, S
     }
 }
 
-fn nchannel_pixel_format<const N: usize>() -> Result<PixelFormat, String> {
+pub(crate) fn nchannel_pixel_format<const N: usize>() -> Result<PixelFormat, String> {
     match N {
         5 => Ok(PixelFormat::CMYK5_16),
         6 => Ok(PixelFormat::CMYK6_16),

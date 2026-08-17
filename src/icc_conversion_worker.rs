@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use memmap2::MmapOptions;
 use sha2::{Digest, Sha256};
 
-use crate::color_conversion::ConversionEngineMode;
+use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use crate::conversion_tiff::{
     ConversionTiffSpec, write_conversion_tiff_u8_atomic, write_conversion_tiff_u16_atomic,
 };
@@ -15,6 +15,7 @@ use crate::conversion_transaction::{
     CapturedOutputPolicy, CapturedSourceProfile, CommittedConversionOutput, ConversionCancellation,
     ConversionJobCapture, ConversionPhase, ConversionProgress, ConversionTransactionBackend,
 };
+use crate::devicelink_conversion::ProductionDeviceLinkTransform;
 use crate::icc_conversion::{IccSourceModel, ProductionCmykTransform, RuntimeIccProfile};
 use crate::model::ShadeProject;
 use crate::nchannel_icc::ProductionNChannelTransform;
@@ -82,12 +83,17 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
             );
         }
 
-        let (source_icc, target_icc) = load_verified_profiles(capture, &stream)?;
-        let transform =
-            RuntimeProductionTransform::new(source_model, &source_icc, &target_icc, capture)?;
+        let profiles = load_verified_profiles(capture, &stream)?;
+        let transform = RuntimeProductionTransform::new(
+            source_model,
+            &profiles.source_icc,
+            &profiles.transform_icc,
+            &capture.conversion_recipe,
+        )?;
         if transform.output_channels() != capture.conversion_recipe.target.channels.len() {
             return Err(
-                "Runtime ICC transform topology does not match the captured target.".to_owned(),
+                "Runtime production transform topology does not match the captured target."
+                    .to_owned(),
             );
         }
 
@@ -96,7 +102,9 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
             cancellation,
             report,
             &stream,
-            &target_icc,
+            profiles
+                .embed_output_icc
+                .then_some(profiles.transform_icc.as_slice()),
             &transform,
             self.default_dpi,
         )?;
@@ -146,10 +154,16 @@ fn source_model(stream: &StreamInfo) -> Result<IccSourceModel, String> {
     }
 }
 
+struct VerifiedConversionProfiles {
+    source_icc: Vec<u8>,
+    transform_icc: Vec<u8>,
+    embed_output_icc: bool,
+}
+
 fn load_verified_profiles(
     capture: &ConversionJobCapture,
     stream: &StreamInfo,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
+) -> Result<VerifiedConversionProfiles, String> {
     let source_icc = match &capture.source_profile {
         CapturedSourceProfile::Embedded => {
             stream.metadata.icc_profile.clone().ok_or_else(|| {
@@ -169,33 +183,49 @@ fn load_verified_profiles(
         "Source ICC",
     )?;
 
-    if capture.conversion_recipe.engine_mode != ConversionEngineMode::Icc {
-        return Err(
-            "This raster backend executes standard Output ICC recipes only; DeviceLink and Custom Optimizer require their dedicated engines."
-                .to_owned(),
-        );
-    }
-    let target_path = capture
-        .conversion_recipe
-        .target
-        .output_profile_path
-        .as_deref()
+    let (target_path, target_identity, label, embed_as_output) =
+        match capture.conversion_recipe.engine_mode {
+            ConversionEngineMode::Icc => (
+                capture
+                    .conversion_recipe
+                    .target
+                    .output_profile_path
+                    .as_deref(),
+                capture
+                    .conversion_recipe
+                    .target
+                    .output_profile_identity
+                    .as_ref(),
+                "Target ICC",
+                true,
+            ),
+            ConversionEngineMode::DeviceLink => (
+                capture.conversion_recipe.target.device_link_path.as_deref(),
+                capture
+                    .conversion_recipe
+                    .target
+                    .device_link_identity
+                    .as_ref(),
+                "DeviceLink ICC",
+                false,
+            ),
+            ConversionEngineMode::CustomOptimizer => {
+                return Err("Custom Optimizer requires its dedicated production engine.".to_owned());
+            }
+        };
+    let target_path = target_path
         .map(Path::new)
-        .ok_or_else(|| "Captured ICC recipe has no target profile path.".to_owned())?;
-    let target_identity = capture
-        .conversion_recipe
-        .target
-        .output_profile_identity
-        .as_ref()
-        .ok_or_else(|| "Captured ICC recipe has no target profile identity.".to_owned())?;
-    let target_icc = fs::read(target_path).map_err(|err| {
-        format!(
-            "Cannot reopen production target ICC {}: {err}",
-            target_path.display()
-        )
-    })?;
-    verify_bytes_sha256(&target_icc, &target_identity.sha256, "Target ICC")?;
-    Ok((source_icc, target_icc))
+        .ok_or_else(|| format!("Captured recipe has no {label} path."))?;
+    let target_identity =
+        target_identity.ok_or_else(|| format!("Captured recipe has no {label} identity."))?;
+    let transform_icc = fs::read(target_path)
+        .map_err(|err| format!("Cannot reopen {label} {}: {err}", target_path.display()))?;
+    verify_bytes_sha256(&transform_icc, &target_identity.sha256, label)?;
+    Ok(VerifiedConversionProfiles {
+        source_icc,
+        transform_icc,
+        embed_output_icc: embed_as_output,
+    })
 }
 
 fn render_convert_and_commit(
@@ -203,7 +233,7 @@ fn render_convert_and_commit(
     cancellation: &ConversionCancellation,
     report: &mut dyn FnMut(ConversionProgress),
     stream: &StreamInfo,
-    target_icc: &[u8],
+    target_icc: Option<&[u8]>,
     transform: &RuntimeProductionTransform,
     default_dpi: f64,
 ) -> Result<(), String> {
@@ -412,6 +442,15 @@ enum RuntimeProductionTransform {
     N10(ProductionNChannelTransform<10>),
     N11(ProductionNChannelTransform<11>),
     N12(ProductionNChannelTransform<12>),
+    LinkCmyk(ProductionDeviceLinkTransform<4>),
+    LinkN5(ProductionDeviceLinkTransform<5>),
+    LinkN6(ProductionDeviceLinkTransform<6>),
+    LinkN7(ProductionDeviceLinkTransform<7>),
+    LinkN8(ProductionDeviceLinkTransform<8>),
+    LinkN9(ProductionDeviceLinkTransform<9>),
+    LinkN10(ProductionDeviceLinkTransform<10>),
+    LinkN11(ProductionDeviceLinkTransform<11>),
+    LinkN12(ProductionDeviceLinkTransform<12>),
 }
 
 impl RuntimeProductionTransform {
@@ -419,9 +458,35 @@ impl RuntimeProductionTransform {
         source_model: IccSourceModel,
         source_icc: &[u8],
         target_icc: &[u8],
-        capture: &ConversionJobCapture,
+        recipe: &ConversionRecipe,
     ) -> Result<Self, String> {
-        let recipe = &capture.conversion_recipe;
+        if recipe.engine_mode == ConversionEngineMode::DeviceLink {
+            macro_rules! create_link {
+                ($n:literal, $variant:ident) => {
+                    Ok(Self::$variant(ProductionDeviceLinkTransform::<$n>::new(
+                        source_model,
+                        RuntimeIccProfile::Embedded(target_icc),
+                    )?))
+                };
+            }
+            return match recipe.target.channels.len() {
+                4 => create_link!(4, LinkCmyk),
+                5 => create_link!(5, LinkN5),
+                6 => create_link!(6, LinkN6),
+                7 => create_link!(7, LinkN7),
+                8 => create_link!(8, LinkN8),
+                9 => create_link!(9, LinkN9),
+                10 => create_link!(10, LinkN10),
+                11 => create_link!(11, LinkN11),
+                12 => create_link!(12, LinkN12),
+                count => Err(format!(
+                    "Unsupported DeviceLink output channel count: {count}."
+                )),
+            };
+        }
+        if recipe.engine_mode != ConversionEngineMode::Icc {
+            return Err("Unsupported production conversion engine.".to_owned());
+        }
         let create_n = |count: usize| -> Result<Self, String> {
             macro_rules! create {
                 ($n:literal, $variant:ident) => {
@@ -469,6 +534,15 @@ impl RuntimeProductionTransform {
             Self::N10(_) => 10,
             Self::N11(_) => 11,
             Self::N12(_) => 12,
+            Self::LinkCmyk(_) => 4,
+            Self::LinkN5(_) => 5,
+            Self::LinkN6(_) => 6,
+            Self::LinkN7(_) => 7,
+            Self::LinkN8(_) => 8,
+            Self::LinkN9(_) => 9,
+            Self::LinkN10(_) => 10,
+            Self::LinkN11(_) => 11,
+            Self::LinkN12(_) => 12,
         }
     }
 
@@ -483,6 +557,15 @@ impl RuntimeProductionTransform {
             Self::N10(transform) => transform_n(transform, source, destination),
             Self::N11(transform) => transform_n(transform, source, destination),
             Self::N12(transform) => transform_n(transform, source, destination),
+            Self::LinkCmyk(transform) => transform_link(transform, source, destination),
+            Self::LinkN5(transform) => transform_link(transform, source, destination),
+            Self::LinkN6(transform) => transform_link(transform, source, destination),
+            Self::LinkN7(transform) => transform_link(transform, source, destination),
+            Self::LinkN8(transform) => transform_link(transform, source, destination),
+            Self::LinkN9(transform) => transform_link(transform, source, destination),
+            Self::LinkN10(transform) => transform_link(transform, source, destination),
+            Self::LinkN11(transform) => transform_link(transform, source, destination),
+            Self::LinkN12(transform) => transform_link(transform, source, destination),
         }
     }
 }
@@ -506,6 +589,23 @@ fn transform_cmyk(
 
 fn transform_n<const N: usize>(
     transform: &ProductionNChannelTransform<N>,
+    source: &[u16],
+    destination: &mut [u16],
+) -> Result<(), String> {
+    match transform.source_model() {
+        IccSourceModel::Rgb => transform.transform_rgb_chunk(
+            samples_as_arrays::<3>(source)?,
+            samples_as_arrays_mut::<N>(destination)?,
+        ),
+        IccSourceModel::Cmyk => transform.transform_cmyk_chunk(
+            samples_as_arrays::<4>(source)?,
+            samples_as_arrays_mut::<N>(destination)?,
+        ),
+    }
+}
+
+fn transform_link<const N: usize>(
+    transform: &ProductionDeviceLinkTransform<N>,
     source: &[u16],
     destination: &mut [u16],
 ) -> Result<(), String> {
@@ -660,6 +760,12 @@ fn unix_time_ms() -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color_conversion::{
+        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionRenderingIntent, ConversionTargetDefinition,
+        SeparationStrategy, TargetChannelDefinition,
+    };
+    use crate::model::IccProfileIdentity;
+    use lcms2::{ColorSpaceSignature, Profile};
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -714,5 +820,58 @@ mod tests {
         assert!(FilesystemIccConversionBackend::new(f64::NAN).is_err());
         assert!(FilesystemIccConversionBackend::new(0.0).is_err());
         assert!(FilesystemIccConversionBackend::new(220.0).is_ok());
+    }
+
+    #[test]
+    fn runtime_dispatch_executes_captured_devicelink_without_source_icc_chain() {
+        let link = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0)
+            .unwrap()
+            .icc()
+            .unwrap();
+        let recipe = ConversionRecipe {
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::DeviceLink,
+            source_profile_identity: IccProfileIdentity {
+                description: "Captured source".to_owned(),
+                sha256: "a".repeat(64),
+            },
+            target: ConversionTargetDefinition {
+                name: "Direct CMYK link".to_owned(),
+                channels: ["Cyan", "Magenta", "Yellow", "Black"]
+                    .map(|name| TargetChannelDefinition {
+                        name: name.to_owned(),
+                        display_rgb: None,
+                        solidity: 1.0,
+                        max_coverage: None,
+                    })
+                    .to_vec(),
+                bit_depth: 16,
+                output_profile_identity: None,
+                output_profile_path: None,
+                device_link_identity: Some(IccProfileIdentity {
+                    description: "240% ink limit".to_owned(),
+                    sha256: "b".repeat(64),
+                }),
+                device_link_path: Some("fixture.icc".to_owned()),
+                characterization_id: None,
+                total_ink_limit: None,
+            },
+            rendering_intent: ConversionRenderingIntent::AbsoluteColorimetric,
+            black_point_compensation: true,
+            strategy: SeparationStrategy::default(),
+        };
+        let transform = RuntimeProductionTransform::new(
+            IccSourceModel::Cmyk,
+            &Profile::new_srgb().icc().unwrap(),
+            &link,
+            &recipe,
+        )
+        .unwrap();
+        let source = [60_000u16, 50_000, 40_000, 30_000];
+        let mut output = [0u16; 4];
+        transform.transform(&source, &mut output).unwrap();
+
+        assert_eq!(transform.output_channels(), 4);
+        assert!(output.into_iter().map(u64::from).sum::<u64>() <= 157_290);
     }
 }

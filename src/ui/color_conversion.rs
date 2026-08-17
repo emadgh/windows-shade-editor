@@ -999,7 +999,10 @@ fn render_target_setup(
                     .color(egui::Color32::LIGHT_GREEN)
                     .strong(),
             );
-            let executable = review.recipe.engine_mode == ConversionEngineMode::Icc;
+            let executable = matches!(
+                review.recipe.engine_mode,
+                ConversionEngineMode::Icc | ConversionEngineMode::DeviceLink
+            );
             if ui
                 .add_enabled(
                     executable,
@@ -1008,7 +1011,7 @@ fn render_target_setup(
                 .on_hover_text(if executable {
                     "Capture the exact saved Source state and add it to the persistent conversion queue."
                 } else {
-                    "DeviceLink execution is not implemented yet; select Standard Output ICC."
+                    "Custom Optimizer execution requires its dedicated engine."
                 })
                 .clicked()
             {
