@@ -205,6 +205,10 @@ enum JobResult {
         result: Result<(), String>,
     },
     InspectTiff(Result<tiff_inspect::TiffInspection, String>),
+    ConversionCapture {
+        result: Result<windows_shade_editor::conversion_transaction::ConversionJobCapture, String>,
+        default_dpi: f64,
+    },
     Export(SnapshotExportBatchResult),
     WorkerPanic(String),
 }
@@ -273,6 +277,7 @@ struct ShadeApp {
     settings_view: ui::settings_panel::SettingsViewState,
     color: ColorManagementController,
     color_conversion: ui::color_conversion::ColorConversionUiState,
+    conversion_queue: windows_shade_editor::conversion_queue::ConversionQueue,
     show_about: bool,
     show_logs: bool,
     previous_shades: previous_shades::PreviousShadesStore,
@@ -349,6 +354,12 @@ impl ShadeApp {
             log.error(&err);
             export_queue::ExportQueue::new()
         });
+        let conversion_queue =
+            windows_shade_editor::conversion_queue::ConversionQueue::load_persistent()
+                .unwrap_or_else(|err| {
+                    log.error(&err);
+                    windows_shade_editor::conversion_queue::ConversionQueue::new()
+                });
         Self {
             project,
             project_path: None,
@@ -367,6 +378,7 @@ impl ShadeApp {
             settings_view: ui::settings_panel::SettingsViewState::default(),
             color: ColorManagementController::default(),
             color_conversion: ui::color_conversion::ColorConversionUiState::default(),
+            conversion_queue,
             show_about: false,
             show_logs: false,
             previous_shades,
@@ -449,7 +461,7 @@ impl ShadeApp {
         match self.lifecycle.request(
             transition,
             self.job.is_some() || self.project_autosave_busy,
-            self.export.queue.has_pending(),
+            self.export.queue.has_pending() || self.conversion_queue.has_pending(),
             self.project_dirty,
             !self.faces.is_empty(),
             self.project_path.is_some(),
@@ -460,7 +472,7 @@ impl ShadeApp {
             TransitionRequest::BlockedByExportQueue => {
                 self.export.show_queue = true;
                 self.report_info(
-                    "Finish or cancel the Export Queue before changing projects or exiting.",
+                    "Finish or cancel the active Export/Conversion Queue before exiting Shade Editor.",
                 );
             }
             TransitionRequest::AwaitingConfirmation => {}
@@ -890,6 +902,12 @@ impl ShadeApp {
     }
 
     fn enqueue_export(&mut self, spec: export_queue::ExportQueueSpec) -> bool {
+        if self.conversion_queue.has_pending() {
+            self.report_error(
+                "Finish or cancel the active Production Conversion before queueing exports.",
+            );
+            return false;
+        }
         let protected_sources = self
             .faces
             .iter()
@@ -983,7 +1001,10 @@ impl ShadeApp {
     }
 
     fn poll_export_queue(&mut self) {
-        let completions = self.export.queue.poll();
+        let completions = self
+            .export
+            .queue
+            .poll_with_start(!self.conversion_queue.is_active());
         if let Some(err) = self.export.queue.take_persistence_error() {
             self.log.error(&format!("Export Queue persistence: {err}"));
         }
@@ -1030,6 +1051,68 @@ impl ShadeApp {
             if let Some(folder) = self.export.open_folder_after.take() {
                 if let Err(err) = open_folder(&folder) {
                     self.report_error(err);
+                }
+            }
+        }
+    }
+
+    fn poll_conversion_queue(&mut self) {
+        use windows_shade_editor::conversion_queue::ConversionQueueCompletionResult;
+
+        let completions = self
+            .conversion_queue
+            .poll_with_start(!self.export.queue.is_active());
+        if let Some(error) = self.conversion_queue.take_persistence_error() {
+            self.log
+                .error(&format!("Conversion Queue persistence: {error}"));
+        }
+        for completion in completions {
+            match completion.result {
+                ConversionQueueCompletionResult::Completed(completed) => {
+                    let is_current_source = self.project_path.as_ref().is_some_and(|path| {
+                        path.to_string_lossy().eq_ignore_ascii_case(
+                            &completion.capture.source_project_path.to_string_lossy(),
+                        )
+                    });
+                    if is_current_source {
+                        let was_dirty = self.project_dirty;
+                        match production_project::link_source_project_to_production(
+                            &mut self.project,
+                            &completed.production_project_path,
+                        ) {
+                            Ok(()) if was_dirty => self.mark_project_dirty(),
+                            Ok(()) => self.mark_project_saved(),
+                            Err(error) => self.log.error(&format!(
+                                "Could not mirror committed Production link in the open Source project: {error}"
+                            )),
+                        }
+                    }
+                    self.report_info(format!(
+                        "Conversion #{} complete: {} and {}",
+                        completion.id,
+                        completed.committed_output.path.display(),
+                        completed.production_project_path.display()
+                    ));
+                }
+                ConversionQueueCompletionResult::Cancelled { phase, message } => {
+                    self.report_info(format!(
+                        "Conversion #{} cancelled during {phase}: {message}",
+                        completion.id
+                    ));
+                }
+                ConversionQueueCompletionResult::Failed { phase, error } => {
+                    self.report_error(format!(
+                        "Conversion #{} failed during {phase}: {error}",
+                        completion.id
+                    ));
+                }
+                ConversionQueueCompletionResult::NeedsRecovery(recovery) => {
+                    self.report_error(format!(
+                        "Conversion #{} committed {} but needs recovery: {}",
+                        completion.id,
+                        recovery.committed_output.path.display(),
+                        recovery.error
+                    ));
                 }
             }
         }
@@ -2105,6 +2188,20 @@ impl ShadeApp {
                 }
                 self.inspector.show = true;
             }
+            JobResult::ConversionCapture {
+                result,
+                default_dpi,
+            } => match result {
+                Ok(capture) => match self.conversion_queue.enqueue(capture, default_dpi) {
+                    Ok(id) => self.report_info(format!(
+                        "Production conversion queued as item #{id}"
+                    )),
+                    Err(error) => self.report_error(error),
+                },
+                Err(error) => self.report_error(format!(
+                    "Could not capture production conversion: {error}"
+                )),
+            },
             JobResult::WorkerPanic(err) => {
                 self.report_error(err);
             }
@@ -2582,6 +2679,14 @@ impl ShadeApp {
             ui.add(
                 egui::ProgressBar::new(value)
                     .desired_width(300.0)
+                    .text(text),
+            );
+            return;
+        }
+        if let Some((value, text)) = self.conversion_queue.active_summary() {
+            ui.add(
+                egui::ProgressBar::new(value)
+                    .desired_width(340.0)
                     .text(text),
             );
             return;
@@ -4658,6 +4763,7 @@ impl eframe::App for ShadeApp {
         self.poll_job();
         self.complete_transition_after_save(ui.ctx());
         self.poll_export_queue();
+        self.poll_conversion_queue();
         self.poll_render(ui.ctx());
         self.sync_update_state();
         self.poll_autosave();

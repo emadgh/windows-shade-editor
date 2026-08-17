@@ -233,7 +233,19 @@ The bounded callback path currently writes uncompressed strips because the encod
 
 The transaction reports distinct decode, source-adjustment, conversion, metadata, staged-write, validation, TIFF-commit and Production-project-save phases. Cancellation is honored until the atomic TIFF commit point. Once a validated TIFF is committed, the small Production-project save boundary is completed even if cancellation arrives, because rolling back or deleting a durable production file would violate recovery guarantees.
 
-If project construction or saving fails after TIFF commit, the transaction returns a structured recovery result containing the committed output identity and, when construction succeeded, the clean Production project payload. It never silently deletes the committed TIFF. Persistent queue integration remains separate work under #100.
+If project construction or saving fails after TIFF commit, the transaction returns a structured recovery result containing the committed output identity and, when construction succeeded, the clean Production project payload. It never silently deletes the committed TIFF.
+
+## Persistent conversion queue and reciprocal link boundary
+
+Valid Standard Output ICC Target Setup can now capture and enqueue production work. Capture hashes both the saved Source `.shade` and immutable source TIFF in a foreground-independent worker, freezes the source adjustment/profile/target recipe plus destinations, and persists it in `conversion-queue.json` before raster execution begins.
+
+Queue entries have explicit Waiting, Processing, Done, Failed, Cancelled and Needs Recovery states. A process restart converts an interrupted Processing entry back to Waiting and requires explicit operator resume; it never silently repeats a production write. Progress follows transaction phases. Active cancellation signals the transaction token and is honored until atomic TIFF commit. A failure after commit retains the committed output identity and optional clean Production-project payload for diagnosis/retry.
+
+The captured destination policy survives queue delay. Safe versioned work requires the TIFF and Production-project destinations to remain absent. TIFF publication uses an atomic same-volume no-replace hard-link boundary, so a destination created after capture is preserved even at the final commit race. Only an explicitly captured transactional-replacement policy uses the replace-existing commit path.
+
+After TIFF and Production-project commit, the worker re-hashes the Source `.shade` before writing its reciprocal Production link. If the saved Source changed since capture, the worker preserves both committed production artifacts and reports Needs Recovery instead of overwriting newer Source bytes. The open in-memory Source project mirrors a successful disk link while retaining any newer unsaved edits.
+
+Export and conversion workers are independently persistent but are not started concurrently, avoiding competing full-resolution disk/CPU pressure.
 
 ## Standard ICC raster backend
 
@@ -243,7 +255,7 @@ The backend currently accepts streamable TIFF sources containing exactly three R
 
 LittleCMS then converts each requested strip to CMYK or a typed 5C-12C target. The writer emits 8-bit or 16-bit output, embeds the revalidated target profile, preserves DPI/orientation and authoritative target channel order, validates and atomically commits the TIFF, and returns its full SHA-256 before the transaction saves the clean Production project.
 
-This backend deliberately rejects DeviceLink and Custom Optimizer recipes, RGB/CMYK sources with Spot or extra samples, and non-streamable TIFF input. Those paths require dedicated semantics rather than an implicit fallback. Persistent queue/UI orchestration, deterministic real Output-ICC fixtures, LZW, Photoshop-specific spot metadata and external Photoshop/RIP validation remain release gates.
+This backend deliberately rejects DeviceLink and Custom Optimizer recipes, RGB/CMYK sources with Spot or extra samples, and non-streamable TIFF input. Those paths require dedicated semantics rather than an implicit fallback. Deterministic real Output-ICC fixtures, LZW, Photoshop-specific spot metadata and external Photoshop/RIP validation remain release gates.
 
 ## Serialization policy
 

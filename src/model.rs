@@ -437,6 +437,23 @@ impl ShadeProject {
             .map_err(|err| format!("Cannot safely save .shade file {}: {err}", path.display()))
     }
 
+    pub fn save_new(&self, path: &Path, resolved_face_paths: &[PathBuf]) -> Result<(), String> {
+        let mut portable = self.clone();
+        portable.schema_version = SHADE_SCHEMA_VERSION;
+        let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        for (face, source) in portable.faces.iter_mut().zip(resolved_face_paths.iter()) {
+            face.path = make_portable_path(source, project_dir);
+        }
+        let text = serde_json::to_string_pretty(&portable)
+            .map_err(|err| format!("Cannot serialize project: {err}"))?;
+        safe_fs::atomic_write_if_absent(path, text.as_bytes()).map_err(|err| {
+            format!(
+                "Cannot safely create new .shade file {}: {err}",
+                path.display()
+            )
+        })
+    }
+
     pub fn resolve_face_paths(&self, shade_path: &Path) -> Vec<PathBuf> {
         let base = shade_path.parent().unwrap_or_else(|| Path::new("."));
         self.faces

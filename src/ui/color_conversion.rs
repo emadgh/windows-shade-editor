@@ -16,6 +16,9 @@ use windows_shade_editor::conversion_preflight::{
     SourceImageFormat, SourceProfileState, TransparencyState, build_conversion_preflight,
 };
 use windows_shade_editor::conversion_recipe::recipe_sha256;
+use windows_shade_editor::conversion_transaction::{
+    CapturedOutputPolicy, CapturedSourceProfile, ConversionJobCapture,
+};
 use windows_shade_editor::conversion_workflow::{
     ConversionSaveGate, ConversionSourceState, conversion_save_gate,
 };
@@ -120,10 +123,32 @@ struct CurrentConversionSource {
     report: ConversionPreflightReport,
 }
 
+#[derive(Clone)]
 struct TargetSetupReview {
     recipe: ConversionRecipe,
     recipe_sha256: String,
     effective_output_path: PathBuf,
+    production_project_path: PathBuf,
+}
+
+#[derive(Clone)]
+struct ConversionQueueRow {
+    id: u64,
+    label: String,
+    status: windows_shade_editor::conversion_queue::ConversionQueueStatus,
+    progress: f32,
+    phase: String,
+    detail: String,
+    error: Option<String>,
+    requires_resume: bool,
+}
+
+enum ConversionQueueUiAction {
+    ResumeRecovered,
+    TogglePaused,
+    Cancel(u64),
+    Retry(u64),
+    ClearFinished,
 }
 
 impl ShadeApp {
@@ -188,6 +213,25 @@ impl ShadeApp {
         let mut clear_production_profile = false;
         let mut select_target_profile = false;
         let mut select_output_path = false;
+        let mut start_conversion = false;
+        let queue_rows = self
+            .conversion_queue
+            .items()
+            .iter()
+            .map(|item| ConversionQueueRow {
+                id: item.id,
+                label: item.label.clone(),
+                status: item.status,
+                progress: item.progress,
+                phase: item.phase.clone(),
+                detail: item.detail.clone(),
+                error: item.error.clone(),
+                requires_resume: item.requires_resume,
+            })
+            .collect::<Vec<_>>();
+        let queue_paused = self.conversion_queue.is_paused();
+        let recovered_waiting = self.conversion_queue.recovered_waiting_count();
+        let mut queue_actions = Vec::new();
 
         let state = &mut self.color_conversion;
         egui::Window::new("Production Color Conversion")
@@ -259,6 +303,7 @@ impl ShadeApp {
                             &source,
                             &mut select_target_profile,
                             &mut select_output_path,
+                            &mut start_conversion,
                         );
                     }
                 }
@@ -267,6 +312,13 @@ impl ShadeApp {
                 ui.separator();
                 ui.small(
                     "Target Setup does not write pixels. The original Source file remains byte-identical; production conversion starts only through the transactional worker.",
+                );
+                render_conversion_queue(
+                    ui,
+                    &queue_rows,
+                    queue_paused,
+                    recovered_waiting,
+                    &mut queue_actions,
                 );
             });
 
@@ -336,6 +388,32 @@ impl ShadeApp {
                     Ok(()) => self.color_conversion.output_path = Some(path),
                     Err(err) => self.report_error(output_path_error(err)),
                 }
+            }
+        }
+        for action in queue_actions {
+            match action {
+                ConversionQueueUiAction::ResumeRecovered => {
+                    let count = self.conversion_queue.resume_recovered();
+                    self.report_info(format!("Resumed {count} recovered conversion(s)"));
+                }
+                ConversionQueueUiAction::TogglePaused => {
+                    self.conversion_queue.set_paused(!queue_paused);
+                }
+                ConversionQueueUiAction::Cancel(id) => {
+                    self.conversion_queue.cancel(id);
+                }
+                ConversionQueueUiAction::Retry(id) => {
+                    self.conversion_queue.retry(id);
+                }
+                ConversionQueueUiAction::ClearFinished => {
+                    self.conversion_queue.clear_finished();
+                }
+            }
+        }
+        if start_conversion {
+            match build_target_setup_review(&self.color_conversion, &source) {
+                Ok(review) => self.capture_conversion_job(&source, review),
+                Err(errors) => self.report_error(errors.join(" ")),
             }
         }
     }
@@ -446,6 +524,116 @@ impl ShadeApp {
                 "Cleared the production Source ICC override for {label}. Embedded ICC preflight is active again."
             ));
         }
+    }
+
+    fn capture_conversion_job(
+        &mut self,
+        source: &CurrentConversionSource,
+        review: TargetSetupReview,
+    ) {
+        if self.job.is_some() {
+            self.report_info("Finish the current foreground operation before queueing conversion.");
+            return;
+        }
+        if self.export.queue.has_pending() {
+            self.report_info(
+                "Finish or cancel Export Queue before queueing production conversion.",
+            );
+            return;
+        }
+        let Some(source_project_path) = self.project_path.clone() else {
+            self.report_error("Save the Source project before queueing production conversion.");
+            return;
+        };
+        if self
+            .export
+            .queue
+            .reserved_destination_keys()
+            .contains(&path_safety::path_key(&review.effective_output_path))
+        {
+            self.report_error("The selected TIFF is already reserved by Export Queue.");
+            return;
+        }
+        let source_profile = source
+            .production_profile_path
+            .as_deref()
+            .map(PathBuf::from)
+            .map(|path| CapturedSourceProfile::External { path })
+            .unwrap_or(CapturedSourceProfile::Embedded);
+        let project = self.project.clone();
+        let source_face_path = source.source_path.clone();
+        let source_snapshot_id = source.snapshot_id;
+        let output_tiff_path = review.effective_output_path;
+        let production_project_path = review.production_project_path;
+        let target_name = review.recipe.target.name.clone();
+        let production_project_name = format!("{} - {target_name}", project.name);
+        let output_face_label = format!("{} - {target_name}", source.face_label);
+        let recipe = review.recipe;
+        let output_policy = match self.color_conversion.collision_policy {
+            OutputCollisionPolicy::Versioned => CapturedOutputPolicy::MustNotExist,
+            OutputCollisionPolicy::TransactionalReplace => {
+                CapturedOutputPolicy::TransactionalReplace
+            }
+        };
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Capturing production conversion", move |progress| {
+            Self::set_progress(
+                &progress,
+                Some(0.05),
+                "Capturing production conversion",
+                "Hashing saved Source project",
+            );
+            let result = (|| {
+                let captured_project: windows_shade_editor::model::ShadeProject =
+                    serde_json::from_value(serde_json::to_value(&project).map_err(|error| {
+                        format!("Cannot serialize Source project for conversion capture: {error}")
+                    })?)
+                    .map_err(|error| {
+                        format!("Cannot materialize Source project capture: {error}")
+                    })?;
+                let source_project_file_sha256 =
+                    windows_shade_editor::icc_conversion_worker::sha256_file(&source_project_path)?;
+                Self::set_progress(
+                    &progress,
+                    Some(0.45),
+                    "Capturing production conversion",
+                    "Hashing immutable source TIFF",
+                );
+                let source_file_sha256 =
+                    windows_shade_editor::icc_conversion_worker::sha256_file(&source_face_path)?;
+                Self::set_progress(
+                    &progress,
+                    Some(0.90),
+                    "Capturing production conversion",
+                    "Freezing saved recipe and destinations",
+                );
+                ConversionJobCapture::capture(
+                    &captured_project,
+                    source_project_path,
+                    source_project_file_sha256,
+                    source_face_path,
+                    source_snapshot_id,
+                    source_file_sha256,
+                    source_profile,
+                    recipe,
+                    output_policy,
+                    output_tiff_path,
+                    production_project_path,
+                    production_project_name,
+                    output_face_label,
+                )
+            })();
+            Self::set_progress(
+                &progress,
+                Some(1.0),
+                "Capturing production conversion",
+                "Complete",
+            );
+            JobResult::ConversionCapture {
+                result,
+                default_dpi,
+            }
+        });
     }
 }
 
@@ -579,6 +767,7 @@ fn render_target_setup(
     source: &CurrentConversionSource,
     select_target_profile: &mut bool,
     select_output_path: &mut bool,
+    start_conversion: &mut bool,
 ) {
     ui.separator();
     ui.heading("Target Setup");
@@ -794,6 +983,10 @@ fn render_target_setup(
                             "Effective output",
                             review.effective_output_path.display().to_string(),
                         ),
+                        (
+                            "Production project",
+                            review.production_project_path.display().to_string(),
+                        ),
                         ("Recipe SHA-256", review.recipe_sha256),
                     ] {
                         ui.strong(label);
@@ -806,10 +999,21 @@ fn render_target_setup(
                     .color(egui::Color32::LIGHT_GREEN)
                     .strong(),
             );
-            ui.add_enabled(false, egui::Button::new("Start Production Conversion"))
-                .on_hover_text(
-                    "Target setup is valid. The button remains disabled until the transactional raster worker is wired in the next slice.",
-                );
+            let executable = review.recipe.engine_mode == ConversionEngineMode::Icc;
+            if ui
+                .add_enabled(
+                    executable,
+                    egui::Button::new("Queue Production Conversion"),
+                )
+                .on_hover_text(if executable {
+                    "Capture the exact saved Source state and add it to the persistent conversion queue."
+                } else {
+                    "DeviceLink execution is not implemented yet; select Standard Output ICC."
+                })
+                .clicked()
+            {
+                *start_conversion = true;
+            }
         }
         Err(errors) => {
             for error in errors {
@@ -884,6 +1088,15 @@ fn build_target_setup_review(
         },
         OutputCollisionPolicy::TransactionalReplace => preferred_output.to_path_buf(),
     };
+    let production_project_path = effective_output_path.with_extension("shade");
+    if state.collision_policy == OutputCollisionPolicy::Versioned
+        && production_project_path.exists()
+    {
+        errors.push(format!(
+            "Production project already exists: {}. Select another TIFF name or explicitly choose transactional replacement.",
+            production_project_path.display()
+        ));
+    }
 
     let profile_path = inspected.path.to_string_lossy().into_owned();
     let profile_identity = inspected.identity.clone();
@@ -935,7 +1148,100 @@ fn build_target_setup_review(
         recipe,
         recipe_sha256,
         effective_output_path,
+        production_project_path,
     })
+}
+
+fn render_conversion_queue(
+    ui: &mut egui::Ui,
+    rows: &[ConversionQueueRow],
+    paused: bool,
+    recovered_waiting: usize,
+    actions: &mut Vec<ConversionQueueUiAction>,
+) {
+    use windows_shade_editor::conversion_queue::ConversionQueueStatus;
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.heading("Conversion Queue");
+        if ui
+            .button(if paused {
+                "Resume queue"
+            } else {
+                "Pause queue"
+            })
+            .clicked()
+        {
+            actions.push(ConversionQueueUiAction::TogglePaused);
+        }
+        if recovered_waiting > 0
+            && ui
+                .button(format!("Resume {recovered_waiting} recovered"))
+                .clicked()
+        {
+            actions.push(ConversionQueueUiAction::ResumeRecovered);
+        }
+        if rows.iter().any(|row| {
+            matches!(
+                row.status,
+                ConversionQueueStatus::Done
+                    | ConversionQueueStatus::Failed
+                    | ConversionQueueStatus::Cancelled
+            )
+        }) && ui.button("Clear finished").clicked()
+        {
+            actions.push(ConversionQueueUiAction::ClearFinished);
+        }
+    });
+    if rows.is_empty() {
+        ui.small("No production conversions queued.");
+        return;
+    }
+    for row in rows {
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("#{} {}", row.id, row.label));
+                ui.label(row.status.label());
+                if row.requires_resume {
+                    ui.label(
+                        egui::RichText::new("Recovered / paused").color(egui::Color32::YELLOW),
+                    );
+                }
+            });
+            if row.status == ConversionQueueStatus::Processing {
+                ui.add(
+                    egui::ProgressBar::new(row.progress.clamp(0.0, 1.0))
+                        .show_percentage()
+                        .text(if row.phase.is_empty() {
+                            row.detail.clone()
+                        } else {
+                            format!("{} - {}", row.phase, row.detail)
+                        }),
+                );
+            } else if !row.detail.is_empty() {
+                ui.small(&row.detail);
+            }
+            if let Some(error) = &row.error {
+                ui.label(egui::RichText::new(error).color(egui::Color32::LIGHT_RED));
+            }
+            ui.horizontal(|ui| match row.status {
+                ConversionQueueStatus::Waiting | ConversionQueueStatus::Processing => {
+                    if ui.button("Cancel").clicked() {
+                        actions.push(ConversionQueueUiAction::Cancel(row.id));
+                    }
+                }
+                ConversionQueueStatus::Failed
+                | ConversionQueueStatus::Cancelled
+                | ConversionQueueStatus::NeedsRecovery => {
+                    if ui.button("Retry safely").clicked() {
+                        actions.push(ConversionQueueUiAction::Retry(row.id));
+                    }
+                }
+                ConversionQueueStatus::Done => {}
+            });
+        });
+    }
 }
 
 fn recommended_output_path(
