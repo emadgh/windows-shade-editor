@@ -74,9 +74,17 @@ pub enum CapturedSourceProfile {
     External { path: PathBuf },
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturedOutputPolicy {
+    MustNotExist,
+    TransactionalReplace,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversionJobCapture {
     pub source_project_path: PathBuf,
+    pub source_project_file_sha256: String,
     pub source_face_path: PathBuf,
     pub source_snapshot_id: Option<u64>,
     pub source_file_sha256: String,
@@ -84,6 +92,7 @@ pub struct ConversionJobCapture {
     pub source_recipe: ExportRecipe,
     pub conversion_recipe: ConversionRecipe,
     pub conversion_recipe_sha256: String,
+    pub output_policy: CapturedOutputPolicy,
     pub output_tiff_path: PathBuf,
     pub production_project_path: PathBuf,
     pub production_project_name: String,
@@ -94,11 +103,13 @@ impl ConversionJobCapture {
     pub fn capture(
         source_project: &ShadeProject,
         source_project_path: PathBuf,
+        source_project_file_sha256: String,
         source_face_path: PathBuf,
         source_snapshot_id: Option<u64>,
         source_file_sha256: String,
         source_profile: CapturedSourceProfile,
         conversion_recipe: ConversionRecipe,
+        output_policy: CapturedOutputPolicy,
         output_tiff_path: PathBuf,
         production_project_path: PathBuf,
         production_project_name: String,
@@ -107,6 +118,7 @@ impl ConversionJobCapture {
         let conversion_recipe_sha256 = recipe_sha256(&conversion_recipe)?;
         let capture = Self {
             source_project_path,
+            source_project_file_sha256,
             source_face_path,
             source_snapshot_id,
             source_file_sha256,
@@ -114,6 +126,7 @@ impl ConversionJobCapture {
             source_recipe: ExportRecipe::from_project(source_project),
             conversion_recipe,
             conversion_recipe_sha256,
+            output_policy,
             output_tiff_path,
             production_project_path,
             production_project_name,
@@ -130,6 +143,9 @@ impl ConversionJobCapture {
             return Err(
                 "Conversion capture requires saved Source project and Face paths.".to_owned(),
             );
+        }
+        if !has_sha256(&self.source_project_file_sha256) {
+            return Err("Conversion capture requires a full Source-project SHA-256.".to_owned());
         }
         if !has_sha256(&self.source_file_sha256) {
             return Err("Conversion capture requires a full source-file SHA-256.".to_owned());
@@ -197,7 +213,7 @@ impl ConversionCancellation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommittedConversionOutput {
     pub path: PathBuf,
     pub sha256: String,
@@ -451,11 +467,13 @@ mod tests {
         ConversionJobCapture::capture(
             &source,
             PathBuf::from(r"C:\Design\Source.shade"),
+            HASH_A.to_owned(),
             PathBuf::from(r"C:\Design\Face.tif"),
             Some(7),
             HASH_A.to_owned(),
             CapturedSourceProfile::Embedded,
             recipe(),
+            CapturedOutputPolicy::MustNotExist,
             PathBuf::from(r"C:\Production\Face_CMYK.tif"),
             PathBuf::from(r"C:\Production\Job.shade"),
             "Production Job".to_owned(),
@@ -535,11 +553,13 @@ mod tests {
         let captured = ConversionJobCapture::capture(
             &source,
             PathBuf::from(r"C:\Design\Source.shade"),
+            HASH_A.to_owned(),
             PathBuf::from(r"C:\Design\Face.tif"),
             None,
             HASH_A.to_owned(),
             CapturedSourceProfile::Embedded,
             recipe(),
+            CapturedOutputPolicy::MustNotExist,
             PathBuf::from(r"C:\Production\Face.tif"),
             PathBuf::from(r"C:\Production\Job.shade"),
             "Job".to_owned(),

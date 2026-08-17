@@ -1,3 +1,12 @@
+# Shade Editor 0.21.8
+
+- Wire valid Standard Output ICC Target Setup directly into an immutable background capture and persistent Production Conversion Queue.
+- Persist queued recipes, source/profile identities, destinations and fallback DPI; recovered waiting/processing work stays paused until the operator explicitly resumes it.
+- Add serialized Waiting/Processing/Done/Failed/Cancelled/Needs Recovery states with phase progress, pause, pre-commit cancellation, retry and clear controls in the Color Conversion UI and status bar.
+- Serialize the full Source-project SHA-256 in each capture and commit the reciprocal Production link only when the saved Source project still matches, preventing a background completion from overwriting newer project bytes.
+- Prevent Export Queue and Conversion Queue workers from running concurrently while keeping both queues independently durable and recoverable.
+- Preserve the safe versioned-output promise at delayed execution time with a serialized no-replace policy and an atomic hard-link publication boundary; only explicit transactional replacement may overwrite.
+
 # Shade Editor 0.21.7
 
 - Add the filesystem-backed production ICC raster backend for standard Output ICC recipes from pure RGB or CMYK TIFF sources into CMYK or 5C-12C output.

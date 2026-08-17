@@ -79,6 +79,35 @@ pub fn atomic_write(path: &Path, bytes: &[u8], backup: Option<&Path>) -> Result<
     write_result
 }
 
+pub fn atomic_write_if_absent(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Cannot create folder {}: {err}", parent.display()))?;
+    let temp = temp_path(path);
+    if temp.exists() {
+        fs::remove_file(&temp)
+            .map_err(|err| format!("Cannot remove stale temp file {}: {err}", temp.display()))?;
+    }
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|err| format!("Cannot create temp file {}: {err}", temp.display()))?;
+        file.write_all(bytes)
+            .map_err(|err| format!("Cannot write temp file {}: {err}", temp.display()))?;
+        file.flush()
+            .and_then(|_| file.sync_all())
+            .map_err(|err| format!("Cannot sync temp file {}: {err}", temp.display()))?;
+        drop(file);
+        commit_staged_file_if_absent(&temp, path)
+    })();
+    if result.is_err() && temp.exists() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 pub fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -121,6 +150,34 @@ pub fn commit_staged_file(staged: &Path, destination: &Path) -> Result<(), Strin
         .and_then(|file| file.sync_all())
         .map_err(|err| format!("Cannot sync staged file {}: {err}", staged.display()))?;
     replace_path(staged, destination)
+}
+
+/// Atomically publish a staged file only when the destination is still absent.
+/// A same-volume hard link provides a no-replace create boundary; removing the
+/// staging name afterwards leaves the committed bytes owned by the destination.
+pub fn commit_staged_file_if_absent(staged: &Path, destination: &Path) -> Result<(), String> {
+    if staged.parent() != destination.parent() {
+        return Err("Atomic commit requires the staged file beside its destination.".to_owned());
+    }
+    if !staged.is_file() {
+        return Err(format!("Staged file is missing: {}", staged.display()));
+    }
+    OpenOptions::new()
+        .write(true)
+        .open(staged)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| format!("Cannot sync staged file {}: {err}", staged.display()))?;
+    fs::hard_link(staged, destination).map_err(|err| {
+        format!(
+            "Cannot commit new destination {} because it exists or cannot be created: {err}",
+            destination.display()
+        )
+    })?;
+    // Once the hard link succeeds, the destination is durably committed. A
+    // staging-name cleanup failure must not be reported as pre-commit failure;
+    // the caller's best-effort cleanup can remove the extra name later.
+    let _ = fs::remove_file(staged);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -208,6 +265,19 @@ mod tests {
     }
 
     #[test]
+    fn atomic_new_write_preserves_an_existing_file() {
+        let folder = temp_folder("new-write");
+        fs::create_dir_all(&folder).unwrap();
+        let target = folder.join("project.shade");
+        fs::write(&target, b"existing").unwrap();
+
+        assert!(atomic_write_if_absent(&target, b"new").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+        assert!(!temp_path(&target).exists());
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
     fn staged_file_commit_replaces_destination_atomically() {
         let folder = temp_folder("staged-commit");
         fs::create_dir_all(&folder).unwrap();
@@ -220,6 +290,21 @@ mod tests {
 
         assert_eq!(fs::read(&destination).unwrap(), b"new");
         assert!(!staged.exists());
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn new_only_staged_commit_preserves_an_existing_destination() {
+        let folder = temp_folder("staged-new-only");
+        fs::create_dir_all(&folder).unwrap();
+        let destination = folder.join("output.tif");
+        let staged = folder.join("output.tif.conversion.tmp");
+        fs::write(&destination, b"existing").unwrap();
+        fs::write(&staged, b"new").unwrap();
+
+        assert!(commit_staged_file_if_absent(&staged, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"existing");
+        assert_eq!(fs::read(&staged).unwrap(), b"new");
         let _ = fs::remove_dir_all(folder);
     }
 }

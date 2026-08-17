@@ -454,6 +454,10 @@ impl ExportQueue {
         self.pending_count() > 0
     }
 
+    pub fn is_active(&self) -> bool {
+        self.active_id.is_some()
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused
     }
@@ -695,6 +699,10 @@ impl ExportQueue {
     }
 
     pub fn poll(&mut self) -> Vec<ExportQueueCompletion> {
+        self.poll_with_start(true)
+    }
+
+    pub fn poll_with_start(&mut self, allow_start: bool) -> Vec<ExportQueueCompletion> {
         let mut completions = Vec::new();
         let mut changed = false;
         while let Ok(event) = self.rx.try_recv() {
@@ -756,7 +764,7 @@ impl ExportQueue {
             }
         }
 
-        if self.active_id.is_none() && !self.stop_after_current && !self.paused {
+        if allow_start && self.active_id.is_none() && !self.stop_after_current && !self.paused {
             changed |= self.start_next();
         }
         if changed {

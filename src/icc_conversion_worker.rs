@@ -12,8 +12,8 @@ use crate::conversion_tiff::{
     ConversionTiffSpec, write_conversion_tiff_u8_atomic, write_conversion_tiff_u16_atomic,
 };
 use crate::conversion_transaction::{
-    CapturedSourceProfile, CommittedConversionOutput, ConversionCancellation, ConversionJobCapture,
-    ConversionPhase, ConversionProgress, ConversionTransactionBackend,
+    CapturedOutputPolicy, CapturedSourceProfile, CommittedConversionOutput, ConversionCancellation,
+    ConversionJobCapture, ConversionPhase, ConversionProgress, ConversionTransactionBackend,
 };
 use crate::icc_conversion::{IccSourceModel, ProductionCmykTransform, RuntimeIccProfile};
 use crate::model::ShadeProject;
@@ -25,6 +25,7 @@ static CONVERSION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub struct FilesystemIccConversionBackend {
     default_dpi: f64,
+    replace_existing: bool,
 }
 
 impl FilesystemIccConversionBackend {
@@ -32,7 +33,10 @@ impl FilesystemIccConversionBackend {
         if !default_dpi.is_finite() || default_dpi <= 0.0 {
             return Err("Conversion fallback DPI must be finite and positive.".to_owned());
         }
-        Ok(Self { default_dpi })
+        Ok(Self {
+            default_dpi,
+            replace_existing: false,
+        })
     }
 }
 
@@ -44,6 +48,15 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
         report: &mut dyn FnMut(ConversionProgress),
     ) -> Result<CommittedConversionOutput, String> {
         cancellation.check_before_commit()?;
+        self.replace_existing = capture.output_policy == CapturedOutputPolicy::TransactionalReplace;
+        if !self.replace_existing
+            && (capture.output_tiff_path.exists() || capture.production_project_path.exists())
+        {
+            return Err(
+                "Queued versioned conversion destination is no longer free; review and queue a new version."
+                    .to_owned(),
+            );
+        }
         report(ConversionProgress::new(
             ConversionPhase::CaptureValidation,
             0.02,
@@ -106,7 +119,11 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
             );
         }
         let output = PathBuf::from(&project.faces[0].path);
-        project.save(path, &[output])
+        if self.replace_existing {
+            project.save(path, &[output])
+        } else {
+            project.save_new(path, &[output])
+        }
     }
 }
 
@@ -228,6 +245,7 @@ fn render_convert_and_commit(
             orientation: metadata.orientation,
             rows_per_strip: stream.rows_per_strip.max(1),
             force_bigtiff: false,
+            replace_existing: capture.output_policy == CapturedOutputPolicy::TransactionalReplace,
         };
         let source_channels = metadata.samples_per_pixel;
         let width = metadata.width as usize;

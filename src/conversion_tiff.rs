@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use tiff::encoder::{colortype, Compression, TiffEncoder, TiffValue};
+use tiff::encoder::{Compression, TiffEncoder, TiffValue, colortype};
 use tiff::tags::{ExtraSamples, Tag, Type};
 
 use crate::{dpi, safe_fs, tiff_io};
@@ -37,6 +37,7 @@ pub struct ConversionTiffSpec<'a> {
     pub orientation: Option<u16>,
     pub rows_per_strip: u32,
     pub force_bigtiff: bool,
+    pub replace_existing: bool,
 }
 
 pub fn write_conversion_tiff_u8_atomic<F>(
@@ -88,7 +89,11 @@ where
     let result = (|| {
         write_staged(&staged)?;
         verify_staged(&staged, spec, bit_depth)?;
-        safe_fs::commit_staged_file(&staged, destination)
+        if spec.replace_existing {
+            safe_fs::commit_staged_file(&staged, destination)
+        } else {
+            safe_fs::commit_staged_file_if_absent(&staged, destination)
+        }
     })();
     if result.is_err() && staged.exists() {
         let _ = fs::remove_file(&staged);
@@ -586,6 +591,7 @@ mod tests {
             orientation: Some(1),
             rows_per_strip: 1,
             force_bigtiff: false,
+            replace_existing: true,
         };
 
         write_conversion_tiff_u16_atomic(&destination, &spec, |start, _, samples| {
@@ -620,9 +626,10 @@ mod tests {
         );
         let raw = fs::read(&destination).unwrap();
         let expected_ink_names = b"Blue\0Brown\0Beige\0Black\0Yellow\0Pink\0Green\0";
-        assert!(raw
-            .windows(expected_ink_names.len())
-            .any(|window| window == expected_ink_names));
+        assert!(
+            raw.windows(expected_ink_names.len())
+                .any(|window| window == expected_ink_names)
+        );
         let _ = fs::remove_file(destination);
     }
 
@@ -641,6 +648,7 @@ mod tests {
             orientation: Some(1),
             rows_per_strip: 1,
             force_bigtiff: false,
+            replace_existing: true,
         };
 
         write_conversion_tiff_u8_atomic(&destination, &spec, |_, _, samples| {
@@ -681,6 +689,7 @@ mod tests {
             orientation: None,
             rows_per_strip: 1,
             force_bigtiff: false,
+            replace_existing: true,
         };
 
         let error = write_conversion_tiff_u8_atomic(&destination, &spec, |_, _, _| {
@@ -690,6 +699,37 @@ mod tests {
 
         assert!(error.contains("simulated"));
         assert_eq!(fs::read(&destination).unwrap(), b"existing-production");
+        assert!(!staged_path(&destination).unwrap().exists());
+        let _ = fs::remove_file(destination);
+    }
+
+    #[test]
+    fn new_only_commit_never_replaces_a_destination_that_appeared_after_capture() {
+        let destination = temp_path("new-only-race");
+        fs::write(&destination, b"other-production-job").unwrap();
+        let names = ["Cyan", "Magenta", "Yellow", "Black"].map(str::to_owned);
+        let profile = profile_bytes();
+        let spec = ConversionTiffSpec {
+            width: 1,
+            height: 1,
+            channel_names: &names,
+            target_icc: &profile,
+            dpi_x: 220.0,
+            dpi_y: 220.0,
+            orientation: None,
+            rows_per_strip: 1,
+            force_bigtiff: false,
+            replace_existing: false,
+        };
+
+        let error = write_conversion_tiff_u8_atomic(&destination, &spec, |_, _, samples| {
+            samples.copy_from_slice(&[1, 2, 3, 4]);
+            Ok(())
+        })
+        .expect_err("new-only commit must preserve an occupied destination");
+
+        assert!(error.contains("exists or cannot be created"));
+        assert_eq!(fs::read(&destination).unwrap(), b"other-production-job");
         assert!(!staged_path(&destination).unwrap().exists());
         let _ = fs::remove_file(destination);
     }
@@ -709,6 +749,7 @@ mod tests {
             orientation: None,
             rows_per_strip: 1,
             force_bigtiff: false,
+            replace_existing: true,
         };
         assert!(write_conversion_tiff_u8_atomic(&destination, &spec, |_, _, _| Ok(())).is_err());
         assert!(!destination.exists());
@@ -728,6 +769,7 @@ mod tests {
             orientation: None,
             rows_per_strip: 32,
             force_bigtiff: false,
+            replace_existing: true,
         };
         assert!(should_write_bigtiff(&spec, 16));
     }
@@ -747,6 +789,7 @@ mod tests {
             orientation: None,
             rows_per_strip: 1,
             force_bigtiff: true,
+            replace_existing: true,
         };
 
         write_conversion_tiff_u8_atomic(&destination, &spec, |_, _, samples| {
