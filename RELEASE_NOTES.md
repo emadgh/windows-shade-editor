@@ -1,3 +1,11 @@
+# Shade Editor 0.21.10
+
+- LZW-compress all production color-conversion TIFF/BigTIFF output and verify the staged Compression tag before atomic commit.
+- Preserve bounded transformation memory by rendering one strip at a time into a uniquely-created local disk spool, then memory-map that spool for the encoder's full-slice compression API instead of allocating a second full-resolution N-channel image in RAM.
+- Remove the local conversion-output spool on both success and render failure while preserving the existing destination and staged-output cleanup guarantees.
+- Exercise LZW round trips for 8-bit CMYK, 16-bit seven-channel and forced BigTIFF output, including exact samples, callback strip bounds, metadata and cleanup checks.
+- Keep Photoshop Image Resources/DisplayInfo generation and Spot sample-polarity changes pending until their target metadata and external Photoshop/RIP interpretation are validated together.
+
 # Shade Editor 0.21.9
 
 - Execute verified ICC DeviceLink recipes directly through a single-profile LittleCMS chain for CMYK or 5C-12C production output, without inserting preview state or a separate Source ICC into the encoded link.
