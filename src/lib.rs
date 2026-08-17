@@ -13,6 +13,7 @@ pub mod conversion_tiff;
 pub mod conversion_transaction;
 pub mod conversion_workflow;
 pub mod device_characterization;
+pub mod device_characterization_package;
 pub mod devicelink_conversion;
 pub mod export_recipe;
 pub mod icc_conversion;
