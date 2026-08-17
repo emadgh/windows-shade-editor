@@ -27,6 +27,7 @@ mod model;
 mod palette;
 mod path_safety;
 mod previous_shades;
+mod production_project;
 mod project_autosave;
 mod project_lifecycle;
 mod recovery;
