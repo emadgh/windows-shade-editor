@@ -18,6 +18,8 @@ pub mod device_characterization_model;
 pub mod device_characterization_package;
 pub mod devicelink_conversion;
 pub mod export_recipe;
+pub mod gradient_continuity;
+pub mod gradient_validation;
 pub mod icc_conversion;
 pub mod icc_conversion_worker;
 pub mod inverse_separation_solver;
