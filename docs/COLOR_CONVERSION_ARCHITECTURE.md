@@ -35,15 +35,15 @@ The source `.shade` is never mutated into the Production `.shade`.
 
 Existing `.shade` files predate this workflow and can represent many real production scenarios. They must not be guessed to be `source` or `production` projects.
 
-The future serialized project role therefore has three semantic states:
+The serialized project role has three semantic states:
 
 - `standalone` — backward-compatible/default behavior for existing projects;
 - `source` — design/source project participating in conversion lineage;
 - `production` — project containing converted production separations.
 
-Missing role data must deserialize as `standalone` when the role is integrated into the `.shade` schema.
+Missing role data deserializes as `standalone`.
 
-This foundation does **not** change `SHADE_SCHEMA_VERSION` yet. Role/provenance serialization will land only with explicit migration/backward-compatibility tests.
+Schema v9 now stores defaultable role, linked-project and per-Face production-provenance fields. This does **not** change `SHADE_SCHEMA_VERSION`: explicit backward-compatibility tests prove that files without the fields retain standalone behavior.
 
 ## Decision 3 — Conversion requires a saved Source state
 
@@ -223,7 +223,7 @@ It does **not** yet perform pixel conversion or write TIFFs. Those capabilities 
 
 `CONVERSION_RECIPE_SCHEMA_VERSION` is independent from the `.shade` schema version. Conversion recipes need their own semantic version boundary because optimizer/profile strategy semantics can change independently from the project container.
 
-When project role/provenance fields are eventually added to `ShadeProject`, they should be defaultable where backward-safe. A `.shade` schema bump is required if semantic compatibility cannot be preserved by defaults.
+`ShadeProject` stores role, reciprocal project links and production provenance using Serde defaults. A fresh Production project is built from target channel definitions and intentionally starts with clean target-domain adjustments/Snapshots; source-domain adjustments are never copied into it. A future `.shade` schema bump remains required if semantic compatibility can no longer be preserved by defaults.
 
 Per-Face production Source ICC assignment was added to schema-v9 projects as a backward-safe optional `FaceRef` field with a Serde default. Legacy Face records deserialize with no assignment and continue to use embedded ICC preflight.
 

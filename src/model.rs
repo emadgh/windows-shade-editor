@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::color_conversion::{LinkedProjectRef, ProductionProvenance, ProjectRole};
 use crate::safe_fs;
 
 use crate::palette::ChannelPalette;
@@ -104,6 +105,18 @@ impl Default for PreviewColorSettings {
 pub struct ShadeProject {
     pub schema_version: u32,
     pub name: String,
+    /// Explicit source/production role. Legacy projects remain standalone.
+    #[serde(default)]
+    pub project_role: ProjectRole,
+    /// Portable references to the source/production project on the other side
+    /// of a conversion workflow. Missing links never make this project unusable.
+    #[serde(default)]
+    pub linked_projects: Vec<LinkedProjectRef>,
+    /// Per-output lineage captured from immutable conversion job inputs/results.
+    /// Source projects normally keep this empty; Production projects keep one
+    /// entry per converted Face/version.
+    #[serde(default)]
+    pub production_provenance: Vec<ProductionProvenance>,
     pub faces: Vec<FaceRef>,
     pub adjustments: BTreeMap<String, ChannelAdjustment>,
     #[serde(default)]
@@ -136,6 +149,9 @@ impl Default for ShadeProject {
         Self {
             schema_version: SHADE_SCHEMA_VERSION,
             name: String::new(),
+            project_role: ProjectRole::Standalone,
+            linked_projects: Vec::new(),
+            production_provenance: Vec::new(),
             faces: Vec::new(),
             adjustments: BTreeMap::new(),
             snapshots: Vec::new(),

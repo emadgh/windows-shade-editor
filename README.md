@@ -15,6 +15,7 @@ Shade Editor keeps source TIFF Faces immutable and stores non-destructive shade 
 - ICC-aware preview with embedded-profile support and non-destructive **preview profile assignment**.
 - Per-Face **Production Source ICC assignment** is stored separately from preview settings, hash-verified, color-space checked and consumed by Color Conversion preflight without changing source pixels.
 - Production **Target Setup** validates Output ICC/DeviceLink class, exact profile identity, CMYK/5C–12C topology, authoritative channel order, output precision and a non-destructive TIFF destination before a recipe can become ready.
+- Schema-v9 projects can persist explicit Source/Production roles, reciprocal project links and exact per-Face conversion provenance; legacy projects remain Standalone by default.
 - True printer/RIP **Soft Proof** using an output-device ICC proofing transform; proof settings remain preview-only.
 - Hold the middle mouse button over the viewport for a cached original-source preview using only the TIFF embedded ICC; right mouse remains the current-color-management BEFORE preview.
 - Searchable installed Windows ICC/ICM profile list, keyboard navigation, rendering intent and optional black-point compensation.
