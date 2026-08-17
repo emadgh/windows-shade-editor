@@ -13,6 +13,9 @@ pub const INVERSE_LUT_IDENTITY_SCHEMA_VERSION: u32 = 1;
 pub const INVERSE_LUT_BUILD_POLICY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_INVERSE_LUT_GRID_NODES: u64 = 1_000_000;
 pub const MAX_INVERSE_LUT_AXIS_SAMPLES: u16 = 257;
+pub const INVERSE_LUT_JACOBI_FIELD_METHOD_MAX_ITERATIONS: u16 = 64;
+pub const MAX_INVERSE_LUT_JACOBI_FIELD_GRID_NODES: u64 = 250_000;
+pub const MAX_INVERSE_LUT_JACOBI_FIELD_NODE_SOLVES: u64 = 4_000_000;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -54,10 +57,70 @@ pub enum InverseLutOutputQuantization {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum InverseLutContinuitySeedMethod {
+    /// Every supported grid node is first solved independently through the
+    /// exact BoundedHaltonBeamV1 search using the V2 solver's numerical knobs.
+    IndependentV1NodeSolveV1,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum InverseLutContinuityFieldMethod {
     /// Every PCS grid node is solved independently. This exactly represents V1
     /// and V2 with zero continuity weight, where the solver ignores references.
     IndependentNodeSolvesV1,
+    /// Synchronous six-neighbor Jacobi field. L-, L+, a-, a+, b-, b+ neighbor
+    /// accumulation order, immutable previous snapshots and fixed iteration
+    /// count are part of the versioned method contract.
+    JacobiSixNeighborV1 {
+        seed_method: InverseLutContinuitySeedMethod,
+        iterations: u16,
+        self_weight: f32,
+    },
+}
+
+impl InverseLutContinuityFieldMethod {
+    pub fn validate_for_grid(&self, grid: &LabGridSpec) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if let Self::JacobiSixNeighborV1 {
+            iterations,
+            self_weight,
+            ..
+        } = self
+        {
+            if !(1..=INVERSE_LUT_JACOBI_FIELD_METHOD_MAX_ITERATIONS).contains(iterations) {
+                errors.push(format!(
+                    "Jacobi inverse-LUT field iterations must be in 1..={INVERSE_LUT_JACOBI_FIELD_METHOD_MAX_ITERATIONS}."
+                ));
+            }
+            if !self_weight.is_finite() || !(0.0..=1.0).contains(self_weight) {
+                errors.push(
+                    "Jacobi inverse-LUT field self_weight must be finite and in 0..=1.".to_owned(),
+                );
+            }
+            if let Some(nodes) = grid.node_count() {
+                if nodes > MAX_INVERSE_LUT_JACOBI_FIELD_GRID_NODES {
+                    errors.push(format!(
+                        "Jacobi inverse-LUT field contains {nodes} nodes; maximum is {MAX_INVERSE_LUT_JACOBI_FIELD_GRID_NODES}."
+                    ));
+                }
+                match nodes.checked_mul(u64::from(*iterations) + 1) {
+                    Some(solves) if solves <= MAX_INVERSE_LUT_JACOBI_FIELD_NODE_SOLVES => {}
+                    Some(solves) => errors.push(format!(
+                        "Jacobi inverse-LUT field requires up to {solves} node solves; maximum is {MAX_INVERSE_LUT_JACOBI_FIELD_NODE_SOLVES}."
+                    )),
+                    None => errors.push(
+                        "Jacobi inverse-LUT field work budget overflowed u64.".to_owned(),
+                    ),
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -79,6 +142,16 @@ impl LabGridSpec {
         u64::from(self.l_samples)
             .checked_mul(u64::from(self.a_samples))?
             .checked_mul(u64::from(self.b_samples))
+    }
+
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        self.validate_into(&mut errors);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     fn validate_into(&self, errors: &mut Vec<String>) {
@@ -154,6 +227,9 @@ impl InverseLutBuildPolicy {
             ));
         }
         self.grid.validate_into(&mut errors);
+        if let Err(field_errors) = self.continuity_field.validate_for_grid(&self.grid) {
+            errors.extend(field_errors);
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -233,6 +309,7 @@ pub enum InverseLutIdentityError {
         model: Vec<String>,
     },
     PositiveContinuityRequiresFieldConstruction,
+    ContinuityFieldPolicyDoesNotMatchSolver,
     InvalidBuildPolicy(Vec<String>),
     InvalidIdentityRecord(Vec<String>),
     FingerprintFailed(String),
@@ -242,10 +319,10 @@ impl InverseLutIdentityRecord {
     /// Construct a content-addressable identity from the actual validated local
     /// forward model and exact conversion recipe.
     ///
-    /// Positive-weight V2 continuity is deliberately rejected for now: a static
-    /// Lab->inks grid cannot discard the explicit reference dependency. #179 must
-    /// define and validate a versioned offline continuity-field construction
-    /// method before such a LUT can receive a production identity.
+    /// Positive-weight V2 continuity is eligible only when the build policy binds
+    /// the versioned offline Jacobi continuity-field method and seed rule. V1 and
+    /// zero-weight V2 remain single-valued independent-node LUT constructions and
+    /// therefore require `IndependentNodeSolvesV1`.
     pub fn from_local_model(
         recipe: &ConversionRecipe,
         model: &ValidatedLocalForwardModel,
@@ -265,7 +342,7 @@ impl InverseLutIdentityRecord {
             .custom_optimizer_solver
             .as_ref()
             .ok_or(InverseLutIdentityError::MissingSolverConfig)?;
-        validate_solver_lut_semantics(solver)?;
+        validate_solver_lut_semantics(solver, build_policy.continuity_field)?;
 
         let model_identity = model.identity();
         let recipe_characterization = recipe
@@ -363,16 +440,38 @@ impl InverseLutIdentityRecord {
 
 fn validate_solver_lut_semantics(
     solver: &CustomOptimizerSolverConfig,
+    field_method: InverseLutContinuityFieldMethod,
 ) -> Result<(), InverseLutIdentityError> {
+    let independent = matches!(
+        field_method,
+        InverseLutContinuityFieldMethod::IndependentNodeSolvesV1
+    );
     match (solver.method, solver.continuity_preference) {
-        (CustomOptimizerSolverMethod::BoundedHaltonBeamV1, _) => Ok(()),
+        (CustomOptimizerSolverMethod::BoundedHaltonBeamV1, _) => {
+            if independent {
+                Ok(())
+            } else {
+                Err(InverseLutIdentityError::ContinuityFieldPolicyDoesNotMatchSolver)
+            }
+        }
         (CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2, Some(policy))
             if policy.weight == 0.0 =>
         {
-            Ok(())
+            if independent {
+                Ok(())
+            } else {
+                Err(InverseLutIdentityError::ContinuityFieldPolicyDoesNotMatchSolver)
+            }
         }
         (CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2, Some(_)) => {
-            Err(InverseLutIdentityError::PositiveContinuityRequiresFieldConstruction)
+            if matches!(
+                field_method,
+                InverseLutContinuityFieldMethod::JacobiSixNeighborV1 { .. }
+            ) {
+                Ok(())
+            } else {
+                Err(InverseLutIdentityError::PositiveContinuityRequiresFieldConstruction)
+            }
         }
         (CustomOptimizerSolverMethod::BoundedHaltonBeamContinuityV2, None) => {
             Err(InverseLutIdentityError::MissingSolverConfig)
@@ -491,6 +590,16 @@ mod tests {
             output_quantization: InverseLutOutputQuantization::ClampScaleRoundV1,
             continuity_field: InverseLutContinuityFieldMethod::IndependentNodeSolvesV1,
         }
+    }
+
+    fn jacobi_policy() -> InverseLutBuildPolicy {
+        let mut value = policy();
+        value.continuity_field = InverseLutContinuityFieldMethod::JacobiSixNeighborV1 {
+            seed_method: InverseLutContinuitySeedMethod::IndependentV1NodeSolveV1,
+            iterations: 16,
+            self_weight: 0.35,
+        };
+        value
     }
 
     fn record() -> InverseLutIdentityRecord {
@@ -755,11 +864,26 @@ mod tests {
     #[test]
     fn positive_v2_continuity_fails_closed_until_field_construction_is_versioned() {
         assert_eq!(
-            validate_solver_lut_semantics(&v2(1.0)),
+            validate_solver_lut_semantics(
+                &v2(1.0),
+                InverseLutContinuityFieldMethod::IndependentNodeSolvesV1,
+            ),
             Err(InverseLutIdentityError::PositiveContinuityRequiresFieldConstruction)
         );
-        assert!(validate_solver_lut_semantics(&v2(0.0)).is_ok());
-        assert!(validate_solver_lut_semantics(&CustomOptimizerSolverConfig::default()).is_ok());
+        assert!(
+            validate_solver_lut_semantics(
+                &v2(0.0),
+                InverseLutContinuityFieldMethod::IndependentNodeSolvesV1,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_solver_lut_semantics(
+                &CustomOptimizerSolverConfig::default(),
+                InverseLutContinuityFieldMethod::IndependentNodeSolvesV1,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -807,5 +931,78 @@ mod tests {
             .expect_err("non-finite identity must fail");
         assert!(errors.iter().any(|error| error.contains("distance power")));
         assert!(errors.iter().any(|error| error.contains("a* maximum")));
+    }
+    #[test]
+    fn positive_v2_accepts_versioned_jacobi_field_policy() {
+        let package = integration_package();
+        let model = integration_model(&package);
+        let mut recipe = integration_recipe(package.package().id.clone());
+        recipe.custom_optimizer_solver = Some(v2(1.0));
+        let identity = InverseLutIdentityRecord::from_local_model(&recipe, &model, jacobi_policy())
+            .expect("positive V2 must bind to the versioned Jacobi field policy");
+        assert!(matches!(
+            identity.build_policy.continuity_field,
+            InverseLutContinuityFieldMethod::JacobiSixNeighborV1 { .. }
+        ));
+    }
+
+    #[test]
+    fn jacobi_field_policy_is_rejected_for_v1_and_zero_weight_v2() {
+        let package = integration_package();
+        let model = integration_model(&package);
+        let mut recipe = integration_recipe(package.package().id.clone());
+        assert_eq!(
+            InverseLutIdentityRecord::from_local_model(&recipe, &model, jacobi_policy()),
+            Err(InverseLutIdentityError::ContinuityFieldPolicyDoesNotMatchSolver)
+        );
+        recipe.custom_optimizer_solver = Some(v2(0.0));
+        assert_eq!(
+            InverseLutIdentityRecord::from_local_model(&recipe, &model, jacobi_policy()),
+            Err(InverseLutIdentityError::ContinuityFieldPolicyDoesNotMatchSolver)
+        );
+    }
+
+    #[test]
+    fn jacobi_field_parameters_participate_in_content_address() {
+        let mut first = record();
+        first.build_policy = jacobi_policy();
+        let first_id = first.content_id().unwrap();
+        let mut second = first.clone();
+        if let InverseLutContinuityFieldMethod::JacobiSixNeighborV1 {
+            ref mut iterations, ..
+        } = second.build_policy.continuity_field
+        {
+            *iterations += 1;
+        }
+        assert_ne!(first_id, second.content_id().unwrap());
+    }
+
+    #[test]
+    fn jacobi_field_policy_has_bounded_parameters_and_work() {
+        let mut invalid = jacobi_policy();
+        invalid.continuity_field = InverseLutContinuityFieldMethod::JacobiSixNeighborV1 {
+            seed_method: InverseLutContinuitySeedMethod::IndependentV1NodeSolveV1,
+            iterations: 0,
+            self_weight: f32::NAN,
+        };
+        let errors = invalid
+            .validate()
+            .expect_err("invalid Jacobi policy must fail");
+        assert!(errors.iter().any(|error| error.contains("iterations")));
+        assert!(errors.iter().any(|error| error.contains("self_weight")));
+
+        let mut oversized = jacobi_policy();
+        oversized.grid.l_samples = 100;
+        oversized.grid.a_samples = 50;
+        oversized.grid.b_samples = 50;
+        oversized.continuity_field = InverseLutContinuityFieldMethod::JacobiSixNeighborV1 {
+            seed_method: InverseLutContinuitySeedMethod::IndependentV1NodeSolveV1,
+            iterations: 16,
+            self_weight: 0.35,
+        };
+        let errors = oversized
+            .validate()
+            .expect_err("Jacobi work budget must fail");
+        assert!(errors.iter().any(|error| error.contains("node solves")));
     }
 }

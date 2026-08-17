@@ -244,7 +244,7 @@ pub fn analyze_continuity_aware_gradient_path(
     Ok(build_report(target, strategy, samples, policy))
 }
 
-fn build_report(
+pub(crate) fn build_report(
     target: &ConversionTargetDefinition,
     strategy: &SeparationStrategy,
     samples: Vec<GradientSampleDiagnostic>,
