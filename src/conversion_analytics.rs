@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::color_conversion::ConversionRecipe;
 use crate::tiff_io::{for_each_decoded_region, stream_info, working_sample_from_tiff};
 
+/// 4096 bins keep percentile memory bounded while retaining roughly 12-bit
+/// coverage resolution. The footprint scales with channel count, not image size.
 const HISTOGRAM_BINS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -19,6 +21,7 @@ pub struct ChannelUsageStats {
     pub name: String,
     pub mean_coverage: f32,
     pub peak_coverage: f32,
+    /// Approximate streaming percentiles with 4096 deterministic bins.
     pub percentiles: CoveragePercentiles,
     pub nonzero_percent: f32,
     pub limit_hit_percent: Option<f32>,
@@ -33,6 +36,7 @@ pub struct ConversionUsageReport {
     pub channels: Vec<ChannelUsageStats>,
     pub mean_total_ink: f32,
     pub peak_total_ink: f32,
+    /// Approximate streaming percentiles of summed normalized channel coverage.
     pub total_ink_percentiles: CoveragePercentiles,
     pub total_ink_limit_hit_percent: Option<f32>,
     /// None until a caller supplies a valid PCS/characterization-based neutral
@@ -70,9 +74,12 @@ pub struct ConversionUsageAccumulator {
 
 impl ConversionUsageAccumulator {
     pub fn from_recipe(recipe: &ConversionRecipe) -> Result<Self, String> {
-        recipe
-            .validate()
-            .map_err(|errors| format!("Cannot analyze invalid conversion recipe: {}", errors.join(" ")))?;
+        recipe.validate().map_err(|errors| {
+            format!(
+                "Cannot analyze invalid conversion recipe: {}",
+                errors.join(" ")
+            )
+        })?;
 
         let channel_names = recipe
             .target
@@ -174,7 +181,9 @@ impl ConversionUsageAccumulator {
             self.peaks[index] = self.peaks[index].max(sample);
             self.nonzero[index] += u64::from(sample != 0);
             self.channel_histograms[index][coverage_bin_u16(sample)] += 1;
-            if self.channel_limits[index].is_some_and(|limit| coverage >= limit) {
+            if self.channel_limits[index]
+                .is_some_and(|limit| coverage > limit || (limit > 0.0 && coverage >= limit))
+            {
                 self.limit_hits[index] += 1;
             }
             total += coverage;
@@ -191,62 +200,80 @@ impl ConversionUsageAccumulator {
             self.neutral_pixels = self.neutral_pixels.saturating_add(1);
             self.neutral_total_ink += f64::from(total);
             if let Some(index) = self.black_index {
-                self.neutral_black_ink +=
-                    f64::from(pixel[index]) / f64::from(u16::MAX);
+                self.neutral_black_ink += f64::from(pixel[index]) / f64::from(u16::MAX);
             }
         }
         Ok(())
     }
 
     pub fn finish(self) -> ConversionUsageReport {
-        let count = self.pixel_count.max(1) as f64;
-        let channels = self
-            .channel_names
+        let Self {
+            channel_names,
+            channel_limits,
+            total_ink_limit,
+            black_index,
+            pixel_count,
+            sums,
+            peaks,
+            nonzero,
+            limit_hits,
+            channel_histograms,
+            total_sum,
+            total_peak,
+            total_limit_hits,
+            total_histogram,
+            neutral_pixels,
+            neutral_total_ink,
+            neutral_black_ink,
+        } = self;
+
+        let count = pixel_count.max(1) as f64;
+        let channel_count = channel_names.len();
+        let channels = channel_names
             .into_iter()
             .enumerate()
             .map(|(index, name)| ChannelUsageStats {
                 name,
-                mean_coverage: (self.sums[index] / count) as f32,
-                peak_coverage: f32::from(self.peaks[index]) / f32::from(u16::MAX),
-                percentiles: coverage_percentiles(&self.channel_histograms[index], self.pixel_count),
-                nonzero_percent: percent(self.nonzero[index], self.pixel_count),
-                limit_hit_percent: self.channel_limits[index]
-                    .map(|_| percent(self.limit_hits[index], self.pixel_count)),
-                integrated_coverage: self.sums[index],
+                mean_coverage: (sums[index] / count) as f32,
+                peak_coverage: f32::from(peaks[index]) / f32::from(u16::MAX),
+                percentiles: coverage_percentiles(&channel_histograms[index], pixel_count),
+                nonzero_percent: percent(nonzero[index], pixel_count),
+                limit_hit_percent: channel_limits[index]
+                    .map(|_| percent(limit_hits[index], pixel_count)),
+                integrated_coverage: sums[index],
             })
             .collect::<Vec<_>>();
 
-        let neutral_black_share = if self.black_index.is_some()
-            && self.neutral_pixels > 0
-            && self.neutral_total_ink > f64::EPSILON
+        let neutral_black_share = if black_index.is_some()
+            && neutral_pixels > 0
+            && neutral_total_ink > f64::EPSILON
         {
-            Some((self.neutral_black_ink / self.neutral_total_ink) as f32)
+            Some((neutral_black_ink / neutral_total_ink) as f32)
         } else {
             None
         };
 
         ConversionUsageReport {
-            pixel_count: self.pixel_count,
+            pixel_count,
             channels,
-            mean_total_ink: (self.total_sum / count) as f32,
-            peak_total_ink: self.total_peak,
+            mean_total_ink: (total_sum / count) as f32,
+            peak_total_ink: total_peak,
             total_ink_percentiles: total_ink_percentiles(
-                &self.total_histogram,
-                self.pixel_count,
-                self.channel_limits.len(),
+                &total_histogram,
+                pixel_count,
+                channel_count,
             ),
-            total_ink_limit_hit_percent: self
-                .total_ink_limit
-                .map(|_| percent(self.total_limit_hits, self.pixel_count)),
+            total_ink_limit_hit_percent: total_ink_limit
+                .map(|_| percent(total_limit_hits, pixel_count)),
             neutral_black_share,
         }
     }
 }
 
-/// Analyze the committed/previewable conversion TIFF itself in bounded memory.
-/// The report is rejected unless TIFF sample count and exact channel order match
-/// the captured conversion recipe. Neutrality is intentionally `Unknown` here:
-/// it cannot be inferred safely from output ink coverages alone.
+/// Analyze the produced conversion TIFF itself in bounded memory. The report is
+/// rejected unless TIFF sample count and exact channel order match the captured
+/// recipe. Neutrality is intentionally `Unknown`: it cannot be inferred safely
+/// from output ink coverages alone.
 pub fn analyze_conversion_tiff(
     path: &Path,
     recipe: &ConversionRecipe,
@@ -281,13 +308,18 @@ pub fn analyze_conversion_tiff(
 
     let mut accumulator = ConversionUsageAccumulator::from_recipe(recipe)?;
     let channel_count = accumulator.channel_count();
+    let mut working_pixel = vec![0u16; channel_count];
     for_each_decoded_region(
         path,
         &info,
         |_x, _y, width, height, samples| {
             let pixels = usize::try_from(width)
                 .ok()
-                .and_then(|width| usize::try_from(height).ok().and_then(|height| width.checked_mul(height)))
+                .and_then(|width| {
+                    usize::try_from(height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
                 .ok_or_else(|| "Analytics region dimensions overflow.".to_owned())?;
             let expected_samples = pixels
                 .checked_mul(channel_count)
@@ -300,15 +332,14 @@ pub fn analyze_conversion_tiff(
             }
             for pixel_index in 0..pixels {
                 let base = pixel_index * channel_count;
-                let mut working = Vec::with_capacity(channel_count);
                 for channel in 0..channel_count {
-                    working.push(working_sample_from_tiff(
+                    working_pixel[channel] = working_sample_from_tiff(
                         &info.metadata,
                         channel,
                         samples[base + channel],
-                    ));
+                    );
                 }
-                accumulator.observe_u16(&working, NeutralClassification::Unknown)?;
+                accumulator.observe_u16(&working_pixel, NeutralClassification::Unknown)?;
             }
             Ok(())
         },
@@ -438,10 +469,16 @@ mod tests {
     fn integrated_coverage_and_limits_are_deterministic() {
         let mut analytics = ConversionUsageAccumulator::from_recipe(&recipe()).unwrap();
         analytics
-            .observe_u16(&[u16::MAX / 2, 0, 0, u16::MAX / 4], NeutralClassification::Unknown)
+            .observe_u16(
+                &[u16::MAX / 2, 0, 0, u16::MAX / 4],
+                NeutralClassification::Unknown,
+            )
             .unwrap();
         analytics
-            .observe_u16(&[u16::MAX, u16::MAX / 2, 0, u16::MAX / 2], NeutralClassification::Unknown)
+            .observe_u16(
+                &[u16::MAX, u16::MAX / 2, 0, u16::MAX / 2],
+                NeutralClassification::Unknown,
+            )
             .unwrap();
         let report = analytics.finish();
 
@@ -458,19 +495,46 @@ mod tests {
     }
 
     #[test]
+    fn zero_channel_limit_counts_only_nonzero_coverage_as_hit() {
+        let mut analytics = ConversionUsageAccumulator::new(
+            vec!["Ink".to_owned()],
+            vec![Some(0.0)],
+            None,
+            None,
+        )
+        .unwrap();
+        analytics
+            .observe_u16(&[0], NeutralClassification::Unknown)
+            .unwrap();
+        analytics
+            .observe_u16(&[1], NeutralClassification::Unknown)
+            .unwrap();
+        assert_eq!(analytics.finish().channels[0].limit_hit_percent, Some(50.0));
+    }
+
+    #[test]
     fn neutral_black_share_requires_explicit_neutral_classification() {
         let mut unknown = ConversionUsageAccumulator::from_recipe(&recipe()).unwrap();
         unknown
-            .observe_u16(&[1000, 1000, 1000, 20000], NeutralClassification::Unknown)
+            .observe_u16(
+                &[1000, 1000, 1000, 20000],
+                NeutralClassification::Unknown,
+            )
             .unwrap();
         assert_eq!(unknown.finish().neutral_black_share, None);
 
         let mut classified = ConversionUsageAccumulator::from_recipe(&recipe()).unwrap();
         classified
-            .observe_u16(&[1000, 1000, 1000, 20000], NeutralClassification::Neutral)
+            .observe_u16(
+                &[1000, 1000, 1000, 20000],
+                NeutralClassification::Neutral,
+            )
             .unwrap();
         classified
-            .observe_u16(&[30000, 1000, 1000, 1000], NeutralClassification::Chromatic)
+            .observe_u16(
+                &[30000, 1000, 1000, 1000],
+                NeutralClassification::Chromatic,
+            )
             .unwrap();
         let share = classified.finish().neutral_black_share.unwrap();
         assert!(share > 0.85);
