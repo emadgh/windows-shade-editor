@@ -1,0 +1,48 @@
+name: Temporary guarded production Lab v0.21.26 bump
+on:
+  pull_request:
+    branches:
+      - tmp/production-lab-v02126-bump
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  bump:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-production-lab-transform
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Regenerate, verify and publish version identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '051992b5dabb53b7325d870d8d15440f134a749f'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Expected $expectedHead, got $actualHead" }
+          $toml = Get-Content Cargo.toml -Raw
+          $updated = $toml -replace '(?m)^version = "0\.21\.25"$', 'version = "0.21.26"'
+          if ($updated -eq $toml) { throw 'Cargo.toml version anchor not replaced.' }
+          Set-Content Cargo.toml -Value $updated -NoNewline
+          Set-Content VERSION -Value '0.21.26' -NoNewline
+          cargo check --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          $expected = @('Cargo.lock','Cargo.toml','VERSION')
+          if ((@($changed | Sort-Object) -join "`n") -ne (@($expected | Sort-Object) -join "`n")) { throw "Unexpected files: $($changed -join ', ')" }
+          $lockDiff = @(git diff --unified=0 -- Cargo.lock)
+          $removed = @($lockDiff | Where-Object { $_ -match '^-version = "0\.21\.25"$' })
+          $added = @($lockDiff | Where-Object { $_ -match '^\+version = "0\.21\.26"$' })
+          $other = @($lockDiff | Where-Object { $_ -match '^[+-]' -and $_ -notmatch '^---' -and $_ -notmatch '^\+\+\+' -and $_ -notmatch '^-version = "0\.21\.25"$' -and $_ -notmatch '^\+version = "0\.21\.26"$' })
+          if ($removed.Count -ne 1 -or $added.Count -ne 1 -or $other.Count -ne 0) { throw "Cargo.lock drift:`n$($lockDiff -join "`n")" }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: bump production Lab transform to v0.21.26'
+          git push origin HEAD:codex/custom-optimizer-production-lab-transform
