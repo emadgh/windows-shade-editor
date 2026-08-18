@@ -28,6 +28,7 @@ pub mod icc_conversion_worker;
 pub mod inverse_lut_artifact;
 pub mod inverse_lut_continuity_builder;
 pub mod inverse_lut_continuity_field;
+pub mod inverse_lut_holdout;
 pub mod inverse_lut_identity;
 pub mod inverse_lut_runtime;
 pub mod inverse_lut_validation;
