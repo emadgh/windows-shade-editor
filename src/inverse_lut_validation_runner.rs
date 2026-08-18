@@ -64,10 +64,11 @@ pub fn run_inverse_lut_validation(
     let recipe_sha = recipe_sha256(recipe)
         .map_err(InverseLutValidationRunError::RecipeIdentity)?;
 
-    // Resolve the numerical reference contract before the potentially long
-    // holdout loop. This fails closed if solver semantics and persisted field
-    // method do not agree.
-    validation_reference_method(&runtime, recipe).map_err(|error| {
+    // Resolve and persist the exact numerical reference contract before the
+    // potentially long holdout loop. This fails closed if solver semantics and
+    // persisted field method do not agree, and prevents later reinterpretation
+    // of a report under different reference-adapter semantics.
+    let reference_method = validation_reference_method(&runtime, recipe).map_err(|error| {
         InverseLutValidationRunError::Reference {
             sample_index: 0,
             error,
@@ -144,6 +145,7 @@ pub fn run_inverse_lut_validation(
         recipe_sha,
         characterization_id,
         policy,
+        reference_method,
         path_diagnostics,
         &samples,
     )
