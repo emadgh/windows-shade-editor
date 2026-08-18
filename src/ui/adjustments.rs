@@ -142,14 +142,18 @@ impl ShadeApp {
                 );
             }
         });
-        if clickable_row(
+        let composite_accent = ui.visuals().text_color();
+        if clickable_channel_row(
             ui,
+            false,
+            false,
             self.solo_channel.is_none(),
             "Composite",
-            None,
+            composite_accent,
             None,
             32.0,
         )
+        .on_hover_text("Composite view · filled square means no individual channel is soloed. Click to return adjustment editing to Master.")
         .clicked()
         {
             self.dispatch_adjustment_ui_action(AdjustmentUiAction::ShowComposite, ui.ctx());
@@ -203,8 +207,8 @@ impl ShadeApp {
             }
             let response = clickable_channel_row(
                 ui,
-                self.selected_channel == index,
-                self.adjustment_scope == AdjustmentScope::All,
+                self.adjustment_scope == AdjustmentScope::Selected && self.selected_channel == index,
+                false,
                 is_solo,
                 &label,
                 accent,
@@ -246,7 +250,7 @@ impl ShadeApp {
                 if ui
                     .small_button(toggle_label)
                     .on_hover_text(format!(
-                        "Show/hide Match Color target histogram overlay ({target_name})"
+                        "Show/hide Reference/Match Color histogram overlay ({target_name})"
                     ))
                     .clicked()
                 {
@@ -254,11 +258,11 @@ impl ShadeApp {
                     match_color::set_overlay_visible(target_overlay_visible);
                 }
                 if target_overlay_visible {
-                    ui.colored_label(match_color::target_overlay_color(ui), "Target");
+                    ui.colored_label(match_color::target_overlay_color(ui), "Reference");
                 }
                 clear_match_target = ui
                     .small_button("×")
-                    .on_hover_text("Clear Match Color target. Applied Levels are kept.")
+                    .on_hover_text("Clear Reference/Match Color target. Applied Levels are kept.")
                     .clicked();
             }
         });
@@ -266,7 +270,7 @@ impl ShadeApp {
             match_color::clear_target();
             match_target = None;
             target_overlay_visible = false;
-            self.report_info("Cleared Match Color target; applied Levels were kept.");
+            self.report_info("Cleared Reference image; applied Match Color Levels were kept.");
         }
         if tonal_display_changed {
             self.dispatch_adjustment_ui_action(AdjustmentUiAction::PersistSettings, ui.ctx());
@@ -369,14 +373,14 @@ impl ShadeApp {
             match_requested = ui
                 .button("Match Color")
                 .on_hover_text(
-                    "Histogram-match all source channels to a target TIFF using editable Levels. Source-only extra channels are set to zero; target-only extra channels are ignored.",
+                    "Match all source channels to the current Reference image using editable Levels. If no Reference is selected, choose one first.",
                 )
                 .clicked();
             if let Some(target) = existing_match_target.as_ref() {
-                ui.small(format!("Target: {}", target.display_name()))
+                ui.small(format!("Reference: {}", target.display_name()))
                     .on_hover_text(target.path.display().to_string());
             } else {
-                ui.small("Choose a target TIFF");
+                ui.small("No Reference selected");
             }
         });
         if match_requested {
@@ -661,9 +665,15 @@ impl ShadeApp {
             .is_some_and(master_adjustment_is_modified);
 
         let mut tonal_display_changed = false;
+        let mut reset_everything = false;
         ui.horizontal(|ui| {
             ui.heading("Adjustments");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                reset_everything = ui
+                    .small_button("↻")
+                    .on_hover_text("Reset All Channels + Master adjustments")
+                    .clicked();
+                ui.separator();
                 let layout_label = if self.settings.adjustment_tabs {
                     "Tabs"
                 } else {
@@ -681,6 +691,16 @@ impl ShadeApp {
                     tonal_display_mode_selector(ui, &mut self.settings.tonal_display_mode);
             });
         });
+        if reset_everything {
+            for output in &channel_names {
+                let adjustment = self.project.adjustments.entry(output.clone()).or_default();
+                *adjustment = ChannelAdjustment::default();
+                reset_mixer_row(adjustment, output, &channel_names);
+            }
+            self.project.adjustments.remove(MASTER_ADJUSTMENT_KEY);
+            self.report_info("Reset all channel and Master adjustments");
+            self.dispatch_adjustment_ui_action(AdjustmentUiAction::InvalidatePreviews, ui.ctx());
+        }
         if tonal_display_changed {
             self.dispatch_adjustment_ui_action(AdjustmentUiAction::PersistSettings, ui.ctx());
         }
@@ -733,7 +753,7 @@ impl ShadeApp {
             }
         });
         if self.settings.show_clipping_warnings {
-            if let Some(stats) = active_clipping {
+            if let Some(stats) = active_clipping.filter(|stats| stats.max_percent() > 0.0) {
                 clipping_summary_ui(ui, stats);
             }
         }
@@ -800,16 +820,12 @@ impl ShadeApp {
                                 }
                             }
                         }
-                        let reset_label = match self.adjustment_scope {
-                            AdjustmentScope::Selected => "Reset channel",
-                            AdjustmentScope::All => match self.tool {
-                                ToolPanel::Levels => "Reset Master Levels",
-                                ToolPanel::Curves => "Reset Master Curve",
-                                ToolPanel::Mixer => "Reset mixers",
-                            },
-                        };
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.small_button(reset_label).clicked()
+                            let tooltip = match self.adjustment_scope {
+                                AdjustmentScope::Selected => "Reset Channel — reset all adjustments for this channel",
+                                AdjustmentScope::All => "Reset Master — reset the complete Master adjustment stack",
+                            };
+                            ui.small_button("↻").on_hover_text(tooltip).clicked()
                         })
                         .inner
                     })
@@ -826,20 +842,10 @@ impl ShadeApp {
                             reset_mixer_row(adjustment, &output_name, &channel_names);
                             self.report_info(format!("Reset {output_display} adjustments"));
                         }
-                        AdjustmentScope::All => match self.tool {
-                            ToolPanel::Levels => {
-                                reset_master_levels(&mut self.project.adjustments);
-                                self.report_info("Reset Master Levels");
-                            }
-                            ToolPanel::Curves => {
-                                reset_master_curve(&mut self.project.adjustments);
-                                self.report_info("Reset Master Curve");
-                            }
-                            ToolPanel::Mixer => {
-                                reset_all_mixers(&mut self.project.adjustments, &channel_names);
-                                self.report_info("Reset all Mixer rows");
-                            }
-                        },
+                        AdjustmentScope::All => {
+                            self.project.adjustments.remove(MASTER_ADJUSTMENT_KEY);
+                            self.report_info("Reset Master adjustments");
+                        }
                     }
                     self.dispatch_adjustment_ui_action(AdjustmentUiAction::InvalidatePreviews, ui.ctx());
                 }
