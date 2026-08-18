@@ -30,6 +30,7 @@ pub mod inverse_lut_continuity_builder;
 pub mod inverse_lut_continuity_field;
 pub mod inverse_lut_identity;
 pub mod inverse_lut_runtime;
+pub mod inverse_lut_validation;
 pub mod inverse_separation_solver;
 pub mod model;
 pub mod nchannel_icc;
@@ -58,5 +59,7 @@ mod inverse_lut_continuity_path_validation_tests;
 mod inverse_lut_continuity_sensitivity_tests;
 #[cfg(test)]
 mod inverse_lut_runtime_tests;
+#[cfg(test)]
+mod inverse_lut_validation_tests;
 #[cfg(test)]
 mod tiff_conformance_tests;
