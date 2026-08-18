@@ -25,6 +25,7 @@ use crate::inverse_lut_validation::{
     InverseLutValidationPolicy, InverseLutValidationSample, summarize_validation_samples,
 };
 use crate::inverse_lut_validation_artifact::VerifiedInverseLutValidationArtifact;
+use crate::inverse_lut_validation_reference::InverseLutValidationReferenceMethod;
 use crate::model::IccProfileIdentity;
 
 const NODE_COUNT: usize = 8;
@@ -188,6 +189,7 @@ fn validation(
         recipe_sha256(recipe).unwrap(),
         characterization_id(),
         InverseLutValidationPolicy::default(),
+        InverseLutValidationReferenceMethod::IndependentPointSolveV1,
         paths(),
         &[sample],
     )
