@@ -6,7 +6,10 @@ use crate::conversion_recipe::recipe_sha256;
 use crate::device_characterization::DeviceForwardModel;
 use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
 use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};
-use crate::inverse_lut_threshold_set::InverseLutValidationThresholdSet;
+use crate::inverse_lut_threshold_set::{
+    InverseLutCalibrationSolverFamily, InverseLutThresholdCalibrationApproval,
+    InverseLutThresholdCalibrationManifest, InverseLutValidationThresholdSet,
+};
 use crate::inverse_lut_validation_artifact::VerifiedInverseLutValidationArtifact;
 use crate::inverse_lut_validation_reference::{
     InverseLutValidationReferenceError, InverseLutValidationReferenceMethod,
@@ -16,7 +19,7 @@ use crate::production_colorimetry::{
     ProductionPcsCompatibilityMethod, ValidatedProductionPcsCompatibility,
 };
 
-pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 3;
+pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 4;
 
 /// Immutable evidence that an exact inverse LUT has a passing validation report
 /// for the exact recipe, measured characterization and ICC PCS compatibility
@@ -30,6 +33,8 @@ pub struct InverseLutProductionEligibility {
     pub lut_payload_sha256: String,
     pub validation_report_content_id: String,
     pub threshold_set_content_id: String,
+    pub calibration_manifest_content_id: String,
+    pub calibration_approval_content_id: String,
     pub recipe_sha256: String,
     pub characterization_id: String,
     pub pcs_compatibility_content_id: String,
@@ -57,6 +62,14 @@ impl InverseLutProductionEligibility {
             (
                 "threshold_set_content_id",
                 self.threshold_set_content_id.as_str(),
+            ),
+            (
+                "calibration_manifest_content_id",
+                self.calibration_manifest_content_id.as_str(),
+            ),
+            (
+                "calibration_approval_content_id",
+                self.calibration_approval_content_id.as_str(),
             ),
             ("characterization_id", self.characterization_id.as_str()),
             (
@@ -109,6 +122,28 @@ pub enum InverseLutProductionEligibilityError {
         actual: String,
     },
     ThresholdPolicyMismatch,
+    InvalidCalibrationManifest(Vec<String>),
+    CalibrationManifestIdentity(String),
+    InvalidCalibrationApproval(Vec<String>),
+    CalibrationApprovalIdentity(String),
+    CalibrationManifestThresholdSetMismatch {
+        manifest: String,
+        actual: String,
+    },
+    CalibrationPcsMethodMismatch {
+        compatibility: ProductionPcsCompatibilityMethod,
+        manifest: ProductionPcsCompatibilityMethod,
+        approval: ProductionPcsCompatibilityMethod,
+    },
+    CalibrationObservationMissing {
+        validation_report_content_id: String,
+        solver_family: InverseLutCalibrationSolverFamily,
+    },
+    CalibrationApprovalBinding(Vec<String>),
+    CalibrationApprovalCheck(String),
+    CalibrationApprovalNotProductionApproved {
+        calibration_approval_content_id: String,
+    },
     InvalidPcsCompatibility(Vec<String>),
     PcsCompatibilityIdentity(String),
     LutIdentityMismatch {
@@ -145,13 +180,6 @@ pub enum InverseLutProductionEligibilityError {
         lut: Vec<String>,
         model: Vec<String>,
     },
-    /// Structural validation is complete, but #205 has not yet frozen thresholds
-    /// against measured ceramic characterization/print fixtures. This barrier is
-    /// intentional: a numerically passing report with provisional constants must
-    /// never authorize #191.
-    ThresholdsNotProductionFrozen {
-        threshold_set_content_id: String,
-    },
 }
 
 /// Revalidate every production-critical binding and mint eligibility evidence.
@@ -165,6 +193,8 @@ pub fn validate_inverse_lut_production_eligibility(
     lut: &VerifiedInverseLutArtifact,
     validation: &VerifiedInverseLutValidationArtifact,
     threshold_set: &InverseLutValidationThresholdSet,
+    calibration_manifest: &InverseLutThresholdCalibrationManifest,
+    calibration_approval: &InverseLutThresholdCalibrationApproval,
     pcs_compatibility: &ValidatedProductionPcsCompatibility,
     recipe: &ConversionRecipe,
     model: &dyn DeviceForwardModel,
@@ -184,6 +214,18 @@ pub fn validate_inverse_lut_production_eligibility(
     let threshold_set_content_id = threshold_set
         .content_id()
         .map_err(InverseLutProductionEligibilityError::ThresholdSetIdentity)?;
+    calibration_manifest
+        .validate()
+        .map_err(InverseLutProductionEligibilityError::InvalidCalibrationManifest)?;
+    let calibration_manifest_content_id = calibration_manifest
+        .content_id()
+        .map_err(InverseLutProductionEligibilityError::CalibrationManifestIdentity)?;
+    calibration_approval
+        .validate()
+        .map_err(InverseLutProductionEligibilityError::InvalidCalibrationApproval)?;
+    let calibration_approval_content_id = calibration_approval
+        .content_id()
+        .map_err(InverseLutProductionEligibilityError::CalibrationApprovalIdentity)?;
     pcs_compatibility
         .validate()
         .map_err(InverseLutProductionEligibilityError::InvalidPcsCompatibility)?;
@@ -285,7 +327,56 @@ pub fn validate_inverse_lut_production_eligibility(
         );
     }
 
-    ensure_production_thresholds_frozen(threshold_set, &threshold_set_content_id)?;
+    if calibration_manifest.threshold_set_content_id != threshold_set_content_id {
+        return Err(
+            InverseLutProductionEligibilityError::CalibrationManifestThresholdSetMismatch {
+                manifest: calibration_manifest.threshold_set_content_id.clone(),
+                actual: threshold_set_content_id.clone(),
+            },
+        );
+    }
+    if calibration_manifest.pcs_method != pcs_compatibility.method
+        || calibration_approval.pcs_method != pcs_compatibility.method
+    {
+        return Err(
+            InverseLutProductionEligibilityError::CalibrationPcsMethodMismatch {
+                compatibility: pcs_compatibility.method,
+                manifest: calibration_manifest.pcs_method,
+                approval: calibration_approval.pcs_method,
+            },
+        );
+    }
+
+    let solver_family = solver_family_for_reference(actual_reference_method);
+    let observation_matches = calibration_manifest.observations.iter().any(|observation| {
+        observation.solver_family == solver_family
+            && observation.characterization_id == validation.report.characterization_id
+            && observation.recipe_sha256 == actual_recipe_sha
+            && observation.lut_identity_content_id == runtime.identity_content_id()
+            && observation.validation_report_content_id == actual_report_id
+    });
+    if !observation_matches {
+        return Err(
+            InverseLutProductionEligibilityError::CalibrationObservationMissing {
+                validation_report_content_id: actual_report_id.clone(),
+                solver_family,
+            },
+        );
+    }
+
+    calibration_approval
+        .validate_bindings(threshold_set, calibration_manifest)
+        .map_err(InverseLutProductionEligibilityError::CalibrationApprovalBinding)?;
+    let production_approved = calibration_approval
+        .is_production_approved(threshold_set, calibration_manifest)
+        .map_err(InverseLutProductionEligibilityError::CalibrationApprovalCheck)?;
+    if !production_approved {
+        return Err(
+            InverseLutProductionEligibilityError::CalibrationApprovalNotProductionApproved {
+                calibration_approval_content_id: calibration_approval_content_id.clone(),
+            },
+        );
+    }
 
     let evidence = InverseLutProductionEligibility {
         schema_version: INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION,
@@ -293,6 +384,8 @@ pub fn validate_inverse_lut_production_eligibility(
         lut_payload_sha256: lut.payload_sha256.clone(),
         validation_report_content_id: actual_report_id,
         threshold_set_content_id,
+        calibration_manifest_content_id,
+        calibration_approval_content_id,
         recipe_sha256: actual_recipe_sha,
         characterization_id: validation.report.characterization_id.clone(),
         pcs_compatibility_content_id,
@@ -302,22 +395,17 @@ pub fn validate_inverse_lut_production_eligibility(
     Ok(evidence)
 }
 
-/// No policy schema is production-approved yet. This function is the single
-/// deliberate switch that a later measured-fixture calibration PR must change,
-/// together with tests and a versioned threshold-set contract. Keeping the
-/// current implementation unconditional avoids treating provisional constants
-/// as production truth merely because their numerical checks happen to pass.
-fn ensure_production_thresholds_frozen(
-    _threshold_set: &InverseLutValidationThresholdSet,
-    threshold_set_content_id: &str,
-) -> Result<(), InverseLutProductionEligibilityError> {
-    // #205 has no production-approved measured calibration approval yet.
-    // Keep production closed even when a structurally valid threshold set exists.
-    Err(
-        InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen {
-            threshold_set_content_id: threshold_set_content_id.to_owned(),
-        },
-    )
+fn solver_family_for_reference(
+    method: InverseLutValidationReferenceMethod,
+) -> InverseLutCalibrationSolverFamily {
+    match method {
+        InverseLutValidationReferenceMethod::IndependentPointSolveV1 => {
+            InverseLutCalibrationSolverFamily::IndependentV1
+        }
+        InverseLutValidationReferenceMethod::FrozenJacobiTrilinearThenV2SolveV1 => {
+            InverseLutCalibrationSolverFamily::PositiveContinuityV2
+        }
+    }
 }
 
 fn is_prefixed_sha256(value: &str) -> bool {
@@ -347,6 +435,8 @@ mod tests {
             lut_payload_sha256: "2".repeat(64),
             validation_report_content_id: pcs_id('3'),
             threshold_set_content_id: pcs_id('9'),
+            calibration_manifest_content_id: pcs_id('a'),
+            calibration_approval_content_id: pcs_id('b'),
             recipe_sha256: "4".repeat(64),
             characterization_id: pcs_id('5'),
             pcs_compatibility_content_id: pcs_id('6'),
@@ -359,8 +449,16 @@ mod tests {
         assert_ne!(changed.content_id().unwrap(), base_id);
 
         let mut changed_threshold_set = base.clone();
-        changed_threshold_set.threshold_set_content_id = pcs_id('a');
+        changed_threshold_set.threshold_set_content_id = pcs_id('c');
         assert_ne!(changed_threshold_set.content_id().unwrap(), base_id);
+
+        let mut changed_manifest = base.clone();
+        changed_manifest.calibration_manifest_content_id = pcs_id('d');
+        assert_ne!(changed_manifest.content_id().unwrap(), base_id);
+
+        let mut changed_approval = base.clone();
+        changed_approval.calibration_approval_content_id = pcs_id('e');
+        assert_ne!(changed_approval.content_id().unwrap(), base_id);
 
         let mut changed = base;
         changed.pcs_compatibility_content_id = pcs_id('8');
@@ -375,6 +473,8 @@ mod tests {
             lut_payload_sha256: "2".repeat(64),
             validation_report_content_id: pcs_id('3'),
             threshold_set_content_id: pcs_id('9'),
+            calibration_manifest_content_id: pcs_id('a'),
+            calibration_approval_content_id: pcs_id('b'),
             recipe_sha256: "4".repeat(64),
             characterization_id: pcs_id('5'),
             pcs_compatibility_content_id: pcs_id('6'),
@@ -384,12 +484,18 @@ mod tests {
     }
 
     #[test]
-    fn provisional_threshold_set_is_never_implicitly_promoted_to_production() {
-        let threshold_set = InverseLutValidationThresholdSet::provisional_v1();
-        let threshold_set_content_id = threshold_set.content_id().unwrap();
-        assert!(matches!(
-            ensure_production_thresholds_frozen(&threshold_set, &threshold_set_content_id),
-            Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen { .. })
-        ));
+    fn reference_methods_map_to_explicit_calibration_solver_families() {
+        assert_eq!(
+            solver_family_for_reference(
+                InverseLutValidationReferenceMethod::IndependentPointSolveV1
+            ),
+            InverseLutCalibrationSolverFamily::IndependentV1
+        );
+        assert_eq!(
+            solver_family_for_reference(
+                InverseLutValidationReferenceMethod::FrozenJacobiTrilinearThenV2SolveV1
+            ),
+            InverseLutCalibrationSolverFamily::PositiveContinuityV2
+        );
     }
 }
