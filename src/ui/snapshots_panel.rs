@@ -1,3 +1,4 @@
+use crate::model::AdjustmentSnapshot;
 use crate::*;
 use eframe::egui;
 
