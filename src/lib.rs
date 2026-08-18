@@ -45,6 +45,8 @@ pub mod separation_optimizer;
 pub mod tiff_io;
 
 #[cfg(test)]
+mod custom_optimizer_objective_tests;
+#[cfg(test)]
 mod inverse_lut_artifact_tests;
 #[cfg(test)]
 mod inverse_lut_continuity_field_tests;
