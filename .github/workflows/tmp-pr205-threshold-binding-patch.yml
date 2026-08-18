@@ -1,0 +1,211 @@
+name: Temporary guarded threshold-set binding patch
+on:
+  pull_request:
+    branches:
+      - tmp/pr205-threshold-binding-patch
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-threshold-set-binding
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply guarded threshold-set provenance binding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '8ba259f388a060cdcf9351d23b5658489fa864d5'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Expected $expectedHead, got $actualHead" }
+          @'
+          from pathlib import Path
+
+          def repl(path, old, new, count=1):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              found = text.count(old)
+              if found != count:
+                  raise SystemExit(f"{path}: expected {count} occurrences, found {found}: {old[:100]!r}")
+              p.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+
+          # Validation report schema/content identity.
+          repl("src/inverse_lut_validation.rs",
+               "pub const INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION: u32 = 3;",
+               "pub const INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION: u32 = 4;")
+          repl("src/inverse_lut_validation.rs",
+               "    pub characterization_id: String,\n    pub policy: InverseLutValidationPolicy,",
+               "    pub characterization_id: String,\n    /// Exact content-addressed numerical threshold set used for this report.\n    pub threshold_set_content_id: String,\n    pub policy: InverseLutValidationPolicy,")
+          repl("src/inverse_lut_validation.rs",
+               "        if !is_prefixed_sha256(&self.characterization_id) {\n            errors.push(\"Validation report characterization ID must be canonical sha256:<hex>.\".to_owned());\n        }\n        if let Err(policy_errors) = self.policy.validate() {",
+               "        if !is_prefixed_sha256(&self.characterization_id) {\n            errors.push(\"Validation report characterization ID must be canonical sha256:<hex>.\".to_owned());\n        }\n        if !is_prefixed_sha256(&self.threshold_set_content_id) {\n            errors.push(\"Validation report threshold-set content ID must be canonical sha256:<hex>.\".to_owned());\n        }\n        if let Err(policy_errors) = self.policy.validate() {")
+          repl("src/inverse_lut_validation.rs",
+               "    characterization_id: String,\n    policy: InverseLutValidationPolicy,\n    reference_method:",
+               "    characterization_id: String,\n    threshold_set_content_id: String,\n    policy: InverseLutValidationPolicy,\n    reference_method:")
+          repl("src/inverse_lut_validation.rs",
+               "        characterization_id,\n        policy,\n        reference_method,",
+               "        characterization_id,\n        threshold_set_content_id,\n        policy,\n        reference_method,")
+
+          # Runner accepts a complete threshold set, not loose numerical policy.
+          repl("src/inverse_lut_validation_runner.rs",
+               "use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};\nuse crate::inverse_lut_validation::{",
+               "use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};\nuse crate::inverse_lut_threshold_set::InverseLutValidationThresholdSet;\nuse crate::inverse_lut_validation::{")
+          repl("src/inverse_lut_validation_runner.rs",
+               "    InvalidArtifact(InverseLutLookupError),\n    HoldoutGeneration",
+               "    InvalidArtifact(InverseLutLookupError),\n    InvalidThresholdSet(Vec<String>),\n    ThresholdSetIdentity(String),\n    HoldoutGeneration")
+          repl("src/inverse_lut_validation_runner.rs",
+               "    model: &dyn DeviceForwardModel,\n    policy: InverseLutValidationPolicy,\n) -> Result<InverseLutValidationReport, InverseLutValidationRunError> {",
+               "    model: &dyn DeviceForwardModel,\n    threshold_set: InverseLutValidationThresholdSet,\n) -> Result<InverseLutValidationReport, InverseLutValidationRunError> {",
+               count=2)
+          repl("src/inverse_lut_validation_runner.rs",
+               "    let runtime = InverseLutRuntime::from_verified(artifact)\n        .map_err(InverseLutValidationRunError::InvalidArtifact)?;\n    let holdouts = generate_inverse_lut_holdouts(grid, policy.holdout_method)",
+               "    threshold_set\n        .validate()\n        .map_err(InverseLutValidationRunError::InvalidThresholdSet)?;\n    let threshold_set_content_id = threshold_set\n        .content_id()\n        .map_err(InverseLutValidationRunError::ThresholdSetIdentity)?;\n    let policy = threshold_set.policy;\n\n    let runtime = InverseLutRuntime::from_verified(artifact)\n        .map_err(InverseLutValidationRunError::InvalidArtifact)?;\n    let holdouts = generate_inverse_lut_holdouts(grid, policy.holdout_method)")
+          repl("src/inverse_lut_validation_runner.rs",
+               "        characterization_id,\n        policy,\n        reference_method,",
+               "        characterization_id,\n        threshold_set_content_id,\n        policy,\n        reference_method,")
+          repl("src/inverse_lut_validation_runner.rs",
+               "    run_inverse_lut_validation(artifact, recipe, model, policy)",
+               "    run_inverse_lut_validation(artifact, recipe, model, threshold_set)")
+          repl("src/inverse_lut_validation_runner.rs",
+               "use crate::inverse_lut_validation::{\n    InverseLutValidationPolicy, InverseLutValidationReport, InverseLutValidationSample,",
+               "use crate::inverse_lut_validation::{\n    InverseLutValidationReport, InverseLutValidationSample,")
+
+          # Persisted artifact format advances because report schema gained a required binding.
+          repl("src/inverse_lut_validation_artifact.rs",
+               "pub const INVERSE_LUT_VALIDATION_ARTIFACT_FORMAT_VERSION: u32 = 1;",
+               "pub const INVERSE_LUT_VALIDATION_ARTIFACT_FORMAT_VERSION: u32 = 2;")
+          repl("src/inverse_lut_validation_artifact.rs",
+               "            id('d'),\n            InverseLutValidationPolicy::default(),",
+               "            id('d'),\n            id('e'),\n            InverseLutValidationPolicy::default()")
+
+          # Validation contract tests pass a stable threshold-set identity and prove it affects report identity.
+          repl("src/inverse_lut_validation_tests.rs",
+               "        characterization_id,\n        policy,\n        independent_reference_method(),",
+               "        characterization_id,\n        id('e'),\n        policy,\n        independent_reference_method(),")
+          repl("src/inverse_lut_validation_tests.rs",
+               "        id('d'),\n        policy,\n        independent_reference_method(),",
+               "        id('d'),\n        id('e'),\n        policy,\n        independent_reference_method(),",
+               count=2)
+          repl("src/inverse_lut_validation_tests.rs",
+               "        id('d'),\n        InverseLutValidationPolicy::default(),\n        independent_reference_method(),",
+               "        id('d'),\n        id('e'),\n        InverseLutValidationPolicy::default(),\n        independent_reference_method(),")
+          repl("src/inverse_lut_validation_tests.rs",
+               "    let mut changed_policy = policy;",
+               "    let mut changed_threshold_set = base.clone();\n    changed_threshold_set.threshold_set_content_id = id('f');\n    assert_ne!(changed_threshold_set.content_id().unwrap(), base_id);\n\n    let mut changed_policy = policy;")
+          repl("src/inverse_lut_validation_tests.rs",
+               "    let mut tampered_schema = report(",
+               "    let mut tampered_threshold_set = report(\n        InverseLutValidationPolicy::default(),\n        &[supported(0.5, 0.05)],\n    );\n    tampered_threshold_set.threshold_set_content_id = \"not-a-sha\".to_owned();\n    assert!(tampered_threshold_set.validate().is_err());\n\n    let mut tampered_schema = report(")
+
+          # Eligibility is bound to and revalidates the exact threshold set.
+          repl("src/inverse_lut_production_eligibility.rs",
+               "use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};\nuse crate::inverse_lut_validation::InverseLutValidationPolicy;",
+               "use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};\nuse crate::inverse_lut_threshold_set::InverseLutValidationThresholdSet;")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 2;",
+               "pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 3;")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "    pub validation_report_content_id: String,\n    pub recipe_sha256: String,",
+               "    pub validation_report_content_id: String,\n    pub threshold_set_content_id: String,\n    pub recipe_sha256: String,")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "            (\"characterization_id\", self.characterization_id.as_str()),",
+               "            (\"threshold_set_content_id\", self.threshold_set_content_id.as_str()),\n            (\"characterization_id\", self.characterization_id.as_str()),")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "    ValidationFailed,\n    InvalidPcsCompatibility",
+               "    ValidationFailed,\n    InvalidThresholdSet(Vec<String>),\n    ThresholdSetIdentity(String),\n    ThresholdSetMismatch { report: String, actual: String },\n    ThresholdPolicyMismatch,\n    InvalidPcsCompatibility")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "    ThresholdsNotProductionFrozen { policy_schema_version: u32 },",
+               "    ThresholdsNotProductionFrozen { threshold_set_content_id: String },")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "    validation: &VerifiedInverseLutValidationArtifact,\n    pcs_compatibility:",
+               "    validation: &VerifiedInverseLutValidationArtifact,\n    threshold_set: &InverseLutValidationThresholdSet,\n    pcs_compatibility:")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "    validation\n        .report\n        .validate()\n        .map_err(InverseLutProductionEligibilityError::InvalidValidationReport)?;\n    pcs_compatibility",
+               "    validation\n        .report\n        .validate()\n        .map_err(InverseLutProductionEligibilityError::InvalidValidationReport)?;\n    threshold_set\n        .validate()\n        .map_err(InverseLutProductionEligibilityError::InvalidThresholdSet)?;\n    let threshold_set_content_id = threshold_set\n        .content_id()\n        .map_err(InverseLutProductionEligibilityError::ThresholdSetIdentity)?;\n    pcs_compatibility")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "    if !validation.report.passed {\n        return Err(InverseLutProductionEligibilityError::ValidationFailed);\n    }\n\n    let runtime_identity_id",
+               "    if !validation.report.passed {\n        return Err(InverseLutProductionEligibilityError::ValidationFailed);\n    }\n    if validation.report.threshold_set_content_id != threshold_set_content_id {\n        return Err(InverseLutProductionEligibilityError::ThresholdSetMismatch {\n            report: validation.report.threshold_set_content_id.clone(),\n            actual: threshold_set_content_id.clone(),\n        });\n    }\n    if validation.report.policy != threshold_set.policy {\n        return Err(InverseLutProductionEligibilityError::ThresholdPolicyMismatch);\n    }\n\n    let runtime_identity_id")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "    ensure_production_thresholds_frozen(&validation.report.policy)?;",
+               "    ensure_production_thresholds_frozen(threshold_set, &threshold_set_content_id)?;")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "        validation_report_content_id: actual_report_id,\n        recipe_sha256:",
+               "        validation_report_content_id: actual_report_id,\n        threshold_set_content_id,\n        recipe_sha256:")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "fn ensure_production_thresholds_frozen(\n    policy: &InverseLutValidationPolicy,\n) -> Result<(), InverseLutProductionEligibilityError> {\n    Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen {\n        policy_schema_version: policy.schema_version,\n    })\n}",
+               "fn ensure_production_thresholds_frozen(\n    threshold_set: &InverseLutValidationThresholdSet,\n    threshold_set_content_id: &str,\n) -> Result<(), InverseLutProductionEligibilityError> {\n    match threshold_set\n        .is_production_approved()\n        .map_err(InverseLutProductionEligibilityError::ThresholdSetIdentity)?\n    {\n        true => Ok(()),\n        false => Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen {\n            threshold_set_content_id: threshold_set_content_id.to_owned(),\n        }),\n    }\n}")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "            validation_report_content_id: pcs_id('3'),\n            recipe_sha256:",
+               "            validation_report_content_id: pcs_id('3'),\n            threshold_set_content_id: pcs_id('9'),\n            recipe_sha256:",
+               count=2)
+          repl("src/inverse_lut_production_eligibility.rs",
+               "        let mut changed = base;\n        changed.pcs_compatibility_content_id",
+               "        let mut changed_threshold_set = base.clone();\n        changed_threshold_set.threshold_set_content_id = pcs_id('9');\n        assert_ne!(changed_threshold_set.content_id().unwrap(), base_id);\n\n        let mut changed = base;\n        changed.pcs_compatibility_content_id")
+          repl("src/inverse_lut_production_eligibility.rs",
+               "    fn provisional_policy_is_never_implicitly_promoted_to_production() {\n        assert!(matches!(\n            ensure_production_thresholds_frozen(&InverseLutValidationPolicy::default()),\n            Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen { .. })\n        ));\n    }",
+               "    fn provisional_threshold_set_is_never_implicitly_promoted_to_production() {\n        let threshold_set = InverseLutValidationThresholdSet::provisional_v1();\n        let threshold_set_content_id = threshold_set.content_id().unwrap();\n        assert!(matches!(\n            ensure_production_thresholds_frozen(&threshold_set, &threshold_set_content_id),\n            Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen { .. })\n        ));\n    }")
+
+          # Eligibility integration fixtures use the same deterministic provisional set.
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "use crate::inverse_lut_production_eligibility::{\n    InverseLutProductionEligibilityError, validate_inverse_lut_production_eligibility,\n};\nuse crate::inverse_lut_validation::{",
+               "use crate::inverse_lut_production_eligibility::{\n    InverseLutProductionEligibilityError, validate_inverse_lut_production_eligibility,\n};\nuse crate::inverse_lut_threshold_set::InverseLutValidationThresholdSet;\nuse crate::inverse_lut_validation::{")
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "fn recipe() -> ConversionRecipe {",
+               "fn threshold_set() -> InverseLutValidationThresholdSet {\n    InverseLutValidationThresholdSet::provisional_v1()\n}\n\nfn recipe() -> ConversionRecipe {")
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "    let report = summarize_validation_samples(\n        lut.identity_content_id.clone(),",
+               "    let thresholds = threshold_set();\n    let report = summarize_validation_samples(\n        lut.identity_content_id.clone(),")
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "        characterization_id(),\n        InverseLutValidationPolicy::default(),",
+               "        characterization_id(),\n        thresholds.content_id().unwrap(),\n        thresholds.policy,")
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "    let pcs = pcs_compatibility();\n    let model = FixtureModel::new();",
+               "    let pcs = pcs_compatibility();\n    let thresholds = threshold_set();\n    let model = FixtureModel::new();",
+               count=7)
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "validate_inverse_lut_production_eligibility(&lut, &validation, &pcs, &recipe, &model)",
+               "validate_inverse_lut_production_eligibility(&lut, &validation, &thresholds, &pcs, &recipe, &model)",
+               count=6)
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "            &validation,\n            &pcs,",
+               "            &validation,\n            &thresholds,\n            &pcs,")
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "#[test]\nfn forged_lut_payload_is_rehashed_before_eligibility() {",
+               "#[test]\nfn stale_threshold_set_cannot_authorize_report() {\n    let recipe = recipe();\n    let lut = lut(&recipe);\n    let validation = validation(&recipe, &lut);\n    let pcs = pcs_compatibility();\n    let mut thresholds = threshold_set();\n    thresholds.policy.max_delta_e00 += 0.25;\n    let model = FixtureModel::new();\n\n    assert!(matches!(\n        validate_inverse_lut_production_eligibility(\n            &lut,\n            &validation,\n            &thresholds,\n            &pcs,\n            &recipe,\n            &model,\n        ),\n        Err(InverseLutProductionEligibilityError::ThresholdSetMismatch { .. })\n    ));\n}\n\n#[test]\nfn forged_lut_payload_is_rehashed_before_eligibility() {")
+
+          # Remove now-unused policy import in eligibility integration test if rustfmt/check flags it.
+          repl("src/inverse_lut_production_eligibility_tests.rs",
+               "use crate::inverse_lut_validation::{\n    InverseLutValidationPolicy, InverseLutValidationSample, summarize_validation_samples,\n};",
+               "use crate::inverse_lut_validation::{\n    InverseLutValidationSample, summarize_validation_samples,\n};")
+          '@ | Set-Content -Path .tmp-threshold-binding-patch.py -Encoding utf8
+          python .tmp-threshold-binding-patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-threshold-binding-patch.py
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          $expected = @(
+            'src/inverse_lut_production_eligibility.rs',
+            'src/inverse_lut_production_eligibility_tests.rs',
+            'src/inverse_lut_validation.rs',
+            'src/inverse_lut_validation_artifact.rs',
+            'src/inverse_lut_validation_runner.rs',
+            'src/inverse_lut_validation_tests.rs'
+          )
+          if ((@($changed | Sort-Object) -join "`n") -ne (@($expected | Sort-Object) -join "`n")) { throw "Unexpected files: $($changed -join ', ')" }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add @($expected)
+          git commit -m 'feat(color-conversion): bind threshold-set identity end to end'
+          git push origin HEAD:codex/custom-optimizer-threshold-set-binding
