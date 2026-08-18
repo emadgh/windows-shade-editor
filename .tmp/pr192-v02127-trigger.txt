@@ -1,0 +1,1 @@
+Trigger the guarded temporary workflow that regenerates and validates only Cargo.toml, Cargo.lock and VERSION for PR #192 v0.21.27. Never merge this temporary PR.
