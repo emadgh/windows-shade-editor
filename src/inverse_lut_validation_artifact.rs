@@ -35,7 +35,7 @@ pub enum InverseLutValidationPublishOutcome {
 ///
 /// The stored report content ID is never trusted: it is recomputed from the
 /// complete versioned report, including exact LUT/recipe/characterization
-/// bindings and ordered path diagnostics.
+/// bindings, reference semantics and ordered path diagnostics.
 pub fn load_inverse_lut_validation_artifact(
     path: &Path,
 ) -> Result<VerifiedInverseLutValidationArtifact, String> {
@@ -90,7 +90,7 @@ pub fn publish_inverse_lut_validation_artifact_if_absent(
 
         match safe_fs::commit_staged_file_if_absent(&staged, destination) {
             Ok(()) => Ok(InverseLutValidationPublishOutcome::Published),
-            Err(commit_error) if destination.exists() => {
+            Err(_commit_error) if destination.exists() => {
                 let _ = fs::remove_file(&staged);
                 verify_existing(destination, &expected_content_id)?;
                 Ok(InverseLutValidationPublishOutcome::ReusedExisting)
@@ -195,6 +195,7 @@ mod tests {
     use crate::inverse_lut_validation::{
         InverseLutValidationPolicy, InverseLutValidationSample, summarize_validation_samples,
     };
+    use crate::inverse_lut_validation_reference::InverseLutValidationReferenceMethod;
 
     fn id(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))
@@ -255,6 +256,7 @@ mod tests {
             bare('c'),
             id('d'),
             InverseLutValidationPolicy::default(),
+            InverseLutValidationReferenceMethod::IndependentPointSolveV1,
             paths(),
             &[sample],
         )
