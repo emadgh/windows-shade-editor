@@ -33,6 +33,7 @@ pub mod inverse_lut_identity;
 pub mod inverse_lut_path_validation;
 pub mod inverse_lut_runtime;
 pub mod inverse_lut_validation;
+pub mod inverse_lut_validation_artifact;
 pub mod inverse_lut_validation_eval;
 pub mod inverse_lut_validation_reference;
 pub mod inverse_lut_validation_runner;
