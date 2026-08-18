@@ -13,7 +13,20 @@ pub struct ExportRecipe {
 }
 
 impl ExportRecipe {
+    /// Normal Face/Export All recipe. Test-code drawing is deliberately disabled:
+    /// coded test output belongs exclusively to the Snapshot export workflow.
     pub fn from_project(project: &ShadeProject) -> Self {
+        let mut test_code = project.test_code.clone();
+        test_code.enabled = false;
+        Self {
+            adjustments: project.adjustments.clone(),
+            test_code,
+        }
+    }
+
+    /// Snapshot/test export recipe. This is the only export recipe constructor
+    /// that preserves enabled Test Code drawing.
+    pub fn from_snapshot_project(project: &ShadeProject) -> Self {
         let mut test_code = project.test_code.clone();
         // Freeze the effective fallback text at enqueue time. Otherwise a recipe
         // detached from the full snapshot collection could change meaning later.
@@ -40,7 +53,17 @@ mod tests {
     use crate::model::MASTER_ADJUSTMENT_KEY;
 
     #[test]
-    fn recipe_excludes_heavy_project_state_and_freezes_test_code() {
+    fn normal_recipe_never_writes_test_code() {
+        let mut project = ShadeProject::default();
+        project.test_code.enabled = true;
+        project.test_code.text = "TEST-42".to_owned();
+        let recipe = ExportRecipe::from_project(&project);
+        assert!(!recipe.test_code.enabled);
+        assert_eq!(recipe.test_code.text, "TEST-42");
+    }
+
+    #[test]
+    fn snapshot_recipe_freezes_effective_test_code() {
         let mut project = ShadeProject::default();
         project.test_code.enabled = true;
         project.create_snapshot();
@@ -59,7 +82,8 @@ mod tests {
             .or_default()
             .levels
             .gamma = 1.25;
-        let recipe = ExportRecipe::from_project(&project);
+        let recipe = ExportRecipe::from_snapshot_project(&project);
+        assert!(recipe.test_code.enabled);
         assert_eq!(recipe.test_code.text, expected);
         assert_eq!(
             recipe
