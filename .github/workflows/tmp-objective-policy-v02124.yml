@@ -1,0 +1,61 @@
+name: Temporary guarded v0.21.24 generation
+on:
+  push:
+    branches:
+      - tmp/objective-policy-v02124-bump
+permissions:
+  contents: write
+jobs:
+  bump:
+    if: github.event.head_commit.message != 'chore(version): prepare v0.21.24'
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: tmp/objective-policy-v02124-bump
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Generate version identity through Cargo
+        shell: pwsh
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text(encoding='utf-8')
+          old = 'version = "0.21.23"'
+          new = 'version = "0.21.24"'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one root version marker, got {text.count(old)}')
+          cargo.write_text(text.replace(old, new), encoding='utf-8', newline='')
+          Path('VERSION').write_text('0.21.24\n', encoding='utf-8', newline='')
+          PY
+          cargo update -p windows-shade-editor --precise 0.21.24
+      - name: Guard exact version-only drift
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only)
+          $expected = @('Cargo.lock','Cargo.toml','VERSION')
+          if ((Compare-Object ($changed | Sort-Object) ($expected | Sort-Object))) {
+            throw "Unexpected changed files: $($changed -join ', ')"
+          }
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          diff = Path('Cargo.lock').read_text(encoding='utf-8')
+          # Cargo.lock must contain the root package at the new version.
+          marker = 'name = "windows-shade-editor"\nversion = "0.21.24"'
+          if marker not in diff:
+              raise SystemExit('root package version was not regenerated to 0.21.24')
+          PY
+          git diff --check
+          cargo check --locked --target x86_64-pc-windows-msvc
+      - name: Commit exact generated files
+        shell: pwsh
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore(version): prepare v0.21.24'
+          git push origin HEAD:tmp/objective-policy-v02124-bump
