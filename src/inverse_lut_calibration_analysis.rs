@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::inverse_lut_path_validation::{
-    InverseLutPathDiagnostic, InverseLutValidationPathKind,
-};
+use crate::inverse_lut_path_validation::{InverseLutPathDiagnostic, InverseLutValidationPathKind};
 use crate::inverse_lut_threshold_set::{
     InverseLutCalibrationSolverFamily, InverseLutThresholdCalibrationManifest,
     InverseLutValidationThresholdSet,
@@ -70,7 +68,8 @@ pub struct InverseLutCalibrationPointEnvelope {
 impl InverseLutCalibrationPointEnvelope {
     fn include(&mut self, summary: InverseLutValidationSummary) -> Result<(), String> {
         self.report_count = checked_add(self.report_count, 1, "report_count")?;
-        self.total_samples = checked_add(self.total_samples, summary.total_samples, "total_samples")?;
+        self.total_samples =
+            checked_add(self.total_samples, summary.total_samples, "total_samples")?;
         self.supported_samples = checked_add(
             self.supported_samples,
             summary.supported_samples,
@@ -90,7 +89,8 @@ impl InverseLutCalibrationPointEnvelope {
             .max_unsupported_fraction
             .max(summary.unsupported_fraction);
         self.lut_delta_e00.include(summary.lut_delta_e00);
-        self.reference_delta_e00.include(summary.reference_delta_e00);
+        self.reference_delta_e00
+            .include(summary.reference_delta_e00);
         self.lut_vs_reference_delta_e00
             .include(summary.lut_vs_reference_delta_e00);
         self.ink_l1.include(summary.ink_l1);
@@ -111,18 +111,18 @@ impl InverseLutCalibrationPointEnvelope {
         if self.report_count == 0 {
             errors.push("Inverse-LUT calibration analysis requires reports.".to_owned());
         }
-        if self.total_samples != self.supported_samples + self.unsupported_samples {
-            errors.push(
+        match self.supported_samples.checked_add(self.unsupported_samples) {
+            Some(total) if total == self.total_samples => {}
+            _ => errors.push(
                 "Inverse-LUT calibration analysis aggregate sample counts are inconsistent."
                     .to_owned(),
-            );
+            ),
         }
         if !self.max_unsupported_fraction.is_finite()
             || !(0.0..=1.0).contains(&self.max_unsupported_fraction)
         {
             errors.push(
-                "Inverse-LUT calibration analysis max unsupported fraction is invalid."
-                    .to_owned(),
+                "Inverse-LUT calibration analysis max unsupported fraction is invalid.".to_owned(),
             );
         }
         self.lut_delta_e00.validate("lut_delta_e00", errors);
@@ -303,7 +303,10 @@ impl InverseLutThresholdCalibrationAnalysis {
             );
         }
         for (name, value) in [
-            ("threshold_set_content_id", self.threshold_set_content_id.as_str()),
+            (
+                "threshold_set_content_id",
+                self.threshold_set_content_id.as_str(),
+            ),
             (
                 "calibration_manifest_content_id",
                 self.calibration_manifest_content_id.as_str(),
@@ -316,7 +319,9 @@ impl InverseLutThresholdCalibrationAnalysis {
             }
         }
         if self.observations.is_empty() {
-            errors.push("Inverse-LUT threshold calibration analysis requires observations.".to_owned());
+            errors.push(
+                "Inverse-LUT threshold calibration analysis requires observations.".to_owned(),
+            );
         }
 
         let mut report_ids = BTreeSet::new();
@@ -338,6 +343,7 @@ impl InverseLutThresholdCalibrationAnalysis {
                     "Inverse-LUT calibration analysis observation {index} contains a non-canonical identity."
                 ));
             }
+            validate_summary(&observation.summary, index, &mut errors);
             if !reference_matches_solver_family(
                 observation.solver_family,
                 observation.reference_method,
@@ -394,7 +400,11 @@ impl InverseLutThresholdCalibrationAnalysis {
             );
         }
 
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn content_id(&self) -> Result<String, String> {
@@ -573,6 +583,79 @@ fn compute_envelopes(
     Ok((point, paths))
 }
 
+fn validate_summary(summary: &InverseLutValidationSummary, index: usize, errors: &mut Vec<String>) {
+    match summary
+        .supported_samples
+        .checked_add(summary.unsupported_samples)
+    {
+        Some(total) if total == summary.total_samples => {}
+        _ => errors.push(format!(
+            "Inverse-LUT calibration analysis observation {index} sample counts are inconsistent."
+        )),
+    }
+    if summary.total_samples == 0 {
+        errors.push(format!(
+            "Inverse-LUT calibration analysis observation {index} cannot have zero samples."
+        ));
+    }
+    let expected_fraction = if summary.total_samples == 0 {
+        0.0
+    } else {
+        summary.unsupported_samples as f64 / summary.total_samples as f64
+    };
+    if !summary.unsupported_fraction.is_finite()
+        || !(0.0..=1.0).contains(&summary.unsupported_fraction)
+        || (summary.unsupported_fraction - expected_fraction).abs() > 1.0e-12
+    {
+        errors.push(format!(
+            "Inverse-LUT calibration analysis observation {index} unsupported fraction is invalid."
+        ));
+    }
+    for (name, distribution) in [
+        ("lut_delta_e00", summary.lut_delta_e00),
+        ("reference_delta_e00", summary.reference_delta_e00),
+        (
+            "lut_vs_reference_delta_e00",
+            summary.lut_vs_reference_delta_e00,
+        ),
+        ("ink_l1", summary.ink_l1),
+    ] {
+        for (field, value) in [
+            ("mean", distribution.mean),
+            ("p95", distribution.p95),
+            ("max", distribution.max),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                errors.push(format!(
+                    "Inverse-LUT calibration analysis observation {index} {name}.{field} must be finite and >= 0."
+                ));
+            }
+        }
+        if distribution.mean > distribution.p95 || distribution.p95 > distribution.max {
+            errors.push(format!(
+                "Inverse-LUT calibration analysis observation {index} {name} must satisfy mean <= p95 <= max."
+            ));
+        }
+    }
+    for (name, value) in [
+        ("max_ink_l2", summary.max_ink_l2),
+        ("max_channel_deviation", summary.max_channel_deviation),
+        ("max_u8_quantization_l1", summary.max_u8_quantization_l1),
+        ("max_u16_quantization_l1", summary.max_u16_quantization_l1),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            errors.push(format!(
+                "Inverse-LUT calibration analysis observation {index} {name} must be finite and >= 0."
+            ));
+        }
+    }
+    if summary.constraint_violation_count > summary.supported_samples {
+        errors.push(format!(
+            "Inverse-LUT calibration analysis observation {index} constraint violations exceed supported samples."
+        ));
+    }
+}
+
 fn reference_matches_solver_family(
     family: InverseLutCalibrationSolverFamily,
     method: InverseLutValidationReferenceMethod,
@@ -711,17 +794,22 @@ mod tests {
 
     fn manifest(
         threshold_set: &InverseLutValidationThresholdSet,
-        reports: &[(InverseLutCalibrationSolverFamily, InverseLutValidationReport)],
+        reports: &[(
+            InverseLutCalibrationSolverFamily,
+            InverseLutValidationReport,
+        )],
     ) -> InverseLutThresholdCalibrationManifest {
         let observations = reports
             .iter()
-            .map(|(family, report)| InverseLutThresholdCalibrationObservation {
-                solver_family: *family,
-                characterization_id: report.characterization_id.clone(),
-                recipe_sha256: report.recipe_sha256.clone(),
-                lut_identity_content_id: report.lut_identity_content_id.clone(),
-                validation_report_content_id: report.content_id().unwrap(),
-            })
+            .map(
+                |(family, report)| InverseLutThresholdCalibrationObservation {
+                    solver_family: *family,
+                    characterization_id: report.characterization_id.clone(),
+                    recipe_sha256: report.recipe_sha256.clone(),
+                    lut_identity_content_id: report.lut_identity_content_id.clone(),
+                    validation_report_content_id: report.content_id().unwrap(),
+                },
+            )
             .collect();
         InverseLutThresholdCalibrationManifest {
             schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION,
@@ -748,7 +836,10 @@ mod tests {
             '2',
         );
         let pairs = vec![
-            (InverseLutCalibrationSolverFamily::IndependentV1, first.clone()),
+            (
+                InverseLutCalibrationSolverFamily::IndependentV1,
+                first.clone(),
+            ),
             (
                 InverseLutCalibrationSolverFamily::PositiveContinuityV2,
                 second.clone(),
@@ -761,16 +852,13 @@ mod tests {
     #[test]
     fn analysis_is_deterministic_and_input_report_order_independent() {
         let (threshold_set, manifest, reports) = fixture();
-        let first = analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports)
-            .unwrap();
+        let first =
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports).unwrap();
         let mut reversed = reports.clone();
         reversed.reverse();
-        let second = analyze_inverse_lut_threshold_calibration(
-            &threshold_set,
-            &manifest,
-            &reversed,
-        )
-        .unwrap();
+        let second =
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reversed)
+                .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.content_id().unwrap(), second.content_id().unwrap());
     }
@@ -780,8 +868,7 @@ mod tests {
         let (threshold_set, mut manifest, reports) = fixture();
         manifest.observations[0].recipe_sha256 = bare('f');
         assert!(
-            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports)
-                .is_err()
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports).is_err()
         );
     }
 
@@ -793,8 +880,7 @@ mod tests {
         manifest.observations[1].solver_family =
             InverseLutCalibrationSolverFamily::PositiveContinuityV2;
         assert!(
-            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports)
-                .is_err()
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports).is_err()
         );
     }
 
@@ -832,23 +918,38 @@ mod tests {
             '2',
         );
         let pairs = vec![
-            (InverseLutCalibrationSolverFamily::IndependentV1, first.clone()),
+            (
+                InverseLutCalibrationSolverFamily::IndependentV1,
+                first.clone(),
+            ),
             (
                 InverseLutCalibrationSolverFamily::PositiveContinuityV2,
                 second.clone(),
             ),
         ];
         let manifest = manifest(&threshold_set, &pairs);
-        let analysis = analyze_inverse_lut_threshold_calibration(
-            &threshold_set,
-            &manifest,
-            &[first, second],
-        )
-        .unwrap();
-        assert_eq!(analysis.path_envelopes[0].reports_with_unsupported_samples, 1);
+        let analysis =
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &[first, second])
+                .unwrap();
+        assert_eq!(
+            analysis.path_envelopes[0].reports_with_unsupported_samples,
+            1
+        );
         assert_eq!(analysis.path_envelopes[0].unsupported_samples, 1);
         assert_eq!(analysis.path_envelopes[0].max_channel_jump, Some(0.0));
         assert!(!analysis.all_reports_passed_current_policy);
+    }
+
+    #[test]
+    fn analysis_rejects_tampered_negative_observation_summary() {
+        let (threshold_set, manifest, reports) = fixture();
+        let mut analysis =
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports).unwrap();
+        analysis.observations[0].summary.lut_delta_e00.mean = -0.25;
+        let (point, paths) = compute_envelopes(&analysis.observations).unwrap();
+        analysis.point_envelope = point;
+        analysis.path_envelopes = paths;
+        assert!(analysis.validate().is_err());
     }
 
     #[test]
@@ -860,8 +961,7 @@ mod tests {
             '3',
         ));
         assert!(
-            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports)
-                .is_err()
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports).is_err()
         );
     }
 }
