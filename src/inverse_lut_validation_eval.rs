@@ -113,11 +113,8 @@ pub fn evaluate_inverse_lut_validation_sample(
         .map_err(InverseLutValidationEvaluationError::ForwardModel)?;
     let reference_color = evaluate_characterized_color(model, target_lab, reference_coverages)
         .map_err(InverseLutValidationEvaluationError::ForwardModel)?;
-    // Compute this now even though the schema-v1 summary does not yet persist a
-    // dedicated distribution. Keeping it in the evaluator makes the numerical
-    // comparison explicit and ready for the next schema revision rather than
-    // conflating two target-error values.
-    let _lut_vs_reference_delta_e00 = delta_e_2000(lut_color.predicted, reference_color.predicted);
+    let lut_vs_reference_delta_e00 =
+        delta_e_2000(lut_color.predicted, reference_color.predicted);
 
     let (ink_l1, ink_l2, max_channel_deviation) =
         ink_deviation(&lut_coverages, reference_coverages)?;
@@ -143,6 +140,7 @@ pub fn evaluate_inverse_lut_validation_sample(
         supported: true,
         lut_delta_e00: Some(lut_color.delta_e00),
         reference_delta_e00: Some(reference_color.delta_e00),
+        lut_vs_reference_delta_e00: Some(lut_vs_reference_delta_e00),
         ink_l1: Some(ink_l1),
         ink_l2: Some(ink_l2),
         max_channel_deviation: Some(max_channel_deviation),
@@ -337,6 +335,7 @@ fn unsupported_sample() -> InverseLutValidationSample {
         supported: false,
         lut_delta_e00: None,
         reference_delta_e00: None,
+        lut_vs_reference_delta_e00: None,
         ink_l1: None,
         ink_l2: None,
         max_channel_deviation: None,
