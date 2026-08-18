@@ -1,3 +1,6 @@
+use crate::inverse_lut_path_validation::{
+    InverseLutPathDiagnostic, InverseLutValidationPathKind,
+};
 use crate::inverse_lut_validation::{
     INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION, InverseLutValidationPolicy,
     InverseLutValidationSample, summarize_validation_samples,
@@ -41,12 +44,49 @@ fn unsupported() -> InverseLutValidationSample {
     }
 }
 
-fn report_with_inputs(
+fn path(kind: InverseLutValidationPathKind) -> InverseLutPathDiagnostic {
+    InverseLutPathDiagnostic {
+        kind,
+        sample_count: 5,
+        unsupported_samples: 0,
+        max_channel_jump: Some(0.0),
+        max_normalized_channel_jump: Some(0.0),
+        max_vector_l1_jump: Some(0.0),
+        max_vector_l2_jump: Some(0.0),
+        max_total_ink_jump: Some(0.0),
+        dominant_channel_switches: Some(0),
+        max_channel_second_difference: Some(0.0),
+        max_normalized_channel_second_difference: Some(0.0),
+        max_vector_l1_second_difference: Some(0.0),
+        max_vector_l2_second_difference: Some(0.0),
+        max_total_ink_second_difference: Some(0.0),
+        continuity_violation_count: Some(0),
+        curvature_violation_count: Some(0),
+    }
+}
+
+fn passing_paths() -> Vec<InverseLutPathDiagnostic> {
+    [
+        InverseLutValidationPathKind::NeutralAxis,
+        InverseLutValidationPathKind::NearNeutralWarm,
+        InverseLutValidationPathKind::NearNeutralCool,
+        InverseLutValidationPathKind::AAxis,
+        InverseLutValidationPathKind::BAxis,
+        InverseLutValidationPathKind::AbDiagonal,
+        InverseLutValidationPathKind::AbOpposedDiagonal,
+    ]
+    .into_iter()
+    .map(path)
+    .collect()
+}
+
+fn report_with_inputs_and_paths(
     lut_identity_content_id: String,
     lut_payload_sha256: String,
     recipe_sha256: String,
     characterization_id: String,
     policy: InverseLutValidationPolicy,
+    paths: Vec<InverseLutPathDiagnostic>,
     samples: &[InverseLutValidationSample],
 ) -> crate::inverse_lut_validation::InverseLutValidationReport {
     summarize_validation_samples(
@@ -55,9 +95,29 @@ fn report_with_inputs(
         recipe_sha256,
         characterization_id,
         policy,
+        paths,
         samples,
     )
     .unwrap()
+}
+
+fn report_with_inputs(
+    lut_identity_content_id: String,
+    lut_payload_sha256: String,
+    recipe_sha256: String,
+    characterization_id: String,
+    policy: InverseLutValidationPolicy,
+    samples: &[InverseLutValidationSample],
+) -> crate::inverse_lut_validation::InverseLutValidationReport {
+    report_with_inputs_and_paths(
+        lut_identity_content_id,
+        lut_payload_sha256,
+        recipe_sha256,
+        characterization_id,
+        policy,
+        passing_paths(),
+        samples,
+    )
 }
 
 fn report(
@@ -149,6 +209,19 @@ fn each_bound_input_changes_report_content_identity() {
     changed_policy.max_delta_e00 += 0.5;
     let changed = report(changed_policy, &samples);
     assert_ne!(changed.content_id().unwrap(), base_id);
+
+    let mut changed_paths = passing_paths();
+    changed_paths[0].max_channel_jump = Some(0.01);
+    let changed = report_with_inputs_and_paths(
+        id('a'),
+        bare('b'),
+        bare('c'),
+        id('d'),
+        policy,
+        changed_paths,
+        &samples,
+    );
+    assert_ne!(changed.content_id().unwrap(), base_id);
 }
 
 #[test]
@@ -173,6 +246,84 @@ fn unsupported_fraction_and_constraint_failures_are_explicit() {
 }
 
 #[test]
+fn ordered_path_gate_fails_closed_and_cannot_be_omitted() {
+    let policy = InverseLutValidationPolicy::default();
+    let samples = [supported(0.4, 0.05)];
+
+    let mut unsupported_path = passing_paths();
+    unsupported_path[0] = InverseLutPathDiagnostic {
+        kind: InverseLutValidationPathKind::NeutralAxis,
+        sample_count: 5,
+        unsupported_samples: 1,
+        max_channel_jump: None,
+        max_normalized_channel_jump: None,
+        max_vector_l1_jump: None,
+        max_vector_l2_jump: None,
+        max_total_ink_jump: None,
+        dominant_channel_switches: None,
+        max_channel_second_difference: None,
+        max_normalized_channel_second_difference: None,
+        max_vector_l1_second_difference: None,
+        max_vector_l2_second_difference: None,
+        max_total_ink_second_difference: None,
+        continuity_violation_count: None,
+        curvature_violation_count: None,
+    };
+    let failed = report_with_inputs_and_paths(
+        id('a'),
+        bare('b'),
+        bare('c'),
+        id('d'),
+        policy,
+        unsupported_path,
+        &samples,
+    );
+    assert!(!failed.passed);
+
+    let missing = summarize_validation_samples(
+        id('a'),
+        bare('b'),
+        bare('c'),
+        id('d'),
+        policy,
+        passing_paths()[..6].to_vec(),
+        &samples,
+    );
+    assert!(missing.is_err());
+
+    let mut reordered = passing_paths();
+    reordered.swap(0, 1);
+    let reordered = summarize_validation_samples(
+        id('a'),
+        bare('b'),
+        bare('c'),
+        id('d'),
+        policy,
+        reordered,
+        &samples,
+    );
+    assert!(reordered.is_err());
+}
+
+#[test]
+fn dominant_channel_switches_are_a_separate_path_gate() {
+    let mut policy = InverseLutValidationPolicy::default();
+    policy.path_policy.max_dominant_channel_switches_per_path = 1;
+    let mut paths = passing_paths();
+    paths[3].dominant_channel_switches = Some(2);
+    let failed = report_with_inputs_and_paths(
+        id('a'),
+        bare('b'),
+        bare('c'),
+        id('d'),
+        policy,
+        paths,
+        &[supported(0.4, 0.05)],
+    );
+    assert!(!failed.passed);
+}
+
+#[test]
 fn direct_lut_reference_delta_has_an_independent_gate() {
     let mut policy = InverseLutValidationPolicy::default();
     policy.max_mean_lut_vs_reference_delta_e00 = 0.05;
@@ -193,6 +344,7 @@ fn unsupported_samples_cannot_smuggle_numeric_metrics() {
         bare('c'),
         id('d'),
         InverseLutValidationPolicy::default(),
+        passing_paths(),
         &[sample],
     )
     .unwrap_err();
@@ -200,7 +352,7 @@ fn unsupported_samples_cannot_smuggle_numeric_metrics() {
 }
 
 #[test]
-fn report_rejects_tampered_pass_flag_and_schema() {
+fn report_rejects_tampered_pass_flag_schema_and_path_order() {
     let mut tampered_pass = report(
         InverseLutValidationPolicy::default(),
         &[supported(0.5, 0.05)],
@@ -214,6 +366,13 @@ fn report_rejects_tampered_pass_flag_and_schema() {
     );
     tampered_schema.schema_version = INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION + 1;
     assert!(tampered_schema.validate().is_err());
+
+    let mut tampered_path_order = report(
+        InverseLutValidationPolicy::default(),
+        &[supported(0.5, 0.05)],
+    );
+    tampered_path_order.path_diagnostics.swap(0, 1);
+    assert!(tampered_path_order.validate().is_err());
 }
 
 #[test]
@@ -232,5 +391,9 @@ fn policy_rejects_nonfinite_negative_and_nonmonotonic_thresholds() {
     let mut policy = InverseLutValidationPolicy::default();
     policy.max_mean_lut_vs_reference_delta_e00 = 1.0;
     policy.max_p95_lut_vs_reference_delta_e00 = 0.5;
+    assert!(policy.validate().is_err());
+
+    let mut policy = InverseLutValidationPolicy::default();
+    policy.path_policy.max_vector_l1_second_difference = -0.1;
     assert!(policy.validate().is_err());
 }
