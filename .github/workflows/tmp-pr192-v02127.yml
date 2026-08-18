@@ -1,0 +1,48 @@
+name: Temporary guarded PR192 v0.21.27 bump
+on:
+  pull_request:
+    branches:
+      - tmp/pr192-v02127-bump
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  bump:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-lut-validation-report
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Regenerate, verify and publish version identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '4b4826a4779674f192ecdc2ea8bfb5b92af615d1'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Expected $expectedHead, got $actualHead" }
+          $toml = Get-Content Cargo.toml -Raw
+          $updated = $toml -replace '(?m)^version = "0\.21\.26"$', 'version = "0.21.27"'
+          if ($updated -eq $toml) { throw 'Cargo.toml version anchor not replaced.' }
+          Set-Content Cargo.toml -Value $updated -NoNewline
+          Set-Content VERSION -Value '0.21.27' -NoNewline
+          cargo check --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          $expected = @('Cargo.lock','Cargo.toml','VERSION')
+          if ((@($changed | Sort-Object) -join "`n") -ne (@($expected | Sort-Object) -join "`n")) { throw "Unexpected files: $($changed -join ', ')" }
+          $lockDiff = @(git diff --unified=0 -- Cargo.lock)
+          $removed = @($lockDiff | Where-Object { $_ -match '^-version = "0\.21\.26"$' })
+          $added = @($lockDiff | Where-Object { $_ -match '^\+version = "0\.21\.27"$' })
+          $other = @($lockDiff | Where-Object { $_ -match '^[+-]' -and $_ -notmatch '^---' -and $_ -notmatch '^\+\+\+' -and $_ -notmatch '^-version = "0\.21\.26"$' -and $_ -notmatch '^\+version = "0\.21\.27"$' })
+          if ($removed.Count -ne 1 -or $added.Count -ne 1 -or $other.Count -ne 0) { throw "Cargo.lock drift:`n$($lockDiff -join "`n")" }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: finalize v0.21.27 inverse LUT validation contract'
+          git push origin HEAD:codex/custom-optimizer-lut-validation-report
