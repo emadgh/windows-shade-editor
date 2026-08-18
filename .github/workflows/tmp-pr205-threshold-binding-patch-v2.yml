@@ -44,6 +44,7 @@ jobs:
           $script = $script.Replace('count=7)', 'count=5)')
           $script = $script.Replace('InverseLutValidationPolicy::default()")', 'InverseLutValidationPolicy::default(),")')
           $script = $script.Replace("changed_threshold_set.threshold_set_content_id = pcs_id('9');", "changed_threshold_set.threshold_set_content_id = pcs_id('a');")
+          $script += "`n`nrepl(`"src/inverse_lut_production_eligibility_tests.rs`",`n     `"    let mut pcs = pcs_compatibility();\n`",`n     `"    let mut pcs = pcs_compatibility();\n    let thresholds = threshold_set();\n`",`n     count=2)`n"
           Set-Content -Path .tmp-threshold-binding-patch.py -Value $script -Encoding utf8 -NoNewline
 
           python .tmp-threshold-binding-patch.py
