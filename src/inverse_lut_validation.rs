@@ -5,9 +5,10 @@ use crate::inverse_lut_path_validation::{
     InverseLutPathDiagnostic, InverseLutPathValidationPolicy, InverseLutValidationPathKind,
     path_diagnostics_pass,
 };
+use crate::inverse_lut_validation_reference::InverseLutValidationReferenceMethod;
 
 pub const INVERSE_LUT_VALIDATION_POLICY_SCHEMA_VERSION: u32 = 2;
-pub const INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION: u32 = 2;
+pub const INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -240,6 +241,10 @@ pub struct InverseLutValidationReport {
     pub recipe_sha256: String,
     pub characterization_id: String,
     pub policy: InverseLutValidationPolicy,
+    /// Exact versioned off-grid reference semantics used to generate the report.
+    /// Persisting this prevents a future adapter implementation from silently
+    /// reinterpreting evidence that was produced under an older method.
+    pub reference_method: InverseLutValidationReferenceMethod,
     /// Exactly the ordered diagnostic paths required by `holdout_method`.
     /// Missing/reordered paths are rejected so a failing path cannot be omitted
     /// from a persisted report without invalidating its content identity.
@@ -312,6 +317,7 @@ pub fn summarize_validation_samples(
     recipe_sha256: String,
     characterization_id: String,
     policy: InverseLutValidationPolicy,
+    reference_method: InverseLutValidationReferenceMethod,
     path_diagnostics: Vec<InverseLutPathDiagnostic>,
     samples: &[InverseLutValidationSample],
 ) -> Result<InverseLutValidationReport, String> {
@@ -390,6 +396,7 @@ pub fn summarize_validation_samples(
         recipe_sha256,
         characterization_id,
         policy,
+        reference_method,
         path_diagnostics,
         summary,
         passed,
@@ -422,9 +429,7 @@ fn validate_path_set(
         ));
         return;
     }
-    for (index, (diagnostic, expected_kind)) in
-        diagnostics.iter().zip(expected).enumerate()
-    {
+    for (index, (diagnostic, expected_kind)) in diagnostics.iter().zip(expected).enumerate() {
         if diagnostic.kind != expected_kind {
             errors.push(format!(
                 "Inverse-LUT validation path {index} kind/order mismatch: expected {expected_kind:?}, got {:?}.",
