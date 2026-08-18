@@ -20,17 +20,15 @@ jobs:
       - name: Generate version identity through Cargo
         shell: pwsh
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          cargo = Path('Cargo.toml')
-          text = cargo.read_text(encoding='utf-8')
-          old = 'version = "0.21.23"'
-          new = 'version = "0.21.24"'
-          if text.count(old) != 1:
-              raise SystemExit(f'expected exactly one root version marker, got {text.count(old)}')
-          cargo.write_text(text.replace(old, new), encoding='utf-8', newline='')
-          Path('VERSION').write_text('0.21.24\n', encoding='utf-8', newline='')
-          PY
+          $cargoPath = 'Cargo.toml'
+          $text = Get-Content -Raw $cargoPath
+          $old = 'version = "0.21.23"'
+          $new = 'version = "0.21.24"'
+          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
+          if ($count -ne 1) { throw "Expected exactly one root version marker, got $count" }
+          $text = $text.Replace($old, $new)
+          [System.IO.File]::WriteAllText((Resolve-Path $cargoPath), $text, [System.Text.UTF8Encoding]::new($false))
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'VERSION'), "0.21.24`n", [System.Text.UTF8Encoding]::new($false))
           cargo update -p windows-shade-editor --precise 0.21.24
       - name: Guard exact version-only drift
         shell: pwsh
@@ -40,15 +38,14 @@ jobs:
           if ((Compare-Object ($changed | Sort-Object) ($expected | Sort-Object))) {
             throw "Unexpected changed files: $($changed -join ', ')"
           }
-          python - <<'PY'
+          $script = @'
           from pathlib import Path
-          import re
-          diff = Path('Cargo.lock').read_text(encoding='utf-8')
-          # Cargo.lock must contain the root package at the new version.
+          lock = Path('Cargo.lock').read_text(encoding='utf-8')
           marker = 'name = "windows-shade-editor"\nversion = "0.21.24"'
-          if marker not in diff:
+          if marker not in lock:
               raise SystemExit('root package version was not regenerated to 0.21.24')
-          PY
+          '@
+          $script | python -
           git diff --check
           cargo check --locked --target x86_64-pc-windows-msvc
       - name: Commit exact generated files
