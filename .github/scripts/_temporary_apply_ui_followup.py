@@ -202,7 +202,7 @@ replace_count(
     "    }",
 )
 
-# 3 + 4) Channels histogram: normalize each visible series to its own peak + 4 divisions.
+# 3 + 4) Channels histogram: normalize Original/Adjusted/Reference independently + 4 divisions.
 replace_count(
     "src/ui/match_color.rs",
     "fn histogram_bin_density(histogram: &[u32; 256], index: usize) -> f32 {\n"
@@ -260,12 +260,7 @@ replace_count(
     "src/ui/match_color.rs",
     "            let h = histogram_bin_density(bins, index) / max_density * rect.height();",
     "            let h = histogram_display_height(bins, index, rect.height());",
-    expected=2,
-)
-replace_count(
-    "src/ui/match_color.rs",
-    "                let h = histogram_bin_density(bins, index) / max_density * rect.height();",
-    "                let h = histogram_display_height(bins, index, rect.height());",
+    expected=3,
 )
 replace_count(
     "src/ui/match_color.rs",
