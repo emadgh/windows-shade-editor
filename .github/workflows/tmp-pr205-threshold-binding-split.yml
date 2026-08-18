@@ -118,9 +118,11 @@ jobs:
           git diff --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $changed = @(git diff --name-only)
+          Write-Host "Changed files: $($changed -join ', ')"
           $expected = @(
             'src/inverse_lut_production_eligibility.rs',
             'src/inverse_lut_production_eligibility_tests.rs',
+            'src/inverse_lut_threshold_set.rs',
             'src/inverse_lut_validation.rs',
             'src/inverse_lut_validation_artifact.rs',
             'src/inverse_lut_validation_runner.rs',
@@ -136,6 +138,6 @@ jobs:
           $ErrorActionPreference = 'Stop'
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/inverse_lut_production_eligibility.rs src/inverse_lut_production_eligibility_tests.rs src/inverse_lut_validation.rs src/inverse_lut_validation_artifact.rs src/inverse_lut_validation_runner.rs src/inverse_lut_validation_tests.rs
+          git add src/inverse_lut_production_eligibility.rs src/inverse_lut_production_eligibility_tests.rs src/inverse_lut_threshold_set.rs src/inverse_lut_validation.rs src/inverse_lut_validation_artifact.rs src/inverse_lut_validation_runner.rs src/inverse_lut_validation_tests.rs
           git commit -m 'feat(color-conversion): bind threshold-set identity end to end'
           git push origin HEAD:codex/custom-optimizer-threshold-set-binding
