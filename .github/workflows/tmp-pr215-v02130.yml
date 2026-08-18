@@ -1,0 +1,48 @@
+name: Temporary guarded PR215 v0.21.30 bump
+on:
+  pull_request:
+    branches:
+      - tmp/pr215-v02130-bump
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  bump:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-threshold-set-binding
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Regenerate, verify and publish version identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'e713daf87dc91e3336bd2f730932a5fc9fc87834'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Expected $expectedHead, got $actualHead" }
+          $toml = Get-Content Cargo.toml -Raw
+          $updated = $toml -replace '(?m)^version = "0\.21\.29"$', 'version = "0.21.30"'
+          if ($updated -eq $toml) { throw 'Cargo.toml version anchor not replaced.' }
+          Set-Content Cargo.toml -Value $updated -NoNewline
+          Set-Content VERSION -Value '0.21.30' -NoNewline
+          cargo check --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          $expected = @('Cargo.lock','Cargo.toml','VERSION')
+          if ((@($changed | Sort-Object) -join "`n") -ne (@($expected | Sort-Object) -join "`n")) { throw "Unexpected files: $($changed -join ', ')" }
+          $lockDiff = @(git diff --unified=0 -- Cargo.lock)
+          $removed = @($lockDiff | Where-Object { $_ -match '^-version = "0\.21\.29"$' })
+          $added = @($lockDiff | Where-Object { $_ -match '^\+version = "0\.21\.30"$' })
+          $other = @($lockDiff | Where-Object { $_ -match '^[+-]' -and $_ -notmatch '^---' -and $_ -notmatch '^\+\+\+' -and $_ -notmatch '^-version = "0\.21\.29"$' -and $_ -notmatch '^\+version = "0\.21\.30"$' })
+          if ($removed.Count -ne 1 -or $added.Count -ne 1 -or $other.Count -ne 0) { throw "Cargo.lock drift:`n$($lockDiff -join "`n")" }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: finalize v0.21.30 threshold-set provenance binding'
+          git push origin HEAD:codex/custom-optimizer-threshold-set-binding
