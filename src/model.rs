@@ -332,6 +332,12 @@ pub struct SnapshotExportRecord {
     pub face_key: String,
     pub folder: String,
     pub exported_at_unix_ms: i64,
+    #[serde(default)]
+    pub test_code: String,
+    #[serde(default)]
+    pub adjustment_sha256: String,
+    #[serde(default)]
+    pub destination: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -647,16 +653,39 @@ impl ShadeProject {
         folder: String,
         exported_at_unix_ms: i64,
     ) -> bool {
+        self.record_snapshot_export_with_identity(
+            id,
+            face_key,
+            folder,
+            exported_at_unix_ms,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    }
+
+    /// Append a committed Snapshot export to durable history. Do not replace
+    /// older records: previously used codes/states remain auditable.
+    pub fn record_snapshot_export_with_identity(
+        &mut self,
+        id: u64,
+        face_key: String,
+        folder: String,
+        exported_at_unix_ms: i64,
+        test_code: String,
+        adjustment_sha256: String,
+        destination: String,
+    ) -> bool {
         let Some(snapshot) = self.snapshots.iter_mut().find(|snapshot| snapshot.id == id) else {
             return false;
         };
-        snapshot
-            .exports
-            .retain(|record| record.face_key != face_key);
         snapshot.exports.push(SnapshotExportRecord {
             face_key,
             folder,
             exported_at_unix_ms,
+            test_code,
+            adjustment_sha256,
+            destination,
         });
         true
     }

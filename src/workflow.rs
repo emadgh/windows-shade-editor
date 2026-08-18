@@ -30,12 +30,14 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
     let Some(active_id) = app.project.active_snapshot_id else {
         return;
     };
-    let exported = app
+    let exported_record = app
         .project
         .snapshots
         .iter()
         .find(|snapshot| snapshot.id == active_id)
-        .is_some_and(|snapshot| !snapshot.exports.is_empty());
+        .and_then(|snapshot| snapshot.exports.iter().max_by_key(|record| record.exported_at_unix_ms))
+        .cloned();
+    let exported = exported_record.is_some();
     let dirty = !app.project.active_snapshot_matches();
     let mut reusing_exported_code = false;
 
@@ -46,8 +48,14 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
             .unwrap_or("Snapshot")
             .to_owned();
         let current_code = app.project.effective_test_code_text();
+        let exported_code = exported_record
+            .as_ref()
+            .map(|record| record.test_code.trim())
+            .filter(|code| !code.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| current_code.clone());
         let description = format!(
-            "'{snapshot_name}' has already been exported with Test Code '{current_code}'.\n\nYes = Create a NEW Snapshot + Test Code (recommended)\nNo = Reuse the SAME exported Test Code and update this Snapshot\nCancel = Keep the exported Snapshot unchanged\n\nReusing the same code does not bypass the separate file overwrite confirmation during the next export."
+            "'{snapshot_name}' has already been exported with Test Code '{exported_code}'.\n\nYes = Create a NEW Snapshot + Test Code (recommended)\nNo = Reuse the SAME exported Test Code and update this Snapshot\nCancel = Keep the exported Snapshot unchanged\n\nReusing the same code does not bypass the separate file overwrite confirmation during the next export."
         );
         match rfd::MessageDialog::new()
             .set_title("Exported Snapshot / Test Code")
@@ -58,7 +66,7 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
         {
             rfd::MessageDialogResult::Yes => {
                 app.flush_history_now();
-                let new_code = next_test_code(&current_code);
+                let new_code = next_test_code(&exported_code);
                 app.project.test_code.enabled = true;
                 app.project.test_code.text = new_code.clone();
                 let new_id = app.project.create_snapshot();
@@ -82,6 +90,10 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
                 return;
             }
             rfd::MessageDialogResult::No => {
+                if !exported_code.is_empty() {
+                    app.project.test_code.enabled = true;
+                    app.project.test_code.text = exported_code;
+                }
                 reusing_exported_code = true;
             }
             _ => return,

@@ -1024,12 +1024,24 @@ impl ShadeApp {
                 continue;
             }
             if let Some(mark) = completion.mark {
-                self.project.record_snapshot_export(
-                    mark.snapshot_id,
-                    mark.face_key,
-                    mark.folder.to_string_lossy().into_owned(),
-                    unix_ms_now(),
-                );
+                if let Some(provenance) = completion.provenance {
+                    self.project.record_snapshot_export_with_identity(
+                        mark.snapshot_id,
+                        mark.face_key,
+                        mark.folder.to_string_lossy().into_owned(),
+                        unix_ms_now(),
+                        provenance.test_code,
+                        provenance.adjustment_sha256,
+                        provenance.destination.to_string_lossy().into_owned(),
+                    );
+                } else {
+                    self.project.record_snapshot_export(
+                        mark.snapshot_id,
+                        mark.face_key,
+                        mark.folder.to_string_lossy().into_owned(),
+                        unix_ms_now(),
+                    );
+                }
                 self.mark_project_dirty();
             }
             match completion.result {
@@ -1438,8 +1450,7 @@ impl ShadeApp {
         let folder_template = self.settings.export_folder_template.clone();
         let conflict_policy = self.settings.export_all_conflict_policy;
         let open_after = self.settings.export_all_open_folder;
-        let mut project = self.project.clone();
-        project.test_code.enabled = self.settings.export_all_test_code;
+        let project = self.project.clone();
         let date = Local::now().format("%Y-%m-%d").to_string();
         let mut reserved = self.export.queue.reserved_destination_keys();
         let mut queued = 0usize;
@@ -1681,12 +1692,6 @@ impl ShadeApp {
                         "Open root folder after queue finishes",
                     )
                     .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.export_all_test_code,
-                        "Write Test Code on every exported Face",
-                    )
-                    .changed();
 
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1793,7 +1798,7 @@ impl ShadeApp {
             label: format!("Face {} / {}", self.current_face + 1, snapshot.name),
             source,
             destination,
-            recipe: export_recipe::ExportRecipe::from_project(&project),
+            recipe: export_recipe::ExportRecipe::from_snapshot_project(&project),
             default_dpi: self.settings.default_dpi,
             force_lzw: self.settings.lzw_compression,
             validate_after_export: self.settings.validate_after_export,
@@ -1912,7 +1917,7 @@ impl ShadeApp {
                 label: format!("{face_name} / {}", snapshot.name),
                 source: source.clone(),
                 destination,
-                recipe: export_recipe::ExportRecipe::from_project(&project),
+                recipe: export_recipe::ExportRecipe::from_snapshot_project(&project),
                 default_dpi: self.settings.default_dpi,
                 force_lzw: self.settings.lzw_compression,
                 validate_after_export: self.settings.validate_after_export,

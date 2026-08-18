@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::model::{ChannelAdjustment, ShadeProject, TestCodeConfig};
 
@@ -39,6 +40,23 @@ impl ExportRecipe {
         }
     }
 
+    /// Exact code frozen into this queued export. Empty means this recipe is uncoded.
+    pub fn exported_test_code(&self) -> String {
+        if self.test_code.enabled {
+            self.test_code.text.trim().to_owned()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Stable identity of the exact adjustment payload consumed by the exporter.
+    pub fn adjustment_sha256(&self) -> String {
+        let bytes = serde_json::to_vec(&self.adjustments).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
     pub fn materialize_project(&self) -> ShadeProject {
         let mut project = ShadeProject::default();
         project.adjustments = self.adjustments.clone();
@@ -60,6 +78,7 @@ mod tests {
         let recipe = ExportRecipe::from_project(&project);
         assert!(!recipe.test_code.enabled);
         assert_eq!(recipe.test_code.text, "TEST-42");
+        assert!(recipe.exported_test_code().is_empty());
     }
 
     #[test]
@@ -85,6 +104,8 @@ mod tests {
         let recipe = ExportRecipe::from_snapshot_project(&project);
         assert!(recipe.test_code.enabled);
         assert_eq!(recipe.test_code.text, expected);
+        assert_eq!(recipe.exported_test_code(), expected);
+        assert_eq!(recipe.adjustment_sha256().len(), 64);
         assert_eq!(
             recipe
                 .adjustments
