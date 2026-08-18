@@ -27,6 +27,7 @@ pub mod icc_conversion;
 pub mod icc_conversion_worker;
 pub mod inverse_lut_artifact;
 pub mod inverse_lut_calibration_analysis;
+pub mod inverse_lut_calibration_corpus;
 pub mod inverse_lut_continuity_builder;
 pub mod inverse_lut_continuity_field;
 pub mod inverse_lut_holdout;
