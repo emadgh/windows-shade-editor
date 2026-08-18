@@ -1,0 +1,129 @@
+name: Temporary guarded PR223 D50 snapshot hardening
+on:
+  pull_request:
+    branches:
+      - tmp/pr223-d50-snapshot-hardening
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-measured-calibration-corpus
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Guard exact feature head
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = 'b5e5eb5f66a867b627c70925a0b2a6fe2c8450e8'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $expected) { throw "Expected $expected, got $actual" }
+
+      - name: Harden stored D50 and observer snapshot validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+
+          p = Path('src/inverse_lut_calibration_corpus.rs')
+          text = p.read_text(encoding='utf-8')
+
+          context_end = '''    }
+          }
+
+          fn validate_model_contract(
+          '''
+          insertion = '''    }
+              if !is_d50_illuminant(&entry.measurement.illuminant) {
+                  errors.push(format!(
+                      "Calibration corpus entry {index} measurement illuminant must remain D50-compatible."
+                  ));
+              }
+              if !is_two_degree_observer(&entry.measurement.observer) {
+                  errors.push(format!(
+                      "Calibration corpus entry {index} measurement observer must remain CIE 2-degree compatible."
+                  ));
+              }
+          }
+
+          fn validate_model_contract(
+          '''
+          if text.count(context_end) != 1:
+              raise SystemExit('Cannot locate validate_context end marker')
+          text = text.replace(context_end, insertion, 1)
+
+          helper_anchor = '''fn is_prefixed_sha256(value: &str) -> bool {
+          '''
+          helpers = '''fn is_d50_illuminant(value: &str) -> bool {
+              value.trim().eq_ignore_ascii_case("d50")
+          }
+
+          fn is_two_degree_observer(value: &str) -> bool {
+              let normalized = value.trim().to_ascii_lowercase();
+              matches!(
+                  normalized.as_str(),
+                  "2deg" | "2°" | "2 degree" | "2 degrees" | "2-degree" | "2-deg"
+              )
+          }
+
+          '''
+          if text.count(helper_anchor) != 1:
+              raise SystemExit('Cannot locate SHA helper anchor')
+          text = text.replace(helper_anchor, helpers + helper_anchor, 1)
+
+          test_anchor = '''        let mut metric_tamper = corpus;
+          '''
+          test_insert = '''        let mut measurement_tamper = corpus.clone();
+              measurement_tamper.entries[0].measurement.illuminant = "D65".to_owned();
+              assert!(measurement_tamper.validate().is_err());
+
+              let mut observer_tamper = corpus.clone();
+              observer_tamper.entries[0].measurement.observer = "10deg".to_owned();
+              assert!(observer_tamper.validate().is_err());
+
+              let mut metric_tamper = corpus;
+          '''
+          if text.count(test_anchor) != 1:
+              raise SystemExit('Cannot locate metric tamper test anchor')
+          text = text.replace(test_anchor, test_insert, 1)
+
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | Set-Content -Path .tmp-pr223-d50.py -Encoding utf8
+          python .tmp-pr223-d50.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-pr223-d50.py
+          rustfmt --edition 2024 src/inverse_lut_calibration_corpus.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check and test locked Windows target
+        shell: pwsh
+        run: |
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Guard and publish exact patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          if (($changed -join "`n") -ne 'src/inverse_lut_calibration_corpus.rs') {
+            throw "Unexpected changed files: $($changed -join ', ')"
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/inverse_lut_calibration_corpus.rs
+          git commit -m 'test(color-conversion): harden measured corpus colorimetry snapshot'
+          git push origin HEAD:codex/custom-optimizer-measured-calibration-corpus
