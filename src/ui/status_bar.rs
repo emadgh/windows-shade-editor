@@ -30,17 +30,6 @@ impl ShadeApp {
             ui.label(format!("{}{}", self.status_message, dirty));
             self.ui_color_conversion_status(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Fit").clicked() {
-                    self.fit_requested = true;
-                }
-                let zoom = ui.add(
-                    egui::Slider::new(&mut self.zoom, 0.05..=8.0)
-                        .logarithmic(true)
-                        .text("Zoom"),
-                );
-                if zoom.changed() {
-                    self.viewport_recenter = true;
-                }
                 if let Some(path) = &self.project_path {
                     ui.label(path.display().to_string());
                 }
