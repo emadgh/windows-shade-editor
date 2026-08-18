@@ -91,16 +91,7 @@ jobs:
           $changed = @(git diff --name-only | Sort-Object)
           $status = @(git status --short)
           $stat = @(git diff --stat)
-          $body = @(
-            'Changed files:',
-            $changed,
-            '',
-            'Status:',
-            $status,
-            '',
-            'Diff stat:',
-            $stat
-          ) -join "`n"
+          $body = "Changed files:`n$($changed -join "`n")`n`nStatus:`n$($status -join "`n")`n`nDiff stat:`n$($stat -join "`n")"
           Set-Content .tmp/threshold-binding-surface.txt -Value $body -Encoding utf8 -NoNewline
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
