@@ -65,8 +65,7 @@ impl InverseLutMeasuredCalibrationCorpus {
         }
         if self.pcs_method != ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1 {
             errors.push(
-                "Inverse-LUT measured calibration corpus requires ICC PCS Lab D50/2°."
-                    .to_owned(),
+                "Inverse-LUT measured calibration corpus requires ICC PCS Lab D50/2°.".to_owned(),
             );
         }
         if self.entries.is_empty() {
@@ -94,7 +93,11 @@ impl InverseLutMeasuredCalibrationCorpus {
             validate_entry(entry, index, self.pcs_method, &mut errors);
         }
 
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn content_id(&self) -> Result<String, String> {
@@ -125,7 +128,11 @@ impl InverseLutMeasuredCalibrationCorpus {
                 "Supplied measured calibration evidence cannot reproduce the corpus: {error}"
             )),
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
@@ -145,10 +152,12 @@ pub fn build_inverse_lut_measured_calibration_corpus(
     let mut entries = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.iter().enumerate() {
         let package = input.characterization;
-        package
-            .package()
-            .validate()
-            .map_err(|errors| format!("Characterization input {index} is invalid: {}", errors.join("\n")))?;
+        package.package().validate().map_err(|errors| {
+            format!(
+                "Characterization input {index} is invalid: {}",
+                errors.join("\n")
+            )
+        })?;
         let payload = &package.package().payload;
         if payload.validation_level != CharacterizationValidationLevel::ProductionValidated {
             return Err(format!(
@@ -335,7 +344,10 @@ fn validate_context(
             entry.production_context.linearization_id.as_str(),
         ),
         ("substrate", entry.production_context.substrate.as_str()),
-        ("instrument model", entry.measurement.instrument_model.as_str()),
+        (
+            "instrument model",
+            entry.measurement.instrument_model.as_str(),
+        ),
         ("illuminant", entry.measurement.illuminant.as_str()),
         ("observer", entry.measurement.observer.as_str()),
         (
@@ -348,6 +360,16 @@ fn validate_context(
                 "Calibration corpus entry {index} {label} cannot be empty."
             ));
         }
+    }
+    if !is_d50_illuminant(&entry.measurement.illuminant) {
+        errors.push(format!(
+            "Calibration corpus entry {index} measurement illuminant must remain D50-compatible."
+        ));
+    }
+    if !is_two_degree_observer(&entry.measurement.observer) {
+        errors.push(format!(
+            "Calibration corpus entry {index} measurement observer must remain CIE 2-degree compatible."
+        ));
     }
 }
 
@@ -465,6 +487,18 @@ fn validate_model_contract(
             "Calibration corpus entry {index} forward-model validation report exceeds its stored policy."
         ));
     }
+}
+
+fn is_d50_illuminant(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("d50")
+}
+
+fn is_two_degree_observer(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "2deg" | "2°" | "2 degree" | "2 degrees" | "2-degree" | "2-deg"
+    )
 }
 
 fn is_prefixed_sha256(value: &str) -> bool {
@@ -610,9 +644,13 @@ mod tests {
             },
         ];
         let first_corpus = build_inverse_lut_measured_calibration_corpus(&first_inputs).unwrap();
-        let second_corpus = build_inverse_lut_measured_calibration_corpus(&reversed_inputs).unwrap();
+        let second_corpus =
+            build_inverse_lut_measured_calibration_corpus(&reversed_inputs).unwrap();
         assert_eq!(first_corpus, second_corpus);
-        assert_eq!(first_corpus.content_id().unwrap(), second_corpus.content_id().unwrap());
+        assert_eq!(
+            first_corpus.content_id().unwrap(),
+            second_corpus.content_id().unwrap()
+        );
         assert!(first_corpus.validate_bindings(&first_inputs).is_ok());
     }
 
@@ -719,12 +757,21 @@ mod tests {
         let corpus = build_inverse_lut_measured_calibration_corpus(&inputs).unwrap();
 
         let mut pcs_tamper = corpus.clone();
-        pcs_tamper.entries[0].pcs_compatibility_content_id =
-            format!("sha256:{}", "f".repeat(64));
+        pcs_tamper.entries[0].pcs_compatibility_content_id = format!("sha256:{}", "f".repeat(64));
         assert!(pcs_tamper.validate().is_err());
 
+        let mut measurement_tamper = corpus.clone();
+        measurement_tamper.entries[0].measurement.illuminant = "D65".to_owned();
+        assert!(measurement_tamper.validate().is_err());
+
+        let mut observer_tamper = corpus.clone();
+        observer_tamper.entries[0].measurement.observer = "10deg".to_owned();
+        assert!(observer_tamper.validate().is_err());
+
         let mut metric_tamper = corpus;
-        metric_tamper.entries[0].forward_model_validation.mean_delta_e00 = -0.1;
+        metric_tamper.entries[0]
+            .forward_model_validation
+            .mean_delta_e00 = -0.1;
         assert!(metric_tamper.validate().is_err());
     }
 }
