@@ -20,6 +20,9 @@ pub struct InverseLutValidationPolicy {
     pub max_mean_delta_e00: f64,
     pub max_p95_delta_e00: f64,
     pub max_delta_e00: f64,
+    pub max_mean_lut_vs_reference_delta_e00: f64,
+    pub max_p95_lut_vs_reference_delta_e00: f64,
+    pub max_lut_vs_reference_delta_e00: f64,
     pub max_mean_ink_l1: f64,
     pub max_p95_ink_l1: f64,
     pub max_ink_l1: f64,
@@ -41,6 +44,9 @@ impl Default for InverseLutValidationPolicy {
             max_mean_delta_e00: 1.0,
             max_p95_delta_e00: 2.0,
             max_delta_e00: 3.0,
+            max_mean_lut_vs_reference_delta_e00: 0.75,
+            max_p95_lut_vs_reference_delta_e00: 1.5,
+            max_lut_vs_reference_delta_e00: 2.0,
             max_mean_ink_l1: 0.15,
             max_p95_ink_l1: 0.30,
             max_ink_l1: 0.50,
@@ -66,6 +72,18 @@ impl InverseLutValidationPolicy {
             ("max_mean_delta_e00", self.max_mean_delta_e00),
             ("max_p95_delta_e00", self.max_p95_delta_e00),
             ("max_delta_e00", self.max_delta_e00),
+            (
+                "max_mean_lut_vs_reference_delta_e00",
+                self.max_mean_lut_vs_reference_delta_e00,
+            ),
+            (
+                "max_p95_lut_vs_reference_delta_e00",
+                self.max_p95_lut_vs_reference_delta_e00,
+            ),
+            (
+                "max_lut_vs_reference_delta_e00",
+                self.max_lut_vs_reference_delta_e00,
+            ),
             ("max_mean_ink_l1", self.max_mean_ink_l1),
             ("max_p95_ink_l1", self.max_p95_ink_l1),
             ("max_ink_l1", self.max_ink_l1),
@@ -93,6 +111,14 @@ impl InverseLutValidationPolicy {
                 "Inverse-LUT DeltaE thresholds must satisfy mean <= p95 <= max.".to_owned(),
             );
         }
+        if self.max_mean_lut_vs_reference_delta_e00 > self.max_p95_lut_vs_reference_delta_e00
+            || self.max_p95_lut_vs_reference_delta_e00 > self.max_lut_vs_reference_delta_e00
+        {
+            errors.push(
+                "Inverse-LUT LUT-vs-reference DeltaE thresholds must satisfy mean <= p95 <= max."
+                    .to_owned(),
+            );
+        }
         if self.max_mean_ink_l1 > self.max_p95_ink_l1
             || self.max_p95_ink_l1 > self.max_ink_l1
         {
@@ -114,6 +140,8 @@ pub struct InverseLutValidationSample {
     pub lut_delta_e00: Option<f64>,
     /// Color error of the authoritative reference separation for the same target.
     pub reference_delta_e00: Option<f64>,
+    /// Direct CIEDE2000 difference between LUT-predicted and reference-predicted Lab.
+    pub lut_vs_reference_delta_e00: Option<f64>,
     /// Normalized device-space distance between LUT and reference separation.
     pub ink_l1: Option<f64>,
     pub ink_l2: Option<f64>,
@@ -128,6 +156,7 @@ impl InverseLutValidationSample {
         if !self.supported {
             if self.lut_delta_e00.is_some()
                 || self.reference_delta_e00.is_some()
+                || self.lut_vs_reference_delta_e00.is_some()
                 || self.ink_l1.is_some()
                 || self.ink_l2.is_some()
                 || self.max_channel_deviation.is_some()
@@ -143,6 +172,10 @@ impl InverseLutValidationSample {
         for (name, value) in [
             ("lut_delta_e00", self.lut_delta_e00),
             ("reference_delta_e00", self.reference_delta_e00),
+            (
+                "lut_vs_reference_delta_e00",
+                self.lut_vs_reference_delta_e00,
+            ),
             ("ink_l1", self.ink_l1),
             ("ink_l2", self.ink_l2),
             ("max_channel_deviation", self.max_channel_deviation),
@@ -179,6 +212,7 @@ pub struct InverseLutValidationSummary {
     pub unsupported_fraction: f64,
     pub lut_delta_e00: ValidationDistribution,
     pub reference_delta_e00: ValidationDistribution,
+    pub lut_vs_reference_delta_e00: ValidationDistribution,
     pub ink_l1: ValidationDistribution,
     pub max_ink_l2: f64,
     pub max_channel_deviation: f64,
@@ -276,6 +310,7 @@ pub fn summarize_validation_samples(
 
     let mut lut_delta = Vec::with_capacity(supported.len());
     let mut reference_delta = Vec::with_capacity(supported.len());
+    let mut lut_vs_reference_delta = Vec::with_capacity(supported.len());
     let mut ink_l1 = Vec::with_capacity(supported.len());
     let mut max_ink_l2 = 0.0f64;
     let mut max_channel_deviation = 0.0f64;
@@ -285,6 +320,11 @@ pub fn summarize_validation_samples(
     for sample in supported {
         lut_delta.push(sample.lut_delta_e00.expect("validated supported metric"));
         reference_delta.push(sample.reference_delta_e00.expect("validated supported metric"));
+        lut_vs_reference_delta.push(
+            sample
+                .lut_vs_reference_delta_e00
+                .expect("validated supported metric"),
+        );
         ink_l1.push(sample.ink_l1.expect("validated supported metric"));
         max_ink_l2 = max_ink_l2.max(sample.ink_l2.expect("validated supported metric"));
         max_channel_deviation = max_channel_deviation
@@ -307,6 +347,7 @@ pub fn summarize_validation_samples(
         unsupported_fraction,
         lut_delta_e00: distribution(&mut lut_delta),
         reference_delta_e00: distribution(&mut reference_delta),
+        lut_vs_reference_delta_e00: distribution(&mut lut_vs_reference_delta),
         ink_l1: distribution(&mut ink_l1),
         max_ink_l2,
         max_channel_deviation,
@@ -349,6 +390,9 @@ fn summary_passes(summary: &InverseLutValidationSummary, policy: &InverseLutVali
         && summary.lut_delta_e00.mean <= policy.max_mean_delta_e00
         && summary.lut_delta_e00.p95 <= policy.max_p95_delta_e00
         && summary.lut_delta_e00.max <= policy.max_delta_e00
+        && summary.lut_vs_reference_delta_e00.mean <= policy.max_mean_lut_vs_reference_delta_e00
+        && summary.lut_vs_reference_delta_e00.p95 <= policy.max_p95_lut_vs_reference_delta_e00
+        && summary.lut_vs_reference_delta_e00.max <= policy.max_lut_vs_reference_delta_e00
         && summary.ink_l1.mean <= policy.max_mean_ink_l1
         && summary.ink_l1.p95 <= policy.max_p95_ink_l1
         && summary.ink_l1.max <= policy.max_ink_l1
