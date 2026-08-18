@@ -3,6 +3,9 @@ use crate::conversion_recipe::recipe_sha256;
 use crate::device_characterization::DeviceForwardModel;
 use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
 use crate::inverse_lut_holdout::{InverseLutHoldoutError, generate_inverse_lut_holdouts};
+use crate::inverse_lut_path_validation::{
+    InverseLutPathValidationError, analyze_inverse_lut_paths,
+};
 use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};
 use crate::inverse_lut_validation::{
     InverseLutValidationPolicy, InverseLutValidationReport, InverseLutValidationSample,
@@ -24,6 +27,7 @@ pub enum InverseLutValidationRunError {
         sample_index: usize,
         error: InverseLutValidationReferenceError,
     },
+    PathDiagnostics(InverseLutPathValidationError),
     Evaluation {
         sample_index: usize,
         error: InverseLutValidationEvaluationError,
@@ -38,6 +42,10 @@ pub enum InverseLutValidationRunError {
 /// V1/zero-continuity V2 use independent point references. Positive-continuity
 /// V2 uses the exact persisted frozen Jacobi field as an off-grid trilinear
 /// continuity reference and never invents raster/previous-pixel state.
+///
+/// The versioned ordered diagnostic paths are evaluated independently of the
+/// aggregate holdout distribution and become part of report identity. Any
+/// unsupported sample invalidates its whole path rather than bridging across it.
 pub fn run_inverse_lut_validation(
     artifact: VerifiedInverseLutArtifact,
     recipe: &ConversionRecipe,
@@ -65,6 +73,18 @@ pub fn run_inverse_lut_validation(
             error,
         }
     })?;
+
+    // Persist first- and second-order diagnostics for the exact ordered V1
+    // paths. This uses the existing gradient-continuity/curvature semantics and
+    // never stitches across an unsupported runtime lookup.
+    let path_diagnostics = analyze_inverse_lut_paths(
+        &runtime,
+        recipe,
+        model,
+        &holdouts.paths,
+        policy.path_policy,
+    )
+    .map_err(InverseLutValidationRunError::PathDiagnostics)?;
 
     let total_hint = holdouts
         .paths
@@ -124,6 +144,7 @@ pub fn run_inverse_lut_validation(
         recipe_sha,
         characterization_id,
         policy,
+        path_diagnostics,
         &samples,
     )
     .map_err(InverseLutValidationRunError::Report)
