@@ -1,0 +1,117 @@
+Changed files:
+src/color_conversion.rs
+src/conversion_analytics.rs
+src/conversion_capabilities.rs
+src/conversion_output.rs
+src/conversion_preset_library.rs
+src/conversion_presets.rs
+src/conversion_queue.rs
+src/conversion_recipe.rs
+src/custom_optimizer_config.rs
+src/device_characterization_model.rs
+src/device_characterization_package.rs
+src/device_characterization.rs
+src/gradient_validation.rs
+src/icc_conversion.rs
+src/inverse_lut_build_tests.rs
+src/inverse_lut_holdout.rs
+src/inverse_lut_path_validation.rs
+src/inverse_lut_production_eligibility_tests.rs
+src/inverse_lut_production_eligibility.rs
+src/inverse_lut_runtime_tests.rs
+src/inverse_lut_runtime.rs
+src/inverse_lut_threshold_set.rs
+src/inverse_lut_validation_artifact.rs
+src/inverse_lut_validation_eval.rs
+src/inverse_lut_validation_reference.rs
+src/inverse_lut_validation_runner.rs
+src/inverse_lut_validation_tests.rs
+src/inverse_lut_validation.rs
+src/main.rs
+src/nchannel_icc.rs
+src/png_source.rs
+src/production_colorimetry.rs
+src/production_lab_transform.rs
+src/production_project.rs
+src/separation_optimizer.rs
+src/ui/color_conversion.rs
+src/ui/match_color.rs
+
+Status:
+ M src/color_conversion.rs
+ M src/conversion_analytics.rs
+ M src/conversion_capabilities.rs
+ M src/conversion_output.rs
+ M src/conversion_preset_library.rs
+ M src/conversion_presets.rs
+ M src/conversion_queue.rs
+ M src/conversion_recipe.rs
+ M src/custom_optimizer_config.rs
+ M src/device_characterization.rs
+ M src/device_characterization_model.rs
+ M src/device_characterization_package.rs
+ M src/gradient_validation.rs
+ M src/icc_conversion.rs
+ M src/inverse_lut_build_tests.rs
+ M src/inverse_lut_holdout.rs
+ M src/inverse_lut_path_validation.rs
+ M src/inverse_lut_production_eligibility.rs
+ M src/inverse_lut_production_eligibility_tests.rs
+ M src/inverse_lut_runtime.rs
+ M src/inverse_lut_runtime_tests.rs
+ M src/inverse_lut_threshold_set.rs
+ M src/inverse_lut_validation.rs
+ M src/inverse_lut_validation_artifact.rs
+ M src/inverse_lut_validation_eval.rs
+ M src/inverse_lut_validation_reference.rs
+ M src/inverse_lut_validation_runner.rs
+ M src/inverse_lut_validation_tests.rs
+ M src/main.rs
+ M src/nchannel_icc.rs
+ M src/png_source.rs
+ M src/production_colorimetry.rs
+ M src/production_lab_transform.rs
+ M src/production_project.rs
+ M src/separation_optimizer.rs
+ M src/ui/color_conversion.rs
+ M src/ui/match_color.rs
+
+Diff stat:
+ src/color_conversion.rs                         |  30 ++++-
+ src/conversion_analytics.rs                     | 118 ++++++++----------
+ src/conversion_capabilities.rs                  |   5 +-
+ src/conversion_output.rs                        |   3 +-
+ src/conversion_preset_library.rs                |  56 ++++-----
+ src/conversion_presets.rs                       |  20 ++-
+ src/conversion_queue.rs                         |   5 +-
+ src/conversion_recipe.rs                        |  76 +++++++++---
+ src/custom_optimizer_config.rs                  |  21 ++--
+ src/device_characterization.rs                  |  10 +-
+ src/device_characterization_model.rs            |  29 +++--
+ src/device_characterization_package.rs          |  55 ++++++---
+ src/gradient_validation.rs                      |  57 ++++++---
+ src/icc_conversion.rs                           |  30 +++--
+ src/inverse_lut_build_tests.rs                  |  23 ++--
+ src/inverse_lut_holdout.rs                      |  31 ++++-
+ src/inverse_lut_path_validation.rs              |  73 ++++++-----
+ src/inverse_lut_production_eligibility.rs       | 155 +++++++++++++++++-------
+ src/inverse_lut_production_eligibility_tests.rs | 105 +++++++++++++---
+ src/inverse_lut_runtime.rs                      |  26 ++--
+ src/inverse_lut_runtime_tests.rs                |   6 +-
+ src/inverse_lut_threshold_set.rs                |  67 +++++++---
+ src/inverse_lut_validation.rs                   |  87 +++++++++----
+ src/inverse_lut_validation_artifact.rs          |   7 +-
+ src/inverse_lut_validation_eval.rs              |  98 +++++++--------
+ src/inverse_lut_validation_reference.rs         |  35 ++++--
+ src/inverse_lut_validation_runner.rs            |  63 +++++-----
+ src/inverse_lut_validation_tests.rs             |  55 +++------
+ src/main.rs                                     |  14 +--
+ src/nchannel_icc.rs                             |  39 +++---
+ src/png_source.rs                               |  27 ++---
+ src/production_colorimetry.rs                   |   6 +-
+ src/production_lab_transform.rs                 |  24 ++--
+ src/production_project.rs                       |   6 +-
+ src/separation_optimizer.rs                     |  35 +++---
+ src/ui/color_conversion.rs                      |   5 +-
+ src/ui/match_color.rs                           |  53 ++++----
+ 37 files changed, 956 insertions(+), 599 deletions(-)
