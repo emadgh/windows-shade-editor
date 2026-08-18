@@ -29,14 +29,19 @@ use crate::inverse_lut_validation_reference::InverseLutValidationReferenceMethod
 use crate::model::IccProfileIdentity;
 
 const NODE_COUNT: usize = 8;
-const CHANNEL_COUNT: usize = 2;
+const CHANNEL_COUNT: usize = 4;
 
 fn characterization_id() -> String {
     format!("sha256:{}", "1".repeat(64))
 }
 
 fn channels() -> Vec<String> {
-    vec!["A".to_owned(), "B".to_owned()]
+    vec![
+        "Cyan".to_owned(),
+        "Magenta".to_owned(),
+        "Yellow".to_owned(),
+        "Black".to_owned(),
+    ]
 }
 
 fn recipe() -> ConversionRecipe {
