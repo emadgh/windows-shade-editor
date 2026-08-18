@@ -231,20 +231,16 @@ impl DeviceForwardModel for FixtureModel {
 }
 
 #[test]
-fn exact_lut_report_recipe_and_characterization_mint_eligibility() {
+fn exact_bindings_still_fail_closed_until_thresholds_are_frozen() {
     let recipe = recipe();
     let lut = lut(&recipe);
     let validation = validation(&recipe, &lut);
     let model = FixtureModel::new();
 
-    let evidence =
-        validate_inverse_lut_production_eligibility(&lut, &validation, &recipe, &model).unwrap();
-    assert_eq!(evidence.lut_identity_content_id, lut.identity_content_id);
-    assert_eq!(evidence.lut_payload_sha256, lut.payload_sha256);
-    assert_eq!(evidence.validation_report_content_id, validation.report_content_id);
-    assert_eq!(evidence.recipe_sha256, recipe_sha256(&recipe).unwrap());
-    assert_eq!(evidence.characterization_id, characterization_id());
-    assert!(evidence.content_id().is_ok());
+    assert!(matches!(
+        validate_inverse_lut_production_eligibility(&lut, &validation, &recipe, &model),
+        Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen { .. })
+    ));
 }
 
 #[test]
