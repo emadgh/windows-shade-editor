@@ -313,7 +313,10 @@ impl ShadeApp {
             AdjustmentUiAction::SelectProjectPalette(palette) => {
                 self.select_project_palette(palette);
             }
-            AdjustmentUiAction::ShowComposite => self.show_composite(),
+            AdjustmentUiAction::ShowComposite => {
+                self.adjustment_scope = AdjustmentScope::All;
+                self.show_composite();
+            }
             AdjustmentUiAction::SelectChannel(index) => self.select_channel(index, true),
             AdjustmentUiAction::PersistSettings => self.save_settings_quietly(),
             AdjustmentUiAction::InvalidatePreviews => self.mark_all_previews_dirty(),
