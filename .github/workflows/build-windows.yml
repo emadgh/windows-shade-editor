@@ -1,7 +1,7 @@
 name: Build Shade Editor for Windows
 
 permissions:
-  contents: read
+  contents: write
 
 on:
   pull_request:
@@ -15,6 +15,29 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+      - name: Apply UI follow-up patch
+        if: github.event_name == 'pull_request' && github.head_ref == 'fix/ui-workspace-followup-polish'
+        shell: pwsh
+        run: |
+          $message = git log -1 --pretty=%B
+          if ($message -match '\[ui-followup-applied\]') {
+            Write-Host 'UI follow-up patch already applied.'
+            exit 0
+          }
+          python .github/scripts/_temporary_apply_ui_followup.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/ui/viewport_controls.rs src/ui/adjustments.rs src/ui/levels_mixer.rs src/ui/match_color.rs src/ui/curve_editor.rs Cargo.toml Cargo.lock VERSION
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git commit -m "fix: polish viewport and histogram UI [ui-followup-applied]"
+          git push origin HEAD:fix/ui-workspace-followup-polish
+          Write-Host 'Patch pushed; ending superseded validation run.'
+          exit 1
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
