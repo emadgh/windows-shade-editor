@@ -1,14 +1,31 @@
 use crate::*;
 use eframe::egui;
 
+fn current_viewport_rect(ctx: &egui::Context) -> egui::Rect {
+    let mut rect = ctx.content_rect();
+    if let Some(state) = egui::containers::panel::PanelState::load(ctx, egui::Id::new("toolbar")) {
+        rect.min.y = rect.min.y.max(state.outer_rect.max.y);
+    }
+    if let Some(state) = egui::containers::panel::PanelState::load(ctx, egui::Id::new("status")) {
+        rect.max.y = rect.max.y.min(state.outer_rect.min.y);
+    }
+    if let Some(state) = egui::containers::panel::PanelState::load(ctx, egui::Id::new("faces")) {
+        rect.min.x = rect.min.x.max(state.outer_rect.max.x);
+    }
+    if let Some(state) = egui::containers::panel::PanelState::load(ctx, egui::Id::new("tools")) {
+        rect.max.x = rect.max.x.min(state.outer_rect.min.x);
+    }
+    rect
+}
+
 pub(crate) fn show(app: &mut ShadeApp, ctx: &egui::Context) {
     if app.faces.is_empty() {
         return;
     }
 
-    // This post-pass runs after CentralPanel has been laid out, so available_rect
-    // is the usable image viewport after top/bottom/left/right application panels.
-    let viewport = ctx.available_rect();
+    // Top-level panel state is already updated by the time this post-CentralPanel
+    // hook runs, so the control follows resized Faces/Tools/Toolbar/Status panels.
+    let viewport = current_viewport_rect(ctx);
     if viewport.width() < 120.0 || viewport.height() < 80.0 {
         return;
     }
@@ -54,4 +71,17 @@ pub(crate) fn show(app: &mut ShadeApp, ctx: &egui::Context) {
                     });
                 });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_rect_intersection_keeps_positive_viewport_geometry() {
+        let rect = egui::Rect::from_min_max(egui::pos2(270.0, 42.0), egui::pos2(1200.0, 760.0));
+        assert!(rect.width() > 0.0);
+        assert!(rect.height() > 0.0);
+        assert_eq!(rect.center().x, 735.0);
+    }
 }
