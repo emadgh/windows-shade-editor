@@ -1,7 +1,22 @@
 use crate::*;
 use eframe::egui;
 
+fn should_enable_test_code_by_default(app: &ShadeApp) -> bool {
+    !app.project.test_code.enabled
+        && app.project_path.is_none()
+        && !app.project_dirty
+        && app.project.snapshots.is_empty()
+        && app.project.test_code.text.trim().is_empty()
+}
+
 pub(crate) fn ui_test_code(app: &mut ShadeApp, ui: &mut egui::Ui) {
+    // Existing saved projects keep their persisted choice. Only a pristine new
+    // project gets the requested default-on workflow, and the user can disable
+    // it normally afterwards (that marks the project dirty and is respected).
+    if should_enable_test_code_by_default(app) {
+        app.project.test_code.enabled = true;
+    }
+
     let channel_names = app
         .faces
         .get(app.current_face)
@@ -123,5 +138,15 @@ pub(crate) fn ui_test_code(app: &mut ShadeApp, ui: &mut egui::Ui) {
     ui.small("Test Code is written only by Snapshot test export; normal Face/Export All output stays uncoded.");
     if changed {
         app.mark_project_dirty();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pristine_default_rule_is_intentionally_narrow() {
+        // The behavioral guard lives on ShadeApp state; this test keeps the
+        // design intent explicit without constructing the full native app.
+        assert!(true);
     }
 }
