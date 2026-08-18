@@ -16,9 +16,9 @@ mod app_features;
 mod app_icon;
 mod app_log;
 mod color_conversion;
-mod custom_optimizer_config;
 mod color_management;
 mod conversion_tiff;
+mod custom_optimizer_config;
 mod dpi;
 mod export;
 mod export_batch;
@@ -30,8 +30,8 @@ mod palette;
 mod path_safety;
 mod previous_shades;
 mod production_project;
-mod project_autosave;
 mod project_lifecycle;
+mod project_persistence;
 mod recovery;
 mod render;
 mod safe_fs;
@@ -293,11 +293,6 @@ struct ShadeApp {
     status_message: String,
     project_dirty: bool,
     project_revision: u64,
-    last_project_edit_at: Instant,
-    project_autosave_tx: mpsc::Sender<project_autosave::Completion>,
-    project_autosave_rx: mpsc::Receiver<project_autosave::Completion>,
-    project_autosave_busy: bool,
-    project_autosave_error: Option<String>,
     snapshot_rename_id: Option<u64>,
     snapshot_rename_buffer: String,
     pending_snapshot_action: Option<PendingSnapshotAction>,
@@ -329,7 +324,6 @@ impl ShadeApp {
         }
         let (render_tx, render_rx) = mpsc::channel();
         let (autosave_tx, autosave_rx) = mpsc::channel();
-        let (project_autosave_tx, project_autosave_rx) = mpsc::channel();
         let mut project = ShadeProject::default();
         project.channel_palette = settings.default_project_palette();
         let log = app_log::AppLog::default();
@@ -394,11 +388,6 @@ impl ShadeApp {
             status_message: "Ready".to_owned(),
             project_dirty: false,
             project_revision: 0,
-            last_project_edit_at: Instant::now(),
-            project_autosave_tx,
-            project_autosave_rx,
-            project_autosave_busy: false,
-            project_autosave_error: None,
             snapshot_rename_id: None,
             snapshot_rename_buffer: String::new(),
             pending_snapshot_action: None,
@@ -440,14 +429,10 @@ impl ShadeApp {
     fn mark_project_dirty(&mut self) {
         self.project_dirty = true;
         self.project_revision = self.project_revision.wrapping_add(1).max(1);
-        self.last_project_edit_at = Instant::now();
-        self.project_autosave_error = None;
     }
 
     fn mark_project_saved(&mut self) {
         self.project_dirty = false;
-        self.last_project_edit_at = Instant::now();
-        self.project_autosave_error = None;
     }
 
     fn new_project(&mut self) {
@@ -461,7 +446,7 @@ impl ShadeApp {
     ) {
         match self.lifecycle.request(
             transition,
-            self.job.is_some() || self.project_autosave_busy,
+            self.job.is_some(),
             self.export.queue.has_pending() || self.conversion_queue.has_pending(),
             self.project_dirty,
             !self.faces.is_empty(),
@@ -777,18 +762,14 @@ impl ShadeApp {
     }
 
     fn begin_project_save(&mut self, path: PathBuf) -> bool {
-        if self.project_autosave_busy {
-            self.report_info("Project autosave is already in progress.");
-            return false;
-        }
         let save_revision = self.project_revision;
         if self.job.is_some() || self.faces.is_empty() {
             return false;
         }
         self.flush_history_now();
         self.sync_history_to_active_snapshot();
-        self.project.name = project_name_for_path(&self.project.name, &path);
         let mut project = self.project.clone();
+        project.name = project_name_for_path(&project.name, &path);
         project.ensure_snapshot_histories();
         project.file_metadata = Some(build_project_file_metadata(
             &self.project,
@@ -824,7 +805,7 @@ impl ShadeApp {
                     "Saving project",
                     "Serializing project and metadata",
                 );
-                project.save(&path, &face_paths)
+                project_persistence::save_active_source_project(&project, &path, &face_paths)
             })();
             Self::set_progress(&progress, Some(1.0), "Saving project", "Complete");
             JobResult::Save {
@@ -1088,13 +1069,16 @@ impl ShadeApp {
                         )
                     });
                     if is_current_source {
-                        let was_dirty = self.project_dirty;
                         match production_project::link_source_project_to_production(
                             &mut self.project,
                             &completed.production_project_path,
                         ) {
-                            Ok(()) if was_dirty => self.mark_project_dirty(),
-                            Ok(()) => self.mark_project_saved(),
+                            Ok(()) => {
+                                self.mark_project_dirty();
+                                self.log.info(
+                                    "Source/Production linkage changed; explicit Source project Save is required.",
+                                );
+                            }
                             Err(error) => self.log.error(&format!(
                                 "Could not mirror committed Production link in the open Source project: {error}"
                             )),
@@ -2199,14 +2183,14 @@ impl ShadeApp {
                 default_dpi,
             } => match result {
                 Ok(capture) => match self.conversion_queue.enqueue(capture, default_dpi) {
-                    Ok(id) => self.report_info(format!(
-                        "Production conversion queued as item #{id}"
-                    )),
+                    Ok(id) => {
+                        self.report_info(format!("Production conversion queued as item #{id}"))
+                    }
                     Err(error) => self.report_error(error),
                 },
-                Err(error) => self.report_error(format!(
-                    "Could not capture production conversion: {error}"
-                )),
+                Err(error) => {
+                    self.report_error(format!("Could not capture production conversion: {error}"))
+                }
             },
             JobResult::WorkerPanic(err) => {
                 self.report_error(err);
@@ -3152,65 +3136,6 @@ impl ShadeApp {
         self.last_autosave = Instant::now();
         std::thread::spawn(move || {
             let _ = tx.send(recovery::write(&recovery_file));
-        });
-    }
-
-    fn poll_project_autosave(&mut self) {
-        while let Ok(completion) = self.project_autosave_rx.try_recv() {
-            self.project_autosave_busy = false;
-            match completion.result {
-                Ok(()) => {
-                    self.project_autosave_error = None;
-                    self.log
-                        .info(&format!("Project autosaved: {}", completion.path.display()));
-                    if self.project_revision == completion.revision {
-                        self.mark_project_saved();
-                    }
-                }
-                Err(err) => {
-                    self.project_autosave_error = Some(err.clone());
-                    self.log.error(&format!("Project autosave failed: {err}"));
-                }
-            }
-        }
-    }
-
-    fn maybe_project_autosave(&mut self) {
-        let eligibility = project_autosave::Eligibility {
-            dirty: self.project_dirty,
-            has_project_path: self.project_path.is_some(),
-            has_faces: !self.faces.is_empty(),
-            save_busy: self.project_autosave_busy,
-            other_operation_busy: self.job.is_some(),
-            transition_pending: self.lifecycle.pending.is_some()
-                || self.lifecycle.after_save.is_some(),
-            snapshot_choice_pending: self.pending_snapshot_action.is_some(),
-            snapshot_has_unupdated_changes: self.active_snapshot_has_unupdated_changes(),
-            quiet_for: self.last_project_edit_at.elapsed(),
-        };
-        if !project_autosave::should_start(eligibility) {
-            return;
-        }
-        let Some(path) = self.project_path.clone() else {
-            return;
-        };
-        let project = self.project.clone();
-        let face_paths = self
-            .faces
-            .iter()
-            .map(|face| face.path.clone())
-            .collect::<Vec<_>>();
-        let revision = self.project_revision;
-        let tx = self.project_autosave_tx.clone();
-        self.project_autosave_busy = true;
-        self.project_autosave_error = None;
-        std::thread::spawn(move || {
-            let result = project.save(&path, &face_paths);
-            let _ = tx.send(project_autosave::Completion {
-                revision,
-                path,
-                result,
-            });
         });
     }
 
@@ -4773,7 +4698,6 @@ impl eframe::App for ShadeApp {
         self.poll_render(ui.ctx());
         self.sync_update_state();
         self.poll_autosave();
-        self.poll_project_autosave();
         self.handle_dropped_files(ui.ctx());
         workflow::handle_shortcuts(self, ui.ctx());
         if !self.project_view.open {
@@ -4783,7 +4707,6 @@ impl eframe::App for ShadeApp {
             data.insert_temp(egui::Id::new("shade-editor-curve-graph-focused"), false);
         });
         self.maybe_autosave();
-        self.maybe_project_autosave();
         self.handle_close_request(ui.ctx());
 
         egui::Panel::top("toolbar").show(ui, |ui| self.ui_toolbar(ui));

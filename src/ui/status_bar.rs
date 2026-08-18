@@ -3,11 +3,7 @@ use eframe::egui;
 
 impl ShadeApp {
     pub(crate) fn project_save_state_label(&self) -> (&'static str, bool) {
-        if self.project_autosave_busy {
-            ("Saving…", false)
-        } else if self.project_autosave_error.is_some() {
-            ("Autosave failed", true)
-        } else if self.project_path.is_none() {
+        if self.project_path.is_none() {
             if self.project_dirty && !self.faces.is_empty() {
                 ("Unsaved changes", false)
             } else {

@@ -30,7 +30,7 @@ Shade Editor keeps source TIFF Faces immutable and stores non-destructive shade 
 - Export Queue supports pause/resume for waiting work, batch retry/cleanup, compact progress with ETA/throughput, and restart-safe recovered jobs.
 - Faces can be marked Accepted or Rejected; Rejected Faces remain traceable in the project but are excluded from Export All by default.
 - Quick Relative Adjustments provide cumulative Warmer/Cooler/Richer/Lighter/Redder/Beige tuning plus editable custom presets without overwriting the current recipe.
-- Saved projects use revision-safe smart autosave while preserving Snapshot dirty-state protections and crash recovery.
+- Active `.shade` projects use explicit Save / Save As / Quick Save only; crash recovery autosave is stored separately and never clears the project's unsaved state.
 - Export filename/folder templates support `{project}`, `{face}`, `{snapshot}`, `{date}` and `{source}`.
 - `File > Inspect TIFF` reports production transport metadata and can copy a diagnostic report.
 - Optional test-code raster in one separation or all separations.
@@ -124,6 +124,7 @@ src/
 ├─ validation.rs        Production round-trip validation
 ├─ settings.rs          Application-only persistent preferences
 ├─ previous_shades.rs   Project View history/index
+├─ project_persistence.rs Explicit active-Source save boundary
 ├─ recovery.rs          Crash recovery
 ├─ update.rs            Update subsystem
 └─ workflow.rs          Missing-Face/relink workflow helpers

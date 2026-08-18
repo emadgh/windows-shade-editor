@@ -5,6 +5,13 @@ use super::match_color;
 use crate::*;
 use eframe::egui;
 
+fn toggled_adjustment_scope(scope: AdjustmentScope) -> AdjustmentScope {
+    match scope {
+        AdjustmentScope::Selected => AdjustmentScope::All,
+        AdjustmentScope::All => AdjustmentScope::Selected,
+    }
+}
+
 impl ShadeApp {
     pub(crate) fn ui_history(&mut self, ui: &mut egui::Ui) {
         let scope = self.project.active_snapshot_id;
@@ -207,7 +214,8 @@ impl ShadeApp {
             }
             let response = clickable_channel_row(
                 ui,
-                self.adjustment_scope == AdjustmentScope::Selected && self.selected_channel == index,
+                self.adjustment_scope == AdjustmentScope::Selected
+                    && self.selected_channel == index,
                 false,
                 is_solo,
                 &label,
@@ -716,37 +724,30 @@ impl ShadeApp {
         }
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            let mut all_channels = self.adjustment_scope == AdjustmentScope::All;
-            let all_label = if master_modified {
-                "Master  •   (~)"
-            } else {
-                "Master   (~)"
+            let selected_scope = self.adjustment_scope == AdjustmentScope::Selected;
+            let scope_label = match self.adjustment_scope {
+                AdjustmentScope::Selected if output_modified => format!("{output_display}  •"),
+                AdjustmentScope::Selected => output_display.to_owned(),
+                AdjustmentScope::All if master_modified => "Master  •".to_owned(),
+                AdjustmentScope::All => "Master".to_owned(),
             };
-            if ui.checkbox(&mut all_channels, all_label).changed() {
-                self.adjustment_scope = if all_channels {
-                    AdjustmentScope::All
-                } else {
-                    AdjustmentScope::Selected
-                };
-            }
-            let selected = self.adjustment_scope == AdjustmentScope::Selected;
-            let channel_button_label = if output_modified {
-                format!("{output_display}  •")
+            let scope_text = if selected_scope && control_accent.is_some() {
+                egui::WidgetText::from(egui::RichText::new(scope_label).color(egui::Color32::WHITE))
             } else {
-                output_display.to_owned()
+                egui::WidgetText::from(scope_label)
             };
-            let channel_button_text = if selected && control_accent.is_some() {
-                egui::WidgetText::from(
-                    egui::RichText::new(channel_button_label).color(egui::Color32::WHITE),
-                )
+            let scope_accent = if selected_scope { control_accent } else { None };
+            let hover = if selected_scope {
+                "Switch adjustment scope to Master (~)".to_owned()
             } else {
-                egui::WidgetText::from(channel_button_label)
+                format!("Switch adjustment scope to {output_display} (~)")
             };
-            let response = with_accent(ui, control_accent, |ui| {
-                ui.add(egui::Button::new(channel_button_text).selected(selected))
-            });
+            let response = with_accent(ui, scope_accent, |ui| {
+                ui.add(egui::Button::new(scope_text).selected(true))
+            })
+            .on_hover_text(hover);
             if response.clicked() {
-                self.adjustment_scope = AdjustmentScope::Selected;
+                self.adjustment_scope = toggled_adjustment_scope(self.adjustment_scope);
             }
             if modified_count > 0 {
                 ui.small(format!("Modified {modified_count}/{}", channel_names.len()));
@@ -997,5 +998,18 @@ impl ShadeApp {
             }
         });
         changed
+    }
+}
+
+#[cfg(test)]
+mod scope_toggle_tests {
+    use super::{AdjustmentScope, toggled_adjustment_scope};
+
+    #[test]
+    fn adjustment_scope_toggle_round_trips() {
+        let master = toggled_adjustment_scope(AdjustmentScope::Selected);
+        assert!(matches!(master, AdjustmentScope::All));
+        let selected = toggled_adjustment_scope(master);
+        assert!(matches!(selected, AdjustmentScope::Selected));
     }
 }
