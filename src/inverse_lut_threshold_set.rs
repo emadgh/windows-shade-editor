@@ -6,22 +6,24 @@ use sha2::{Digest, Sha256};
 use crate::inverse_lut_validation::InverseLutValidationPolicy;
 use crate::production_colorimetry::ProductionPcsCompatibilityMethod;
 
-pub const INVERSE_LUT_THRESHOLD_SET_SCHEMA_VERSION: u32 = 1;
-pub const INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const INVERSE_LUT_THRESHOLD_SET_SCHEMA_VERSION: u32 = 2;
+pub const INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const INVERSE_LUT_THRESHOLD_CALIBRATION_APPROVAL_SCHEMA_VERSION: u32 = 1;
 
-/// No threshold-set ID is production approved yet. #205 must add an exact
-/// measured-fixture-derived content ID here only after calibration evidence is
-/// reviewed. Keeping this list empty preserves the #192 fail-closed barrier.
-const PRODUCTION_APPROVED_THRESHOLD_SET_IDS: &[&str] = &[];
+/// No calibration approval is production-approved yet. #205 may add an exact,
+/// code-reviewed approval content ID only after representative measured ceramic
+/// D50/2° evidence has been reviewed. Keeping this list empty preserves the
+/// production fail-closed barrier without creating a content-identity cycle.
+const PRODUCTION_APPROVED_THRESHOLD_APPROVAL_IDS: &[&str] = &[];
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InverseLutThresholdSetMethod {
     /// Current repository defaults. Useful for diagnostics and collecting
-    /// calibration observations, but never production-authorizing.
+    /// calibration observations, but never production-authorizing by itself.
     ProvisionalV1,
-    /// A future threshold set derived from representative measured ceramic
-    /// characterization/validation fixtures in the ICC PCS D50/2° basis.
+    /// A numerical policy derived from representative measured ceramic fixtures
+    /// in the ICC PCS D50/2° basis. Approval evidence is intentionally separate.
     MeasuredCeramicD50TwoDegreeV1,
 }
 
@@ -30,6 +32,48 @@ pub enum InverseLutThresholdSetMethod {
 pub enum InverseLutCalibrationSolverFamily {
     IndependentV1,
     PositiveContinuityV2,
+}
+
+/// Pure numerical threshold identity. It deliberately does not contain a
+/// calibration-manifest ID: reports bind this ID, manifests bind report IDs, and
+/// a separate approval record binds the threshold set to the manifest. This
+/// one-way graph avoids the impossible threshold-set -> manifest -> report ->
+/// threshold-set hash cycle.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InverseLutValidationThresholdSet {
+    pub schema_version: u32,
+    pub method: InverseLutThresholdSetMethod,
+    pub policy: InverseLutValidationPolicy,
+}
+
+impl InverseLutValidationThresholdSet {
+    pub fn provisional_v1() -> Self {
+        Self {
+            schema_version: INVERSE_LUT_THRESHOLD_SET_SCHEMA_VERSION,
+            method: InverseLutThresholdSetMethod::ProvisionalV1,
+            policy: InverseLutValidationPolicy::default(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if self.schema_version != INVERSE_LUT_THRESHOLD_SET_SCHEMA_VERSION {
+            errors.push(format!(
+                "Unsupported inverse-LUT threshold-set schema {} (expected {}).",
+                self.schema_version, INVERSE_LUT_THRESHOLD_SET_SCHEMA_VERSION
+            ));
+        }
+        if let Err(policy_errors) = self.policy.validate() {
+            errors.extend(policy_errors);
+        }
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
+    }
+
+    pub fn content_id(&self) -> Result<String, String> {
+        self.validate().map_err(|errors| errors.join("\n"))?;
+        content_id(self)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,16 +112,18 @@ impl InverseLutThresholdCalibrationObservation {
 }
 
 /// Content-addressed evidence manifest describing the exact measured validation
-/// reports reviewed when a production threshold set is frozen.
+/// reports reviewed for one exact numerical threshold set.
 ///
-/// This deliberately stores identities, not mutable file paths. It also requires
-/// observations from both independent V1 and positive-continuity V2 so a future
-/// production approval cannot silently calibrate only one solver family.
+/// The manifest points downstream to report identities. Reports point only to the
+/// already-stable threshold-set identity; the threshold set never points back to
+/// this manifest. That makes every identity constructible and independently
+/// verifiable.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InverseLutThresholdCalibrationManifest {
     pub schema_version: u32,
     pub pcs_method: ProductionPcsCompatibilityMethod,
+    pub threshold_set_content_id: String,
     pub observations: Vec<InverseLutThresholdCalibrationObservation>,
 }
 
@@ -92,7 +138,13 @@ impl InverseLutThresholdCalibrationManifest {
         }
         if self.pcs_method != ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1 {
             errors.push(
-                "Inverse-LUT threshold calibration V1 requires ICC PCS Lab D50/2° compatibility."
+                "Inverse-LUT threshold calibration requires ICC PCS Lab D50/2° compatibility."
+                    .to_owned(),
+            );
+        }
+        if !is_prefixed_sha256(&self.threshold_set_content_id) {
+            errors.push(
+                "Inverse-LUT threshold calibration manifest threshold-set ID must be canonical sha256:<hex>."
                     .to_owned(),
             );
         }
@@ -130,60 +182,48 @@ impl InverseLutThresholdCalibrationManifest {
 
     pub fn content_id(&self) -> Result<String, String> {
         self.validate().map_err(|errors| errors.join("\n"))?;
-        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+        content_id(self)
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+/// Explicit review/approval edge between one numerical threshold set and one
+/// immutable measured calibration manifest. Production approval is based on the
+/// content ID of this entire record, not on a mutable boolean inside JSON.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct InverseLutValidationThresholdSet {
+pub struct InverseLutThresholdCalibrationApproval {
     pub schema_version: u32,
-    pub method: InverseLutThresholdSetMethod,
-    pub policy: InverseLutValidationPolicy,
-    /// Required only for measured production-candidate sets. This is the exact
-    /// content ID of `InverseLutThresholdCalibrationManifest` reviewed for the set.
-    pub calibration_manifest_content_id: Option<String>,
+    pub pcs_method: ProductionPcsCompatibilityMethod,
+    pub threshold_set_content_id: String,
+    pub calibration_manifest_content_id: String,
 }
 
-impl InverseLutValidationThresholdSet {
-    pub fn provisional_v1() -> Self {
-        Self {
-            schema_version: INVERSE_LUT_THRESHOLD_SET_SCHEMA_VERSION,
-            method: InverseLutThresholdSetMethod::ProvisionalV1,
-            policy: InverseLutValidationPolicy::default(),
-            calibration_manifest_content_id: None,
-        }
-    }
-
+impl InverseLutThresholdCalibrationApproval {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        if self.schema_version != INVERSE_LUT_THRESHOLD_SET_SCHEMA_VERSION {
+        if self.schema_version != INVERSE_LUT_THRESHOLD_CALIBRATION_APPROVAL_SCHEMA_VERSION {
             errors.push(format!(
-                "Unsupported inverse-LUT threshold-set schema {} (expected {}).",
-                self.schema_version, INVERSE_LUT_THRESHOLD_SET_SCHEMA_VERSION
+                "Unsupported inverse-LUT threshold calibration approval schema {} (expected {}).",
+                self.schema_version, INVERSE_LUT_THRESHOLD_CALIBRATION_APPROVAL_SCHEMA_VERSION
             ));
         }
-        if let Err(policy_errors) = self.policy.validate() {
-            errors.extend(policy_errors);
+        if self.pcs_method != ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1 {
+            errors.push(
+                "Inverse-LUT threshold calibration approval requires ICC PCS Lab D50/2°."
+                    .to_owned(),
+            );
         }
-        match self.method {
-            InverseLutThresholdSetMethod::ProvisionalV1 => {
-                if self.calibration_manifest_content_id.is_some() {
-                    errors.push(
-                        "Provisional inverse-LUT threshold set must not claim calibration evidence."
-                            .to_owned(),
-                    );
-                }
-            }
-            InverseLutThresholdSetMethod::MeasuredCeramicD50TwoDegreeV1 => {
-                match self.calibration_manifest_content_id.as_deref() {
-                    Some(value) if is_prefixed_sha256(value) => {}
-                    _ => errors.push(
-                        "Measured inverse-LUT threshold set requires a canonical calibration manifest content ID."
-                            .to_owned(),
-                    ),
-                }
+        for (name, value) in [
+            ("threshold_set_content_id", self.threshold_set_content_id.as_str()),
+            (
+                "calibration_manifest_content_id",
+                self.calibration_manifest_content_id.as_str(),
+            ),
+        ] {
+            if !is_prefixed_sha256(value) {
+                errors.push(format!(
+                    "Inverse-LUT threshold calibration approval {name} must be canonical sha256:<hex>."
+                ));
             }
         }
         if errors.is_empty() { Ok(()) } else { Err(errors) }
@@ -191,18 +231,85 @@ impl InverseLutValidationThresholdSet {
 
     pub fn content_id(&self) -> Result<String, String> {
         self.validate().map_err(|errors| errors.join("\n"))?;
-        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+        content_id(self)
+    }
+
+    pub fn validate_bindings(
+        &self,
+        threshold_set: &InverseLutValidationThresholdSet,
+        manifest: &InverseLutThresholdCalibrationManifest,
+    ) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if let Err(mut own) = self.validate() {
+            errors.append(&mut own);
+        }
+        if let Err(mut threshold_errors) = threshold_set.validate() {
+            errors.append(&mut threshold_errors);
+        }
+        if let Err(mut manifest_errors) = manifest.validate() {
+            errors.append(&mut manifest_errors);
+        }
+
+        let threshold_set_id = threshold_set.content_id();
+        let manifest_id = manifest.content_id();
+        match threshold_set_id {
+            Ok(ref actual) => {
+                if threshold_set.method != InverseLutThresholdSetMethod::MeasuredCeramicD50TwoDegreeV1 {
+                    errors.push(
+                        "Only a measured ceramic D50/2° threshold set can receive production calibration approval."
+                            .to_owned(),
+                    );
+                }
+                if self.threshold_set_content_id != *actual {
+                    errors.push(format!(
+                        "Threshold calibration approval records threshold set {}, actual is {}.",
+                        self.threshold_set_content_id, actual
+                    ));
+                }
+                if manifest.threshold_set_content_id != *actual {
+                    errors.push(format!(
+                        "Threshold calibration manifest records threshold set {}, actual is {}.",
+                        manifest.threshold_set_content_id, actual
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!("Cannot identify threshold set: {error}")),
+        }
+        match manifest_id {
+            Ok(ref actual) if self.calibration_manifest_content_id != *actual => errors.push(format!(
+                "Threshold calibration approval records manifest {}, actual is {}.",
+                self.calibration_manifest_content_id, actual
+            )),
+            Err(error) => errors.push(format!("Cannot identify calibration manifest: {error}")),
+            _ => {}
+        }
+        if self.pcs_method != manifest.pcs_method {
+            errors.push("Threshold calibration approval PCS method does not match manifest.".to_owned());
+        }
+
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
     }
 
     /// Production authorization is an explicit code-reviewed allowlist of exact
-    /// threshold-set content IDs, never a boolean embedded in mutable JSON.
-    pub fn is_production_approved(&self) -> Result<bool, String> {
+    /// approval content IDs. With the current empty list this always fails closed
+    /// after all structural bindings are verified.
+    pub fn is_production_approved(
+        &self,
+        threshold_set: &InverseLutValidationThresholdSet,
+        manifest: &InverseLutThresholdCalibrationManifest,
+    ) -> Result<bool, String> {
+        self.validate_bindings(threshold_set, manifest)
+            .map_err(|errors| errors.join("\n"))?;
         let id = self.content_id()?;
-        Ok(PRODUCTION_APPROVED_THRESHOLD_SET_IDS
+        Ok(PRODUCTION_APPROVED_THRESHOLD_APPROVAL_IDS
             .iter()
             .any(|approved| *approved == id))
     }
+}
+
+fn content_id<T: Serialize>(value: &T) -> Result<String, String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
 fn is_prefixed_sha256(value: &str) -> bool {
@@ -228,6 +335,12 @@ mod tests {
         hex.to_string().repeat(64)
     }
 
+    fn measured_set() -> InverseLutValidationThresholdSet {
+        let mut set = InverseLutValidationThresholdSet::provisional_v1();
+        set.method = InverseLutThresholdSetMethod::MeasuredCeramicD50TwoDegreeV1;
+        set
+    }
+
     fn observation(
         family: InverseLutCalibrationSolverFamily,
         report_hex: char,
@@ -241,10 +354,11 @@ mod tests {
         }
     }
 
-    fn complete_manifest() -> InverseLutThresholdCalibrationManifest {
+    fn complete_manifest(threshold_set_content_id: String) -> InverseLutThresholdCalibrationManifest {
         InverseLutThresholdCalibrationManifest {
             schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION,
             pcs_method: ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
+            threshold_set_content_id,
             observations: vec![
                 observation(InverseLutCalibrationSolverFamily::IndependentV1, '4'),
                 observation(InverseLutCalibrationSolverFamily::PositiveContinuityV2, '5'),
@@ -253,11 +367,10 @@ mod tests {
     }
 
     #[test]
-    fn provisional_set_is_deterministic_and_never_implicitly_approved() {
+    fn provisional_set_identity_is_deterministic() {
         let first = InverseLutValidationThresholdSet::provisional_v1();
         let second = InverseLutValidationThresholdSet::provisional_v1();
         assert_eq!(first.content_id().unwrap(), second.content_id().unwrap());
-        assert!(!first.is_production_approved().unwrap());
     }
 
     #[test]
@@ -270,25 +383,24 @@ mod tests {
     }
 
     #[test]
-    fn measured_candidate_requires_calibration_manifest_identity() {
-        let mut candidate = InverseLutValidationThresholdSet::provisional_v1();
-        candidate.method = InverseLutThresholdSetMethod::MeasuredCeramicD50TwoDegreeV1;
-        assert!(candidate.validate().is_err());
-        candidate.calibration_manifest_content_id = Some(prefixed('6'));
-        assert!(candidate.validate().is_ok());
-        assert!(!candidate.is_production_approved().unwrap());
+    fn measured_set_identity_does_not_depend_on_downstream_manifest() {
+        let measured = measured_set();
+        assert!(measured.validate().is_ok());
+        assert!(measured.content_id().unwrap().starts_with("sha256:"));
     }
 
     #[test]
     fn calibration_manifest_requires_both_solver_families() {
-        let mut manifest = complete_manifest();
+        let measured = measured_set();
+        let mut manifest = complete_manifest(measured.content_id().unwrap());
         manifest.observations.pop();
         assert!(manifest.validate().is_err());
     }
 
     #[test]
     fn calibration_manifest_identity_is_deterministic_and_binds_reports() {
-        let manifest = complete_manifest();
+        let measured = measured_set();
+        let manifest = complete_manifest(measured.content_id().unwrap());
         let id = manifest.content_id().unwrap();
         let mut changed = manifest.clone();
         changed.observations[1].validation_report_content_id = prefixed('6');
@@ -297,9 +409,39 @@ mod tests {
 
     #[test]
     fn duplicate_validation_reports_are_rejected() {
-        let mut manifest = complete_manifest();
+        let measured = measured_set();
+        let mut manifest = complete_manifest(measured.content_id().unwrap());
         manifest.observations[1].validation_report_content_id =
             manifest.observations[0].validation_report_content_id.clone();
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn approval_binds_threshold_set_and_manifest_without_hash_cycle() {
+        let measured = measured_set();
+        let threshold_id = measured.content_id().unwrap();
+        let manifest = complete_manifest(threshold_id.clone());
+        let approval = InverseLutThresholdCalibrationApproval {
+            schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_APPROVAL_SCHEMA_VERSION,
+            pcs_method: ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
+            threshold_set_content_id: threshold_id,
+            calibration_manifest_content_id: manifest.content_id().unwrap(),
+        };
+        assert!(approval.validate_bindings(&measured, &manifest).is_ok());
+        assert!(!approval.is_production_approved(&measured, &manifest).unwrap());
+    }
+
+    #[test]
+    fn approval_rejects_stale_threshold_set_identity() {
+        let measured = measured_set();
+        let threshold_id = measured.content_id().unwrap();
+        let manifest = complete_manifest(threshold_id);
+        let approval = InverseLutThresholdCalibrationApproval {
+            schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_APPROVAL_SCHEMA_VERSION,
+            pcs_method: ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
+            threshold_set_content_id: prefixed('9'),
+            calibration_manifest_content_id: manifest.content_id().unwrap(),
+        };
+        assert!(approval.validate_bindings(&measured, &manifest).is_err());
     }
 }
