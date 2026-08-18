@@ -7,9 +7,9 @@ use crate::inverse_lut_path_validation::{
     InverseLutPathValidationError, analyze_inverse_lut_paths,
 };
 use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};
+use crate::inverse_lut_threshold_set::InverseLutValidationThresholdSet;
 use crate::inverse_lut_validation::{
-    InverseLutValidationPolicy, InverseLutValidationReport, InverseLutValidationSample,
-    summarize_validation_samples,
+    InverseLutValidationReport, InverseLutValidationSample, summarize_validation_samples,
 };
 use crate::inverse_lut_validation_eval::{
     InverseLutValidationEvaluationError, evaluate_inverse_lut_validation_sample,
@@ -21,6 +21,8 @@ use crate::inverse_lut_validation_reference::{
 #[derive(Clone, Debug, PartialEq)]
 pub enum InverseLutValidationRunError {
     InvalidArtifact(InverseLutLookupError),
+    InvalidThresholdSet(Vec<String>),
+    ThresholdSetIdentity(String),
     HoldoutGeneration(InverseLutHoldoutError),
     RecipeIdentity(String),
     Reference {
@@ -50,19 +52,26 @@ pub fn run_inverse_lut_validation(
     artifact: VerifiedInverseLutArtifact,
     recipe: &ConversionRecipe,
     model: &dyn DeviceForwardModel,
-    policy: InverseLutValidationPolicy,
+    threshold_set: InverseLutValidationThresholdSet,
 ) -> Result<InverseLutValidationReport, InverseLutValidationRunError> {
     let lut_identity_content_id = artifact.identity_content_id.clone();
     let lut_payload_sha256 = artifact.payload_sha256.clone();
     let characterization_id = artifact.identity.characterization_id.clone();
     let grid = artifact.identity.build_policy.grid;
 
+    threshold_set
+        .validate()
+        .map_err(InverseLutValidationRunError::InvalidThresholdSet)?;
+    let threshold_set_content_id = threshold_set
+        .content_id()
+        .map_err(InverseLutValidationRunError::ThresholdSetIdentity)?;
+    let policy = threshold_set.policy;
+
     let runtime = InverseLutRuntime::from_verified(artifact)
         .map_err(InverseLutValidationRunError::InvalidArtifact)?;
     let holdouts = generate_inverse_lut_holdouts(grid, policy.holdout_method)
         .map_err(InverseLutValidationRunError::HoldoutGeneration)?;
-    let recipe_sha = recipe_sha256(recipe)
-        .map_err(InverseLutValidationRunError::RecipeIdentity)?;
+    let recipe_sha = recipe_sha256(recipe).map_err(InverseLutValidationRunError::RecipeIdentity)?;
 
     // Resolve and persist the exact numerical reference contract before the
     // potentially long holdout loop. This fails closed if solver semantics and
@@ -78,14 +87,9 @@ pub fn run_inverse_lut_validation(
     // Persist first- and second-order diagnostics for the exact ordered V1
     // paths. This uses the existing gradient-continuity/curvature semantics and
     // never stitches across an unsupported runtime lookup.
-    let path_diagnostics = analyze_inverse_lut_paths(
-        &runtime,
-        recipe,
-        model,
-        &holdouts.paths,
-        policy.path_policy,
-    )
-    .map_err(InverseLutValidationRunError::PathDiagnostics)?;
+    let path_diagnostics =
+        analyze_inverse_lut_paths(&runtime, recipe, model, &holdouts.paths, policy.path_policy)
+            .map_err(InverseLutValidationRunError::PathDiagnostics)?;
 
     let total_hint = holdouts
         .paths
@@ -112,23 +116,21 @@ pub fn run_inverse_lut_validation(
             .iter()
             .flat_map(|path| path.samples.iter().copied()),
     ) {
-        let reference = solve_validation_reference(&runtime, recipe, model, lab)
-            .map_err(|error| InverseLutValidationRunError::Reference {
-                sample_index,
-                error,
+        let reference =
+            solve_validation_reference(&runtime, recipe, model, lab).map_err(|error| {
+                InverseLutValidationRunError::Reference {
+                    sample_index,
+                    error,
+                }
             })?;
         let sample = match reference {
-            Some(reference) => evaluate_inverse_lut_validation_sample(
-                &runtime,
-                recipe,
-                model,
-                lab,
-                &reference,
-            )
-            .map_err(|error| InverseLutValidationRunError::Evaluation {
-                sample_index,
-                error,
-            })?,
+            Some(reference) => {
+                evaluate_inverse_lut_validation_sample(&runtime, recipe, model, lab, &reference)
+                    .map_err(|error| InverseLutValidationRunError::Evaluation {
+                        sample_index,
+                        error,
+                    })?
+            }
             None => unsupported_sample(),
         };
         samples.push(sample);
@@ -144,6 +146,7 @@ pub fn run_inverse_lut_validation(
         lut_payload_sha256,
         recipe_sha,
         characterization_id,
+        threshold_set_content_id,
         policy,
         reference_method,
         path_diagnostics,
@@ -159,9 +162,9 @@ pub fn run_independent_inverse_lut_validation(
     artifact: VerifiedInverseLutArtifact,
     recipe: &ConversionRecipe,
     model: &dyn DeviceForwardModel,
-    policy: InverseLutValidationPolicy,
+    threshold_set: InverseLutValidationThresholdSet,
 ) -> Result<InverseLutValidationReport, InverseLutValidationRunError> {
-    run_inverse_lut_validation(artifact, recipe, model, policy)
+    run_inverse_lut_validation(artifact, recipe, model, threshold_set)
 }
 
 fn unsupported_sample() -> InverseLutValidationSample {

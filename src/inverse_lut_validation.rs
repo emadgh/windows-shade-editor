@@ -8,7 +8,7 @@ use crate::inverse_lut_path_validation::{
 use crate::inverse_lut_validation_reference::InverseLutValidationReferenceMethod;
 
 pub const INVERSE_LUT_VALIDATION_POLICY_SCHEMA_VERSION: u32 = 2;
-pub const INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION: u32 = 3;
+pub const INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -104,7 +104,9 @@ impl InverseLutValidationPolicy {
             ("max_u16_quantization_l1", self.max_u16_quantization_l1),
         ] {
             if !value.is_finite() || value < 0.0 {
-                errors.push(format!("Inverse-LUT validation {name} must be finite and >= 0."));
+                errors.push(format!(
+                    "Inverse-LUT validation {name} must be finite and >= 0."
+                ));
             }
         }
         if !self.max_unsupported_fraction.is_finite()
@@ -118,9 +120,8 @@ impl InverseLutValidationPolicy {
         if self.max_mean_delta_e00 > self.max_p95_delta_e00
             || self.max_p95_delta_e00 > self.max_delta_e00
         {
-            errors.push(
-                "Inverse-LUT DeltaE thresholds must satisfy mean <= p95 <= max.".to_owned(),
-            );
+            errors
+                .push("Inverse-LUT DeltaE thresholds must satisfy mean <= p95 <= max.".to_owned());
         }
         if self.max_mean_lut_vs_reference_delta_e00 > self.max_p95_lut_vs_reference_delta_e00
             || self.max_p95_lut_vs_reference_delta_e00 > self.max_lut_vs_reference_delta_e00
@@ -130,10 +131,9 @@ impl InverseLutValidationPolicy {
                     .to_owned(),
             );
         }
-        if self.max_mean_ink_l1 > self.max_p95_ink_l1
-            || self.max_p95_ink_l1 > self.max_ink_l1
-        {
-            errors.push("Inverse-LUT ink-L1 thresholds must satisfy mean <= p95 <= max.".to_owned());
+        if self.max_mean_ink_l1 > self.max_p95_ink_l1 || self.max_p95_ink_l1 > self.max_ink_l1 {
+            errors
+                .push("Inverse-LUT ink-L1 thresholds must satisfy mean <= p95 <= max.".to_owned());
         }
         if errors.is_empty() {
             Ok(())
@@ -240,6 +240,8 @@ pub struct InverseLutValidationReport {
     pub lut_payload_sha256: String,
     pub recipe_sha256: String,
     pub characterization_id: String,
+    /// Exact content-addressed numerical threshold set used for this report.
+    pub threshold_set_content_id: String,
     pub policy: InverseLutValidationPolicy,
     /// Exact versioned off-grid reference semantics used to generate the report.
     /// Persisting this prevents a future adapter implementation from silently
@@ -263,16 +265,29 @@ impl InverseLutValidationReport {
             ));
         }
         if !is_prefixed_sha256(&self.lut_identity_content_id) {
-            errors.push("Validation report LUT identity must be canonical sha256:<hex>.".to_owned());
+            errors
+                .push("Validation report LUT identity must be canonical sha256:<hex>.".to_owned());
         }
         if !is_bare_sha256(&self.lut_payload_sha256) {
-            errors.push("Validation report LUT payload SHA-256 must be canonical lowercase hex.".to_owned());
+            errors.push(
+                "Validation report LUT payload SHA-256 must be canonical lowercase hex.".to_owned(),
+            );
         }
         if !is_bare_sha256(&self.recipe_sha256) {
-            errors.push("Validation report recipe SHA-256 must be canonical lowercase hex.".to_owned());
+            errors.push(
+                "Validation report recipe SHA-256 must be canonical lowercase hex.".to_owned(),
+            );
         }
         if !is_prefixed_sha256(&self.characterization_id) {
-            errors.push("Validation report characterization ID must be canonical sha256:<hex>.".to_owned());
+            errors.push(
+                "Validation report characterization ID must be canonical sha256:<hex>.".to_owned(),
+            );
+        }
+        if !is_prefixed_sha256(&self.threshold_set_content_id) {
+            errors.push(
+                "Validation report threshold-set content ID must be canonical sha256:<hex>."
+                    .to_owned(),
+            );
         }
         if let Err(policy_errors) = self.policy.validate() {
             errors.extend(policy_errors);
@@ -295,7 +310,8 @@ impl InverseLutValidationReport {
         let expected_pass = summary_passes(&self.summary, &self.policy)
             && path_diagnostics_pass(&self.path_diagnostics, &self.policy.path_policy);
         if self.passed != expected_pass {
-            errors.push("Validation report pass flag does not match its metrics/policy.".to_owned());
+            errors
+                .push("Validation report pass flag does not match its metrics/policy.".to_owned());
         }
         if errors.is_empty() {
             Ok(())
@@ -316,6 +332,7 @@ pub fn summarize_validation_samples(
     lut_payload_sha256: String,
     recipe_sha256: String,
     characterization_id: String,
+    threshold_set_content_id: String,
     policy: InverseLutValidationPolicy,
     reference_method: InverseLutValidationReferenceMethod,
     path_diagnostics: Vec<InverseLutPathDiagnostic>,
@@ -334,7 +351,10 @@ pub fn summarize_validation_samples(
         sample.validate(index)?;
     }
 
-    let supported = samples.iter().filter(|sample| sample.supported).collect::<Vec<_>>();
+    let supported = samples
+        .iter()
+        .filter(|sample| sample.supported)
+        .collect::<Vec<_>>();
     let total_samples = samples.len() as u64;
     let supported_samples = supported.len() as u64;
     let unsupported_samples = total_samples - supported_samples;
@@ -351,7 +371,11 @@ pub fn summarize_validation_samples(
     let mut constraint_violation_count = 0u64;
     for sample in supported {
         lut_delta.push(sample.lut_delta_e00.expect("validated supported metric"));
-        reference_delta.push(sample.reference_delta_e00.expect("validated supported metric"));
+        reference_delta.push(
+            sample
+                .reference_delta_e00
+                .expect("validated supported metric"),
+        );
         lut_vs_reference_delta.push(
             sample
                 .lut_vs_reference_delta_e00
@@ -359,12 +383,21 @@ pub fn summarize_validation_samples(
         );
         ink_l1.push(sample.ink_l1.expect("validated supported metric"));
         max_ink_l2 = max_ink_l2.max(sample.ink_l2.expect("validated supported metric"));
-        max_channel_deviation = max_channel_deviation
-            .max(sample.max_channel_deviation.expect("validated supported metric"));
-        max_u8_quantization_l1 = max_u8_quantization_l1
-            .max(sample.u8_quantization_l1.expect("validated supported metric"));
-        max_u16_quantization_l1 = max_u16_quantization_l1
-            .max(sample.u16_quantization_l1.expect("validated supported metric"));
+        max_channel_deviation = max_channel_deviation.max(
+            sample
+                .max_channel_deviation
+                .expect("validated supported metric"),
+        );
+        max_u8_quantization_l1 = max_u8_quantization_l1.max(
+            sample
+                .u8_quantization_l1
+                .expect("validated supported metric"),
+        );
+        max_u16_quantization_l1 = max_u16_quantization_l1.max(
+            sample
+                .u16_quantization_l1
+                .expect("validated supported metric"),
+        );
         if !sample.constraints_preserved {
             constraint_violation_count = constraint_violation_count
                 .checked_add(1)
@@ -395,6 +428,7 @@ pub fn summarize_validation_samples(
         lut_payload_sha256,
         recipe_sha256,
         characterization_id,
+        threshold_set_content_id,
         policy,
         reference_method,
         path_diagnostics,
@@ -437,7 +471,9 @@ fn validate_path_set(
             ));
         }
         if let Err(error) = diagnostic.validate() {
-            errors.push(format!("Inverse-LUT validation path {index} is invalid: {error}"));
+            errors.push(format!(
+                "Inverse-LUT validation path {index} is invalid: {error}"
+            ));
         }
     }
 }
@@ -456,7 +492,10 @@ fn distribution(values: &mut [f64]) -> ValidationDistribution {
     }
 }
 
-fn summary_passes(summary: &InverseLutValidationSummary, policy: &InverseLutValidationPolicy) -> bool {
+fn summary_passes(
+    summary: &InverseLutValidationSummary,
+    policy: &InverseLutValidationPolicy,
+) -> bool {
     summary.supported_samples > 0
         && summary.unsupported_fraction <= policy.max_unsupported_fraction
         && summary.lut_delta_e00.mean <= policy.max_mean_delta_e00

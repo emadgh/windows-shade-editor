@@ -67,7 +67,11 @@ impl InverseLutValidationThresholdSet {
         if let Err(policy_errors) = self.policy.validate() {
             errors.extend(policy_errors);
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn content_id(&self) -> Result<String, String> {
@@ -90,7 +94,10 @@ impl InverseLutThresholdCalibrationObservation {
     fn validate(&self, index: usize) -> Result<(), String> {
         for (name, value) in [
             ("characterization_id", self.characterization_id.as_str()),
-            ("lut_identity_content_id", self.lut_identity_content_id.as_str()),
+            (
+                "lut_identity_content_id",
+                self.lut_identity_content_id.as_str(),
+            ),
             (
                 "validation_report_content_id",
                 self.validation_report_content_id.as_str(),
@@ -177,7 +184,11 @@ impl InverseLutThresholdCalibrationManifest {
             }
         }
 
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn content_id(&self) -> Result<String, String> {
@@ -214,7 +225,10 @@ impl InverseLutThresholdCalibrationApproval {
             );
         }
         for (name, value) in [
-            ("threshold_set_content_id", self.threshold_set_content_id.as_str()),
+            (
+                "threshold_set_content_id",
+                self.threshold_set_content_id.as_str(),
+            ),
             (
                 "calibration_manifest_content_id",
                 self.calibration_manifest_content_id.as_str(),
@@ -226,7 +240,11 @@ impl InverseLutThresholdCalibrationApproval {
                 ));
             }
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn content_id(&self) -> Result<String, String> {
@@ -254,7 +272,9 @@ impl InverseLutThresholdCalibrationApproval {
         let manifest_id = manifest.content_id();
         match threshold_set_id {
             Ok(ref actual) => {
-                if threshold_set.method != InverseLutThresholdSetMethod::MeasuredCeramicD50TwoDegreeV1 {
+                if threshold_set.method
+                    != InverseLutThresholdSetMethod::MeasuredCeramicD50TwoDegreeV1
+                {
                     errors.push(
                         "Only a measured ceramic D50/2° threshold set can receive production calibration approval."
                             .to_owned(),
@@ -276,18 +296,26 @@ impl InverseLutThresholdCalibrationApproval {
             Err(error) => errors.push(format!("Cannot identify threshold set: {error}")),
         }
         match manifest_id {
-            Ok(ref actual) if self.calibration_manifest_content_id != *actual => errors.push(format!(
-                "Threshold calibration approval records manifest {}, actual is {}.",
-                self.calibration_manifest_content_id, actual
-            )),
+            Ok(ref actual) if self.calibration_manifest_content_id != *actual => {
+                errors.push(format!(
+                    "Threshold calibration approval records manifest {}, actual is {}.",
+                    self.calibration_manifest_content_id, actual
+                ))
+            }
             Err(error) => errors.push(format!("Cannot identify calibration manifest: {error}")),
             _ => {}
         }
         if self.pcs_method != manifest.pcs_method {
-            errors.push("Threshold calibration approval PCS method does not match manifest.".to_owned());
+            errors.push(
+                "Threshold calibration approval PCS method does not match manifest.".to_owned(),
+            );
         }
 
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     /// Production authorization is an explicit code-reviewed allowlist of exact
@@ -354,7 +382,9 @@ mod tests {
         }
     }
 
-    fn complete_manifest(threshold_set_content_id: String) -> InverseLutThresholdCalibrationManifest {
+    fn complete_manifest(
+        threshold_set_content_id: String,
+    ) -> InverseLutThresholdCalibrationManifest {
         InverseLutThresholdCalibrationManifest {
             schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION,
             pcs_method: ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
@@ -411,8 +441,9 @@ mod tests {
     fn duplicate_validation_reports_are_rejected() {
         let measured = measured_set();
         let mut manifest = complete_manifest(measured.content_id().unwrap());
-        manifest.observations[1].validation_report_content_id =
-            manifest.observations[0].validation_report_content_id.clone();
+        manifest.observations[1].validation_report_content_id = manifest.observations[0]
+            .validation_report_content_id
+            .clone();
         assert!(manifest.validate().is_err());
     }
 
@@ -428,7 +459,11 @@ mod tests {
             calibration_manifest_content_id: manifest.content_id().unwrap(),
         };
         assert!(approval.validate_bindings(&measured, &manifest).is_ok());
-        assert!(!approval.is_production_approved(&measured, &manifest).unwrap());
+        assert!(
+            !approval
+                .is_production_approved(&measured, &manifest)
+                .unwrap()
+        );
     }
 
     #[test]

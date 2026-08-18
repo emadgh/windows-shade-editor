@@ -2,7 +2,8 @@ use sha2::{Digest, Sha256};
 
 use crate::color_conversion::{
     CONVERSION_RECIPE_SCHEMA_VERSION, ConversionEngineMode, ConversionRecipe,
-    ConversionRenderingIntent, ConversionTargetDefinition, SeparationStrategy, TargetChannelDefinition,
+    ConversionRenderingIntent, ConversionTargetDefinition, SeparationStrategy,
+    TargetChannelDefinition,
 };
 use crate::conversion_recipe::recipe_sha256;
 use crate::custom_optimizer_config::CustomOptimizerSolverConfig;
@@ -15,15 +16,12 @@ use crate::inverse_lut_identity::{
     InverseLutLocalForwardModelConfigIdentity, InverseLutNumericalPrecision,
     InverseLutOutputQuantization, InverseLutValidityEncoding, LabGridSpec,
 };
-use crate::inverse_lut_path_validation::{
-    InverseLutPathDiagnostic, InverseLutValidationPathKind,
-};
+use crate::inverse_lut_path_validation::{InverseLutPathDiagnostic, InverseLutValidationPathKind};
 use crate::inverse_lut_production_eligibility::{
     InverseLutProductionEligibilityError, validate_inverse_lut_production_eligibility,
 };
-use crate::inverse_lut_validation::{
-    InverseLutValidationPolicy, InverseLutValidationSample, summarize_validation_samples,
-};
+use crate::inverse_lut_threshold_set::InverseLutValidationThresholdSet;
+use crate::inverse_lut_validation::{InverseLutValidationSample, summarize_validation_samples};
 use crate::inverse_lut_validation_artifact::VerifiedInverseLutValidationArtifact;
 use crate::inverse_lut_validation_reference::InverseLutValidationReferenceMethod;
 use crate::model::IccProfileIdentity;
@@ -56,6 +54,10 @@ fn pcs_compatibility() -> ValidatedProductionPcsCompatibility {
         canonical_illuminant: "D50".to_owned(),
         canonical_observer: "2deg".to_owned(),
     }
+}
+
+fn threshold_set() -> InverseLutValidationThresholdSet {
+    InverseLutValidationThresholdSet::provisional_v1()
 }
 
 fn recipe() -> ConversionRecipe {
@@ -202,12 +204,14 @@ fn validation(
         u16_quantization_l1: Some(0.0),
         constraints_preserved: true,
     };
+    let thresholds = threshold_set();
     let report = summarize_validation_samples(
         lut.identity_content_id.clone(),
         lut.payload_sha256.clone(),
         recipe_sha256(recipe).unwrap(),
         characterization_id(),
-        InverseLutValidationPolicy::default(),
+        thresholds.content_id().unwrap(),
+        thresholds.policy,
         InverseLutValidationReferenceMethod::IndependentPointSolveV1,
         paths(),
         &[sample],
@@ -257,10 +261,18 @@ fn exact_bindings_still_fail_closed_until_thresholds_are_frozen() {
     let lut = lut(&recipe);
     let validation = validation(&recipe, &lut);
     let pcs = pcs_compatibility();
+    let thresholds = threshold_set();
     let model = FixtureModel::new();
 
     assert!(matches!(
-        validate_inverse_lut_production_eligibility(&lut, &validation, &pcs, &recipe, &model),
+        validate_inverse_lut_production_eligibility(
+            &lut,
+            &validation,
+            &thresholds,
+            &pcs,
+            &recipe,
+            &model
+        ),
         Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen { .. })
     ));
 }
@@ -273,10 +285,18 @@ fn stale_report_for_another_payload_cannot_authorize_lut() {
     validation.report.lut_payload_sha256 = "9".repeat(64);
     validation.report_content_id = validation.report.content_id().unwrap();
     let pcs = pcs_compatibility();
+    let thresholds = threshold_set();
     let model = FixtureModel::new();
 
     assert!(matches!(
-        validate_inverse_lut_production_eligibility(&lut, &validation, &pcs, &recipe, &model),
+        validate_inverse_lut_production_eligibility(
+            &lut,
+            &validation,
+            &thresholds,
+            &pcs,
+            &recipe,
+            &model
+        ),
         Err(InverseLutProductionEligibilityError::LutPayloadMismatch { .. })
     ));
 }
@@ -287,6 +307,7 @@ fn stale_report_for_another_recipe_cannot_authorize_lut() {
     let lut = lut(&recipe);
     let validation = validation(&recipe, &lut);
     let pcs = pcs_compatibility();
+    let thresholds = threshold_set();
     let model = FixtureModel::new();
     let mut changed_recipe = recipe.clone();
     changed_recipe.black_point_compensation = !changed_recipe.black_point_compensation;
@@ -296,6 +317,7 @@ fn stale_report_for_another_recipe_cannot_authorize_lut() {
         validate_inverse_lut_production_eligibility(
             &lut,
             &validation,
+            &thresholds,
             &pcs,
             &changed_recipe,
             &model,
@@ -313,10 +335,18 @@ fn mismatched_reference_method_cannot_authorize_lut() {
         InverseLutValidationReferenceMethod::FrozenJacobiTrilinearThenV2SolveV1;
     validation.report_content_id = validation.report.content_id().unwrap();
     let pcs = pcs_compatibility();
+    let thresholds = threshold_set();
     let model = FixtureModel::new();
 
     assert!(matches!(
-        validate_inverse_lut_production_eligibility(&lut, &validation, &pcs, &recipe, &model),
+        validate_inverse_lut_production_eligibility(
+            &lut,
+            &validation,
+            &thresholds,
+            &pcs,
+            &recipe,
+            &model
+        ),
         Err(InverseLutProductionEligibilityError::ReferenceMethodMismatch { .. })
     ));
 }
@@ -327,11 +357,19 @@ fn pcs_evidence_for_another_characterization_cannot_authorize_lut() {
     let lut = lut(&recipe);
     let validation = validation(&recipe, &lut);
     let mut pcs = pcs_compatibility();
+    let thresholds = threshold_set();
     pcs.characterization_id = format!("sha256:{}", "8".repeat(64));
     let model = FixtureModel::new();
 
     assert!(matches!(
-        validate_inverse_lut_production_eligibility(&lut, &validation, &pcs, &recipe, &model),
+        validate_inverse_lut_production_eligibility(
+            &lut,
+            &validation,
+            &thresholds,
+            &pcs,
+            &recipe,
+            &model
+        ),
         Err(InverseLutProductionEligibilityError::PcsCharacterizationMismatch { .. })
     ));
 }
@@ -342,12 +380,43 @@ fn malformed_pcs_evidence_fails_before_threshold_gate() {
     let lut = lut(&recipe);
     let validation = validation(&recipe, &lut);
     let mut pcs = pcs_compatibility();
+    let thresholds = threshold_set();
     pcs.canonical_illuminant = "D65".to_owned();
     let model = FixtureModel::new();
 
     assert!(matches!(
-        validate_inverse_lut_production_eligibility(&lut, &validation, &pcs, &recipe, &model),
+        validate_inverse_lut_production_eligibility(
+            &lut,
+            &validation,
+            &thresholds,
+            &pcs,
+            &recipe,
+            &model
+        ),
         Err(InverseLutProductionEligibilityError::InvalidPcsCompatibility(_))
+    ));
+}
+
+#[test]
+fn stale_threshold_set_cannot_authorize_report() {
+    let recipe = recipe();
+    let lut = lut(&recipe);
+    let validation = validation(&recipe, &lut);
+    let pcs = pcs_compatibility();
+    let mut thresholds = threshold_set();
+    thresholds.policy.max_delta_e00 += 0.25;
+    let model = FixtureModel::new();
+
+    assert!(matches!(
+        validate_inverse_lut_production_eligibility(
+            &lut,
+            &validation,
+            &thresholds,
+            &pcs,
+            &recipe,
+            &model,
+        ),
+        Err(InverseLutProductionEligibilityError::ThresholdSetMismatch { .. })
     ));
 }
 
@@ -357,11 +426,19 @@ fn forged_lut_payload_is_rehashed_before_eligibility() {
     let mut lut = lut(&recipe);
     let validation = validation(&recipe, &lut);
     let pcs = pcs_compatibility();
+    let thresholds = threshold_set();
     let model = FixtureModel::new();
     lut.coverages[0] = 0.75;
 
     assert!(matches!(
-        validate_inverse_lut_production_eligibility(&lut, &validation, &pcs, &recipe, &model),
+        validate_inverse_lut_production_eligibility(
+            &lut,
+            &validation,
+            &thresholds,
+            &pcs,
+            &recipe,
+            &model
+        ),
         Err(InverseLutProductionEligibilityError::InvalidLut(_))
     ));
 }
