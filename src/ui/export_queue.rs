@@ -4,6 +4,10 @@ use eframe::egui;
 
 impl ShadeApp {
     pub(crate) fn ui_export_queue_window(&mut self, ctx: &egui::Context) {
+        // Called after CentralPanel each frame, so this is the stable post-layout
+        // hook for viewport-owned controls even when the Export Queue itself is closed.
+        super::viewport_controls::show(self, ctx);
+
         if !self.export.show_queue {
             return;
         }
