@@ -37,6 +37,7 @@ pub mod nchannel_icc;
 pub mod palette;
 pub mod png_source;
 pub mod production_acceptance;
+pub mod production_lab_transform;
 pub mod production_project;
 pub mod production_target;
 #[path = "safe_fs.rs"]

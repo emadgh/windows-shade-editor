@@ -18,7 +18,7 @@ pub enum RuntimeIccProfile<'a> {
 }
 
 impl RuntimeIccProfile<'_> {
-    fn open(&self, role: &str) -> Result<Profile, String> {
+    pub(crate) fn open(&self, role: &str) -> Result<Profile, String> {
         match self {
             Self::Embedded(bytes) => Profile::new_icc(bytes)
                 .map_err(|err| format!("Cannot open {role} ICC profile from embedded bytes: {err}")),
@@ -176,7 +176,7 @@ impl ProductionCmykTransform {
     }
 }
 
-fn validate_chunk_lengths(source_len: usize, destination_len: usize) -> Result<(), String> {
+pub(crate) fn validate_chunk_lengths(source_len: usize, destination_len: usize) -> Result<(), String> {
     if source_len != destination_len {
         return Err(format!(
             "ICC conversion chunk length mismatch: {source_len} source pixels, {destination_len} destination pixels."
@@ -185,7 +185,7 @@ fn validate_chunk_lengths(source_len: usize, destination_len: usize) -> Result<(
     Ok(())
 }
 
-fn to_lcms_intent(intent: ConversionRenderingIntent) -> Intent {
+pub(crate) fn to_lcms_intent(intent: ConversionRenderingIntent) -> Intent {
     match intent {
         ConversionRenderingIntent::Perceptual => Intent::Perceptual,
         ConversionRenderingIntent::RelativeColorimetric => Intent::RelativeColorimetric,
