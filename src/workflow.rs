@@ -6,17 +6,99 @@ pub(super) fn active_face_available(app: &ShadeApp) -> bool {
         .is_some_and(|face| face.available)
 }
 
+fn next_test_code(current: &str) -> String {
+    let current = current.trim();
+    if current.is_empty() {
+        return "Test-2".to_owned();
+    }
+    let split = current
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let (prefix, digits) = current.split_at(split);
+    if !digits.is_empty() {
+        if let Ok(number) = digits.parse::<u64>() {
+            return format!("{prefix}{}", number.saturating_add(1));
+        }
+    }
+    format!("{current}-2")
+}
+
 pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
     let Some(active_id) = app.project.active_snapshot_id else {
         return;
     };
+    let exported = app
+        .project
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.id == active_id)
+        .is_some_and(|snapshot| !snapshot.exports.is_empty());
+    let dirty = !app.project.active_snapshot_matches();
+    let mut reusing_exported_code = false;
+
+    if exported && dirty {
+        let snapshot_name = app
+            .project
+            .active_snapshot_name()
+            .unwrap_or("Snapshot")
+            .to_owned();
+        let current_code = app.project.effective_test_code_text();
+        let description = format!(
+            "'{snapshot_name}' has already been exported with Test Code '{current_code}'.\n\nYes = Create a NEW Snapshot + Test Code (recommended)\nNo = Reuse the SAME exported Test Code and update this Snapshot\nCancel = Keep the exported Snapshot unchanged\n\nReusing the same code does not bypass the separate file overwrite confirmation during the next export."
+        );
+        match rfd::MessageDialog::new()
+            .set_title("Exported Snapshot / Test Code")
+            .set_description(description)
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show()
+        {
+            rfd::MessageDialogResult::Yes => {
+                app.flush_history_now();
+                let new_code = next_test_code(&current_code);
+                app.project.test_code.enabled = true;
+                app.project.test_code.text = new_code.clone();
+                let new_id = app.project.create_snapshot();
+                app.sync_history_to_active_snapshot();
+                if let Some(snapshot) = app
+                    .project
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.id == new_id)
+                {
+                    app.snapshot_rename_id = Some(new_id);
+                    app.snapshot_rename_buffer = snapshot.name.clone();
+                }
+                app.history_clear_backup = None;
+                app.snapshot_preview_cache.remove_snapshot(new_id);
+                app.cache_current_snapshot_preview_if_ready();
+                app.mark_project_dirty();
+                app.report_info(format!(
+                    "Preserved exported Snapshot '{snapshot_name}' and created a new test state with code '{new_code}'"
+                ));
+                return;
+            }
+            rfd::MessageDialogResult::No => {
+                reusing_exported_code = true;
+            }
+            _ => return,
+        }
+    }
+
     app.flush_history_now();
     app.sync_history_to_active_snapshot();
     if app.project.update_snapshot(active_id) {
         app.snapshot_preview_cache.remove_snapshot(active_id);
         app.cache_current_snapshot_preview_if_ready();
         app.mark_project_dirty();
-        app.report_info("Snapshot updated · preview cache refreshed");
+        if reusing_exported_code {
+            app.report_info("Snapshot updated with the previously exported Test Code; disk overwrite protection still applies on export");
+        } else {
+            app.report_info("Snapshot updated · preview cache refreshed");
+        }
     }
 }
 
