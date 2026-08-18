@@ -4,6 +4,7 @@ pub(crate) mod color_conversion;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
 pub(crate) mod faces;
+pub(crate) mod history_panel;
 pub(crate) mod input_router;
 pub(crate) mod levels_mixer;
 pub(crate) mod match_color;
@@ -12,7 +13,9 @@ pub(crate) mod project_navigation;
 pub(crate) mod project_view_state;
 pub(crate) mod reference_panel;
 pub(crate) mod settings_panel;
+pub(crate) mod snapshots_panel;
 pub(crate) mod status_bar;
+pub(crate) mod test_code_panel;
 
 #[cfg(test)]
 mod tests {
