@@ -16,6 +16,7 @@ fn supported(delta: f64, ink_l1: f64) -> InverseLutValidationSample {
         supported: true,
         lut_delta_e00: Some(delta),
         reference_delta_e00: Some(delta * 0.8),
+        lut_vs_reference_delta_e00: Some(delta * 0.2),
         ink_l1: Some(ink_l1),
         ink_l2: Some(ink_l1 * 0.6),
         max_channel_deviation: Some(ink_l1 * 0.4),
@@ -30,6 +31,7 @@ fn unsupported() -> InverseLutValidationSample {
         supported: false,
         lut_delta_e00: None,
         reference_delta_e00: None,
+        lut_vs_reference_delta_e00: None,
         ink_l1: None,
         ink_l2: None,
         max_channel_deviation: None,
@@ -71,6 +73,9 @@ fn deterministic_summary_uses_nearest_rank_p95() {
         max_mean_delta_e00: 100.0,
         max_p95_delta_e00: 100.0,
         max_delta_e00: 100.0,
+        max_mean_lut_vs_reference_delta_e00: 100.0,
+        max_p95_lut_vs_reference_delta_e00: 100.0,
+        max_lut_vs_reference_delta_e00: 100.0,
         max_mean_ink_l1: 100.0,
         max_p95_ink_l1: 100.0,
         max_ink_l1: 100.0,
@@ -89,6 +94,7 @@ fn deterministic_summary_uses_nearest_rank_p95() {
     assert_eq!(first, second);
     assert_eq!(first.summary.lut_delta_e00.p95, 19.0);
     assert_eq!(first.summary.lut_delta_e00.max, 20.0);
+    assert!((first.summary.lut_vs_reference_delta_e00.p95 - 3.8).abs() < 1.0e-12);
     assert_eq!(first.content_id().unwrap(), second.content_id().unwrap());
 }
 
@@ -167,6 +173,17 @@ fn unsupported_fraction_and_constraint_failures_are_explicit() {
 }
 
 #[test]
+fn direct_lut_reference_delta_has_an_independent_gate() {
+    let mut policy = InverseLutValidationPolicy::default();
+    policy.max_mean_lut_vs_reference_delta_e00 = 0.05;
+    policy.max_p95_lut_vs_reference_delta_e00 = 0.05;
+    policy.max_lut_vs_reference_delta_e00 = 0.05;
+    let result = report(policy, &[supported(0.5, 0.05)]);
+    assert!(!result.passed);
+    assert!((result.summary.lut_vs_reference_delta_e00.max - 0.1).abs() < 1.0e-12);
+}
+
+#[test]
 fn unsupported_samples_cannot_smuggle_numeric_metrics() {
     let mut sample = unsupported();
     sample.ink_l1 = Some(0.0);
@@ -210,5 +227,10 @@ fn policy_rejects_nonfinite_negative_and_nonmonotonic_thresholds() {
     let mut policy = InverseLutValidationPolicy::default();
     policy.max_mean_delta_e00 = 2.0;
     policy.max_p95_delta_e00 = 1.0;
+    assert!(policy.validate().is_err());
+
+    let mut policy = InverseLutValidationPolicy::default();
+    policy.max_mean_lut_vs_reference_delta_e00 = 1.0;
+    policy.max_p95_lut_vs_reference_delta_e00 = 0.5;
     assert!(policy.validate().is_err());
 }
