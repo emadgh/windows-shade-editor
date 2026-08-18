@@ -30,6 +30,7 @@ pub mod inverse_lut_continuity_builder;
 pub mod inverse_lut_continuity_field;
 pub mod inverse_lut_holdout;
 pub mod inverse_lut_identity;
+pub mod inverse_lut_path_validation;
 pub mod inverse_lut_runtime;
 pub mod inverse_lut_validation;
 pub mod inverse_lut_validation_eval;
