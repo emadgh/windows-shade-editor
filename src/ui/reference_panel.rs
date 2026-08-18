@@ -21,12 +21,12 @@ pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
             .as_ref()
             .map(|target| target.display_name())
             .unwrap_or_else(|| "No reference".to_owned());
-        let mut response = ui.add_sized(
+        let response = ui.add_sized(
             [field_width, 20.0],
             egui::Label::new(egui::RichText::new(text).small()).truncate(),
         );
         if let Some(target) = target.as_ref() {
-            response = response.on_hover_text(format!(
+            response.on_hover_text(format!(
                 "{}\nCtrl + Right Click: quick in-app preview",
                 target.path.display()
             ));
