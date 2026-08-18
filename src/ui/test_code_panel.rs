@@ -140,13 +140,3 @@ pub(crate) fn ui_test_code(app: &mut ShadeApp, ui: &mut egui::Ui) {
         app.mark_project_dirty();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn pristine_default_rule_is_intentionally_narrow() {
-        // The behavioral guard lives on ShadeApp state; this test keeps the
-        // design intent explicit without constructing the full native app.
-        assert!(true);
-    }
-}
