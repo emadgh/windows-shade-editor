@@ -1,7 +1,7 @@
 name: Build Shade Editor for Windows
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   pull_request:
@@ -15,29 +15,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
-          fetch-depth: 0
-      - name: Update snapshot provenance regression test
-        if: github.event_name == 'pull_request' && github.head_ref == 'feat/ui-workspace-snapshot-safety'
-        shell: pwsh
-        run: |
-          $message = git log -1 --pretty=%B
-          if ($message -match '\[provenance-test-fix\]') {
-            Write-Host 'Provenance test fix already applied.'
-            exit 0
-          }
-          python .github/scripts/_temporary_fix_snapshot_provenance_test.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/model.rs
-          git diff --cached --check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git commit -m "test: preserve snapshot export provenance history [provenance-test-fix]"
-          git push origin HEAD:feat/ui-workspace-snapshot-safety
-          Write-Host 'Test fix pushed; ending superseded validation run.'
-          exit 1
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -47,17 +24,23 @@ jobs:
           $cargoMatch = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"$' | Select-Object -First 1
           if (-not $cargoMatch) { throw "Cannot read package version from Cargo.toml" }
           $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
+
           $fileVersion = (Get-Content -Raw VERSION).Trim()
+
           $lockText = Get-Content -Raw Cargo.lock
           $lockVersion = $null
           $packageBlocks = [regex]::Matches($lockText, '(?ms)^\[\[package\]\]\s*(.*?)(?=^\[\[package\]\]|\z)')
           foreach ($block in $packageBlocks) {
             if ($block.Value -match '(?m)^name = "windows-shade-editor"\s*$') {
               $versionMatch = [regex]::Match($block.Value, '(?m)^version = "([^"]+)"\s*$')
-              if ($versionMatch.Success) { $lockVersion = $versionMatch.Groups[1].Value; break }
+              if ($versionMatch.Success) {
+                $lockVersion = $versionMatch.Groups[1].Value
+                break
+              }
             }
           }
           if (-not $lockVersion) { throw "Cannot read root package version from Cargo.lock" }
+
           if ($cargoVersion -ne $fileVersion -or $cargoVersion -ne $lockVersion) {
             throw "Version mismatch: Cargo.toml=$cargoVersion VERSION=$fileVersion Cargo.lock=$lockVersion"
           }
@@ -99,7 +82,11 @@ jobs:
           Copy-Item $exe artifact/ShadeEditor.exe
           Copy-Item target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256 artifact/ShadeEditor.exe.sha256
           Copy-Item VERSION artifact/VERSION
-          @("Shade Editor $env:SHADE_VERSION", "Commit: $env:GITHUB_SHA", "ShadeEditor.exe SHA-256: $hash") | Set-Content -Encoding ascii artifact/build-info.txt
+          @(
+            "Shade Editor $env:SHADE_VERSION"
+            "Commit: $env:GITHUB_SHA"
+            "ShadeEditor.exe SHA-256: $hash"
+          ) | Set-Content -Encoding ascii artifact/build-info.txt
           Copy-Item README.md artifact/README.md
           Copy-Item LICENSE artifact/LICENSE
           New-Item -ItemType Directory -Force artifact/Shell | Out-Null
