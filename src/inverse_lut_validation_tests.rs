@@ -5,6 +5,7 @@ use crate::inverse_lut_validation::{
     INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION, InverseLutValidationPolicy,
     InverseLutValidationSample, summarize_validation_samples,
 };
+use crate::inverse_lut_validation_reference::InverseLutValidationReferenceMethod;
 
 fn id(byte: char) -> String {
     format!("sha256:{}", byte.to_string().repeat(64))
@@ -12,6 +13,10 @@ fn id(byte: char) -> String {
 
 fn bare(byte: char) -> String {
     byte.to_string().repeat(64)
+}
+
+fn independent_reference_method() -> InverseLutValidationReferenceMethod {
+    InverseLutValidationReferenceMethod::IndependentPointSolveV1
 }
 
 fn supported(delta: f64, ink_l1: f64) -> InverseLutValidationSample {
@@ -95,6 +100,7 @@ fn report_with_inputs_and_paths(
         recipe_sha256,
         characterization_id,
         policy,
+        independent_reference_method(),
         paths,
         samples,
     )
@@ -222,6 +228,11 @@ fn each_bound_input_changes_report_content_identity() {
         &samples,
     );
     assert_ne!(changed.content_id().unwrap(), base_id);
+
+    let mut changed_reference_method = base.clone();
+    changed_reference_method.reference_method =
+        InverseLutValidationReferenceMethod::FrozenJacobiTrilinearThenV2SolveV1;
+    assert_ne!(changed_reference_method.content_id().unwrap(), base_id);
 }
 
 #[test]
@@ -286,6 +297,7 @@ fn ordered_path_gate_fails_closed_and_cannot_be_omitted() {
         bare('c'),
         id('d'),
         policy,
+        independent_reference_method(),
         passing_paths()[..6].to_vec(),
         &samples,
     );
@@ -299,6 +311,7 @@ fn ordered_path_gate_fails_closed_and_cannot_be_omitted() {
         bare('c'),
         id('d'),
         policy,
+        independent_reference_method(),
         reordered,
         &samples,
     );
@@ -344,6 +357,7 @@ fn unsupported_samples_cannot_smuggle_numeric_metrics() {
         bare('c'),
         id('d'),
         InverseLutValidationPolicy::default(),
+        independent_reference_method(),
         passing_paths(),
         &[sample],
     )
