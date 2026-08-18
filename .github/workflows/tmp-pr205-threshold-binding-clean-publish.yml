@@ -1,0 +1,154 @@
+name: Temporary clean threshold-set binding publisher
+on:
+  pull_request:
+    branches:
+      - tmp/pr205-threshold-binding-split
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-threshold-set-binding
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Guard exact feature head
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '3124412bb6b4c4733209cd90625f3492c952618b'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Expected $expectedHead, got $actualHead" }
+
+      - name: Apply exact report runner and eligibility binding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $raw = (git show origin/tmp/pr205-threshold-binding-patch:.github/workflows/tmp-pr205-threshold-binding-patch.yml | Out-String)
+          $lines = $raw -split "`r?`n"
+          $start = -1
+          $end = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($start -lt 0 -and $lines[$i].Trim() -eq "@'") { $start = $i + 1; continue }
+            if ($start -ge 0 -and $lines[$i].Trim().StartsWith("'@ | Set-Content")) { $end = $i; break }
+          }
+          if ($start -lt 0 -or $end -le $start) { throw 'Cannot extract guarded Python patch.' }
+          $scriptLines = @()
+          for ($i = $start; $i -lt $end; $i++) {
+            $line = $lines[$i]
+            if ($line.StartsWith('          ')) { $line = $line.Substring(10) }
+            $scriptLines += $line
+          }
+          $script = $scriptLines -join "`n"
+          $script = $script.Replace('count=7)', 'count=5)')
+          $script = $script.Replace('InverseLutValidationPolicy::default()")', 'InverseLutValidationPolicy::default(),")')
+          $script = $script.Replace("changed_threshold_set.threshold_set_content_id = pcs_id('9');", "changed_threshold_set.threshold_set_content_id = pcs_id('a');")
+          $script += "`n`nrepl(`"src/inverse_lut_production_eligibility_tests.rs`",`n     `"    let mut pcs = pcs_compatibility();\n`",`n     `"    let mut pcs = pcs_compatibility();\n    let thresholds = threshold_set();\n`",`n     count=2)`n"
+          Set-Content -Path .tmp-threshold-binding-patch.py -Value $script -Encoding utf8 -NoNewline
+          python .tmp-threshold-binding-patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-threshold-binding-patch.py
+
+      - name: Keep production approval acyclic and closed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+          p = Path("src/inverse_lut_production_eligibility.rs")
+          text = p.read_text(encoding="utf-8")
+          start = text.find("fn ensure_production_thresholds_frozen(")
+          end = text.find("\nfn is_prefixed_sha256", start)
+          if start < 0 or end < 0:
+              raise SystemExit("Cannot locate generated production-threshold gate block")
+          replacement = '''fn ensure_production_thresholds_frozen(
+              _threshold_set: &InverseLutValidationThresholdSet,
+              threshold_set_content_id: &str,
+          ) -> Result<(), InverseLutProductionEligibilityError> {
+              // #205 has no production-approved measured calibration approval yet.
+              // Keep production closed even when a structurally valid threshold set exists.
+              Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen {
+                  threshold_set_content_id: threshold_set_content_id.to_owned(),
+              })
+          }
+          '''
+          p.write_text(text[:start] + replacement + text[end:], encoding="utf-8", newline="\n")
+          '@ | Set-Content -Path .tmp-break-cycle.py -Encoding utf8
+          python .tmp-break-cycle.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-break-cycle.py
+
+      - name: Format then discard unrelated repository formatting debt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $allowed = @(
+            'src/inverse_lut_production_eligibility.rs',
+            'src/inverse_lut_production_eligibility_tests.rs',
+            'src/inverse_lut_threshold_set.rs',
+            'src/inverse_lut_validation.rs',
+            'src/inverse_lut_validation_artifact.rs',
+            'src/inverse_lut_validation_runner.rs',
+            'src/inverse_lut_validation_tests.rs'
+          )
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) {
+            if ($allowed -notcontains $file) {
+              git checkout -- $file
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+
+      - name: Compile locked Windows target
+        shell: pwsh
+        run: |
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compile and run full tests
+        shell: pwsh
+        run: |
+          cargo test --locked --target x86_64-pc-windows-msvc --no-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate exact seven-file patch surface
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          $expected = @(
+            'src/inverse_lut_production_eligibility.rs',
+            'src/inverse_lut_production_eligibility_tests.rs',
+            'src/inverse_lut_threshold_set.rs',
+            'src/inverse_lut_validation.rs',
+            'src/inverse_lut_validation_artifact.rs',
+            'src/inverse_lut_validation_runner.rs',
+            'src/inverse_lut_validation_tests.rs'
+          )
+          Write-Host "Changed files: $($changed -join ', ')"
+          if ((@($changed | Sort-Object) -join "`n") -ne (@($expected | Sort-Object) -join "`n")) {
+            throw "Unexpected files: $($changed -join ', ')"
+          }
+
+      - name: Publish verified seven-file patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/inverse_lut_production_eligibility.rs src/inverse_lut_production_eligibility_tests.rs src/inverse_lut_threshold_set.rs src/inverse_lut_validation.rs src/inverse_lut_validation_artifact.rs src/inverse_lut_validation_runner.rs src/inverse_lut_validation_tests.rs
+          git commit -m 'feat(color-conversion): bind threshold-set identity end to end'
+          git push origin HEAD:codex/custom-optimizer-threshold-set-binding
