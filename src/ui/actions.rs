@@ -24,7 +24,6 @@ pub(crate) enum NavigationUiAction {
     OpenProjectDialog,
     OpenRecent(PathBuf),
     ShowProjectView,
-    AddFacesDialog,
     QuickSave,
     Save,
     SaveAs,
@@ -149,7 +148,6 @@ impl ShadeApp {
                 self.request_project_transition(ProjectTransition::Open(path), Some(ctx));
             }
             NavigationUiAction::ShowProjectView => self.project_view.open = true,
-            NavigationUiAction::AddFacesDialog => self.add_faces_dialog(),
             NavigationUiAction::QuickSave => {
                 self.quick_save_project();
             }
