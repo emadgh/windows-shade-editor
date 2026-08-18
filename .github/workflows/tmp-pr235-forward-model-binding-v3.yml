@@ -1,0 +1,230 @@
+name: Temporary guarded PR235 forward-model binding v3
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr235-forward-model-binding-v3
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-forward-model-binding
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Guard exact feature head
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne '026d05ee9491cf376a1d39b2dc07c1d55d9a5b80') {
+            throw "Expected feature head 026d05ee9491cf376a1d39b2dc07c1d55d9a5b80, got $actual"
+          }
+
+      - name: Apply index-based exact forward-model binding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 occurrence, got {count}')
+              return text.replace(old, new, 1)
+
+          # Production eligibility.
+          p = Path('src/inverse_lut_production_eligibility.rs')
+          text = p.read_text(encoding='utf-8')
+          text = replace_once(
+              text,
+              'use crate::device_characterization::DeviceForwardModel;\n',
+              'use crate::device_characterization::DeviceForwardModel;\nuse crate::device_characterization_model::ValidatedLocalForwardModel;\n',
+              'eligibility concrete model import',
+          )
+          text = replace_once(
+              text,
+              'use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;\n',
+              '''use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
+          use crate::inverse_lut_identity::{
+              InverseLutForwardModelIdentity, InverseLutForwardModelMethod,
+              InverseLutLocalForwardModelConfigIdentity,
+          };
+          ''',
+              'eligibility LUT identity imports',
+          )
+          enum_close = '\n}\n\n/// Revalidate every production-critical binding and mint eligibility evidence.'
+          if text.count(enum_close) != 1:
+              raise SystemExit(f'eligibility error-enum close marker count {text.count(enum_close)}')
+          variant = '''
+              ForwardModelMismatch {
+                  lut: InverseLutForwardModelIdentity,
+                  model: InverseLutForwardModelIdentity,
+              },'''
+          text = text.replace(enum_close, variant + enum_close, 1)
+          text = replace_once(
+              text,
+              '    model: &dyn DeviceForwardModel,\n) -> Result<InverseLutProductionEligibility, InverseLutProductionEligibilityError> {',
+              '    model: &ValidatedLocalForwardModel,\n) -> Result<InverseLutProductionEligibility, InverseLutProductionEligibilityError> {',
+              'eligibility concrete model parameter',
+          )
+          calibration_marker = '    if calibration_manifest.threshold_set_content_id != threshold_set_content_id {'
+          if text.count(calibration_marker) != 1:
+              raise SystemExit(f'eligibility calibration marker count {text.count(calibration_marker)}')
+          model_check = '''    let actual_forward_model = InverseLutForwardModelIdentity {
+              method: InverseLutForwardModelMethod::LocalInverseDistanceWeightedV1,
+              config: InverseLutLocalForwardModelConfigIdentity::from_runtime(model.config()),
+          };
+          if runtime.identity().forward_model != actual_forward_model {
+              return Err(InverseLutProductionEligibilityError::ForwardModelMismatch {
+                  lut: runtime.identity().forward_model,
+                  model: actual_forward_model,
+              });
+          }
+
+          '''
+          text = text.replace(calibration_marker, model_check + calibration_marker, 1)
+          p.write_text(text, encoding='utf-8', newline='\n')
+
+          # Eligibility tests.
+          p = Path('src/inverse_lut_production_eligibility_tests.rs')
+          text = p.read_text(encoding='utf-8')
+          text = replace_once(
+              text,
+              'use crate::device_characterization::{CharacterizationIdentity, DeviceForwardModel, LabColor};\n',
+              'use crate::device_characterization_model::{LocalForwardModelConfig, ValidatedLocalForwardModel};\n',
+              'eligibility test model import',
+          )
+          char_start = text.find('fn characterization_id() -> String {')
+          char_end = text.find('\n}\n\nfn channels()', char_start)
+          if char_start < 0 or char_end < 0:
+              raise SystemExit('eligibility characterization helper range not found')
+          char_end += len('\n}')
+          text = text[:char_start] + '''fn characterization_id() -> String {
+              crate::color_conversion_test_support::characterization_id()
+          }''' + text[char_end:]
+          text = replace_once(
+              text,
+              '    model: &dyn DeviceForwardModel,\n) -> Result<InverseLutProductionEligibility, InverseLutProductionEligibilityError> {',
+              '    model: &ValidatedLocalForwardModel,\n) -> Result<InverseLutProductionEligibility, InverseLutProductionEligibilityError> {',
+              'eligibility test wrapper model parameter',
+          )
+          fixture_start = text.find('struct FixtureModel {')
+          first_test = text.find('#[test]\nfn exact_bindings_still_fail_closed_until_calibration_approval_is_allowlisted()', fixture_start)
+          if fixture_start < 0 or first_test < 0:
+              raise SystemExit('eligibility FixtureModel range not found')
+          text = text[:fixture_start] + text[first_test:]
+          fixture_calls = text.count('FixtureModel::new()')
+          if fixture_calls < 1:
+              raise SystemExit('eligibility FixtureModel calls not found')
+          text = text.replace('FixtureModel::new()', 'crate::color_conversion_test_support::default_local_model()')
+          forged_anchor = '#[test]\nfn forged_lut_payload_is_rehashed_before_eligibility() {'
+          if text.count(forged_anchor) != 1:
+              raise SystemExit(f'eligibility forged anchor count {text.count(forged_anchor)}')
+          regression = '''#[test]
+          fn same_characterization_with_different_forward_model_config_cannot_authorize_lut() {
+              let recipe = recipe();
+              let lut = lut(&recipe);
+              let validation = validation(&recipe, &lut);
+              let pcs = pcs_compatibility();
+              let thresholds = threshold_set();
+              let model = crate::color_conversion_test_support::local_model(LocalForwardModelConfig {
+                  neighbor_count: 3,
+                  distance_power: 2.0,
+                  max_support_distance: 0.5,
+              });
+
+              assert!(matches!(
+                  validate_with_calibration(&lut, &validation, &thresholds, &pcs, &recipe, &model),
+                  Err(InverseLutProductionEligibilityError::ForwardModelMismatch { .. })
+              ));
+          }
+
+          '''
+          text = text.replace(forged_anchor, regression + forged_anchor, 1)
+          p.write_text(text, encoding='utf-8', newline='\n')
+
+          # Raster authorization/tests.
+          p = Path('src/custom_optimizer_raster_transform.rs')
+          text = p.read_text(encoding='utf-8')
+          text = replace_once(
+              text,
+              'use crate::device_characterization::{DeviceForwardModel, LabColor};\n',
+              'use crate::device_characterization::LabColor;\nuse crate::device_characterization_model::ValidatedLocalForwardModel;\n',
+              'raster concrete model import',
+          )
+          text = replace_once(
+              text,
+              '        model: &dyn DeviceForwardModel,\n',
+              '        model: &ValidatedLocalForwardModel,\n',
+              'raster concrete model parameter',
+          )
+          char_start = text.find('    fn characterization_id() -> String {')
+          char_end = text.find('\n    }\n\n    fn channels()', char_start)
+          if char_start < 0 or char_end < 0:
+              raise SystemExit('raster characterization helper range not found')
+          char_end += len('\n    }')
+          text = text[:char_start] + '''    fn characterization_id() -> String {
+              crate::color_conversion_test_support::characterization_id()
+          }''' + text[char_end:]
+          fixture_start = text.find('    struct FixtureModel {')
+          first_kernel_test = text.find('    #[test]\n    fn constant_lut_quantizes_deterministically_to_u8()', fixture_start)
+          if fixture_start < 0 or first_kernel_test < 0:
+              raise SystemExit('raster FixtureModel range not found')
+          text = text[:fixture_start] + text[first_kernel_test:]
+          fixture_calls = text.count('FixtureModel::new()')
+          if fixture_calls < 1:
+              raise SystemExit('raster FixtureModel calls not found')
+          text = text.replace('FixtureModel::new()', 'crate::color_conversion_test_support::default_local_model()')
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | Set-Content -Path .tmp-pr235-patch-v3.py -Encoding utf8
+          python .tmp-pr235-patch-v3.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-pr235-patch-v3.py
+
+          rustfmt --edition 2024 src/inverse_lut_production_eligibility.rs src/inverse_lut_production_eligibility_tests.rs src/custom_optimizer_raster_transform.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check locked Windows target
+        shell: pwsh
+        run: |
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run full locked tests
+        shell: pwsh
+        run: |
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Guard source surface and publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only HEAD)
+          $expected = @(
+            'src/custom_optimizer_raster_transform.rs',
+            'src/inverse_lut_production_eligibility.rs',
+            'src/inverse_lut_production_eligibility_tests.rs'
+          )
+          $changedKey = (($changed | Sort-Object) -join "`n")
+          $expectedKey = (($expected | Sort-Object) -join "`n")
+          if ($changedKey -ne $expectedKey) {
+            throw "Unexpected patch surface: $($changed -join ', ')"
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add $expected
+          git commit -m 'fix(color-conversion): bind eligibility to exact forward model config'
+          git push origin HEAD:codex/custom-optimizer-forward-model-binding
