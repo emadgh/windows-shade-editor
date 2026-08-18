@@ -1,0 +1,208 @@
+name: Temporary guarded PR218 self-validation patch
+on:
+  pull_request:
+    branches:
+      - tmp/pr218-self-validation
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-calibration-analysis
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Guard exact feature head
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = 'bf9dde1b41c5daf0db5e63aa152e31fdcb6e43cb'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $expected) { throw "Expected $expected, got $actual" }
+
+      - name: Harden embedded summary validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+
+          p = Path('src/inverse_lut_calibration_analysis.rs')
+          text = p.read_text(encoding='utf-8')
+
+          old_counts = '''        if self.total_samples != self.supported_samples + self.unsupported_samples {
+              errors.push(
+                  "Inverse-LUT calibration analysis aggregate sample counts are inconsistent."
+                      .to_owned(),
+              );
+          }
+          '''
+          new_counts = '''        match self.supported_samples.checked_add(self.unsupported_samples) {
+              Some(total) if total == self.total_samples => {}
+              _ => errors.push(
+                  "Inverse-LUT calibration analysis aggregate sample counts are inconsistent."
+                      .to_owned(),
+              ),
+          }
+          '''
+          if text.count(old_counts) != 1:
+              raise SystemExit('Expected one point-envelope count block')
+          text = text.replace(old_counts, new_counts, 1)
+
+          needle = '''            if !reference_matches_solver_family(
+                  observation.solver_family,
+                  observation.reference_method,
+              ) {
+          '''
+          replacement = '''            validate_summary(&observation.summary, index, &mut errors);
+              if !reference_matches_solver_family(
+                  observation.solver_family,
+                  observation.reference_method,
+              ) {
+          '''
+          if text.count(needle) != 1:
+              raise SystemExit('Expected one observation reference-method guard')
+          text = text.replace(needle, replacement, 1)
+
+          helper_anchor = 'fn reference_matches_solver_family(\n'
+          helper = '''fn validate_summary(
+              summary: &InverseLutValidationSummary,
+              index: usize,
+              errors: &mut Vec<String>,
+          ) {
+              match summary.supported_samples.checked_add(summary.unsupported_samples) {
+                  Some(total) if total == summary.total_samples => {}
+                  _ => errors.push(format!(
+                      "Inverse-LUT calibration analysis observation {index} sample counts are inconsistent."
+                  )),
+              }
+              if summary.total_samples == 0 {
+                  errors.push(format!(
+                      "Inverse-LUT calibration analysis observation {index} cannot have zero samples."
+                  ));
+              }
+              let expected_fraction = if summary.total_samples == 0 {
+                  0.0
+              } else {
+                  summary.unsupported_samples as f64 / summary.total_samples as f64
+              };
+              if !summary.unsupported_fraction.is_finite()
+                  || !(0.0..=1.0).contains(&summary.unsupported_fraction)
+                  || (summary.unsupported_fraction - expected_fraction).abs() > 1.0e-12
+              {
+                  errors.push(format!(
+                      "Inverse-LUT calibration analysis observation {index} unsupported fraction is invalid."
+                  ));
+              }
+              for (name, distribution) in [
+                  ("lut_delta_e00", summary.lut_delta_e00),
+                  ("reference_delta_e00", summary.reference_delta_e00),
+                  (
+                      "lut_vs_reference_delta_e00",
+                      summary.lut_vs_reference_delta_e00,
+                  ),
+                  ("ink_l1", summary.ink_l1),
+              ] {
+                  for (field, value) in [
+                      ("mean", distribution.mean),
+                      ("p95", distribution.p95),
+                      ("max", distribution.max),
+                  ] {
+                      if !value.is_finite() || value < 0.0 {
+                          errors.push(format!(
+                              "Inverse-LUT calibration analysis observation {index} {name}.{field} must be finite and >= 0."
+                          ));
+                      }
+                  }
+                  if distribution.mean > distribution.p95 || distribution.p95 > distribution.max {
+                      errors.push(format!(
+                          "Inverse-LUT calibration analysis observation {index} {name} must satisfy mean <= p95 <= max."
+                      ));
+                  }
+              }
+              for (name, value) in [
+                  ("max_ink_l2", summary.max_ink_l2),
+                  ("max_channel_deviation", summary.max_channel_deviation),
+                  ("max_u8_quantization_l1", summary.max_u8_quantization_l1),
+                  ("max_u16_quantization_l1", summary.max_u16_quantization_l1),
+              ] {
+                  if !value.is_finite() || value < 0.0 {
+                      errors.push(format!(
+                          "Inverse-LUT calibration analysis observation {index} {name} must be finite and >= 0."
+                      ));
+                  }
+              }
+              if summary.constraint_violation_count > summary.supported_samples {
+                  errors.push(format!(
+                      "Inverse-LUT calibration analysis observation {index} constraint violations exceed supported samples."
+                  ));
+              }
+          }
+
+          '''
+          if text.count(helper_anchor) != 1:
+              raise SystemExit('Expected one reference helper anchor')
+          text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          test_anchor = '''    #[test]
+              fn analysis_rejects_extra_report() {
+          '''
+          test = '''    #[test]
+              fn analysis_rejects_tampered_negative_observation_summary() {
+                  let (threshold_set, manifest, reports) = fixture();
+                  let mut analysis = analyze_inverse_lut_threshold_calibration(
+                      &threshold_set,
+                      &manifest,
+                      &reports,
+                  )
+                  .unwrap();
+                  analysis.observations[0].summary.lut_delta_e00.mean = -0.25;
+                  let (point, paths) = compute_envelopes(&analysis.observations).unwrap();
+                  analysis.point_envelope = point;
+                  analysis.path_envelopes = paths;
+                  assert!(analysis.validate().is_err());
+              }
+
+          '''
+          if text.count(test_anchor) != 1:
+              raise SystemExit('Expected one extra-report test anchor')
+          text = text.replace(test_anchor, test + test_anchor, 1)
+
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | Set-Content -Path .tmp-pr218-hardening.py -Encoding utf8
+          python .tmp-pr218-hardening.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-pr218-hardening.py
+          rustfmt --edition 2024 src/inverse_lut_calibration_analysis.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check and test locked Windows target
+        shell: pwsh
+        run: |
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Guard and publish exact patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          if (($changed -join "`n") -ne 'src/inverse_lut_calibration_analysis.rs') {
+            throw "Unexpected changed files: $($changed -join ', ')"
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/inverse_lut_calibration_analysis.rs
+          git commit -m 'test(color-conversion): harden calibration analysis self-validation'
+          git push origin HEAD:codex/custom-optimizer-calibration-analysis
