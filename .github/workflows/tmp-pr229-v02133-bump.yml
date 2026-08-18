@@ -1,0 +1,73 @@
+name: Temporary guarded PR229 v0.21.33 bump
+on:
+  pull_request:
+    branches:
+      - tmp/pr229-v02133-bump
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  bump:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-approval-bound-eligibility
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Regenerate verify and publish version identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'bb3382f8c73e19c05805d530fc58acc95ec62848'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Expected $expectedHead, got $actualHead" }
+
+          $cargo = Get-Content Cargo.toml -Raw
+          if (($cargo.Split('version = "0.21.32"').Count - 1) -ne 1) {
+            throw 'Expected exactly one package version 0.21.32 in Cargo.toml.'
+          }
+          $cargo = $cargo.Replace('version = "0.21.32"', 'version = "0.21.33"')
+          Set-Content Cargo.toml -Value $cargo -Encoding utf8 -NoNewline
+
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -ne '0.21.32') { throw "Expected VERSION 0.21.32, got $version" }
+          Set-Content VERSION -Value "0.21.33`n" -Encoding utf8 -NoNewline
+
+          cargo check --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only | Sort-Object)
+          $expected = @('Cargo.lock','Cargo.toml','VERSION') | Sort-Object
+          if (($changed -join "`n") -ne ($expected -join "`n")) {
+            throw "Unexpected changed files: $($changed -join ', ')"
+          }
+
+          $lockDiff = @(git diff --unified=0 -- Cargo.lock)
+          $removed = @($lockDiff | Where-Object { $_ -eq '-version = "0.21.32"' }).Count
+          $added = @($lockDiff | Where-Object { $_ -eq '+version = "0.21.33"' }).Count
+          if ($removed -ne 1 -or $added -ne 1) {
+            throw "Cargo.lock must contain exactly one root version replacement; removed=$removed added=$added"
+          }
+          $otherLockChanges = @($lockDiff | Where-Object {
+            (($_.StartsWith('+') -and -not $_.StartsWith('+++')) -or ($_.StartsWith('-') -and -not $_.StartsWith('---'))) -and
+            $_ -ne '-version = "0.21.32"' -and $_ -ne '+version = "0.21.33"'
+          })
+          if ($otherLockChanges.Count -ne 0) {
+            throw "Unexpected Cargo.lock drift: $($otherLockChanges -join ' | ')"
+          }
+
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: finalize v0.21.33 approval-bound eligibility'
+          git push origin HEAD:codex/custom-optimizer-approval-bound-eligibility
