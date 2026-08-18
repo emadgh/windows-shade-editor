@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::inverse_lut_path_validation::{InverseLutPathDiagnostic, InverseLutValidationPathKind};
 use crate::inverse_lut_threshold_set::{
-    InverseLutCalibrationSolverFamily, InverseLutThresholdCalibrationManifest,
+    INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION, InverseLutCalibrationSolverFamily,
+    InverseLutThresholdCalibrationManifest, InverseLutThresholdCalibrationObservation,
     InverseLutValidationThresholdSet,
 };
 use crate::inverse_lut_validation::{
@@ -371,6 +372,33 @@ impl InverseLutThresholdCalibrationAnalysis {
             }
         }
 
+        let reconstructed_manifest = InverseLutThresholdCalibrationManifest {
+            schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION,
+            pcs_method: self.pcs_method,
+            threshold_set_content_id: self.threshold_set_content_id.clone(),
+            observations: self
+                .observations
+                .iter()
+                .map(|observation| InverseLutThresholdCalibrationObservation {
+                    solver_family: observation.solver_family,
+                    characterization_id: observation.characterization_id.clone(),
+                    recipe_sha256: observation.recipe_sha256.clone(),
+                    lut_identity_content_id: observation.lut_identity_content_id.clone(),
+                    validation_report_content_id: observation.validation_report_content_id.clone(),
+                })
+                .collect(),
+        };
+        match reconstructed_manifest.content_id() {
+    Ok(actual) if actual != self.calibration_manifest_content_id => errors.push(format!(
+        "Inverse-LUT calibration analysis manifest identity mismatch: stored {}, reconstructed {}.",
+        self.calibration_manifest_content_id, actual
+    )),
+    Ok(_) => {}
+    Err(error) => errors.push(format!(
+        "Inverse-LUT calibration analysis cannot reconstruct its manifest identity: {error}"
+    )),
+}
+
         self.point_envelope.validate(&mut errors);
         match compute_envelopes(&self.observations) {
             Ok((point, paths)) => {
@@ -400,6 +428,56 @@ impl InverseLutThresholdCalibrationAnalysis {
             );
         }
 
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Re-verifies a persisted analysis against the exact external evidence that
+    /// produced it. This prevents a self-consistent but unrelated analysis JSON from
+    /// being accepted for a different threshold set, manifest or report matrix.
+    pub fn validate_bindings(
+        &self,
+        threshold_set: &InverseLutValidationThresholdSet,
+        manifest: &InverseLutThresholdCalibrationManifest,
+        reports: &[InverseLutValidationReport],
+    ) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if let Err(mut validation_errors) = self.validate() {
+            errors.append(&mut validation_errors);
+        }
+        match threshold_set.content_id() {
+            Ok(actual) if actual != self.threshold_set_content_id => errors.push(format!(
+                "Inverse-LUT calibration analysis threshold-set identity mismatch: stored {}, supplied {}.",
+                self.threshold_set_content_id, actual
+            )),
+            Ok(_) => {}
+            Err(error) => errors.push(format!(
+                "Supplied inverse-LUT calibration threshold set is invalid: {error}"
+            )),
+        }
+        match manifest.content_id() {
+            Ok(actual) if actual != self.calibration_manifest_content_id => errors.push(format!(
+                "Inverse-LUT calibration analysis manifest identity mismatch: stored {}, supplied {}.",
+                self.calibration_manifest_content_id, actual
+            )),
+            Ok(_) => {}
+            Err(error) => errors.push(format!(
+                "Supplied inverse-LUT calibration manifest is invalid: {error}"
+            )),
+        }
+        match analyze_inverse_lut_threshold_calibration(threshold_set, manifest, reports) {
+            Ok(expected) if expected != *self => errors.push(
+                "Inverse-LUT calibration analysis does not match the supplied evidence matrix."
+                    .to_owned(),
+            ),
+            Ok(_) => {}
+            Err(error) => errors.push(format!(
+                "Supplied inverse-LUT calibration evidence cannot reproduce the analysis: {error}"
+            )),
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -950,6 +1028,34 @@ mod tests {
         analysis.point_envelope = point;
         analysis.path_envelopes = paths;
         assert!(analysis.validate().is_err());
+    }
+
+    #[test]
+    fn persisted_analysis_rejects_manifest_identity_tampering() {
+        let (threshold_set, manifest, reports) = fixture();
+        let mut analysis =
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports).unwrap();
+        analysis.calibration_manifest_content_id = prefixed('f');
+        assert!(analysis.validate().is_err());
+    }
+
+    #[test]
+    fn persisted_analysis_revalidates_exact_external_evidence() {
+        let (threshold_set, manifest, reports) = fixture();
+        let analysis =
+            analyze_inverse_lut_threshold_calibration(&threshold_set, &manifest, &reports).unwrap();
+        assert!(
+            analysis
+                .validate_bindings(&threshold_set, &manifest, &reports)
+                .is_ok()
+        );
+        let mut different_threshold_set = threshold_set.clone();
+        different_threshold_set.policy.max_delta_e00 += 0.25;
+        assert!(
+            analysis
+                .validate_bindings(&different_threshold_set, &manifest, &reports)
+                .is_err()
+        );
     }
 
     #[test]
