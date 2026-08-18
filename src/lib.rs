@@ -65,6 +65,8 @@ mod inverse_lut_continuity_path_validation_tests;
 #[cfg(test)]
 mod inverse_lut_continuity_sensitivity_tests;
 #[cfg(test)]
+mod inverse_lut_production_eligibility_tests;
+#[cfg(test)]
 mod inverse_lut_runtime_tests;
 #[cfg(test)]
 mod inverse_lut_validation_tests;
