@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-pub const CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const LEGACY_CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CUSTOM_OPTIMIZER_OBJECTIVE_WEIGHTS_SCHEMA_VERSION: u32 = 1;
 pub const CUSTOM_OPTIMIZER_MAX_CHANNELS: usize = 12;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,6 +22,57 @@ pub enum CustomOptimizerSolverMethod {
 pub enum ContinuityDistanceMetric {
     NormalizedL1,
     NormalizedL2,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CustomOptimizerObjectiveWeights {
+    pub schema_version: u32,
+    pub color_error: f32,
+    pub ink_preference: f32,
+    pub neutral_black: f32,
+    pub total_ink: f32,
+}
+
+impl Default for CustomOptimizerObjectiveWeights {
+    fn default() -> Self {
+        Self {
+            schema_version: CUSTOM_OPTIMIZER_OBJECTIVE_WEIGHTS_SCHEMA_VERSION,
+            color_error: 1.0,
+            ink_preference: 1.0,
+            neutral_black: 1.0,
+            total_ink: 0.25,
+        }
+    }
+}
+
+impl CustomOptimizerObjectiveWeights {
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if self.schema_version != CUSTOM_OPTIMIZER_OBJECTIVE_WEIGHTS_SCHEMA_VERSION {
+            errors.push(format!(
+                "Unsupported Custom Optimizer objective-weight schema {} (expected {}).",
+                self.schema_version, CUSTOM_OPTIMIZER_OBJECTIVE_WEIGHTS_SCHEMA_VERSION
+            ));
+        }
+        for (name, value) in [
+            ("color_error", self.color_error),
+            ("ink_preference", self.ink_preference),
+            ("neutral_black", self.neutral_black),
+            ("total_ink", self.total_ink),
+        ] {
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                errors.push(format!(
+                    "Custom Optimizer objective weight {name} must be finite and in 0..=100."
+                ));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -85,8 +138,12 @@ pub struct CustomOptimizerSolverConfig {
     /// feasible color in a search stage are colorimetrically equivalent for
     /// production-preference ranking. Zero means strict minimum-DeltaE ranking.
     pub preference_delta_e00: f32,
-    /// Present only for the explicitly versioned V2 method. `skip_serializing_if`
-    /// preserves the historical V1 JSON identity when this field is absent.
+    /// Explicit production objective weights. Schema-v1 solver configs predate
+    /// this provenance and therefore omit the block; they remain readable but
+    /// cannot identify a production inverse LUT safely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_weights: Option<CustomOptimizerObjectiveWeights>,
+    /// Present only for the explicitly versioned V2 method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuity_preference: Option<ContinuityPreferenceConfig>,
 }
@@ -102,6 +159,7 @@ impl Default for CustomOptimizerSolverConfig {
             initial_step_fraction: 0.18,
             step_decay: 0.5,
             preference_delta_e00: 0.10,
+            objective_weights: Some(CustomOptimizerObjectiveWeights::default()),
             continuity_preference: None,
         }
     }
@@ -110,10 +168,16 @@ impl Default for CustomOptimizerSolverConfig {
 impl CustomOptimizerSolverConfig {
     pub fn validate(&self, channel_count: usize) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        if self.schema_version != CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            LEGACY_CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION
+                | CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION
+        ) {
             errors.push(format!(
-                "Unsupported Custom Optimizer solver-config schema {} (expected {}).",
-                self.schema_version, CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION
+                "Unsupported Custom Optimizer solver-config schema {} (supported: {} and {}).",
+                self.schema_version,
+                LEGACY_CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION,
+                CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION
             ));
         }
         if !(1..=CUSTOM_OPTIMIZER_MAX_CHANNELS).contains(&channel_count) {
@@ -154,6 +218,23 @@ impl CustomOptimizerSolverConfig {
             );
         }
 
+        match (self.schema_version, self.objective_weights) {
+            (LEGACY_CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION, Some(_)) => errors.push(
+                "Legacy Custom Optimizer solver-config schema 1 must not carry objective_weights."
+                    .to_owned(),
+            ),
+            (CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION, None) => errors.push(
+                "Custom Optimizer solver-config schema 2 requires explicit objective_weights."
+                    .to_owned(),
+            ),
+            (CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION, Some(weights)) => {
+                if let Err(weight_errors) = weights.validate() {
+                    errors.extend(weight_errors);
+                }
+            }
+            _ => {}
+        }
+
         match (self.method, self.continuity_preference) {
             (CustomOptimizerSolverMethod::BoundedHaltonBeamV1, Some(_)) => errors.push(
                 "BoundedHaltonBeamV1 must not carry continuity_preference; use the versioned V2 method."
@@ -177,6 +258,29 @@ impl CustomOptimizerSolverConfig {
             Err(errors)
         }
     }
+
+    pub fn production_objective_weights(
+        &self,
+    ) -> Result<CustomOptimizerObjectiveWeights, Vec<String>> {
+        self.validate(1).or_else(|errors| {
+            // Channel count is validated by callers with the real topology; this
+            // helper only needs the schema/provenance check below.
+            let only_channel_count_error = errors
+                .iter()
+                .all(|error| error.starts_with("Custom Optimizer solver supports"));
+            if only_channel_count_error {
+                Ok(())
+            } else {
+                Err(errors)
+            }
+        })?;
+        self.objective_weights.ok_or_else(|| {
+            vec![
+                "Custom Optimizer objective-weight provenance is missing; recapture the recipe with solver-config schema 2 before production LUT use."
+                    .to_owned(),
+            ]
+        })
+    }
 }
 
 #[cfg(test)]
@@ -192,19 +296,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_config_is_valid_for_supported_nchannel_targets() {
-        for channel_count in [1usize, 4, 8, 12] {
-            assert!(CustomOptimizerSolverConfig::default().validate(channel_count).is_ok());
+    fn legacy_v1() -> CustomOptimizerSolverConfig {
+        CustomOptimizerSolverConfig {
+            schema_version: LEGACY_CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION,
+            objective_weights: None,
+            ..CustomOptimizerSolverConfig::default()
         }
     }
 
     #[test]
-    fn v1_json_identity_remains_explicit_and_omits_continuity_block() {
-        let json = serde_json::to_string(&CustomOptimizerSolverConfig::default()).unwrap();
+    fn default_config_is_current_and_valid_for_supported_nchannel_targets() {
+        let config = CustomOptimizerSolverConfig::default();
+        assert_eq!(config.schema_version, CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.objective_weights, Some(CustomOptimizerObjectiveWeights::default()));
+        for channel_count in [1usize, 4, 8, 12] {
+            assert!(config.validate(channel_count).is_ok());
+        }
+    }
+
+    #[test]
+    fn legacy_v1_json_identity_omits_objective_block() {
+        let json = serde_json::to_string(&legacy_v1()).unwrap();
         assert!(json.contains("bounded_halton_beam_v1"));
         assert!(json.contains("\"schema_version\":1"));
-        assert!(!json.contains("continuity_preference"));
+        assert!(!json.contains("objective_weights"));
+    }
+
+    #[test]
+    fn current_schema_requires_explicit_valid_objective_weights() {
+        let missing = CustomOptimizerSolverConfig {
+            objective_weights: None,
+            ..CustomOptimizerSolverConfig::default()
+        };
+        assert!(missing.validate(4).is_err());
+
+        let invalid = CustomOptimizerSolverConfig {
+            objective_weights: Some(CustomOptimizerObjectiveWeights {
+                ink_preference: f32::NAN,
+                ..CustomOptimizerObjectiveWeights::default()
+            }),
+            ..CustomOptimizerSolverConfig::default()
+        };
+        assert!(invalid.validate(4).is_err());
+    }
+
+    #[test]
+    fn legacy_v1_is_readable_but_has_no_production_objective_provenance() {
+        let legacy = legacy_v1();
+        assert!(legacy.validate(4).is_ok());
+        assert!(legacy.production_objective_weights().is_err());
+        assert_eq!(
+            CustomOptimizerSolverConfig::default().production_objective_weights(),
+            Ok(CustomOptimizerObjectiveWeights::default())
+        );
     }
 
     #[test]
