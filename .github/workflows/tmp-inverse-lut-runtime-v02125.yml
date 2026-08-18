@@ -1,0 +1,57 @@
+name: Temporary guarded inverse LUT runtime v0.21.25 bump
+on:
+  push:
+    branches:
+      - tmp/inverse-lut-runtime-v02125-bump
+permissions:
+  contents: write
+jobs:
+  bump:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Regenerate and guard version identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = '0.21.25'
+          if ((Get-Content VERSION -Raw).Trim() -eq $target) {
+            Write-Host 'Version already generated; no-op.'
+            exit 0
+          }
+          $toml = Get-Content Cargo.toml -Raw
+          $toml = $toml -replace '(?m)^version = "0\.21\.24"$', 'version = "0.21.25"'
+          Set-Content Cargo.toml -Value $toml -NoNewline
+          Set-Content VERSION -Value $target -NoNewline
+          cargo check --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $changed = @(git diff --name-only)
+          $expected = @('Cargo.lock','Cargo.toml','VERSION')
+          if (@($changed | Sort-Object) -join "`n" -ne @($expected | Sort-Object) -join "`n") {
+            Write-Error "Unexpected changed files: $($changed -join ', ')"
+          }
+
+          $lockDiff = git diff --unified=0 -- Cargo.lock
+          $removed = @($lockDiff | Where-Object { $_ -match '^-version = "0\.21\.24"$' })
+          $added = @($lockDiff | Where-Object { $_ -match '^\+version = "0\.21\.25"$' })
+          $otherLockChanges = @($lockDiff | Where-Object {
+            $_ -match '^[+-]' -and $_ -notmatch '^---' -and $_ -notmatch '^\+\+\+' -and
+            $_ -notmatch '^-version = "0\.21\.24"$' -and $_ -notmatch '^\+version = "0\.21\.25"$'
+          })
+          if ($removed.Count -ne 1 -or $added.Count -ne 1 -or $otherLockChanges.Count -ne 0) {
+            Write-Error "Cargo.lock drift detected.`n$($lockDiff -join "`n")"
+          }
+
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: regenerate v0.21.25 version identity'
+          git push origin HEAD:tmp/inverse-lut-runtime-v02125-bump
