@@ -16,6 +16,7 @@ pub(crate) mod settings_panel;
 pub(crate) mod snapshots_panel;
 pub(crate) mod status_bar;
 pub(crate) mod test_code_panel;
+pub(crate) mod viewport_controls;
 
 #[cfg(test)]
 mod tests {
