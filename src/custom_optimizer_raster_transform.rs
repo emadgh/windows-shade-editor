@@ -1,7 +1,8 @@
 use sha2::{Digest, Sha256};
 
 use crate::color_conversion::ConversionRecipe;
-use crate::device_characterization::{DeviceForwardModel, LabColor};
+use crate::device_characterization::LabColor;
+use crate::device_characterization_model::ValidatedLocalForwardModel;
 use crate::icc_conversion::{IccSourceModel, RuntimeIccProfile};
 use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
 use crate::inverse_lut_identity::quantize_normalized_coverage;
@@ -84,7 +85,7 @@ impl ProductionCustomOptimizerRasterTransform {
         calibration_approval: &InverseLutThresholdCalibrationApproval,
         pcs_compatibility: &ValidatedProductionPcsCompatibility,
         recipe: &ConversionRecipe,
-        model: &dyn DeviceForwardModel,
+        model: &ValidatedLocalForwardModel,
     ) -> Result<Self, ProductionCustomOptimizerRasterError> {
         verify_source_icc(source_icc, &recipe.source_profile_identity.sha256)?;
         let eligibility = validate_inverse_lut_production_eligibility(
@@ -166,7 +167,8 @@ impl CustomOptimizerRasterKernel {
             .collect::<Vec<_>>();
         if recipe_channels != lut_channels {
             return Err(ProductionCustomOptimizerRasterError::Construction(
-                "Authorized raster LUT channel order does not match the captured recipe.".to_owned(),
+                "Authorized raster LUT channel order does not match the captured recipe."
+                    .to_owned(),
             ));
         }
         if runtime.identity().target_bit_depth != recipe.target.bit_depth {
@@ -213,21 +215,19 @@ impl CustomOptimizerRasterKernel {
             return Ok(());
         }
         let quantization = self.runtime.identity().build_policy.output_quantization;
-        let mut normalized = [0.0f32; crate::custom_optimizer_config::CUSTOM_OPTIMIZER_MAX_CHANNELS];
+        let mut normalized =
+            [0.0f32; crate::custom_optimizer_config::CUSTOM_OPTIMIZER_MAX_CHANNELS];
         for (pixel_index, lab) in self.lab_scratch[..pixels].iter().copied().enumerate() {
             self.lookup(pixel_index, lab, &mut normalized[..self.channel_count])?;
             let start = pixel_index * self.channel_count;
             for channel_index in 0..self.channel_count {
-                let value = quantize_normalized_coverage(
-                    normalized[channel_index],
-                    8,
-                    quantization,
-                )
-                .map_err(|error| ProductionCustomOptimizerRasterError::Quantization {
-                    pixel_index,
-                    channel_index,
-                    error,
-                })?;
+                let value =
+                    quantize_normalized_coverage(normalized[channel_index], 8, quantization)
+                        .map_err(|error| ProductionCustomOptimizerRasterError::Quantization {
+                            pixel_index,
+                            channel_index,
+                            error,
+                        })?;
                 destination[start + channel_index] = value as u8;
             }
         }
@@ -246,21 +246,19 @@ impl CustomOptimizerRasterKernel {
             return Ok(());
         }
         let quantization = self.runtime.identity().build_policy.output_quantization;
-        let mut normalized = [0.0f32; crate::custom_optimizer_config::CUSTOM_OPTIMIZER_MAX_CHANNELS];
+        let mut normalized =
+            [0.0f32; crate::custom_optimizer_config::CUSTOM_OPTIMIZER_MAX_CHANNELS];
         for (pixel_index, lab) in self.lab_scratch[..pixels].iter().copied().enumerate() {
             self.lookup(pixel_index, lab, &mut normalized[..self.channel_count])?;
             let start = pixel_index * self.channel_count;
             for channel_index in 0..self.channel_count {
-                destination[start + channel_index] = quantize_normalized_coverage(
-                    normalized[channel_index],
-                    16,
-                    quantization,
-                )
-                .map_err(|error| ProductionCustomOptimizerRasterError::Quantization {
-                    pixel_index,
-                    channel_index,
-                    error,
-                })?;
+                destination[start + channel_index] =
+                    quantize_normalized_coverage(normalized[channel_index], 16, quantization)
+                        .map_err(|error| ProductionCustomOptimizerRasterError::Quantization {
+                            pixel_index,
+                            channel_index,
+                            error,
+                        })?;
             }
         }
         Ok(())
@@ -326,16 +324,10 @@ impl CustomOptimizerRasterKernel {
                 },
                 normalized,
             )
-            .map_err(|error| ProductionCustomOptimizerRasterError::Lookup {
-                pixel_index,
-                error,
-            })
+            .map_err(|error| ProductionCustomOptimizerRasterError::Lookup { pixel_index, error })
     }
 
-    fn require_bit_depth(
-        &self,
-        requested: u8,
-    ) -> Result<(), ProductionCustomOptimizerRasterError> {
+    fn require_bit_depth(&self, requested: u8) -> Result<(), ProductionCustomOptimizerRasterError> {
         if self.target_bit_depth == requested {
             Ok(())
         } else {
@@ -381,10 +373,12 @@ fn verify_source_icc(
     if actual.eq_ignore_ascii_case(expected) {
         Ok(())
     } else {
-        Err(ProductionCustomOptimizerRasterError::SourceProfileMismatch {
-            expected: expected.to_owned(),
-            actual,
-        })
+        Err(
+            ProductionCustomOptimizerRasterError::SourceProfileMismatch {
+                expected: expected.to_owned(),
+                actual,
+            },
+        )
     }
 }
 
@@ -433,9 +427,7 @@ mod tests {
         InverseLutCalibrationSolverFamily, InverseLutThresholdCalibrationObservation,
         InverseLutThresholdSetMethod,
     };
-    use crate::inverse_lut_validation::{
-        InverseLutValidationSample, summarize_validation_samples,
-    };
+    use crate::inverse_lut_validation::{InverseLutValidationSample, summarize_validation_samples};
     use crate::inverse_lut_validation_reference::InverseLutValidationReferenceMethod;
     use crate::model::IccProfileIdentity;
     use crate::production_colorimetry::{
@@ -445,7 +437,7 @@ mod tests {
     const CHANNEL_COUNT: usize = 4;
 
     fn characterization_id() -> String {
-        format!("sha256:{}", "1".repeat(64))
+        crate::color_conversion_test_support::characterization_id()
     }
 
     fn channels() -> Vec<String> {
@@ -572,13 +564,7 @@ mod tests {
         let source_icc = srgb_bytes();
         let recipe = recipe(bit_depth, &source_icc);
         let lut = lut(&recipe, narrow_ab);
-        CustomOptimizerRasterKernel::new(
-            IccSourceModel::Rgb,
-            &source_icc,
-            &lut,
-            &recipe,
-        )
-        .unwrap()
+        CustomOptimizerRasterKernel::new(IccSourceModel::Rgb, &source_icc, &lut, &recipe).unwrap()
     }
 
     fn paths() -> Vec<InverseLutPathDiagnostic> {
@@ -611,38 +597,6 @@ mod tests {
             curvature_violation_count: Some(0),
         })
         .collect()
-    }
-
-    struct FixtureModel {
-        identity: CharacterizationIdentity,
-    }
-
-    impl FixtureModel {
-        fn new() -> Self {
-            Self {
-                identity: CharacterizationIdentity {
-                    id: characterization_id(),
-                    channel_names: channels(),
-                },
-            }
-        }
-    }
-
-    impl DeviceForwardModel for FixtureModel {
-        fn identity(&self) -> &CharacterizationIdentity {
-            &self.identity
-        }
-
-        fn predict_lab(&self, coverages: &[f32]) -> Result<LabColor, String> {
-            if coverages.len() != CHANNEL_COUNT {
-                return Err("fixture topology mismatch".to_owned());
-            }
-            Ok(LabColor {
-                l: 50.0,
-                a: 0.0,
-                b: 0.0,
-            })
-        }
     }
 
     #[test]
@@ -719,7 +673,7 @@ mod tests {
         let mut recipe = recipe(16, &source_icc);
         recipe.source_profile_identity.sha256 = "a".repeat(64);
         let lut = lut(&recipe, false);
-        let model = FixtureModel::new();
+        let model = crate::color_conversion_test_support::default_local_model();
         let thresholds = {
             let mut value = InverseLutValidationThresholdSet::provisional_v1();
             value.method = InverseLutThresholdSetMethod::MeasuredCeramicD50TwoDegreeV1;
@@ -812,7 +766,7 @@ mod tests {
         let source_icc = srgb_bytes();
         let recipe = recipe(16, &source_icc);
         let lut = lut(&recipe, false);
-        let model = FixtureModel::new();
+        let model = crate::color_conversion_test_support::default_local_model();
         let mut thresholds = InverseLutValidationThresholdSet::provisional_v1();
         thresholds.method = InverseLutThresholdSetMethod::MeasuredCeramicD50TwoDegreeV1;
         let sample = InverseLutValidationSample {
