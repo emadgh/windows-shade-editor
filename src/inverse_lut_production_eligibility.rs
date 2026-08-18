@@ -6,6 +6,7 @@ use crate::conversion_recipe::recipe_sha256;
 use crate::device_characterization::DeviceForwardModel;
 use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
 use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};
+use crate::inverse_lut_validation::InverseLutValidationPolicy;
 use crate::inverse_lut_validation_artifact::VerifiedInverseLutValidationArtifact;
 
 pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 1;
@@ -88,6 +89,11 @@ pub enum InverseLutProductionEligibilityError {
         lut: Vec<String>,
         model: Vec<String>,
     },
+    /// Structural validation is complete, but #190 has not yet frozen thresholds
+    /// against measured ceramic characterization/print fixtures. This barrier is
+    /// intentional: a numerically passing report with provisional constants must
+    /// never authorize #191.
+    ThresholdsNotProductionFrozen { policy_schema_version: u32 },
 }
 
 /// Revalidate every production-critical binding and mint eligibility evidence.
@@ -174,6 +180,8 @@ pub fn validate_inverse_lut_production_eligibility(
         });
     }
 
+    ensure_production_thresholds_frozen(&validation.report.policy)?;
+
     let evidence = InverseLutProductionEligibility {
         schema_version: INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION,
         lut_identity_content_id: runtime.identity_content_id().to_owned(),
@@ -184,6 +192,19 @@ pub fn validate_inverse_lut_production_eligibility(
     };
     debug_assert!(evidence.validate().is_ok());
     Ok(evidence)
+}
+
+/// No policy schema is production-approved yet. This function is the single
+/// deliberate switch that a later measured-fixture calibration PR must change,
+/// together with tests and a versioned threshold-set contract. Keeping the
+/// current implementation unconditional avoids treating provisional constants
+/// as production truth merely because their numerical checks happen to pass.
+fn ensure_production_thresholds_frozen(
+    policy: &InverseLutValidationPolicy,
+) -> Result<(), InverseLutProductionEligibilityError> {
+    Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen {
+        policy_schema_version: policy.schema_version,
+    })
 }
 
 fn is_prefixed_sha256(value: &str) -> bool {
@@ -228,5 +249,13 @@ mod tests {
             characterization_id: format!("sha256:{}", "5".repeat(64)),
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn provisional_policy_is_never_implicitly_promoted_to_production() {
+        assert!(matches!(
+            ensure_production_thresholds_frozen(&InverseLutValidationPolicy::default()),
+            Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen { .. })
+        ));
     }
 }
