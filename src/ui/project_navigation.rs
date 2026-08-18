@@ -46,9 +46,6 @@ impl ShadeApp {
                             }
                         }
                     });
-                    if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces...")).clicked() {
-                        actions.push(NavigationUiAction::AddFacesDialog);
-                    }
                     ui.separator();
                     if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() {
                         actions.push(NavigationUiAction::Save);
@@ -67,7 +64,6 @@ impl ShadeApp {
                 if ui.add_enabled(enabled, egui::Button::new("New")).clicked() { actions.push(NavigationUiAction::NewProject); }
                 if ui.add_enabled(enabled, egui::Button::new("Open .shade")).clicked() { actions.push(NavigationUiAction::OpenProjectDialog); }
                 if ui.button("Project View").clicked() { actions.push(NavigationUiAction::ShowProjectView); }
-                if ui.add_enabled(enabled, egui::Button::new("Add TIFF faces")).clicked() { actions.push(NavigationUiAction::AddFacesDialog); }
                 ui.separator();
                 if self.project_path.is_none() && ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Quick Save")).on_hover_text("Create the first .shade project beside the source TIFF files without opening a Save dialog").clicked() { actions.push(NavigationUiAction::QuickSave); }
                 if ui.add_enabled(enabled && !self.faces.is_empty(), egui::Button::new("Save")).clicked() { actions.push(NavigationUiAction::Save); }
