@@ -1,0 +1,32 @@
+name: Temporary inverse LUT validation contract diagnostics
+on:
+  pull_request:
+    branches:
+      - tmp/lut-validation-contract-diagnose
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: b8d34d725810dbd94169a861b459f79eb606e368
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Compile contract
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+      - name: Test deterministic summary
+        run: cargo test --locked --target x86_64-pc-windows-msvc deterministic_summary_uses_nearest_rank_p95 -- --exact
+      - name: Test bound identity inputs
+        run: cargo test --locked --target x86_64-pc-windows-msvc each_bound_input_changes_report_content_identity -- --exact
+      - name: Test unsupported and constraints
+        run: cargo test --locked --target x86_64-pc-windows-msvc unsupported_fraction_and_constraint_failures_are_explicit -- --exact
+      - name: Test unsupported metric smuggling
+        run: cargo test --locked --target x86_64-pc-windows-msvc unsupported_samples_cannot_smuggle_numeric_metrics -- --exact
+      - name: Test tampered report
+        run: cargo test --locked --target x86_64-pc-windows-msvc report_rejects_tampered_pass_flag_and_schema -- --exact
+      - name: Test invalid policy
+        run: cargo test --locked --target x86_64-pc-windows-msvc policy_rejects_nonfinite_negative_and_nonmonotonic_thresholds -- --exact
