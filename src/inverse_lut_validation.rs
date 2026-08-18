@@ -1,8 +1,13 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const INVERSE_LUT_VALIDATION_POLICY_SCHEMA_VERSION: u32 = 1;
-pub const INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION: u32 = 1;
+use crate::inverse_lut_path_validation::{
+    InverseLutPathDiagnostic, InverseLutPathValidationPolicy, InverseLutValidationPathKind,
+    path_diagnostics_pass,
+};
+
+pub const INVERSE_LUT_VALIDATION_POLICY_SCHEMA_VERSION: u32 = 2;
+pub const INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -17,6 +22,7 @@ pub enum InverseLutHoldoutMethod {
 pub struct InverseLutValidationPolicy {
     pub schema_version: u32,
     pub holdout_method: InverseLutHoldoutMethod,
+    pub path_policy: InverseLutPathValidationPolicy,
     pub max_mean_delta_e00: f64,
     pub max_p95_delta_e00: f64,
     pub max_delta_e00: f64,
@@ -38,6 +44,7 @@ impl Default for InverseLutValidationPolicy {
         Self {
             schema_version: INVERSE_LUT_VALIDATION_POLICY_SCHEMA_VERSION,
             holdout_method: InverseLutHoldoutMethod::CellCentersAndFixedPathsV1,
+            path_policy: InverseLutPathValidationPolicy::default(),
             // Deliberately conservative placeholders. Production acceptance must
             // explicitly review/version these values against measured fixtures;
             // callers cannot rely on hidden constants in the runner.
@@ -67,6 +74,9 @@ impl InverseLutValidationPolicy {
                 "Unsupported inverse-LUT validation policy schema {} (expected {}).",
                 self.schema_version, INVERSE_LUT_VALIDATION_POLICY_SCHEMA_VERSION
             ));
+        }
+        if let Err(path_errors) = self.path_policy.validate() {
+            errors.extend(path_errors);
         }
         for (name, value) in [
             ("max_mean_delta_e00", self.max_mean_delta_e00),
@@ -230,6 +240,10 @@ pub struct InverseLutValidationReport {
     pub recipe_sha256: String,
     pub characterization_id: String,
     pub policy: InverseLutValidationPolicy,
+    /// Exactly the ordered diagnostic paths required by `holdout_method`.
+    /// Missing/reordered paths are rejected so a failing path cannot be omitted
+    /// from a persisted report without invalidating its content identity.
+    pub path_diagnostics: Vec<InverseLutPathDiagnostic>,
     pub summary: InverseLutValidationSummary,
     pub passed: bool,
 }
@@ -258,6 +272,11 @@ impl InverseLutValidationReport {
         if let Err(policy_errors) = self.policy.validate() {
             errors.extend(policy_errors);
         }
+        validate_path_set(
+            self.policy.holdout_method,
+            &self.path_diagnostics,
+            &mut errors,
+        );
         if self.summary.total_samples
             != self.summary.supported_samples + self.summary.unsupported_samples
         {
@@ -268,7 +287,8 @@ impl InverseLutValidationReport {
         {
             errors.push("Validation report unsupported fraction is invalid.".to_owned());
         }
-        let expected_pass = summary_passes(&self.summary, &self.policy);
+        let expected_pass = summary_passes(&self.summary, &self.policy)
+            && path_diagnostics_pass(&self.path_diagnostics, &self.policy.path_policy);
         if self.passed != expected_pass {
             errors.push("Validation report pass flag does not match its metrics/policy.".to_owned());
         }
@@ -292,11 +312,17 @@ pub fn summarize_validation_samples(
     recipe_sha256: String,
     characterization_id: String,
     policy: InverseLutValidationPolicy,
+    path_diagnostics: Vec<InverseLutPathDiagnostic>,
     samples: &[InverseLutValidationSample],
 ) -> Result<InverseLutValidationReport, String> {
     policy.validate().map_err(|errors| errors.join("\n"))?;
     if samples.is_empty() {
         return Err("Inverse-LUT validation requires at least one sample.".to_owned());
+    }
+    let mut path_errors = Vec::new();
+    validate_path_set(policy.holdout_method, &path_diagnostics, &mut path_errors);
+    if !path_errors.is_empty() {
+        return Err(path_errors.join("\n"));
     }
     for (index, sample) in samples.iter().enumerate() {
         sample.validate(index)?;
@@ -355,7 +381,8 @@ pub fn summarize_validation_samples(
         max_u16_quantization_l1,
         constraint_violation_count,
     };
-    let passed = summary_passes(&summary, &policy);
+    let passed = summary_passes(&summary, &policy)
+        && path_diagnostics_pass(&path_diagnostics, &policy.path_policy);
     let report = InverseLutValidationReport {
         schema_version: INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION,
         lut_identity_content_id,
@@ -363,11 +390,51 @@ pub fn summarize_validation_samples(
         recipe_sha256,
         characterization_id,
         policy,
+        path_diagnostics,
         summary,
         passed,
     };
     report.validate().map_err(|errors| errors.join("\n"))?;
     Ok(report)
+}
+
+fn validate_path_set(
+    holdout_method: InverseLutHoldoutMethod,
+    diagnostics: &[InverseLutPathDiagnostic],
+    errors: &mut Vec<String>,
+) {
+    let expected = match holdout_method {
+        InverseLutHoldoutMethod::CellCentersAndFixedPathsV1 => [
+            InverseLutValidationPathKind::NeutralAxis,
+            InverseLutValidationPathKind::NearNeutralWarm,
+            InverseLutValidationPathKind::NearNeutralCool,
+            InverseLutValidationPathKind::AAxis,
+            InverseLutValidationPathKind::BAxis,
+            InverseLutValidationPathKind::AbDiagonal,
+            InverseLutValidationPathKind::AbOpposedDiagonal,
+        ],
+    };
+    if diagnostics.len() != expected.len() {
+        errors.push(format!(
+            "Inverse-LUT validation requires exactly {} ordered path diagnostics, got {}.",
+            expected.len(),
+            diagnostics.len()
+        ));
+        return;
+    }
+    for (index, (diagnostic, expected_kind)) in
+        diagnostics.iter().zip(expected).enumerate()
+    {
+        if diagnostic.kind != expected_kind {
+            errors.push(format!(
+                "Inverse-LUT validation path {index} kind/order mismatch: expected {expected_kind:?}, got {:?}.",
+                diagnostic.kind
+            ));
+        }
+        if let Err(error) = diagnostic.validate() {
+            errors.push(format!("Inverse-LUT validation path {index} is invalid: {error}"));
+        }
+    }
 }
 
 fn distribution(values: &mut [f64]) -> ValidationDistribution {
