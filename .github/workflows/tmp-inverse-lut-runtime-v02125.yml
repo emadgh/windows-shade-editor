@@ -1,3 +1,4 @@
+# second push intentionally triggers this branch-only workflow after creation
 name: Temporary guarded inverse LUT runtime v0.21.25 bump
 on:
   push:
