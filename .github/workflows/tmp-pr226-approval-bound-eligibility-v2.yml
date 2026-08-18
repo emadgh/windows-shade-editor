@@ -1,0 +1,71 @@
+name: Temporary marker-based PR226 approval-bound eligibility
+on:
+  pull_request:
+    branches:
+      - tmp/pr226-approval-bound-eligibility-v2
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-approval-bound-eligibility
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Guard exact feature head
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = '3c652ae3a9fd8b17082d1518e9deec2ab00a9bf7'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $expected) { throw "Expected $expected, got $actual" }
+
+      - name: Apply marker-based eligibility patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git show origin/tmp/pr226-approval-bound-eligibility-v2:.tmp/pr226_patch.py | Set-Content .tmp-pr226-patch.py -Encoding utf8
+          python .tmp-pr226-patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-pr226-patch.py
+          rustfmt --edition 2024 src/inverse_lut_production_eligibility.rs src/inverse_lut_production_eligibility_tests.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check locked Windows target
+        shell: pwsh
+        run: |
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run full locked tests
+        shell: pwsh
+        run: |
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Guard exact source surface and publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only | Sort-Object)
+          $expected = @(
+            'src/inverse_lut_production_eligibility.rs',
+            'src/inverse_lut_production_eligibility_tests.rs'
+          ) | Sort-Object
+          if (($changed -join "`n") -ne ($expected -join "`n")) {
+            throw "Unexpected changed files: $($changed -join ', ')"
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/inverse_lut_production_eligibility.rs src/inverse_lut_production_eligibility_tests.rs
+          git commit -m 'feat(color-conversion): bind eligibility to calibration approval'
+          git push origin HEAD:codex/custom-optimizer-approval-bound-eligibility
