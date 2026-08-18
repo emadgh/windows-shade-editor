@@ -1,7 +1,7 @@
 name: Build Shade Editor for Windows
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   pull_request:
@@ -15,34 +15,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
-          fetch-depth: 0
-      - name: Apply isolated #171/#172 patch
-        if: github.event_name == 'pull_request' && github.head_ref == 'feat/ui-workspace-snapshot-safety'
-        shell: pwsh
-        run: |
-          $message = git log -1 --pretty=%B
-          if ($message -match '\[milestone-patch\]') {
-            Write-Host 'Milestone patch already applied.'
-            exit 0
-          }
-          python .github/scripts/_temporary_finish_ui_milestone.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/main.rs src/model.rs src/export_recipe.rs src/export_queue.rs src/workflow.rs
-          git diff --cached --check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff --cached --quiet
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host 'No source changes to commit.'
-            exit 0
-          }
-          git commit -m "fix: complete snapshot test export safety (#171 #172) [milestone-patch]"
-          git push origin HEAD:feat/ui-workspace-snapshot-safety
-          Write-Host 'Source patch pushed; ending this superseded validation run.'
-          exit 1
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
