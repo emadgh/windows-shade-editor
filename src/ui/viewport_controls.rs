@@ -1,6 +1,19 @@
 use crate::*;
 use eframe::egui;
 
+const ZOOM_STRIP_BOTTOM_CLEARANCE: f32 = 30.0;
+
+fn zoom_strip_position(
+    viewport: egui::Rect,
+    panel_width: f32,
+    panel_height: f32,
+) -> egui::Pos2 {
+    egui::pos2(
+        viewport.center().x - panel_width * 0.5,
+        viewport.bottom() - panel_height - ZOOM_STRIP_BOTTOM_CLEARANCE,
+    )
+}
+
 fn current_viewport_rect(ctx: &egui::Context) -> egui::Rect {
     let mut rect = ctx.content_rect();
     if let Some(state) = egui::containers::panel::PanelState::load(ctx, egui::Id::new("toolbar")) {
@@ -32,10 +45,7 @@ pub(crate) fn show(app: &mut ShadeApp, ctx: &egui::Context) {
 
     let panel_width = viewport.width().min(360.0);
     let panel_height = 32.0;
-    let pos = egui::pos2(
-        viewport.center().x - panel_width * 0.5,
-        viewport.bottom() - panel_height - 8.0,
-    );
+    let pos = zoom_strip_position(viewport, panel_width, panel_height);
 
     egui::Area::new(egui::Id::new("viewport-bottom-zoom-controls"))
         .order(egui::Order::Foreground)
@@ -91,5 +101,21 @@ mod tests {
             let panel_width = viewport_width.min(360.0);
             assert!(panel_width <= viewport_width);
         }
+    }
+
+    #[test]
+    fn zoom_strip_reserves_bottom_scrollbar_clearance() {
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(100.0, 50.0),
+            egui::pos2(900.0, 700.0),
+        );
+        let panel_height = 32.0;
+        let pos = zoom_strip_position(viewport, 360.0, panel_height);
+        let strip_bottom = pos.y + panel_height;
+        assert!(
+            (viewport.bottom() - strip_bottom - ZOOM_STRIP_BOTTOM_CLEARANCE).abs()
+                < f32::EPSILON
+        );
+        assert!(strip_bottom <= viewport.bottom() - 24.0);
     }
 }

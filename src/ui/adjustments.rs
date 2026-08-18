@@ -145,7 +145,7 @@ impl ShadeApp {
         let composite_accent = ui.visuals().text_color();
         if clickable_channel_row(
             ui,
-            false,
+            self.adjustment_scope == AdjustmentScope::All,
             false,
             self.solo_channel.is_none(),
             "Composite",

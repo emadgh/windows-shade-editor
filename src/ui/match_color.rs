@@ -297,6 +297,11 @@ fn histogram_bin_density(histogram: &[u32; 256], index: usize) -> f32 {
     }
 }
 
+fn histogram_display_height(histogram: &[u32; 256], index: usize, graph_height: f32) -> f32 {
+    let peak = histogram_peak_density(histogram).max(f32::EPSILON);
+    histogram_bin_density(histogram, index) / peak * graph_height
+}
+
 pub(crate) fn target_overlay_color(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         egui::Color32::from_rgb(255, 177, 66)
@@ -317,6 +322,13 @@ pub(crate) fn draw_histogram_with_target(
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    for step in 1..4 {
+        let x = egui::lerp(rect.x_range(), step as f32 / 4.0);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(0.5, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
+    }
     painter.rect_stroke(
         rect,
         2.0,
@@ -324,13 +336,6 @@ pub(crate) fn draw_histogram_with_target(
         egui::StrokeKind::Inside,
     );
 
-    let max_density = original
-        .into_iter()
-        .chain(adjusted)
-        .chain(target)
-        .map(histogram_peak_density)
-        .fold(0.0_f32, f32::max)
-        .max(f32::EPSILON);
     let original_color = ui.visuals().weak_text_color();
     let adjusted_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
 
@@ -340,14 +345,14 @@ pub(crate) fn draw_histogram_with_target(
             super::curve_editor::tonal_display_value(index as f32 / 255.0, display_mode),
         );
         if let Some(bins) = original {
-            let h = histogram_bin_density(bins, index) / max_density * rect.height();
+            let h = histogram_display_height(bins, index, rect.height());
             painter.line_segment(
                 [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
                 egui::Stroke::new(1.0, original_color),
             );
         }
         if let Some(bins) = adjusted {
-            let h = histogram_bin_density(bins, index) / max_density * rect.height();
+            let h = histogram_display_height(bins, index, rect.height());
             painter.line_segment(
                 [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
                 egui::Stroke::new(1.0, adjusted_color),
@@ -362,7 +367,7 @@ pub(crate) fn draw_histogram_with_target(
                     rect.x_range(),
                     super::curve_editor::tonal_display_value(index as f32 / 255.0, display_mode),
                 );
-                let h = histogram_bin_density(bins, index) / max_density * rect.height();
+                let h = histogram_display_height(bins, index, rect.height());
                 egui::pos2(x, rect.bottom() - h)
             })
             .collect::<Vec<_>>();
@@ -411,6 +416,15 @@ mod tests {
         let large = histogram(&[(32, 200), (128, 600), (220, 200)]);
         assert!((histogram_peak_density(&small) - histogram_peak_density(&large)).abs() < 1e-6);
         assert!((histogram_bin_density(&small, 128) - histogram_bin_density(&large, 128)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn histogram_display_normalizes_each_series_to_its_own_peak() {
+        let weak = histogram(&[(128, 4)]);
+        let strong = histogram(&[(128, 4000)]);
+        let height = 105.0;
+        assert!((histogram_display_height(&weak, 128, height) - height).abs() < 0.001);
+        assert!((histogram_display_height(&strong, 128, height) - height).abs() < 0.001);
     }
 
     #[test]
