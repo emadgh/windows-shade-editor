@@ -1,0 +1,81 @@
+name: Temporary guarded threshold-set binding patch v3
+on:
+  pull_request:
+    branches:
+      - tmp/pr205-threshold-binding-patch
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-threshold-set-binding
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply corrected guarded threshold-set provenance binding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '8ba259f388a060cdcf9351d23b5658489fa864d5'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Expected $expectedHead, got $actualHead" }
+
+          $raw = (git show origin/tmp/pr205-threshold-binding-patch:.github/workflows/tmp-pr205-threshold-binding-patch.yml | Out-String)
+          $lines = $raw -split "`r?`n"
+          $start = -1
+          $end = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($start -lt 0 -and $lines[$i].Trim() -eq "@'") { $start = $i + 1; continue }
+            if ($start -ge 0 -and $lines[$i].Trim().StartsWith("'@ | Set-Content")) { $end = $i; break }
+          }
+          if ($start -lt 0 -or $end -le $start) { throw 'Cannot extract guarded Python patch from v1 workflow.' }
+          $scriptLines = @()
+          for ($i = $start; $i -lt $end; $i++) {
+            $line = $lines[$i]
+            if ($line.StartsWith('          ')) { $line = $line.Substring(10) }
+            $scriptLines += $line
+          }
+          $script = $scriptLines -join "`n"
+          $script = $script.Replace('count=7)', 'count=5)')
+          $script = $script.Replace('InverseLutValidationPolicy::default()")', 'InverseLutValidationPolicy::default(),")')
+          $script = $script.Replace("changed_threshold_set.threshold_set_content_id = pcs_id('9');", "changed_threshold_set.threshold_set_content_id = pcs_id('a');")
+          $script += @'
+
+repl("src/inverse_lut_production_eligibility_tests.rs",
+     "    let mut pcs = pcs_compatibility();\n",
+     "    let mut pcs = pcs_compatibility();\n    let thresholds = threshold_set();\n",
+     count=2)
+'@
+          Set-Content -Path .tmp-threshold-binding-patch.py -Value $script -Encoding utf8 -NoNewline
+
+          python .tmp-threshold-binding-patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-threshold-binding-patch.py
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          $expected = @(
+            'src/inverse_lut_production_eligibility.rs',
+            'src/inverse_lut_production_eligibility_tests.rs',
+            'src/inverse_lut_validation.rs',
+            'src/inverse_lut_validation_artifact.rs',
+            'src/inverse_lut_validation_runner.rs',
+            'src/inverse_lut_validation_tests.rs'
+          )
+          if ((@($changed | Sort-Object) -join "`n") -ne (@($expected | Sort-Object) -join "`n")) { throw "Unexpected files: $($changed -join ', ')" }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add @($expected)
+          git commit -m 'feat(color-conversion): bind threshold-set identity end to end'
+          git push origin HEAD:codex/custom-optimizer-threshold-set-binding
