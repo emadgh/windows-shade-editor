@@ -40,7 +40,7 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.small(format!("{} Face(s)", app.faces.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let add_enabled = app.job.is_none() && !app.project_autosave_busy;
+                    let add_enabled = app.job.is_none();
                     if ui
                         .add_enabled(add_enabled, egui::Button::new("+ Add TIFF Faces"))
                         .on_hover_text("Add one or more TIFF files as Faces in this project")

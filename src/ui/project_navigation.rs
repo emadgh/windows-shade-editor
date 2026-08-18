@@ -17,7 +17,7 @@ impl ShadeApp {
         let mut recent_requested: Option<PathBuf> = None;
         ui.horizontal(|ui| {
             ui.horizontal_wrapped(|ui| {
-                let enabled = self.job.is_none() && !self.project_autosave_busy;
+                let enabled = self.job.is_none();
                 ui.menu_button("File", |ui| {
                     if ui.add_enabled(enabled, egui::Button::new("New project")).clicked() {
                         actions.push(NavigationUiAction::NewProject);
@@ -87,15 +87,9 @@ impl ShadeApp {
                 if ui.button("About").clicked() { actions.push(NavigationUiAction::ShowAbout); }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (save_state, save_error) = self.project_save_state_label();
+                let (save_state, _) = self.project_save_state_label();
                 if !save_state.is_empty() {
-                    let text = egui::RichText::new(save_state).small();
-                    if save_error {
-                        ui.label(text.color(egui::Color32::LIGHT_RED))
-                            .on_hover_text(self.project_autosave_error.as_deref().unwrap_or("Autosave failed"));
-                    } else {
-                        ui.label(text);
-                    }
+                    ui.label(egui::RichText::new(save_state).small());
                 }
                 self.ui_operation_progress(ui);
                 if ui.small_button("Logs").clicked() { actions.push(NavigationUiAction::ShowLogs); }
