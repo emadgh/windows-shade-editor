@@ -60,6 +60,8 @@ pub mod separation_optimizer;
 pub mod tiff_io;
 
 #[cfg(test)]
+pub(crate) mod color_conversion_test_support;
+#[cfg(test)]
 mod inverse_lut_artifact_tests;
 #[cfg(test)]
 mod inverse_lut_build_tests;
