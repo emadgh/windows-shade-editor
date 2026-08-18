@@ -308,13 +308,15 @@ mod tests {
 
     #[test]
     fn large_grid_cell_population_is_bounded() {
+        // 100^3 nodes is exactly the maximum valid LUT grid. Its 99^3
+        // cell-center population is still far larger than the V1 holdout cap.
         let holdouts = generate_inverse_lut_holdouts(
-            grid(101),
+            grid(100),
             InverseLutHoldoutMethod::CellCentersAndFixedPathsV1,
         )
         .unwrap();
         assert!(holdouts.point_samples.len() <= MAX_INVERSE_LUT_CELL_CENTER_HOLDOUTS_V1);
-        assert!(holdouts.paths.iter().all(|path| path.samples.len() <= 100));
+        assert!(holdouts.paths.iter().all(|path| path.samples.len() <= 99));
     }
 
     #[test]
