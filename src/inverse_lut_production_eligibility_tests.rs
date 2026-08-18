@@ -282,6 +282,22 @@ fn stale_report_for_another_recipe_cannot_authorize_lut() {
 }
 
 #[test]
+fn mismatched_reference_method_cannot_authorize_lut() {
+    let recipe = recipe();
+    let lut = lut(&recipe);
+    let mut validation = validation(&recipe, &lut);
+    validation.report.reference_method =
+        InverseLutValidationReferenceMethod::FrozenJacobiTrilinearThenV2SolveV1;
+    validation.report_content_id = validation.report.content_id().unwrap();
+    let model = FixtureModel::new();
+
+    assert!(matches!(
+        validate_inverse_lut_production_eligibility(&lut, &validation, &recipe, &model),
+        Err(InverseLutProductionEligibilityError::ReferenceMethodMismatch { .. })
+    ));
+}
+
+#[test]
 fn forged_lut_payload_is_rehashed_before_eligibility() {
     let recipe = recipe();
     let mut lut = lut(&recipe);
