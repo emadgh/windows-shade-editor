@@ -37,13 +37,12 @@ jobs:
           p = Path('src/inverse_lut_calibration_analysis.rs')
           text = p.read_text(encoding='utf-8')
 
-          old_counts = '''        if self.total_samples != self.supported_samples + self.unsupported_samples {
-              errors.push(
-                  "Inverse-LUT calibration analysis aggregate sample counts are inconsistent."
-                      .to_owned(),
-              );
-          }
-          '''
+          count_start_marker = '        if self.total_samples != self.supported_samples + self.unsupported_samples {'
+          count_end_marker = '        if !self.max_unsupported_fraction.is_finite()'
+          count_start = text.find(count_start_marker)
+          count_end = text.find(count_end_marker, count_start)
+          if count_start < 0 or count_end < 0:
+              raise SystemExit('Cannot locate point-envelope count validation range')
           new_counts = '''        match self.supported_samples.checked_add(self.unsupported_samples) {
               Some(total) if total == self.total_samples => {}
               _ => errors.push(
@@ -52,26 +51,27 @@ jobs:
               ),
           }
           '''
-          if text.count(old_counts) != 1:
-              raise SystemExit('Expected one point-envelope count block')
-          text = text.replace(old_counts, new_counts, 1)
+          text = text[:count_start] + new_counts + text[count_end:]
 
-          needle = '''            if !reference_matches_solver_family(
-                  observation.solver_family,
-                  observation.reference_method,
-              ) {
-          '''
-          replacement = '''            validate_summary(&observation.summary, index, &mut errors);
-              if !reference_matches_solver_family(
-                  observation.solver_family,
-                  observation.reference_method,
-              ) {
-          '''
-          if text.count(needle) != 1:
-              raise SystemExit('Expected one observation reference-method guard')
-          text = text.replace(needle, replacement, 1)
+          observation_loop = text.find(
+              '        for (index, observation) in self.observations.iter().enumerate() {'
+          )
+          required_families = text.find('        for required in [', observation_loop)
+          if observation_loop < 0 or required_families < 0:
+              raise SystemExit('Cannot locate analysis observation validation loop')
+          reference_guard = text.find(
+              '            if !reference_matches_solver_family(',
+              observation_loop,
+              required_families,
+          )
+          if reference_guard < 0:
+              raise SystemExit('Cannot locate observation reference-method guard')
+          insertion = '            validate_summary(&observation.summary, index, &mut errors);\n'
+          text = text[:reference_guard] + insertion + text[reference_guard:]
 
-          helper_anchor = 'fn reference_matches_solver_family(\n'
+          helper_anchor = text.find('fn reference_matches_solver_family(\n')
+          if helper_anchor < 0:
+              raise SystemExit('Cannot locate reference helper anchor')
           helper = '''fn validate_summary(
               summary: &InverseLutValidationSummary,
               index: usize,
@@ -147,13 +147,14 @@ jobs:
           }
 
           '''
-          if text.count(helper_anchor) != 1:
-              raise SystemExit('Expected one reference helper anchor')
-          text = text.replace(helper_anchor, helper + helper_anchor, 1)
+          text = text[:helper_anchor] + helper + text[helper_anchor:]
 
-          test_anchor = '''    #[test]
-              fn analysis_rejects_extra_report() {
-          '''
+          test_anchor = text.find('    fn analysis_rejects_extra_report() {')
+          if test_anchor < 0:
+              raise SystemExit('Cannot locate extra-report test anchor')
+          test_start = text.rfind('    #[test]\n', 0, test_anchor)
+          if test_start < 0:
+              raise SystemExit('Cannot locate test attribute before extra-report test')
           test = '''    #[test]
               fn analysis_rejects_tampered_negative_observation_summary() {
                   let (threshold_set, manifest, reports) = fixture();
@@ -171,9 +172,7 @@ jobs:
               }
 
           '''
-          if text.count(test_anchor) != 1:
-              raise SystemExit('Expected one extra-report test anchor')
-          text = text.replace(test_anchor, test + test_anchor, 1)
+          text = text[:test_start] + test + text[test_start:]
 
           p.write_text(text, encoding='utf-8', newline='\n')
           '@ | Set-Content -Path .tmp-pr218-hardening.py -Encoding utf8
