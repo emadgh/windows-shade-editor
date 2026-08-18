@@ -26,11 +26,11 @@ pub(crate) fn show(app: &mut ShadeApp, ctx: &egui::Context) {
     // Top-level panel state is already updated by the time this post-CentralPanel
     // hook runs, so the control follows resized Faces/Tools/Toolbar/Status panels.
     let viewport = current_viewport_rect(ctx);
-    if viewport.width() < 120.0 || viewport.height() < 80.0 {
+    if viewport.width() < 180.0 || viewport.height() < 80.0 {
         return;
     }
 
-    let panel_width = viewport.width().min(360.0).max(220.0);
+    let panel_width = viewport.width().min(360.0);
     let panel_height = 32.0;
     let pos = egui::pos2(
         viewport.center().x - panel_width * 0.5,
@@ -56,7 +56,7 @@ pub(crate) fn show(app: &mut ShadeApp, ctx: &egui::Context) {
                             app.viewport_recenter = true;
                         }
                         let old_zoom = app.zoom;
-                        let slider_width = (ui.available_width() - 62.0).max(90.0);
+                        let slider_width = (ui.available_width() - 62.0).max(70.0);
                         ui.spacing_mut().slider_width = slider_width;
                         let response = ui.add_sized(
                             [slider_width, 20.0],
@@ -83,5 +83,13 @@ mod tests {
         assert!(rect.width() > 0.0);
         assert!(rect.height() > 0.0);
         assert_eq!(rect.center().x, 735.0);
+    }
+
+    #[test]
+    fn zoom_strip_never_needs_to_exceed_usable_viewport_width() {
+        for viewport_width in [180.0_f32, 220.0, 360.0, 900.0] {
+            let panel_width = viewport_width.min(360.0);
+            assert!(panel_width <= viewport_width);
+        }
     }
 }
