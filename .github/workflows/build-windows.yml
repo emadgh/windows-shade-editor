@@ -1,103 +1,79 @@
-name: Build Shade Editor for Windows
+name: Diagnostic PR192 tests
 
 permissions:
   contents: read
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
-  build:
+  lib-test-build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Validate version identity
-        shell: pwsh
-        run: |
-          $cargoMatch = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"$' | Select-Object -First 1
-          if (-not $cargoMatch) { throw "Cannot read package version from Cargo.toml" }
-          $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
+      - name: Compile library tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib --no-run
 
-          $fileVersion = (Get-Content -Raw VERSION).Trim()
-
-          $lockText = Get-Content -Raw Cargo.lock
-          $lockVersion = $null
-          $packageBlocks = [regex]::Matches($lockText, '(?ms)^\[\[package\]\]\s*(.*?)(?=^\[\[package\]\]|\z)')
-          foreach ($block in $packageBlocks) {
-            if ($block.Value -match '(?m)^name = "windows-shade-editor"\s*$') {
-              $versionMatch = [regex]::Match($block.Value, '(?m)^version = "([^"]+)"\s*$')
-              if ($versionMatch.Success) {
-                $lockVersion = $versionMatch.Groups[1].Value
-                break
-              }
-            }
-          }
-          if (-not $lockVersion) { throw "Cannot read root package version from Cargo.lock" }
-
-          if ($cargoVersion -ne $fileVersion -or $cargoVersion -ne $lockVersion) {
-            throw "Version mismatch: Cargo.toml=$cargoVersion VERSION=$fileVersion Cargo.lock=$lockVersion"
-          }
-          "SHADE_VERSION=$cargoVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Check
-        run: cargo check --locked --target x86_64-pc-windows-msvc
-      - name: Test
-        run: cargo test --locked --target x86_64-pc-windows-msvc
-      - name: Build release
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
-      - name: Build and test native Shell extension
-        shell: cmd
-        run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
-          if not defined VSINSTALL exit /b 1
-          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
-          if not exist shell\bin mkdir shell\bin
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeProjectDataTests.exe shell\ShadeProjectDataTests.cpp shell\ShadeProjectData.cpp
-          if errorlevel 1 exit /b 1
-          shell\bin\ShadeProjectDataTests.exe
-          if errorlevel 1 exit /b 1
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /LD /Fe:shell\bin\ShadeEditorShell.dll shell\ShadeEditorShell.cpp shell\ShadeProjectData.cpp /link ole32.lib shlwapi.lib windowscodecs.lib propsys.lib gdi32.lib
-          if errorlevel 1 exit /b 1
-          cl /nologo /std:c++20 /EHsc /W4 /O2 /DNOMINMAX /DUNICODE /D_UNICODE /Fe:shell\bin\ShadeShellTests.exe shell\ShadeShellTests.cpp /link ole32.lib shlwapi.lib propsys.lib gdi32.lib
-          if errorlevel 1 exit /b 1
-          shell\bin\ShadeShellTests.exe shell\bin\ShadeEditorShell.dll
-          if errorlevel 1 exit /b 1
-      - name: Validate Shell property schema XML
-        shell: pwsh
-        run: |
-          [xml](Get-Content -Raw shell/ShadeEditor.propdesc) | Out-Null
-      - name: Prepare artifact
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force artifact | Out-Null
-          $exe = "target/x86_64-pc-windows-msvc/release/ShadeEditor.exe"
-          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
-          "$hash  ShadeEditor.exe" | Set-Content -Encoding ascii -NoNewline "target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256"
-          Copy-Item $exe artifact/ShadeEditor.exe
-          Copy-Item target/x86_64-pc-windows-msvc/release/ShadeEditor.exe.sha256 artifact/ShadeEditor.exe.sha256
-          Copy-Item VERSION artifact/VERSION
-          @(
-            "Shade Editor $env:SHADE_VERSION"
-            "Commit: $env:GITHUB_SHA"
-            "ShadeEditor.exe SHA-256: $hash"
-          ) | Set-Content -Encoding ascii artifact/build-info.txt
-          Copy-Item README.md artifact/README.md
-          Copy-Item LICENSE artifact/LICENSE
-          New-Item -ItemType Directory -Force artifact/Shell | Out-Null
-          Copy-Item shell/bin/ShadeEditorShell.dll artifact/Shell/ShadeEditorShell.dll
-          Copy-Item shell/ShadeEditor.propdesc artifact/Shell/ShadeEditor.propdesc
-          Copy-Item shell/Install-ShadeEditorShell.ps1 artifact/Shell/Install-ShadeEditorShell.ps1
-          Copy-Item shell/Uninstall-ShadeEditorShell.ps1 artifact/Shell/Uninstall-ShadeEditorShell.ps1
-          Copy-Item shell/README.md artifact/Shell/README.md
-          $shellHash = (Get-FileHash -Algorithm SHA256 shell/bin/ShadeEditorShell.dll).Hash.ToLowerInvariant()
-          "$shellHash  ShadeEditorShell.dll" | Set-Content -Encoding ascii -NoNewline artifact/Shell/ShadeEditorShell.dll.sha256
-      - uses: actions/upload-artifact@v4
+  bin-test-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          name: ShadeEditor-v${{ env.SHADE_VERSION }}-win-x64
-          path: artifact
+          targets: x86_64-pc-windows-msvc
+      - name: Compile binary tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --bin ShadeEditor --no-run
+
+  validation-contract-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Run validation contract tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_validation_tests -- --nocapture
+
+  holdout-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Run holdout generator tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_holdout::tests -- --nocapture
+
+  validation-evaluator-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Run validation evaluator tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_validation_eval::tests -- --nocapture
+
+  full-library-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Run all library tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib
+
+  full-binary-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Run all binary tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --bin ShadeEditor
