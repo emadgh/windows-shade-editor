@@ -24,10 +24,14 @@ jobs:
           $text = Get-Content -Raw $cargoPath
           $old = 'version = "0.21.23"'
           $new = 'version = "0.21.24"'
-          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
-          if ($count -ne 1) { throw "Expected exactly one root version marker, got $count" }
-          $text = $text.Replace($old, $new)
-          [System.IO.File]::WriteAllText((Resolve-Path $cargoPath), $text, [System.Text.UTF8Encoding]::new($false))
+          $oldCount = ([regex]::Matches($text, [regex]::Escape($old))).Count
+          $newCount = ([regex]::Matches($text, [regex]::Escape($new))).Count
+          if ($oldCount -eq 1 -and $newCount -eq 0) {
+            $text = $text.Replace($old, $new)
+            [System.IO.File]::WriteAllText((Resolve-Path $cargoPath), $text, [System.Text.UTF8Encoding]::new($false))
+          } elseif (-not ($oldCount -eq 0 -and $newCount -eq 1)) {
+            throw "Unexpected Cargo.toml root version markers: old=$oldCount new=$newCount"
+          }
           [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'VERSION'), "0.21.24`n", [System.Text.UTF8Encoding]::new($false))
           cargo update -p windows-shade-editor --precise 0.21.24
       - name: Guard exact version-only drift
