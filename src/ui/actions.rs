@@ -7,6 +7,7 @@ use eframe::egui;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum FaceUiAction {
     RenameProject(String),
+    AddFacesDialog,
     Select(usize),
     SetStatus {
         index: usize,
@@ -87,6 +88,7 @@ impl ShadeApp {
                     self.mark_project_dirty();
                 }
             }
+            FaceUiAction::AddFacesDialog => self.add_faces_dialog(),
             FaceUiAction::Select(index) => {
                 if index >= self.faces.len() {
                     return;
@@ -339,6 +341,7 @@ mod tests {
                 status: model::FaceStatus::Rejected,
             }
         );
+        assert_eq!(FaceUiAction::AddFacesDialog, FaceUiAction::AddFacesDialog);
     }
 
     #[test]
