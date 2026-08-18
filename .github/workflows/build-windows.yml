@@ -1,4 +1,4 @@
-name: Diagnostic PR192 tests
+name: Diagnostic PR192 holdout tests
 
 permissions:
   contents: read
@@ -8,72 +8,42 @@ on:
   workflow_dispatch:
 
 jobs:
-  lib-test-build:
+  holdout-determinism:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Compile library tests
-        run: cargo test --locked --target x86_64-pc-windows-msvc --lib --no-run
+      - name: Determinism and non-grid invariant
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_holdout::tests::v1_holdouts_are_deterministic_and_exclude_grid_nodes -- --nocapture
 
-  bin-test-build:
+  holdout-small-grid-union:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Compile binary tests
-        run: cargo test --locked --target x86_64-pc-windows-msvc --bin ShadeEditor --no-run
+      - name: Small grid uniqueness invariant
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_holdout::tests::full_small_grid_uses_every_non_path_cell_center_once -- --nocapture
 
-  validation-contract-tests:
+  holdout-large-grid-bound:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Run validation contract tests
-        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_validation_tests -- --nocapture
+      - name: Large grid work bound invariant
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_holdout::tests::large_grid_cell_population_is_bounded -- --nocapture
 
-  holdout-tests:
+  holdout-path-order:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Run holdout generator tests
-        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_holdout::tests -- --nocapture
-
-  validation-evaluator-tests:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - name: Run validation evaluator tests
-        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_validation_eval::tests -- --nocapture
-
-  full-library-tests:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - name: Run all library tests
-        run: cargo test --locked --target x86_64-pc-windows-msvc --lib
-
-  full-binary-tests:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - name: Run all binary tests
-        run: cargo test --locked --target x86_64-pc-windows-msvc --bin ShadeEditor
+      - name: Path identity and order invariant
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib inverse_lut_holdout::tests::path_identity_and_order_are_stable -- --nocapture
