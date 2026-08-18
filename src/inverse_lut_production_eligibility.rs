@@ -8,6 +8,10 @@ use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
 use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};
 use crate::inverse_lut_validation::InverseLutValidationPolicy;
 use crate::inverse_lut_validation_artifact::VerifiedInverseLutValidationArtifact;
+use crate::inverse_lut_validation_reference::{
+    InverseLutValidationReferenceError, InverseLutValidationReferenceMethod,
+    validation_reference_method,
+};
 
 pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 1;
 
@@ -80,6 +84,11 @@ pub enum InverseLutProductionEligibilityError {
     LutPayloadMismatch { report: String, lut: String },
     RecipeMismatch { report: String, actual: String },
     LutRecipeMismatch { lut: String, actual: String },
+    ReferenceContract(InverseLutValidationReferenceError),
+    ReferenceMethodMismatch {
+        report: InverseLutValidationReferenceMethod,
+        actual: InverseLutValidationReferenceMethod,
+    },
     CharacterizationMismatch {
         report: String,
         lut: String,
@@ -100,9 +109,9 @@ pub enum InverseLutProductionEligibilityError {
 ///
 /// This deliberately accepts verified artifact values instead of loose IDs. The
 /// LUT payload digest is rechecked by `InverseLutRuntime::from_verified`, while
-/// the validation report content ID is recomputed from all report metrics and
-/// ordered path evidence. A stale passing report from another LUT/recipe/device
-/// therefore cannot authorize raster conversion.
+/// the validation report content ID is recomputed from all report metrics,
+/// reference semantics and ordered path evidence. A stale passing report from
+/// another LUT/recipe/device therefore cannot authorize raster conversion.
 pub fn validate_inverse_lut_production_eligibility(
     lut: &VerifiedInverseLutArtifact,
     validation: &VerifiedInverseLutValidationArtifact,
@@ -160,6 +169,15 @@ pub fn validate_inverse_lut_production_eligibility(
         return Err(InverseLutProductionEligibilityError::LutRecipeMismatch {
             lut: runtime.identity().recipe_sha256.clone(),
             actual: actual_recipe_sha,
+        });
+    }
+
+    let actual_reference_method = validation_reference_method(&runtime, recipe)
+        .map_err(InverseLutProductionEligibilityError::ReferenceContract)?;
+    if validation.report.reference_method != actual_reference_method {
+        return Err(InverseLutProductionEligibilityError::ReferenceMethodMismatch {
+            report: validation.report.reference_method,
+            actual: actual_reference_method,
         });
     }
 
