@@ -489,13 +489,19 @@ fn mixer_percent_row(
                     egui::Label::new(label).truncate()
                 };
                 ui.add_sized([layout.label_width, 20.0], label_widget);
-                ui.add_sized(
-                    [layout.slider_width, 20.0],
-                    egui::Slider::new(&mut percent, min_percent..=max_percent)
-                        .step_by(1.0)
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
+                ui.scope(|ui| {
+                    // `Slider` uses `spacing.slider_width` for its actual track. Merely
+                    // wrapping it in add_sized leaves the default short track in place.
+                    // Bind the widget's own desired track width to the responsive row.
+                    ui.spacing_mut().slider_width = layout.slider_width;
+                    ui.add_sized(
+                        [layout.slider_width, 20.0],
+                        egui::Slider::new(&mut percent, min_percent..=max_percent)
+                            .step_by(1.0)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                });
                 ui.add_sized(
                     [layout.value_width, 20.0],
                     egui::DragValue::new(&mut percent)
