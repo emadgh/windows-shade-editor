@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::inverse_lut_validation::InverseLutValidationReport;
 use crate::safe_fs;
 
-pub const INVERSE_LUT_VALIDATION_ARTIFACT_FORMAT_VERSION: u32 = 1;
+pub const INVERSE_LUT_VALIDATION_ARTIFACT_FORMAT_VERSION: u32 = 2;
 pub const MAX_INVERSE_LUT_VALIDATION_ARTIFACT_BYTES: u64 = 1024 * 1024;
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -85,7 +85,9 @@ pub fn publish_inverse_lut_validation_artifact_if_absent(
         })?;
         let staged_verified = load_inverse_lut_validation_artifact(&staged)?;
         if staged_verified.report_content_id != expected_content_id {
-            return Err("Staged inverse-LUT validation artifact identity changed after write.".to_owned());
+            return Err(
+                "Staged inverse-LUT validation artifact identity changed after write.".to_owned(),
+            );
         }
 
         match safe_fs::commit_staged_file_if_absent(&staged, destination) {
@@ -255,6 +257,7 @@ mod tests {
             bare('b'),
             bare('c'),
             id('d'),
+            id('e'),
             InverseLutValidationPolicy::default(),
             InverseLutValidationReferenceMethod::IndependentPointSolveV1,
             paths(),

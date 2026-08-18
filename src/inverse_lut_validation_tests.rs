@@ -1,6 +1,4 @@
-use crate::inverse_lut_path_validation::{
-    InverseLutPathDiagnostic, InverseLutValidationPathKind,
-};
+use crate::inverse_lut_path_validation::{InverseLutPathDiagnostic, InverseLutValidationPathKind};
 use crate::inverse_lut_validation::{
     INVERSE_LUT_VALIDATION_REPORT_SCHEMA_VERSION, InverseLutValidationPolicy,
     InverseLutValidationSample, summarize_validation_samples,
@@ -99,6 +97,7 @@ fn report_with_inputs_and_paths(
         lut_payload_sha256,
         recipe_sha256,
         characterization_id,
+        id('e'),
         policy,
         independent_reference_method(),
         paths,
@@ -171,45 +170,21 @@ fn each_bound_input_changes_report_content_identity() {
     let base = report(policy, &samples);
     let base_id = base.content_id().unwrap();
 
-    let changed = report_with_inputs(
-        id('e'),
-        bare('b'),
-        bare('c'),
-        id('d'),
-        policy,
-        &samples,
-    );
+    let changed = report_with_inputs(id('e'), bare('b'), bare('c'), id('d'), policy, &samples);
     assert_ne!(changed.content_id().unwrap(), base_id);
 
-    let changed = report_with_inputs(
-        id('a'),
-        bare('e'),
-        bare('c'),
-        id('d'),
-        policy,
-        &samples,
-    );
+    let changed = report_with_inputs(id('a'), bare('e'), bare('c'), id('d'), policy, &samples);
     assert_ne!(changed.content_id().unwrap(), base_id);
 
-    let changed = report_with_inputs(
-        id('a'),
-        bare('b'),
-        bare('e'),
-        id('d'),
-        policy,
-        &samples,
-    );
+    let changed = report_with_inputs(id('a'), bare('b'), bare('e'), id('d'), policy, &samples);
     assert_ne!(changed.content_id().unwrap(), base_id);
 
-    let changed = report_with_inputs(
-        id('a'),
-        bare('b'),
-        bare('c'),
-        id('e'),
-        policy,
-        &samples,
-    );
+    let changed = report_with_inputs(id('a'), bare('b'), bare('c'), id('e'), policy, &samples);
     assert_ne!(changed.content_id().unwrap(), base_id);
+
+    let mut changed_threshold_set = base.clone();
+    changed_threshold_set.threshold_set_content_id = id('f');
+    assert_ne!(changed_threshold_set.content_id().unwrap(), base_id);
 
     let mut changed_policy = policy;
     changed_policy.max_delta_e00 += 0.5;
@@ -296,6 +271,7 @@ fn ordered_path_gate_fails_closed_and_cannot_be_omitted() {
         bare('b'),
         bare('c'),
         id('d'),
+        id('e'),
         policy,
         independent_reference_method(),
         passing_paths()[..6].to_vec(),
@@ -310,6 +286,7 @@ fn ordered_path_gate_fails_closed_and_cannot_be_omitted() {
         bare('b'),
         bare('c'),
         id('d'),
+        id('e'),
         policy,
         independent_reference_method(),
         reordered,
@@ -356,6 +333,7 @@ fn unsupported_samples_cannot_smuggle_numeric_metrics() {
         bare('b'),
         bare('c'),
         id('d'),
+        id('e'),
         InverseLutValidationPolicy::default(),
         independent_reference_method(),
         passing_paths(),
@@ -373,6 +351,13 @@ fn report_rejects_tampered_pass_flag_schema_and_path_order() {
     );
     tampered_pass.passed = !tampered_pass.passed;
     assert!(tampered_pass.validate().is_err());
+
+    let mut tampered_threshold_set = report(
+        InverseLutValidationPolicy::default(),
+        &[supported(0.5, 0.05)],
+    );
+    tampered_threshold_set.threshold_set_content_id = "not-a-sha".to_owned();
+    assert!(tampered_threshold_set.validate().is_err());
 
     let mut tampered_schema = report(
         InverseLutValidationPolicy::default(),

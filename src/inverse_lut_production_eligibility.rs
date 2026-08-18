@@ -6,7 +6,7 @@ use crate::conversion_recipe::recipe_sha256;
 use crate::device_characterization::DeviceForwardModel;
 use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
 use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};
-use crate::inverse_lut_validation::InverseLutValidationPolicy;
+use crate::inverse_lut_threshold_set::InverseLutValidationThresholdSet;
 use crate::inverse_lut_validation_artifact::VerifiedInverseLutValidationArtifact;
 use crate::inverse_lut_validation_reference::{
     InverseLutValidationReferenceError, InverseLutValidationReferenceMethod,
@@ -16,7 +16,7 @@ use crate::production_colorimetry::{
     ProductionPcsCompatibilityMethod, ValidatedProductionPcsCompatibility,
 };
 
-pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 2;
+pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 3;
 
 /// Immutable evidence that an exact inverse LUT has a passing validation report
 /// for the exact recipe, measured characterization and ICC PCS compatibility
@@ -29,6 +29,7 @@ pub struct InverseLutProductionEligibility {
     pub lut_identity_content_id: String,
     pub lut_payload_sha256: String,
     pub validation_report_content_id: String,
+    pub threshold_set_content_id: String,
     pub recipe_sha256: String,
     pub characterization_id: String,
     pub pcs_compatibility_content_id: String,
@@ -45,10 +46,17 @@ impl InverseLutProductionEligibility {
             ));
         }
         for (name, value) in [
-            ("lut_identity_content_id", self.lut_identity_content_id.as_str()),
+            (
+                "lut_identity_content_id",
+                self.lut_identity_content_id.as_str(),
+            ),
             (
                 "validation_report_content_id",
                 self.validation_report_content_id.as_str(),
+            ),
+            (
+                "threshold_set_content_id",
+                self.threshold_set_content_id.as_str(),
             ),
             ("characterization_id", self.characterization_id.as_str()),
             (
@@ -72,7 +80,11 @@ impl InverseLutProductionEligibility {
                 ));
             }
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn content_id(&self) -> Result<String, String> {
@@ -90,12 +102,31 @@ pub enum InverseLutProductionEligibilityError {
     InvalidValidationReport(Vec<String>),
     ValidationArtifactIdentity(String),
     ValidationFailed,
+    InvalidThresholdSet(Vec<String>),
+    ThresholdSetIdentity(String),
+    ThresholdSetMismatch {
+        report: String,
+        actual: String,
+    },
+    ThresholdPolicyMismatch,
     InvalidPcsCompatibility(Vec<String>),
     PcsCompatibilityIdentity(String),
-    LutIdentityMismatch { report: String, lut: String },
-    LutPayloadMismatch { report: String, lut: String },
-    RecipeMismatch { report: String, actual: String },
-    LutRecipeMismatch { lut: String, actual: String },
+    LutIdentityMismatch {
+        report: String,
+        lut: String,
+    },
+    LutPayloadMismatch {
+        report: String,
+        lut: String,
+    },
+    RecipeMismatch {
+        report: String,
+        actual: String,
+    },
+    LutRecipeMismatch {
+        lut: String,
+        actual: String,
+    },
     ReferenceContract(InverseLutValidationReferenceError),
     ReferenceMethodMismatch {
         report: InverseLutValidationReferenceMethod,
@@ -118,7 +149,9 @@ pub enum InverseLutProductionEligibilityError {
     /// against measured ceramic characterization/print fixtures. This barrier is
     /// intentional: a numerically passing report with provisional constants must
     /// never authorize #191.
-    ThresholdsNotProductionFrozen { policy_schema_version: u32 },
+    ThresholdsNotProductionFrozen {
+        threshold_set_content_id: String,
+    },
 }
 
 /// Revalidate every production-critical binding and mint eligibility evidence.
@@ -131,6 +164,7 @@ pub enum InverseLutProductionEligibilityError {
 pub fn validate_inverse_lut_production_eligibility(
     lut: &VerifiedInverseLutArtifact,
     validation: &VerifiedInverseLutValidationArtifact,
+    threshold_set: &InverseLutValidationThresholdSet,
     pcs_compatibility: &ValidatedProductionPcsCompatibility,
     recipe: &ConversionRecipe,
     model: &dyn DeviceForwardModel,
@@ -144,6 +178,12 @@ pub fn validate_inverse_lut_production_eligibility(
         .report
         .validate()
         .map_err(InverseLutProductionEligibilityError::InvalidValidationReport)?;
+    threshold_set
+        .validate()
+        .map_err(InverseLutProductionEligibilityError::InvalidThresholdSet)?;
+    let threshold_set_content_id = threshold_set
+        .content_id()
+        .map_err(InverseLutProductionEligibilityError::ThresholdSetIdentity)?;
     pcs_compatibility
         .validate()
         .map_err(InverseLutProductionEligibilityError::InvalidPcsCompatibility)?;
@@ -156,15 +196,24 @@ pub fn validate_inverse_lut_production_eligibility(
         .content_id()
         .map_err(InverseLutProductionEligibilityError::ValidationArtifactIdentity)?;
     if validation.report_content_id != actual_report_id {
-        return Err(InverseLutProductionEligibilityError::ValidationArtifactIdentity(
-            format!(
+        return Err(
+            InverseLutProductionEligibilityError::ValidationArtifactIdentity(format!(
                 "Validation artifact records {}, but report recomputes to {}.",
                 validation.report_content_id, actual_report_id
-            ),
-        ));
+            )),
+        );
     }
     if !validation.report.passed {
         return Err(InverseLutProductionEligibilityError::ValidationFailed);
+    }
+    if validation.report.threshold_set_content_id != threshold_set_content_id {
+        return Err(InverseLutProductionEligibilityError::ThresholdSetMismatch {
+            report: validation.report.threshold_set_content_id.clone(),
+            actual: threshold_set_content_id.clone(),
+        });
+    }
+    if validation.report.policy != threshold_set.policy {
+        return Err(InverseLutProductionEligibilityError::ThresholdPolicyMismatch);
     }
 
     let runtime_identity_id = runtime.identity_content_id().to_owned();
@@ -181,8 +230,8 @@ pub fn validate_inverse_lut_production_eligibility(
         });
     }
 
-    let actual_recipe_sha = recipe_sha256(recipe)
-        .map_err(InverseLutProductionEligibilityError::RecipeIdentity)?;
+    let actual_recipe_sha =
+        recipe_sha256(recipe).map_err(InverseLutProductionEligibilityError::RecipeIdentity)?;
     if validation.report.recipe_sha256 != actual_recipe_sha {
         return Err(InverseLutProductionEligibilityError::RecipeMismatch {
             report: validation.report.recipe_sha256.clone(),
@@ -199,42 +248,51 @@ pub fn validate_inverse_lut_production_eligibility(
     let actual_reference_method = validation_reference_method(&runtime, recipe)
         .map_err(InverseLutProductionEligibilityError::ReferenceContract)?;
     if validation.report.reference_method != actual_reference_method {
-        return Err(InverseLutProductionEligibilityError::ReferenceMethodMismatch {
-            report: validation.report.reference_method,
-            actual: actual_reference_method,
-        });
+        return Err(
+            InverseLutProductionEligibilityError::ReferenceMethodMismatch {
+                report: validation.report.reference_method,
+                actual: actual_reference_method,
+            },
+        );
     }
 
     let model_characterization = model.identity().id.clone();
     if validation.report.characterization_id != runtime.identity().characterization_id
         || validation.report.characterization_id != model_characterization
     {
-        return Err(InverseLutProductionEligibilityError::CharacterizationMismatch {
-            report: validation.report.characterization_id.clone(),
-            lut: runtime.identity().characterization_id.clone(),
-            model: model_characterization,
-        });
+        return Err(
+            InverseLutProductionEligibilityError::CharacterizationMismatch {
+                report: validation.report.characterization_id.clone(),
+                lut: runtime.identity().characterization_id.clone(),
+                model: model_characterization,
+            },
+        );
     }
     if pcs_compatibility.characterization_id != validation.report.characterization_id {
-        return Err(InverseLutProductionEligibilityError::PcsCharacterizationMismatch {
-            compatibility: pcs_compatibility.characterization_id.clone(),
-            expected: validation.report.characterization_id.clone(),
-        });
+        return Err(
+            InverseLutProductionEligibilityError::PcsCharacterizationMismatch {
+                compatibility: pcs_compatibility.characterization_id.clone(),
+                expected: validation.report.characterization_id.clone(),
+            },
+        );
     }
     if runtime.identity().channel_names != model.identity().channel_names {
-        return Err(InverseLutProductionEligibilityError::ChannelTopologyMismatch {
-            lut: runtime.identity().channel_names.clone(),
-            model: model.identity().channel_names.clone(),
-        });
+        return Err(
+            InverseLutProductionEligibilityError::ChannelTopologyMismatch {
+                lut: runtime.identity().channel_names.clone(),
+                model: model.identity().channel_names.clone(),
+            },
+        );
     }
 
-    ensure_production_thresholds_frozen(&validation.report.policy)?;
+    ensure_production_thresholds_frozen(threshold_set, &threshold_set_content_id)?;
 
     let evidence = InverseLutProductionEligibility {
         schema_version: INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION,
         lut_identity_content_id: runtime.identity_content_id().to_owned(),
         lut_payload_sha256: lut.payload_sha256.clone(),
         validation_report_content_id: actual_report_id,
+        threshold_set_content_id,
         recipe_sha256: actual_recipe_sha,
         characterization_id: validation.report.characterization_id.clone(),
         pcs_compatibility_content_id,
@@ -250,11 +308,16 @@ pub fn validate_inverse_lut_production_eligibility(
 /// current implementation unconditional avoids treating provisional constants
 /// as production truth merely because their numerical checks happen to pass.
 fn ensure_production_thresholds_frozen(
-    policy: &InverseLutValidationPolicy,
+    _threshold_set: &InverseLutValidationThresholdSet,
+    threshold_set_content_id: &str,
 ) -> Result<(), InverseLutProductionEligibilityError> {
-    Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen {
-        policy_schema_version: policy.schema_version,
-    })
+    // #205 has no production-approved measured calibration approval yet.
+    // Keep production closed even when a structurally valid threshold set exists.
+    Err(
+        InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen {
+            threshold_set_content_id: threshold_set_content_id.to_owned(),
+        },
+    )
 }
 
 fn is_prefixed_sha256(value: &str) -> bool {
@@ -283,17 +346,21 @@ mod tests {
             lut_identity_content_id: pcs_id('1'),
             lut_payload_sha256: "2".repeat(64),
             validation_report_content_id: pcs_id('3'),
+            threshold_set_content_id: pcs_id('9'),
             recipe_sha256: "4".repeat(64),
             characterization_id: pcs_id('5'),
             pcs_compatibility_content_id: pcs_id('6'),
-            pcs_compatibility_method:
-                ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
+            pcs_compatibility_method: ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
         };
         let base_id = base.content_id().unwrap();
 
         let mut changed = base.clone();
         changed.validation_report_content_id = pcs_id('7');
         assert_ne!(changed.content_id().unwrap(), base_id);
+
+        let mut changed_threshold_set = base.clone();
+        changed_threshold_set.threshold_set_content_id = pcs_id('a');
+        assert_ne!(changed_threshold_set.content_id().unwrap(), base_id);
 
         let mut changed = base;
         changed.pcs_compatibility_content_id = pcs_id('8');
@@ -307,19 +374,21 @@ mod tests {
             lut_identity_content_id: "not-a-sha".to_owned(),
             lut_payload_sha256: "2".repeat(64),
             validation_report_content_id: pcs_id('3'),
+            threshold_set_content_id: pcs_id('9'),
             recipe_sha256: "4".repeat(64),
             characterization_id: pcs_id('5'),
             pcs_compatibility_content_id: pcs_id('6'),
-            pcs_compatibility_method:
-                ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
+            pcs_compatibility_method: ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
         };
         assert!(bad.validate().is_err());
     }
 
     #[test]
-    fn provisional_policy_is_never_implicitly_promoted_to_production() {
+    fn provisional_threshold_set_is_never_implicitly_promoted_to_production() {
+        let threshold_set = InverseLutValidationThresholdSet::provisional_v1();
+        let threshold_set_content_id = threshold_set.content_id().unwrap();
         assert!(matches!(
-            ensure_production_thresholds_frozen(&InverseLutValidationPolicy::default()),
+            ensure_production_thresholds_frozen(&threshold_set, &threshold_set_content_id),
             Err(InverseLutProductionEligibilityError::ThresholdsNotProductionFrozen { .. })
         ));
     }
