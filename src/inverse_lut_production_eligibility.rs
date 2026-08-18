@@ -12,12 +12,16 @@ use crate::inverse_lut_validation_reference::{
     InverseLutValidationReferenceError, InverseLutValidationReferenceMethod,
     validation_reference_method,
 };
+use crate::production_colorimetry::{
+    ProductionPcsCompatibilityMethod, ValidatedProductionPcsCompatibility,
+};
 
-pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 1;
+pub const INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION: u32 = 2;
 
 /// Immutable evidence that an exact inverse LUT has a passing validation report
-/// for the exact recipe and measured characterization expected by production.
-/// #191 should require this evidence rather than accepting a LUT path/ID alone.
+/// for the exact recipe, measured characterization and ICC PCS compatibility
+/// expected by production. #191 should require this evidence rather than
+/// accepting a LUT path/ID alone.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InverseLutProductionEligibility {
@@ -27,6 +31,8 @@ pub struct InverseLutProductionEligibility {
     pub validation_report_content_id: String,
     pub recipe_sha256: String,
     pub characterization_id: String,
+    pub pcs_compatibility_content_id: String,
+    pub pcs_compatibility_method: ProductionPcsCompatibilityMethod,
 }
 
 impl InverseLutProductionEligibility {
@@ -45,6 +51,10 @@ impl InverseLutProductionEligibility {
                 self.validation_report_content_id.as_str(),
             ),
             ("characterization_id", self.characterization_id.as_str()),
+            (
+                "pcs_compatibility_content_id",
+                self.pcs_compatibility_content_id.as_str(),
+            ),
         ] {
             if !is_prefixed_sha256(value) {
                 errors.push(format!(
@@ -80,6 +90,8 @@ pub enum InverseLutProductionEligibilityError {
     InvalidValidationReport(Vec<String>),
     ValidationArtifactIdentity(String),
     ValidationFailed,
+    InvalidPcsCompatibility(Vec<String>),
+    PcsCompatibilityIdentity(String),
     LutIdentityMismatch { report: String, lut: String },
     LutPayloadMismatch { report: String, lut: String },
     RecipeMismatch { report: String, actual: String },
@@ -94,11 +106,15 @@ pub enum InverseLutProductionEligibilityError {
         lut: String,
         model: String,
     },
+    PcsCharacterizationMismatch {
+        compatibility: String,
+        expected: String,
+    },
     ChannelTopologyMismatch {
         lut: Vec<String>,
         model: Vec<String>,
     },
-    /// Structural validation is complete, but #190 has not yet frozen thresholds
+    /// Structural validation is complete, but #205 has not yet frozen thresholds
     /// against measured ceramic characterization/print fixtures. This barrier is
     /// intentional: a numerically passing report with provisional constants must
     /// never authorize #191.
@@ -107,14 +123,15 @@ pub enum InverseLutProductionEligibilityError {
 
 /// Revalidate every production-critical binding and mint eligibility evidence.
 ///
-/// This deliberately accepts verified artifact values instead of loose IDs. The
-/// LUT payload digest is rechecked by `InverseLutRuntime::from_verified`, while
-/// the validation report content ID is recomputed from all report metrics,
-/// reference semantics and ordered path evidence. A stale passing report from
-/// another LUT/recipe/device therefore cannot authorize raster conversion.
+/// This deliberately accepts verified artifact/evidence values instead of loose
+/// IDs. The LUT payload digest is rechecked by `InverseLutRuntime::from_verified`,
+/// the validation report content ID is recomputed from all report metrics, and
+/// the PCS compatibility evidence is revalidated/rehashed. A stale report or a
+/// D65/10-degree characterization therefore cannot authorize raster conversion.
 pub fn validate_inverse_lut_production_eligibility(
     lut: &VerifiedInverseLutArtifact,
     validation: &VerifiedInverseLutValidationArtifact,
+    pcs_compatibility: &ValidatedProductionPcsCompatibility,
     recipe: &ConversionRecipe,
     model: &dyn DeviceForwardModel,
 ) -> Result<InverseLutProductionEligibility, InverseLutProductionEligibilityError> {
@@ -127,6 +144,13 @@ pub fn validate_inverse_lut_production_eligibility(
         .report
         .validate()
         .map_err(InverseLutProductionEligibilityError::InvalidValidationReport)?;
+    pcs_compatibility
+        .validate()
+        .map_err(InverseLutProductionEligibilityError::InvalidPcsCompatibility)?;
+    let pcs_compatibility_content_id = pcs_compatibility
+        .content_id()
+        .map_err(InverseLutProductionEligibilityError::PcsCompatibilityIdentity)?;
+
     let actual_report_id = validation
         .report
         .content_id()
@@ -191,6 +215,12 @@ pub fn validate_inverse_lut_production_eligibility(
             model: model_characterization,
         });
     }
+    if pcs_compatibility.characterization_id != validation.report.characterization_id {
+        return Err(InverseLutProductionEligibilityError::PcsCharacterizationMismatch {
+            compatibility: pcs_compatibility.characterization_id.clone(),
+            expected: validation.report.characterization_id.clone(),
+        });
+    }
     if runtime.identity().channel_names != model.identity().channel_names {
         return Err(InverseLutProductionEligibilityError::ChannelTopologyMismatch {
             lut: runtime.identity().channel_names.clone(),
@@ -207,6 +237,8 @@ pub fn validate_inverse_lut_production_eligibility(
         validation_report_content_id: actual_report_id,
         recipe_sha256: actual_recipe_sha,
         characterization_id: validation.report.characterization_id.clone(),
+        pcs_compatibility_content_id,
+        pcs_compatibility_method: pcs_compatibility.method,
     };
     debug_assert!(evidence.validate().is_ok());
     Ok(evidence)
@@ -240,19 +272,31 @@ fn is_bare_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn pcs_id(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
     #[test]
-    fn eligibility_content_identity_binds_validation_report_identity() {
+    fn eligibility_content_identity_binds_validation_and_pcs_evidence() {
         let base = InverseLutProductionEligibility {
             schema_version: INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION,
-            lut_identity_content_id: format!("sha256:{}", "1".repeat(64)),
+            lut_identity_content_id: pcs_id('1'),
             lut_payload_sha256: "2".repeat(64),
-            validation_report_content_id: format!("sha256:{}", "3".repeat(64)),
+            validation_report_content_id: pcs_id('3'),
             recipe_sha256: "4".repeat(64),
-            characterization_id: format!("sha256:{}", "5".repeat(64)),
+            characterization_id: pcs_id('5'),
+            pcs_compatibility_content_id: pcs_id('6'),
+            pcs_compatibility_method:
+                ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
         };
         let base_id = base.content_id().unwrap();
+
         let mut changed = base.clone();
-        changed.validation_report_content_id = format!("sha256:{}", "6".repeat(64));
+        changed.validation_report_content_id = pcs_id('7');
+        assert_ne!(changed.content_id().unwrap(), base_id);
+
+        let mut changed = base;
+        changed.pcs_compatibility_content_id = pcs_id('8');
         assert_ne!(changed.content_id().unwrap(), base_id);
     }
 
@@ -262,9 +306,12 @@ mod tests {
             schema_version: INVERSE_LUT_PRODUCTION_ELIGIBILITY_SCHEMA_VERSION,
             lut_identity_content_id: "not-a-sha".to_owned(),
             lut_payload_sha256: "2".repeat(64),
-            validation_report_content_id: format!("sha256:{}", "3".repeat(64)),
+            validation_report_content_id: pcs_id('3'),
             recipe_sha256: "4".repeat(64),
-            characterization_id: format!("sha256:{}", "5".repeat(64)),
+            characterization_id: pcs_id('5'),
+            pcs_compatibility_content_id: pcs_id('6'),
+            pcs_compatibility_method:
+                ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
         };
         assert!(bad.validate().is_err());
     }
