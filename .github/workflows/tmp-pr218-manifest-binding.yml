@@ -1,0 +1,217 @@
+name: Temporary guarded PR218 manifest binding
+on:
+  pull_request:
+    branches:
+      - tmp/pr218-manifest-binding
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-calibration-analysis
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Guard exact feature head
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = '08301c65400510586580c74d05b33ac5898e5c74'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $expected) { throw "Expected $expected, got $actual" }
+
+      - name: Bind persisted analysis to exact manifest and evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+
+          p = Path('src/inverse_lut_calibration_analysis.rs')
+          text = p.read_text(encoding='utf-8')
+
+          old_import = '''use crate::inverse_lut_threshold_set::{
+              InverseLutCalibrationSolverFamily, InverseLutThresholdCalibrationManifest,
+              InverseLutValidationThresholdSet,
+          };
+          '''
+          new_import = '''use crate::inverse_lut_threshold_set::{
+              INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION,
+              InverseLutCalibrationSolverFamily, InverseLutThresholdCalibrationManifest,
+              InverseLutThresholdCalibrationObservation, InverseLutValidationThresholdSet,
+          };
+          '''
+          if text.count(old_import) != 1:
+              raise SystemExit('Cannot locate threshold-set import block')
+          text = text.replace(old_import, new_import, 1)
+
+          point_anchor = text.find('        self.point_envelope.validate(&mut errors);')
+          if point_anchor < 0:
+              raise SystemExit('Cannot locate point-envelope validation anchor')
+          manifest_validation = '''        let reconstructed_manifest = InverseLutThresholdCalibrationManifest {
+              schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION,
+              pcs_method: self.pcs_method,
+              threshold_set_content_id: self.threshold_set_content_id.clone(),
+              observations: self
+                  .observations
+                  .iter()
+                  .map(|observation| InverseLutThresholdCalibrationObservation {
+                      solver_family: observation.solver_family,
+                      characterization_id: observation.characterization_id.clone(),
+                      recipe_sha256: observation.recipe_sha256.clone(),
+                      lut_identity_content_id: observation.lut_identity_content_id.clone(),
+                      validation_report_content_id: observation
+                          .validation_report_content_id
+                          .clone(),
+                  })
+                  .collect(),
+          };
+          match reconstructed_manifest.content_id() {
+              Ok(actual) if actual != self.calibration_manifest_content_id => errors.push(format!(
+                  "Inverse-LUT calibration analysis manifest identity mismatch: stored {}, reconstructed {}.",
+                  self.calibration_manifest_content_id, actual
+              )),
+              Ok(_) => {}
+              Err(error) => errors.push(format!(
+                  "Inverse-LUT calibration analysis cannot reconstruct its manifest identity: {error}"
+              )),
+          }
+
+          '''
+          text = text[:point_anchor] + manifest_validation + text[point_anchor:]
+
+          content_anchor = text.find('    pub fn content_id(&self) -> Result<String, String> {')
+          if content_anchor < 0:
+              raise SystemExit('Cannot locate content_id method')
+          binding_method = '''    /// Re-verifies a persisted analysis against the exact external evidence that
+              /// produced it. This prevents a self-consistent but unrelated analysis JSON from
+              /// being accepted for a different threshold set, manifest or report matrix.
+              pub fn validate_bindings(
+                  &self,
+                  threshold_set: &InverseLutValidationThresholdSet,
+                  manifest: &InverseLutThresholdCalibrationManifest,
+                  reports: &[InverseLutValidationReport],
+              ) -> Result<(), Vec<String>> {
+                  let mut errors = Vec::new();
+                  if let Err(mut validation_errors) = self.validate() {
+                      errors.append(&mut validation_errors);
+                  }
+                  match threshold_set.content_id() {
+                      Ok(actual) if actual != self.threshold_set_content_id => errors.push(format!(
+                          "Inverse-LUT calibration analysis threshold-set identity mismatch: stored {}, supplied {}.",
+                          self.threshold_set_content_id, actual
+                      )),
+                      Ok(_) => {}
+                      Err(error) => errors.push(format!(
+                          "Supplied inverse-LUT calibration threshold set is invalid: {error}"
+                      )),
+                  }
+                  match manifest.content_id() {
+                      Ok(actual) if actual != self.calibration_manifest_content_id => errors.push(format!(
+                          "Inverse-LUT calibration analysis manifest identity mismatch: stored {}, supplied {}.",
+                          self.calibration_manifest_content_id, actual
+                      )),
+                      Ok(_) => {}
+                      Err(error) => errors.push(format!(
+                          "Supplied inverse-LUT calibration manifest is invalid: {error}"
+                      )),
+                  }
+                  match analyze_inverse_lut_threshold_calibration(threshold_set, manifest, reports) {
+                      Ok(expected) if expected != *self => errors.push(
+                          "Inverse-LUT calibration analysis does not match the supplied evidence matrix."
+                              .to_owned(),
+                      ),
+                      Ok(_) => {}
+                      Err(error) => errors.push(format!(
+                          "Supplied inverse-LUT calibration evidence cannot reproduce the analysis: {error}"
+                      )),
+                  }
+                  if errors.is_empty() { Ok(()) } else { Err(errors) }
+              }
+
+          '''
+          text = text[:content_anchor] + binding_method + text[content_anchor:]
+
+          extra_anchor = text.find('    fn analysis_rejects_extra_report() {')
+          if extra_anchor < 0:
+              raise SystemExit('Cannot locate extra-report test')
+          test_start = text.rfind('    #[test]\n', 0, extra_anchor)
+          if test_start < 0:
+              raise SystemExit('Cannot locate test attribute before extra-report test')
+          tests = '''    #[test]
+              fn persisted_analysis_rejects_manifest_identity_tampering() {
+                  let (threshold_set, manifest, reports) = fixture();
+                  let mut analysis = analyze_inverse_lut_threshold_calibration(
+                      &threshold_set,
+                      &manifest,
+                      &reports,
+                  )
+                  .unwrap();
+                  analysis.calibration_manifest_content_id = prefixed('f');
+                  assert!(analysis.validate().is_err());
+              }
+
+              #[test]
+              fn persisted_analysis_revalidates_exact_external_evidence() {
+                  let (threshold_set, manifest, reports) = fixture();
+                  let analysis = analyze_inverse_lut_threshold_calibration(
+                      &threshold_set,
+                      &manifest,
+                      &reports,
+                  )
+                  .unwrap();
+                  assert!(
+                      analysis
+                          .validate_bindings(&threshold_set, &manifest, &reports)
+                          .is_ok()
+                  );
+                  let mut different_threshold_set = threshold_set.clone();
+                  different_threshold_set.policy.max_delta_e00 += 0.25;
+                  assert!(
+                      analysis
+                          .validate_bindings(&different_threshold_set, &manifest, &reports)
+                          .is_err()
+                  );
+              }
+
+          '''
+          text = text[:test_start] + tests + text[test_start:]
+
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | Set-Content -Path .tmp-pr218-manifest-binding.py -Encoding utf8
+          python .tmp-pr218-manifest-binding.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-pr218-manifest-binding.py
+          rustfmt --edition 2024 src/inverse_lut_calibration_analysis.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check and test locked Windows target
+        shell: pwsh
+        run: |
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Guard and publish exact patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          if (($changed -join "`n") -ne 'src/inverse_lut_calibration_analysis.rs') {
+            throw "Unexpected changed files: $($changed -join ', ')"
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/inverse_lut_calibration_analysis.rs
+          git commit -m 'feat(color-conversion): bind calibration analysis to exact manifest'
+          git push origin HEAD:codex/custom-optimizer-calibration-analysis
