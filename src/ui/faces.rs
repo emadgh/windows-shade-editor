@@ -32,7 +32,19 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
     }
     ui.add_space(4.0);
     ui.separator();
-    ui.heading("Faces");
+    ui.horizontal(|ui| {
+        ui.heading("Faces");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let add_enabled = app.job.is_none() && !app.project_autosave_busy;
+            if ui
+                .add_enabled(add_enabled, egui::Button::new("+ Add TIFF Faces"))
+                .on_hover_text("Add one or more TIFF files as Faces in this project")
+                .clicked()
+            {
+                actions.push(FaceUiAction::AddFacesDialog);
+            }
+        });
+    });
 
     let active_rejected = app
         .project
@@ -168,7 +180,6 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
         let missing_count = app.faces.iter().filter(|face| !face.available).count();
         let mut locate_file = false;
         let mut locate_folder = false;
-        let mut remove = false;
         ui.horizontal_wrapped(|ui| {
             if active_missing {
                 locate_file = ui.button("Locate file").clicked();
@@ -181,14 +192,11 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                     )
                     .clicked();
             }
-            remove = ui.button("Remove active face").clicked();
         });
         if locate_file {
             actions.push(FaceUiAction::RelinkCurrent);
         } else if locate_folder {
             actions.push(FaceUiAction::RelinkMissingFolder);
-        } else if remove {
-            actions.push(FaceUiAction::Delete(app.current_face));
         }
     }
     ui.separator();
