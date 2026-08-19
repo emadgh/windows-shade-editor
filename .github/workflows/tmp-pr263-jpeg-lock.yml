@@ -1,0 +1,44 @@
+name: Temporary guarded PR263 JPEG lock refresh
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr263-jpeg-lock
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/jpeg-source-decoder-foundation
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Refresh lock and validate JPEG source decoder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '5649a3cca65e780d62536759097652fb28b9ebba'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR263 feature head moved' }
+          cargo check --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git status --short --untracked-files=all | ForEach-Object { $_.Substring(3) })
+          if ($changed.Count -ne 1 -or $changed[0] -ne 'Cargo.lock') {
+            throw "Unexpected lock-refresh surface: $($changed -join ', ')"
+          }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          git commit -m 'Color Conversion: lock JPEG decoder dependency'
+          git push origin HEAD:codex/jpeg-source-decoder-foundation
