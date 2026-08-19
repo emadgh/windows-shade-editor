@@ -1,6 +1,7 @@
 use crate::color_management::PreviewColorTransform;
 use crate::model::{Curve, Levels, MASTER_ADJUSTMENT_KEY, ShadeProject, apply_curve, apply_levels};
-use crate::tiff_io::{self, ColorModel, PreviewFace};
+use crate::runtime_preview::{RuntimeColorModel, RuntimePreviewSource};
+use crate::tiff_io::{self, PreviewFace};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChannelClippingStats {
@@ -44,23 +45,26 @@ impl ChannelClippingStats {
     }
 }
 
-pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u16>> {
+pub fn adjusted_planes<P: RuntimePreviewSource + ?Sized>(
+    face: &P,
+    project: &ShadeProject,
+) -> Vec<Vec<u16>> {
     adjusted_planes_with_stats(face, project).0
 }
 
 /// Apply the production adjustment order to preview samples and collect clipping
 /// estimates from the same downsampled working-space data. These statistics are
 /// diagnostic only; export still processes the full-resolution TIFF separately.
-pub fn adjusted_planes_with_stats(
-    face: &PreviewFace,
+pub fn adjusted_planes_with_stats<P: RuntimePreviewSource + ?Sized>(
+    face: &P,
     project: &ShadeProject,
 ) -> (Vec<Vec<u16>>, Vec<ChannelClippingStats>) {
-    let channel_count = face.channels.len();
+    let channel_count = face.channels().len();
     if channel_count == 0 {
         return (Vec::new(), Vec::new());
     }
-    let pixel_count = face.channels[0].len();
-    let names = &face.metadata.channel_names;
+    let pixel_count = face.channels()[0].len();
+    let names = face.channel_names();
     let master = project
         .adjustments
         .get(MASTER_ADJUSTMENT_KEY)
@@ -82,7 +86,7 @@ pub fn adjusted_planes_with_stats(
     for channel in 0..channel_count {
         let adjustment = project.adjustments.get(&names[channel]);
         for pixel in 0..pixel_count {
-            let raw = face.channels[channel][pixel] as f32 / 65535.0;
+            let raw = face.channels()[channel][pixel] as f32 / 65535.0;
             let mut value = raw;
             let mut clipped_black = false;
             let mut clipped_white = false;
@@ -177,16 +181,16 @@ fn curve_clipping(value: f32, curve: Curve) -> (bool, bool) {
     )
 }
 
-pub fn rgba_from_planes(
-    face: &PreviewFace,
+pub fn rgba_from_planes<P: RuntimePreviewSource + ?Sized>(
+    face: &P,
     planes: &[Vec<u16>],
     solo_channel: Option<usize>,
 ) -> Vec<u8> {
     rgba_from_planes_impl(face, planes, solo_channel, None)
 }
 
-pub fn rgba_from_planes_with_color(
-    face: &PreviewFace,
+pub fn rgba_from_planes_with_color<P: RuntimePreviewSource + ?Sized>(
+    face: &P,
     planes: &[Vec<u16>],
     solo_channel: Option<usize>,
     color: &PreviewColorTransform,
@@ -194,20 +198,22 @@ pub fn rgba_from_planes_with_color(
     rgba_from_planes_impl(face, planes, solo_channel, Some(color))
 }
 
-fn rgba_from_planes_impl(
-    face: &PreviewFace,
+fn rgba_from_planes_impl<P: RuntimePreviewSource + ?Sized>(
+    face: &P,
     planes: &[Vec<u16>],
     solo_channel: Option<usize>,
     color: Option<&PreviewColorTransform>,
 ) -> Vec<u8> {
-    let width = face.width;
-    let height = face.height;
+    let width = face.width();
+    let height = face.height();
     let pixel_count = width.saturating_mul(height);
     let mut rgba = Vec::with_capacity(pixel_count.saturating_mul(4));
 
     // Solo is an engineering separation view, not a colorimetric composite.
     if let Some(channel) = solo_channel.filter(|index| *index < planes.len()) {
-        let invert = tiff_io::solo_channel_uses_ink_coverage(&face.metadata, channel);
+        let invert = face
+            .tiff_metadata()
+            .is_some_and(|metadata| tiff_io::solo_channel_uses_ink_coverage(metadata, channel));
         for value in &planes[channel] {
             let byte = (*value >> 8) as u8;
             let gray = if invert {
@@ -234,8 +240,8 @@ fn rgba_from_planes_impl(
         return rgba;
     }
 
-    match face.metadata.color_model {
-        ColorModel::Rgb if planes.len() >= 3 => {
+    match face.color_model() {
+        RuntimeColorModel::Rgb if planes.len() >= 3 => {
             for pixel in 0..pixel_count {
                 let mut rgb = [
                     planes[0][pixel] as f32 / 65535.0,
@@ -246,7 +252,7 @@ fn rgba_from_planes_impl(
                 push_rgb(&mut rgba, rgb);
             }
         }
-        ColorModel::Cmyk if planes.len() >= 4 => {
+        RuntimeColorModel::Cmyk if planes.len() >= 4 => {
             for pixel in 0..pixel_count {
                 let c = planes[0][pixel] as f32 / 65535.0;
                 let m = planes[1][pixel] as f32 / 65535.0;
@@ -261,7 +267,7 @@ fn rgba_from_planes_impl(
                 push_rgb(&mut rgba, rgb);
             }
         }
-        ColorModel::Gray if !planes.is_empty() => {
+        RuntimeColorModel::Gray if !planes.is_empty() => {
             for pixel in 0..pixel_count {
                 let gray = planes[0][pixel] as f32 / 65535.0;
                 let mut rgb = [gray, gray, gray];
@@ -269,7 +275,7 @@ fn rgba_from_planes_impl(
                 push_rgb(&mut rgba, rgb);
             }
         }
-        ColorModel::Other if has_declared_spot_channels(face, planes.len()) => {
+        RuntimeColorModel::Other if has_declared_spot_channels(face, planes.len()) => {
             // A Photoshop Multichannel/Separated TIFF may consist entirely of
             // printing inks and therefore has no RGB/CMYK base composite. Render
             // declared Spot channels over paper white using their DisplayInfo
@@ -293,8 +299,14 @@ fn rgba_from_planes_impl(
     rgba
 }
 
-fn has_declared_spot_channels(face: &PreviewFace, channel_count: usize) -> bool {
-    face.metadata
+fn has_declared_spot_channels<P: RuntimePreviewSource + ?Sized>(
+    face: &P,
+    channel_count: usize,
+) -> bool {
+    let Some(metadata) = face.tiff_metadata() else {
+        return false;
+    };
+    metadata
         .channel_display_info
         .iter()
         .take(channel_count)
@@ -302,13 +314,16 @@ fn has_declared_spot_channels(face: &PreviewFace, channel_count: usize) -> bool 
         .any(|info| info.is_spot())
 }
 
-fn composite_extra_channels(
-    face: &PreviewFace,
+fn composite_extra_channels<P: RuntimePreviewSource + ?Sized>(
+    face: &P,
     planes: &[Vec<u16>],
     pixel: usize,
     rgb: &mut [f32; 3],
 ) {
-    let first_extra = face.metadata.base_channel_count.min(planes.len());
+    let Some(metadata) = face.tiff_metadata() else {
+        return;
+    };
+    let first_extra = metadata.base_channel_count.min(planes.len());
 
     const DIAGNOSTIC_TINTS: [[f32; 3]; 8] = [
         [0.00, 0.90, 0.45],
@@ -322,8 +337,7 @@ fn composite_extra_channels(
     ];
 
     for channel_index in 0..planes.len() {
-        let display = face
-            .metadata
+        let display = metadata
             .channel_display_info
             .get(channel_index)
             .and_then(|value| *value);
@@ -338,7 +352,7 @@ fn composite_extra_channels(
             continue;
         }
         let coverage = if is_extra {
-            tiff_io::extra_channel_preview_coverage(&face.metadata, channel_index, plane[pixel])
+            tiff_io::extra_channel_preview_coverage(metadata, channel_index, plane[pixel])
         } else {
             // A declared Spot that sits inside a Multichannel base range is not
             // polarity-normalized by tiff_io, so preserve Photoshop's raw Spot
@@ -399,8 +413,10 @@ pub fn histogram(values: &[u16]) -> [u32; 256] {
 mod tests {
     use super::*;
     use crate::model::{ChannelAdjustment, Curve, Levels, MixerRow};
-    use crate::tiff_io::{PhotoshopChannelDisplay, TiffMetadata};
+    use crate::tiff_io::{ColorModel, PhotoshopChannelDisplay, TiffMetadata};
     use std::collections::BTreeMap;
+    use windows_shade_editor::design_source_preview::DesignSourcePreview;
+    use windows_shade_editor::png_source::{DecodedPngSource, PngSourceModel};
 
     fn face(values: Vec<u16>) -> PreviewFace {
         PreviewFace {
@@ -583,5 +599,29 @@ mod tests {
         let actual = planes[0][0] as f32 / 65535.0;
         assert!((actual - expected).abs() < 2.0 / 65535.0);
         assert_eq!(project.adjustments.get("Ink").unwrap(), &local_before);
+    }
+
+    #[test]
+    fn png_design_preview_uses_shared_adjustment_and_rgb_render_boundary() {
+        let decoded = DecodedPngSource {
+            width: 1,
+            height: 1,
+            bit_depth: 16,
+            model: PngSourceModel::Rgb,
+            samples: vec![u16::MAX, 32768, 0],
+            alpha: Some(vec![12345]),
+            icc_profile: None,
+            declares_srgb: false,
+        };
+        let preview = DesignSourcePreview::from_png(&decoded, 512).expect("PNG preview");
+        let project = ShadeProject::default();
+        let (planes, stats) = adjusted_planes_with_stats(&preview, &project);
+        assert_eq!(planes, preview.channels);
+        assert_eq!(stats.len(), 3);
+        assert_eq!(
+            rgba_from_planes(&preview, &planes, None),
+            vec![255, 128, 0, 255]
+        );
+        assert_eq!(preview.alpha.as_deref(), Some(&[12345][..]));
     }
 }

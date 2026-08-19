@@ -34,6 +34,7 @@ mod project_lifecycle;
 mod project_persistence;
 mod recovery;
 mod render;
+mod runtime_preview;
 mod safe_fs;
 mod settings;
 mod snapshot_preview_cache;
