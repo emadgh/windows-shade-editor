@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::color_conversion::{
-    ConversionRecipe, ConversionSourceRef, ProductionProvenance, ProjectRole,
+    ConversionEngineMode, ConversionRecipe, ConversionSourceRef, ProductionProvenance, ProjectRole,
 };
 use crate::conversion_output::validate_conversion_output_path;
 use crate::conversion_recipe::recipe_sha256;
+use crate::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;
 use crate::export_recipe::ExportRecipe;
 use crate::model::ShadeProject;
 use crate::production_project::{ProductionProjectSpec, build_production_project};
@@ -92,6 +93,8 @@ pub struct ConversionJobCapture {
     pub source_recipe: ExportRecipe,
     pub conversion_recipe: ConversionRecipe,
     pub conversion_recipe_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_optimizer_evidence: Option<CapturedCustomOptimizerEvidence>,
     pub output_policy: CapturedOutputPolicy,
     pub output_tiff_path: PathBuf,
     pub production_project_path: PathBuf,
@@ -126,6 +129,46 @@ impl ConversionJobCapture {
             source_recipe: ExportRecipe::from_project(source_project),
             conversion_recipe,
             conversion_recipe_sha256,
+            custom_optimizer_evidence: None,
+            output_policy,
+            output_tiff_path,
+            production_project_path,
+            production_project_name,
+            output_face_label,
+        };
+        capture.validate()?;
+        Ok(capture)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_custom_optimizer(
+        source_project: &ShadeProject,
+        source_project_path: PathBuf,
+        source_project_file_sha256: String,
+        source_face_path: PathBuf,
+        source_snapshot_id: Option<u64>,
+        source_file_sha256: String,
+        source_profile: CapturedSourceProfile,
+        conversion_recipe: ConversionRecipe,
+        custom_optimizer_evidence: CapturedCustomOptimizerEvidence,
+        output_policy: CapturedOutputPolicy,
+        output_tiff_path: PathBuf,
+        production_project_path: PathBuf,
+        production_project_name: String,
+        output_face_label: String,
+    ) -> Result<Self, String> {
+        let conversion_recipe_sha256 = recipe_sha256(&conversion_recipe)?;
+        let capture = Self {
+            source_project_path,
+            source_project_file_sha256,
+            source_face_path,
+            source_snapshot_id,
+            source_file_sha256,
+            source_profile,
+            source_recipe: ExportRecipe::from_project(source_project),
+            conversion_recipe,
+            conversion_recipe_sha256,
+            custom_optimizer_evidence: Some(custom_optimizer_evidence),
             output_policy,
             output_tiff_path,
             production_project_path,
@@ -164,6 +207,32 @@ impl ConversionJobCapture {
             return Err(
                 "Captured conversion recipe SHA-256 does not match its payload.".to_owned(),
             );
+        }
+        match (
+            self.conversion_recipe.engine_mode,
+            self.custom_optimizer_evidence.as_ref(),
+        ) {
+            (ConversionEngineMode::CustomOptimizer, Some(evidence)) => {
+                evidence.validate().map_err(|errors| {
+                    format!(
+                        "Invalid captured Custom Optimizer evidence: {}",
+                        errors.join(" ")
+                    )
+                })?;
+            }
+            (ConversionEngineMode::CustomOptimizer, None) => {
+                return Err(
+                    "Custom Optimizer conversion capture requires immutable production evidence."
+                        .to_owned(),
+                );
+            }
+            (_, Some(_)) => {
+                return Err(
+                    "ICC/DeviceLink conversion capture cannot carry Custom Optimizer evidence."
+                        .to_owned(),
+                );
+            }
+            (_, None) => {}
         }
         validate_conversion_output_path(&self.source_face_path, &self.output_tiff_path)
             .map_err(|err| err.to_string())?;
