@@ -1,0 +1,561 @@
+name: Temporary guarded PR249 production provenance
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr249-provenance-apply
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-production-provenance
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply production provenance contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '497caed0921ca9ef2abcbcb63d9611e29ad5846f'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Expected PR249 head $expectedHead, got $actualHead" }
+
+          @'
+          from pathlib import Path
+
+          def once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected 1 occurrence, got {count}")
+              return text.replace(old, new, 1)
+
+          # color_conversion.rs: versioned, backward-compatible provenance payload.
+          path = Path('src/color_conversion.rs')
+          text = path.read_text(encoding='utf-8')
+          text = once(
+              text,
+              'use crate::model::IccProfileIdentity;\n',
+              'use crate::model::IccProfileIdentity;\nuse crate::production_colorimetry::ProductionPcsCompatibilityMethod;\n',
+              'color conversion PCS import',
+          )
+          old = '''#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+          pub struct ConversionSourceRef {
+              pub source_project_path: String,
+              pub source_face_path: String,
+              pub source_snapshot_id: Option<u64>,
+              pub source_file_sha256: String,
+          }
+
+          #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+          pub struct ProductionProvenance {
+              pub source: ConversionSourceRef,
+              pub recipe: ConversionRecipe,
+              pub output_path: String,
+              pub output_sha256: String,
+              pub converted_at_unix_ms: i64,
+          }
+          '''.replace('          ', '')
+          new = '''#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+          pub struct ConversionSourceRef {
+              pub source_project_path: String,
+              pub source_face_path: String,
+              pub source_snapshot_id: Option<u64>,
+              pub source_file_sha256: String,
+          }
+
+          pub const CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+
+          #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+          #[serde(deny_unknown_fields)]
+          pub struct CustomOptimizerProductionProvenance {
+              pub schema_version: u32,
+              pub lut_identity_content_id: String,
+              pub lut_payload_sha256: String,
+              pub validation_report_content_id: String,
+              pub characterization_id: String,
+              pub threshold_set_content_id: String,
+              pub calibration_manifest_content_id: String,
+              pub calibration_approval_content_id: String,
+              pub pcs_compatibility_method: ProductionPcsCompatibilityMethod,
+              pub pcs_compatibility_content_id: String,
+              pub conversion_recipe_sha256: String,
+          }
+
+          impl CustomOptimizerProductionProvenance {
+              pub fn validate(&self) -> Result<(), Vec<String>> {
+                  let mut errors = Vec::new();
+                  if self.schema_version != CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION {
+                      errors.push(format!(
+                          "Unsupported Custom Optimizer production provenance schema {} (expected {}).",
+                          self.schema_version, CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION
+                      ));
+                  }
+                  for (name, value) in [
+                      ("lut_identity_content_id", self.lut_identity_content_id.as_str()),
+                      ("validation_report_content_id", self.validation_report_content_id.as_str()),
+                      ("characterization_id", self.characterization_id.as_str()),
+                      ("threshold_set_content_id", self.threshold_set_content_id.as_str()),
+                      ("calibration_manifest_content_id", self.calibration_manifest_content_id.as_str()),
+                      ("calibration_approval_content_id", self.calibration_approval_content_id.as_str()),
+                      ("pcs_compatibility_content_id", self.pcs_compatibility_content_id.as_str()),
+                  ] {
+                      if !is_canonical_prefixed_sha256(value) {
+                          errors.push(format!(
+                              "Custom Optimizer production provenance {name} must be canonical sha256:<hex>."
+                          ));
+                      }
+                  }
+                  for (name, value) in [
+                      ("lut_payload_sha256", self.lut_payload_sha256.as_str()),
+                      ("conversion_recipe_sha256", self.conversion_recipe_sha256.as_str()),
+                  ] {
+                      if !is_canonical_bare_sha256(value) {
+                          errors.push(format!(
+                              "Custom Optimizer production provenance {name} must be canonical lowercase SHA-256 hex."
+                          ));
+                      }
+                  }
+                  if self.pcs_compatibility_method
+                      != ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1
+                  {
+                      errors.push(
+                          "Custom Optimizer production provenance requires ICC PCS Lab D50/2-degree compatibility."
+                              .to_owned(),
+                      );
+                  }
+                  if errors.is_empty() { Ok(()) } else { Err(errors) }
+              }
+          }
+
+          fn is_canonical_prefixed_sha256(value: &str) -> bool {
+              value.strip_prefix("sha256:").is_some_and(is_canonical_bare_sha256)
+          }
+
+          fn is_canonical_bare_sha256(value: &str) -> bool {
+              value.len() == 64
+                  && value
+                      .bytes()
+                      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+          }
+
+          #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+          pub struct ProductionProvenance {
+              pub source: ConversionSourceRef,
+              pub recipe: ConversionRecipe,
+              #[serde(default, skip_serializing_if = "Option::is_none")]
+              pub custom_optimizer: Option<CustomOptimizerProductionProvenance>,
+              pub output_path: String,
+              pub output_sha256: String,
+              pub converted_at_unix_ms: i64,
+          }
+          '''.replace('          ', '')
+          text = once(text, old, new, 'production provenance schema block')
+          path.write_text(text, encoding='utf-8', newline='\n')
+
+          # custom_optimizer_evidence.rs: derive a small deterministic audit record from validated capture.
+          path = Path('src/custom_optimizer_evidence.rs')
+          text = path.read_text(encoding='utf-8')
+          text = once(
+              text,
+              'use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};\n',
+              'use crate::color_conversion::{\n    CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION,\n    CustomOptimizerProductionProvenance, ConversionEngineMode, ConversionRecipe,\n};\n',
+              'evidence provenance import',
+          )
+          marker = '''    }
+          }
+
+          #[derive(Clone, Debug)]
+          pub struct LoadedCustomOptimizerEvidence'''.replace('          ', '')
+          addition = '''    }
+
+              pub fn production_provenance(
+                  &self,
+                  conversion_recipe_sha256: &str,
+              ) -> Result<CustomOptimizerProductionProvenance, Vec<String>> {
+                  self.validate()?;
+                  if !is_bare_sha256(conversion_recipe_sha256) {
+                      return Err(vec![
+                          "Custom Optimizer production provenance requires a canonical captured recipe SHA-256."
+                              .to_owned(),
+                      ]);
+                  }
+                  let provenance = CustomOptimizerProductionProvenance {
+                      schema_version: CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION,
+                      lut_identity_content_id: self.lut_identity_content_id.clone(),
+                      lut_payload_sha256: self.lut_payload_sha256.clone(),
+                      validation_report_content_id: self.validation_report_content_id.clone(),
+                      characterization_id: self.characterization_id.clone(),
+                      threshold_set_content_id: self.threshold_set_content_id.clone(),
+                      calibration_manifest_content_id: self.calibration_manifest_content_id.clone(),
+                      calibration_approval_content_id: self.calibration_approval_content_id.clone(),
+                      pcs_compatibility_method: self.pcs_compatibility_method,
+                      pcs_compatibility_content_id: self.pcs_compatibility_content_id.clone(),
+                      conversion_recipe_sha256: conversion_recipe_sha256.to_owned(),
+                  };
+                  provenance.validate()?;
+                  Ok(provenance)
+              }
+          }
+
+          #[derive(Clone, Debug)]
+          pub struct LoadedCustomOptimizerEvidence'''.replace('          ', '')
+          text = once(text, marker, addition, 'evidence provenance method')
+          path.write_text(text, encoding='utf-8', newline='\n')
+
+          # conversion_transaction.rs: persist the exact capture identities after output commit.
+          path = Path('src/conversion_transaction.rs')
+          text = path.read_text(encoding='utf-8')
+          marker = '    let provenance = ProductionProvenance {\n'
+          insert = '''    let custom_optimizer = match capture.custom_optimizer_evidence.as_ref() {
+              Some(evidence) => match evidence.production_provenance(&capture.conversion_recipe_sha256) {
+                  Ok(provenance) => Some(provenance),
+                  Err(errors) => {
+                      return ConversionTransactionOutcome::OutputCommittedNeedsRecovery {
+                          committed_output,
+                          production_project_path: capture.production_project_path.clone(),
+                          production_project: None,
+                          error: format!(
+                              "Cannot persist Custom Optimizer production provenance: {}",
+                              errors.join(" ")
+                          ),
+                      };
+                  }
+              },
+              None => None,
+          };
+
+              let provenance = ProductionProvenance {
+          '''.replace('              ', '')
+          text = once(text, marker, insert, 'transaction provenance insertion')
+          text = once(
+              text,
+              '        recipe: capture.conversion_recipe.clone(),\n        output_path:',
+              '        recipe: capture.conversion_recipe.clone(),\n        custom_optimizer,\n        output_path:',
+              'transaction custom provenance field',
+          )
+          path.write_text(text, encoding='utf-8', newline='\n')
+
+          # production_project.rs: validate engine/evidence binding before project construction.
+          path = Path('src/production_project.rs')
+          text = path.read_text(encoding='utf-8')
+          text = once(
+              text,
+              'use crate::color_conversion::{LinkedProjectRef, ProductionProvenance, ProjectRole};\n',
+              'use crate::color_conversion::{\n    ConversionEngineMode, LinkedProjectRef, ProductionProvenance, ProjectRole,\n};\nuse crate::conversion_recipe::recipe_sha256;\n',
+              'production project imports',
+          )
+          old = '''    spec.provenance
+              .recipe
+              .validate()
+              .map_err(|errors| format!("Invalid production conversion recipe: {}", errors.join(" ")))?;
+          '''.replace('          ', '')
+          text = once(text, old, '    validate_production_provenance(&spec.provenance)?;\n', 'production provenance validation call')
+          marker = '''/// Mark a saved design project as a Source and upsert its Production-project
+          /// link.'''.replace('          ', '')
+          helper = '''pub fn validate_production_provenance(provenance: &ProductionProvenance) -> Result<(), String> {
+              provenance
+                  .recipe
+                  .validate()
+                  .map_err(|errors| format!("Invalid production conversion recipe: {}", errors.join(" ")))?;
+              let actual_recipe_sha256 = recipe_sha256(&provenance.recipe)?;
+              match (provenance.recipe.engine_mode, provenance.custom_optimizer.as_ref()) {
+                  (ConversionEngineMode::CustomOptimizer, Some(custom)) => {
+                      custom.validate().map_err(|errors| {
+                          format!("Invalid Custom Optimizer production provenance: {}", errors.join(" "))
+                      })?;
+                      if custom.conversion_recipe_sha256 != actual_recipe_sha256 {
+                          return Err(format!(
+                              "Custom Optimizer production provenance recipe SHA-256 mismatch: recorded {}, actual {}.",
+                              custom.conversion_recipe_sha256, actual_recipe_sha256
+                          ));
+                      }
+                      let target_characterization = provenance
+                          .recipe
+                          .target
+                          .characterization_id
+                          .as_deref()
+                          .unwrap_or_default();
+                      if custom.characterization_id != target_characterization {
+                          return Err(format!(
+                              "Custom Optimizer production provenance characterization mismatch: recorded {}, recipe {}.",
+                              custom.characterization_id, target_characterization
+                          ));
+                      }
+                  }
+                  (ConversionEngineMode::CustomOptimizer, None) => {
+                      return Err(
+                          "Custom Optimizer Production provenance requires immutable LUT/validation evidence identities."
+                              .to_owned(),
+                      );
+                  }
+                  (_, Some(_)) => {
+                      return Err(
+                          "ICC/DeviceLink Production provenance cannot carry Custom Optimizer evidence identities."
+                              .to_owned(),
+                      );
+                  }
+                  (_, None) => {}
+              }
+              Ok(())
+          }
+
+          /// Mark a saved design project as a Source and upsert its Production-project
+          /// link.'''.replace('          ', '')
+          text = once(text, marker, helper, 'production provenance helper')
+          text = once(
+              text,
+              '            output_path: output.display().to_string(),\n',
+              '            custom_optimizer: None,\n            output_path: output.display().to_string(),\n',
+              'legacy ICC fixture field',
+          )
+          path.write_text(text, encoding='utf-8', newline='\n')
+
+          # New isolated tests avoid touching model/UI code.
+          Path('src/production_provenance_tests.rs').write_text(r'''use std::path::Path;
+
+          use crate::color_conversion::{
+              CONVERSION_RECIPE_SCHEMA_VERSION, CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION,
+              ConversionEngineMode, ConversionRecipe, ConversionRenderingIntent, ConversionSourceRef,
+              ConversionTargetDefinition, CustomOptimizerProductionProvenance, ProductionProvenance,
+              SeparationStrategy, TargetChannelDefinition,
+          };
+          use crate::conversion_recipe::recipe_sha256;
+          use crate::custom_optimizer_config::CustomOptimizerSolverConfig;
+          use crate::model::IccProfileIdentity;
+          use crate::production_colorimetry::ProductionPcsCompatibilityMethod;
+          use crate::production_project::{
+              ProductionProjectSpec, build_production_project, validate_production_provenance,
+          };
+
+          fn prefixed(byte: char) -> String {
+              format!("sha256:{}", byte.to_string().repeat(64))
+          }
+
+          fn bare(byte: char) -> String {
+              byte.to_string().repeat(64)
+          }
+
+          fn custom_recipe() -> ConversionRecipe {
+              ConversionRecipe {
+                  schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+                  engine_mode: ConversionEngineMode::CustomOptimizer,
+                  source_profile_identity: IccProfileIdentity {
+                      description: "fixture source".to_owned(),
+                      sha256: bare('1'),
+                  },
+                  target: ConversionTargetDefinition {
+                      name: "fixture four-ink target".to_owned(),
+                      channels: ["Cyan", "Magenta", "Yellow", "Black"]
+                          .into_iter()
+                          .map(|name| TargetChannelDefinition {
+                              name: name.to_owned(),
+                              display_rgb: None,
+                              solidity: 1.0,
+                              max_coverage: Some(1.0),
+                          })
+                          .collect(),
+                      bit_depth: 16,
+                      output_profile_identity: None,
+                      output_profile_path: None,
+                      device_link_identity: None,
+                      device_link_path: None,
+                      characterization_id: Some(prefixed('2')),
+                      total_ink_limit: Some(1.8),
+                  },
+                  rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
+                  black_point_compensation: true,
+                  strategy: SeparationStrategy::default(),
+                  custom_optimizer_solver: Some(CustomOptimizerSolverConfig::default()),
+              }
+          }
+
+          fn custom_provenance(output: &Path) -> ProductionProvenance {
+              let recipe = custom_recipe();
+              let conversion_recipe_sha256 = recipe_sha256(&recipe).unwrap();
+              ProductionProvenance {
+                  source: ConversionSourceRef {
+                      source_project_path: r"C:\Design\Source.shade".to_owned(),
+                      source_face_path: r"C:\Design\Face.tif".to_owned(),
+                      source_snapshot_id: Some(7),
+                      source_file_sha256: bare('3'),
+                  },
+                  recipe,
+                  custom_optimizer: Some(CustomOptimizerProductionProvenance {
+                      schema_version: CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION,
+                      lut_identity_content_id: prefixed('4'),
+                      lut_payload_sha256: bare('5'),
+                      validation_report_content_id: prefixed('6'),
+                      characterization_id: prefixed('2'),
+                      threshold_set_content_id: prefixed('7'),
+                      calibration_manifest_content_id: prefixed('8'),
+                      calibration_approval_content_id: prefixed('9'),
+                      pcs_compatibility_method:
+                          ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
+                      pcs_compatibility_content_id: prefixed('a'),
+                      conversion_recipe_sha256,
+                  }),
+                  output_path: output.display().to_string(),
+                  output_sha256: bare('b'),
+                  converted_at_unix_ms: 1234,
+              }
+          }
+
+          #[test]
+          fn exact_custom_optimizer_provenance_round_trips_and_builds_project() {
+              let output = Path::new(r"C:\Production\Face_NInk.tif");
+              let provenance = custom_provenance(output);
+              validate_production_provenance(&provenance).unwrap();
+              let bytes = serde_json::to_vec(&provenance).unwrap();
+              let restored: ProductionProvenance = serde_json::from_slice(&bytes).unwrap();
+              assert_eq!(restored, provenance);
+              let project = build_production_project(ProductionProjectSpec {
+                  project_name: "Production N-Ink",
+                  source_project_path: Path::new(r"C:\Design\Source.shade"),
+                  output_tiff_path: output,
+                  output_face_label: "Face N-Ink",
+                  provenance: restored.clone(),
+              })
+              .unwrap();
+              assert_eq!(project.production_provenance[0], restored);
+          }
+
+          #[test]
+          fn stale_recipe_sha_is_rejected_before_project_construction() {
+              let output = Path::new(r"C:\Production\Face_NInk.tif");
+              let mut provenance = custom_provenance(output);
+              provenance
+                  .custom_optimizer
+                  .as_mut()
+                  .unwrap()
+                  .conversion_recipe_sha256 = bare('c');
+              assert!(validate_production_provenance(&provenance)
+                  .unwrap_err()
+                  .contains("recipe SHA-256 mismatch"));
+          }
+
+          #[test]
+          fn custom_optimizer_without_evidence_is_rejected() {
+              let output = Path::new(r"C:\Production\Face_NInk.tif");
+              let mut provenance = custom_provenance(output);
+              provenance.custom_optimizer = None;
+              assert!(validate_production_provenance(&provenance)
+                  .unwrap_err()
+                  .contains("requires immutable"));
+          }
+
+          #[test]
+          fn legacy_icc_json_omits_new_optional_field_and_deserializes() {
+              let output = Path::new(r"C:\Production\Face_CMYK.tif");
+              let mut provenance = custom_provenance(output);
+              provenance.recipe.engine_mode = ConversionEngineMode::Icc;
+              provenance.recipe.target.characterization_id = None;
+              provenance.recipe.target.output_profile_identity = Some(IccProfileIdentity {
+                  description: "fixture target".to_owned(),
+                  sha256: bare('d'),
+              });
+              provenance.recipe.target.output_profile_path = Some(r"C:\Color\Target.icc".to_owned());
+              provenance.recipe.custom_optimizer_solver = None;
+              provenance.custom_optimizer = None;
+              let bytes = serde_json::to_vec(&provenance).unwrap();
+              let text = std::str::from_utf8(&bytes).unwrap();
+              assert!(!text.contains("custom_optimizer"));
+              let restored: ProductionProvenance = serde_json::from_slice(&bytes).unwrap();
+              validate_production_provenance(&restored).unwrap();
+          }
+
+          #[test]
+          fn non_custom_provenance_cannot_smuggle_optimizer_evidence() {
+              let output = Path::new(r"C:\Production\Face_CMYK.tif");
+              let mut provenance = custom_provenance(output);
+              provenance.recipe.engine_mode = ConversionEngineMode::Icc;
+              provenance.recipe.target.characterization_id = None;
+              provenance.recipe.target.output_profile_identity = Some(IccProfileIdentity {
+                  description: "fixture target".to_owned(),
+                  sha256: bare('d'),
+              });
+              provenance.recipe.target.output_profile_path = Some(r"C:\Color\Target.icc".to_owned());
+              provenance.recipe.custom_optimizer_solver = None;
+              assert!(validate_production_provenance(&provenance)
+                  .unwrap_err()
+                  .contains("cannot carry"));
+          }
+          '''.replace('          ', ''), encoding='utf-8', newline='\n')
+
+          # Existing file-backed evidence fixture verifies deterministic capture->provenance mapping.
+          path = Path('src/custom_optimizer_evidence_tests.rs')
+          text = path.read_text(encoding='utf-8')
+          text += r'''
+
+          #[test]
+          fn production_provenance_copies_exact_validated_capture_identities() {
+              let fixture = file_fixture("production-provenance");
+              let recipe_sha = recipe_sha256(&fixture.recipe).unwrap();
+              let first = fixture.capture.production_provenance(&recipe_sha).unwrap();
+              let second = fixture.capture.production_provenance(&recipe_sha).unwrap();
+              assert_eq!(first, second);
+              assert_eq!(first.lut_identity_content_id, fixture.capture.lut_identity_content_id);
+              assert_eq!(first.lut_payload_sha256, fixture.capture.lut_payload_sha256);
+              assert_eq!(first.validation_report_content_id, fixture.capture.validation_report_content_id);
+              assert_eq!(first.characterization_id, fixture.capture.characterization_id);
+              assert_eq!(first.threshold_set_content_id, fixture.capture.threshold_set_content_id);
+              assert_eq!(first.calibration_manifest_content_id, fixture.capture.calibration_manifest_content_id);
+              assert_eq!(first.calibration_approval_content_id, fixture.capture.calibration_approval_content_id);
+              assert_eq!(first.pcs_compatibility_content_id, fixture.capture.pcs_compatibility_content_id);
+              assert_eq!(first.conversion_recipe_sha256, recipe_sha);
+              assert!(first.validate().is_ok());
+          }
+          '''.replace('          ', '')
+          path.write_text(text, encoding='utf-8', newline='\n')
+
+          path = Path('src/lib.rs')
+          text = path.read_text(encoding='utf-8')
+          text = once(
+              text,
+              '#[cfg(test)]\nmod tiff_conformance_tests;\n',
+              '#[cfg(test)]\nmod production_provenance_tests;\n#[cfg(test)]\nmod tiff_conformance_tests;\n',
+              'provenance test registration',
+          )
+          path.write_text(text, encoding='utf-8', newline='\n')
+          '@ | Set-Content -Path .tmp-pr249-provenance.py -Encoding utf8
+          python .tmp-pr249-provenance.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-pr249-provenance.py
+
+          rustfmt --edition 2024 src/color_conversion.rs src/custom_optimizer_evidence.rs src/conversion_transaction.rs src/production_project.rs src/production_provenance_tests.rs src/custom_optimizer_evidence_tests.rs src/lib.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check locked Windows target
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+      - name: Run full locked tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Guard source surface and publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '497caed0921ca9ef2abcbcb63d9611e29ad5846f'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) { throw "Feature head moved during guarded run" }
+          $allowed = @(
+            'src/color_conversion.rs',
+            'src/conversion_transaction.rs',
+            'src/custom_optimizer_evidence.rs',
+            'src/custom_optimizer_evidence_tests.rs',
+            'src/lib.rs',
+            'src/production_project.rs',
+            'src/production_provenance_tests.rs'
+          )
+          $changed = @(git status --short | ForEach-Object { $_.Substring(3) })
+          $unexpected = @($changed | Where-Object { $_ -notin $allowed })
+          if ($unexpected.Count -ne 0) { throw "Unexpected changed files: $($unexpected -join ', ')" }
+          if ($changed.Count -ne $allowed.Count) { throw "Expected exactly $($allowed.Count) changed files, got $($changed.Count): $($changed -join ', ')" }
+          git add -- $allowed
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Color Conversion: persist Custom Optimizer production provenance'
+          git push origin HEAD:codex/custom-optimizer-production-provenance
