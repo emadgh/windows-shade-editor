@@ -1,0 +1,117 @@
+name: Temporary guarded PR307 recipe compatibility tests
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr307-acceptance-tests-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/png-alpha-flatten-policy-clean
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Add recipe compatibility tests, validate, publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'd6ecc1ad61e7c76b53cdbb8fa63f0b4501773141'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR307 feature head moved' }
+          @'
+          from pathlib import Path
+
+          p = Path('src/conversion_recipe.rs')
+          text = p.read_text(encoding='utf-8')
+
+          old_import = '''        SeparationStrategy, TargetChannelDefinition, CONVERSION_RECIPE_SCHEMA_VERSION,
+        LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION,
+'''
+          new_import = '''        SeparationStrategy, TargetChannelDefinition, CONVERSION_RECIPE_SCHEMA_VERSION,
+        LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION, SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION,
+'''
+          if text.count(old_import) != 1:
+              raise SystemExit(f'import marker count was {text.count(old_import)}, expected 1')
+          text = text.replace(old_import, new_import, 1)
+
+          marker = '''    #[test]
+    fn transparency_background_change_changes_recipe_identity() {
+'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'test marker count was {text.count(marker)}, expected 1')
+          tests = '''    #[test]
+    fn schema_v2_without_policy_round_trips_and_omits_transparency_field() {
+        let mut schema_v2 = recipe();
+        schema_v2.schema_version = SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION;
+        schema_v2.source_transparency_policy = None;
+        schema_v2
+            .validate()
+            .expect("schema-v2 recipe without alpha policy remains valid");
+        let before = recipe_sha256(&schema_v2).unwrap();
+        let json = serde_json::to_string(&schema_v2).unwrap();
+        assert!(!json.contains("source_transparency_policy"));
+        let restored: ConversionRecipe = serde_json::from_str(&json).unwrap();
+        restored
+            .validate()
+            .expect("restored schema-v2 recipe remains valid");
+        assert_eq!(before, recipe_sha256(&restored).unwrap());
+    }
+
+    #[test]
+    fn schema_v2_rejects_a_transparency_policy_it_cannot_define() {
+        let mut schema_v2 = recipe();
+        schema_v2.schema_version = SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION;
+        schema_v2.source_transparency_policy = Some(
+            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+                background_rgb: [u16::MAX; 3],
+            },
+        );
+        let errors = schema_v2
+            .validate()
+            .expect_err("schema-v2 must fail closed when a v3 alpha policy is injected");
+        assert!(errors.iter().any(|error| error.contains("schema 3 or newer")));
+    }
+
+    #[test]
+    fn schema_v3_policy_round_trip_preserves_policy_and_recipe_hash() {
+        let mut with_policy = recipe();
+        let policy = crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+            background_rgb: [65535, 32768, 1234],
+        };
+        with_policy.source_transparency_policy = Some(policy);
+        with_policy.validate().expect("schema-v3 alpha policy is valid");
+        let before = recipe_sha256(&with_policy).unwrap();
+        let json = serde_json::to_string(&with_policy).unwrap();
+        assert!(json.contains("source_transparency_policy"));
+        let restored: ConversionRecipe = serde_json::from_str(&json).unwrap();
+        restored.validate().expect("restored schema-v3 recipe is valid");
+        assert_eq!(restored.source_transparency_policy, Some(policy));
+        assert_eq!(before, recipe_sha256(&restored).unwrap());
+    }
+
+'''
+          text = text.replace(marker, tests + marker, 1)
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | python -
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          if (($changed -join "`n") -ne 'src/conversion_recipe.rs') {
+            throw "Unexpected PR307 test surface: $($changed -join ', ')"
+          }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/conversion_recipe.rs
+          git commit -m 'test: lock alpha policy recipe compatibility (#301)'
+          git push origin HEAD:codex/png-alpha-flatten-policy-clean
