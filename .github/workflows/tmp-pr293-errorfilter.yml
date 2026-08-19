@@ -1,0 +1,45 @@
+name: Temporary PR293 compiler error filter
+on:
+  pull_request:
+    branches:
+      - tmp/pr293-diagnostic2-workflow
+permissions:
+  contents: write
+jobs:
+  filter:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: tmp/pr293-diagnostic2-output
+          fetch-depth: 0
+      - name: Extract compiler errors only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+          import re
+
+          src = Path('diagnostics/pr293-check.txt').read_text(encoding='utf-8', errors='replace').splitlines()
+          keep = set()
+          for i, line in enumerate(src):
+              if re.search(r'error(?:\[E\d+\])?:|error\[E\d+\]|could not compile', line):
+                  for j in range(max(0, i-2), min(len(src), i+12)):
+                      keep.add(j)
+          # Also retain source-location lines immediately associated with errors.
+          ordered = []
+          last = -2
+          for i in sorted(keep):
+              if i > last + 1:
+                  ordered.append('---')
+              ordered.append(src[i])
+              last = i
+          Path('diagnostics/pr293-errors.txt').write_text('\n'.join(ordered) + '\n', encoding='utf-8')
+          '@ | python -
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B tmp/pr293-errors-output
+          git add diagnostics/pr293-errors.txt
+          git commit -m 'chore: capture retry6 compiler errors only'
+          git push --force origin HEAD:tmp/pr293-errors-output
