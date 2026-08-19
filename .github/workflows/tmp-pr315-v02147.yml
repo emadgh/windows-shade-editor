@@ -1,0 +1,72 @@
+name: Temporary guarded PR315 v0.21.47 bump
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr315-v02147-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/existing-production-append-contract
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Verify and publish version identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = '036ce5bf3227c7c132d09360bcff5588f1f5c233'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR315 feature head moved before version bump' }
+
+          @'
+          from pathlib import Path
+
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text(encoding='utf-8')
+          old = 'version = "0.21.46"'
+          new = 'version = "0.21.47"'
+          if text.count(old) != 1:
+              raise SystemExit(f'Cargo.toml expected exactly one root version occurrence, found {text.count(old)}')
+          cargo.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          lock = Path('Cargo.lock')
+          text = lock.read_text(encoding='utf-8')
+          old = 'name = "windows-shade-editor"\nversion = "0.21.46"'
+          new = 'name = "windows-shade-editor"\nversion = "0.21.47"'
+          if text.count(old) != 1:
+              raise SystemExit(f'Cargo.lock expected exactly one root package occurrence, found {text.count(old)}')
+          lock.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          version = Path('VERSION')
+          if version.read_text(encoding='utf-8').strip() != '0.21.46':
+              raise SystemExit('VERSION is not 0.21.46')
+          version.write_text('0.21.47\n', encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $changed = @(git diff --name-only)
+          $expectedFiles = @('Cargo.lock', 'Cargo.toml', 'VERSION')
+          if ($changed.Count -ne 3) { throw "Version bump changed $($changed.Count) files: $($changed -join ', ')" }
+          foreach ($file in $expectedFiles) {
+            if ($changed -notcontains $file) { throw "Version bump did not change expected file $file" }
+          }
+          foreach ($file in $changed) {
+            if ($expectedFiles -notcontains $file) { throw "Unexpected version-bump file $file" }
+          }
+
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: finalize v0.21.47 Production append contract (#314)'
+          git push origin HEAD:codex/existing-production-append-contract
