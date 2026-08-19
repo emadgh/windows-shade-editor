@@ -1,0 +1,240 @@
+name: Temporary guarded PR301 alpha policy implementation
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr301-implementation-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/png-alpha-flatten-policy
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply alpha policy recipe and UI wiring, validate, publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'e9fb9bfa8a821c80a9c68b2a065749f9c4977a35'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR301 feature head moved' }
+          @'
+          from pathlib import Path
+
+          def replace_one(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: marker count {count}, expected 1: {old[:80]!r}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+
+          # Library module export.
+          replace_one(
+              'src/lib.rs',
+              'pub mod separation_optimizer;\n#[path = "tiff_io.rs"]',
+              'pub mod separation_optimizer;\npub mod source_transparency;\n#[path = "tiff_io.rs"]',
+          )
+
+          # Recipe schema v3 + explicit source-transparency policy.
+          replace_one(
+              'src/color_conversion.rs',
+              'use crate::model::IccProfileIdentity;\n',
+              'use crate::model::IccProfileIdentity;\nuse crate::source_transparency::SourceTransparencyPolicy;\n',
+          )
+          replace_one(
+              'src/color_conversion.rs',
+              'pub const LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 1;\npub const CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 2;\n',
+              'pub const LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 1;\npub const SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 2;\npub const CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 3;\n',
+          )
+          replace_one(
+              'src/color_conversion.rs',
+              '    pub source_profile_identity: IccProfileIdentity,\n    pub target: ConversionTargetDefinition,',
+              '    pub source_profile_identity: IccProfileIdentity,\n    /// Explicit source-alpha handling captured in recipe identity. `None` means no\n    /// flattening was selected and is valid only when source preflight has no unresolved alpha.\n    #[serde(default, skip_serializing_if = "Option::is_none")]\n    pub source_transparency_policy: Option<SourceTransparencyPolicy>,\n    pub target: ConversionTargetDefinition,',
+          )
+          replace_one(
+              'src/color_conversion.rs',
+              '            LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION | CONVERSION_RECIPE_SCHEMA_VERSION\n',
+              '            LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION\n                | SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION\n                | CONVERSION_RECIPE_SCHEMA_VERSION\n',
+          )
+          replace_one(
+              'src/color_conversion.rs',
+              '                "Unsupported conversion recipe schema {} (supported: {} and {}).",\n                self.schema_version,\n                LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION,\n                CONVERSION_RECIPE_SCHEMA_VERSION\n',
+              '                "Unsupported conversion recipe schema {} (supported: {}, {}, and {}).",\n                self.schema_version,\n                LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION,\n                SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION,\n                CONVERSION_RECIPE_SCHEMA_VERSION\n',
+          )
+          replace_one(
+              'src/color_conversion.rs',
+              '        if self.source_profile_identity.sha256.trim().is_empty() {\n            errors.push("Source ICC identity must include a SHA-256 hash.".to_owned());\n        }\n\n        self.target.validate_into(&mut errors);',
+              '        if self.source_profile_identity.sha256.trim().is_empty() {\n            errors.push("Source ICC identity must include a SHA-256 hash.".to_owned());\n        }\n        if self.source_transparency_policy.is_some()\n            && self.schema_version < CONVERSION_RECIPE_SCHEMA_VERSION\n        {\n            errors.push(\n                "Source transparency policy requires conversion recipe schema 3 or newer."\n                    .to_owned(),\n            );\n        }\n\n        self.target.validate_into(&mut errors);',
+          )
+          replace_one(
+              'src/color_conversion.rs',
+              '                    None if self.schema_version == CONVERSION_RECIPE_SCHEMA_VERSION => {',
+              '                    None if self.schema_version >= SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION => {',
+          )
+
+          # Add None to every existing recipe literal so legacy/test semantics stay explicit.
+          for p in Path('src').rglob('*.rs'):
+              text = p.read_text(encoding='utf-8')
+              lines = text.splitlines(keepends=True)
+              out = []
+              changed = False
+              for index, line in enumerate(lines):
+                  out.append(line)
+                  stripped = line.strip()
+                  is_literal = (
+                      'ConversionRecipe {' in line
+                      and not stripped.startswith('pub struct ConversionRecipe')
+                      and not stripped.startswith('struct ConversionRecipe')
+                      and not stripped.startswith('impl')
+                      and '-> ConversionRecipe {' not in line
+                  )
+                  if is_literal:
+                      following = ''.join(lines[index + 1:index + 5])
+                      if 'source_transparency_policy:' not in following:
+                          indent = line[:len(line) - len(line.lstrip())] + '    '
+                          out.append(f'{indent}source_transparency_policy: None,\n')
+                          changed = True
+              if changed:
+                  p.write_text(''.join(out), encoding='utf-8', newline='\n')
+
+          # Ensure every literal was migrated.
+          for p in Path('src').rglob('*.rs'):
+              lines = p.read_text(encoding='utf-8').splitlines()
+              for index, line in enumerate(lines):
+                  stripped = line.strip()
+                  is_literal = (
+                      'ConversionRecipe {' in line
+                      and not stripped.startswith('pub struct ConversionRecipe')
+                      and not stripped.startswith('struct ConversionRecipe')
+                      and not stripped.startswith('impl')
+                      and '-> ConversionRecipe {' not in line
+                  )
+                  if is_literal and not any(
+                      'source_transparency_policy:' in candidate
+                      for candidate in lines[index + 1:index + 6]
+                  ):
+                      raise SystemExit(f'Unmigrated ConversionRecipe literal: {p}:{index + 1}')
+
+          # Descriptor-aware preflight can resolve alpha only when an explicit policy exists.
+          replace_one(
+              'src/conversion_preflight.rs',
+              'use crate::model::IccProfileIdentity;\n',
+              'use crate::model::IccProfileIdentity;\nuse crate::source_transparency::SourceTransparencyPolicy;\n',
+          )
+          old_header = '''pub fn build_conversion_preflight_for_source(\n    source: &DesignSourceDescriptor<'_>,\n    profile: SourceProfileState,\n    save_gate: ConversionSaveGate,\n) -> ConversionPreflightReport {\n    let input = ConversionPreflightInput {'''
+          new_header = '''pub fn build_conversion_preflight_for_source(\n    source: &DesignSourceDescriptor<'_>,\n    profile: SourceProfileState,\n    save_gate: ConversionSaveGate,\n) -> ConversionPreflightReport {\n    build_conversion_preflight_for_source_with_policy(source, profile, save_gate, None)\n}\n\npub fn build_conversion_preflight_for_source_with_policy(\n    source: &DesignSourceDescriptor<'_>,\n    profile: SourceProfileState,\n    save_gate: ConversionSaveGate,\n    transparency_policy: Option<&SourceTransparencyPolicy>,\n) -> ConversionPreflightReport {\n    let input = ConversionPreflightInput {'''
+          replace_one('src/conversion_preflight.rs', old_header, new_header)
+          replace_one(
+              'src/conversion_preflight.rs',
+              '        transparency: source.transparency,\n',
+              '        transparency: if source.transparency == TransparencyState::PresentUnresolved\n            && transparency_policy.is_some()\n        {\n            TransparencyState::Flattened\n        } else {\n            source.transparency\n        },\n',
+          )
+          preflight_test_marker = '''    #[test]\n    fn source_descriptor_warns_dct_jpeg_as_lossy() {'''
+          preflight_test = '''    #[test]\n    fn explicit_flatten_policy_resolves_only_the_transparency_blocker() {\n        let source = DesignSourceDescriptor::new(\n            SourceImageFormat::Png,\n            DesignSourceColorModel::Rgb,\n            16,\n            3,\n            None,\n            TransparencyState::PresentUnresolved,\n            SourceLossiness::Lossless,\n        );\n        let policy = SourceTransparencyPolicy::FlattenSolidRgb16 {\n            background_rgb: [u16::MAX, u16::MAX, u16::MAX],\n        };\n        let report = build_conversion_preflight_for_source_with_policy(\n            &source,\n            profile(),\n            ConversionSaveGate::Ready,\n            Some(&policy),\n        );\n        assert!(!report.contains(PreflightCode::UnresolvedTransparency));\n        assert!(report.contains(PreflightCode::RgbNotProductionSeparated));\n        assert!(report.can_convert());\n    }\n\n    #[test]\n    fn source_descriptor_warns_dct_jpeg_as_lossy() {'''
+          replace_one('src/conversion_preflight.rs', preflight_test_marker, preflight_test)
+
+          # UI state, source summary, alpha policy controls and recipe capture.
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '    build_conversion_preflight_for_source,\n};\n',
+              '    build_conversion_preflight_for_source_with_policy,\n};\n',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              'use windows_shade_editor::model::IccProfileIdentity as ConversionIccProfileIdentity;\n',
+              'use windows_shade_editor::design_source::{SourceLossiness, TransparencyState};\nuse windows_shade_editor::model::IccProfileIdentity as ConversionIccProfileIdentity;\nuse windows_shade_editor::source_transparency::SourceTransparencyPolicy;\n',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '    black_point_compensation: bool,\n}',
+              '    black_point_compensation: bool,\n    source_transparency_policy: Option<SourceTransparencyPolicy>,\n}',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '            black_point_compensation: true,\n        }',
+              '            black_point_compensation: true,\n            source_transparency_policy: None,\n        }',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '    source_path: PathBuf,\n    source_model: RuntimeColorModel,',
+              '    source_path: PathBuf,\n    source_format_label: &\'static str,\n    source_model: RuntimeColorModel,\n    transparency: TransparencyState,\n    lossiness: SourceLossiness,',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '        let profile_identity = profile.identity().cloned();\n        let report = build_conversion_preflight_for_source(&descriptor, profile, save_gate);\n',
+              '        let profile_identity = profile.identity().cloned();\n        let transparency_policy = if self.color_conversion.source_key.as_deref()\n            == Some(face.path.as_path())\n        {\n            self.color_conversion.source_transparency_policy.as_ref()\n        } else {\n            None\n        };\n        let report = build_conversion_preflight_for_source_with_policy(\n            &descriptor,\n            profile,\n            save_gate,\n            transparency_policy,\n        );\n',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '            source_path: face.path.clone(),\n            source_model,',
+              '            source_path: face.path.clone(),\n            source_format_label: descriptor.format.label(),\n            source_model,\n            transparency: descriptor.transparency,\n            lossiness: descriptor.lossiness,',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '                        render_source_preflight(\n',
+              '                        render_transparency_policy(ui, state, &source);\n                        render_source_preflight(\n',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '                ("Source", source.source_path.display().to_string()),\n                ("Color model", source.color_model_label.to_owned()),',
+              '                ("Source", source.source_path.display().to_string()),\n                ("Source format", source.source_format_label.to_owned()),\n                ("Color model", source.color_model_label.to_owned()),\n                ("Transparency", source.transparency.label().to_owned()),\n                ("Compression", source.lossiness.label().to_owned()),',
+          )
+          transparency_fn = '''fn render_transparency_policy(\n    ui: &mut egui::Ui,\n    state: &mut ColorConversionUiState,\n    source: &CurrentConversionSource,\n) {\n    if source.transparency == TransparencyState::None {\n        state.source_transparency_policy = None;\n        return;\n    }\n\n    ui.add_space(8.0);\n    ui.group(|ui| {\n        ui.strong("PNG transparency handling");\n        ui.small(\n            "Alpha is not an ink channel. Production conversion requires an explicit solid background; the source file is never modified.",\n        );\n\n        let mut enabled = state.source_transparency_policy.is_some();\n        if ui\n            .checkbox(&mut enabled, "Flatten alpha against an explicit solid RGB background")\n            .changed()\n        {\n            state.source_transparency_policy = if enabled {\n                Some(SourceTransparencyPolicy::FlattenSolidRgb16 {\n                    background_rgb: [u16::MAX; 3],\n                })\n            } else {\n                None\n            };\n        }\n\n        if enabled {\n            let background = state\n                .source_transparency_policy\n                .unwrap_or(SourceTransparencyPolicy::FlattenSolidRgb16 {\n                    background_rgb: [u16::MAX; 3],\n                })\n                .background_rgb();\n            let mut rgb8 = background.map(|value| ((u32::from(value) + 128) / 257) as u8);\n            let mut changed = false;\n            ui.horizontal_wrapped(|ui| {\n                ui.label("Background RGB");\n                for (label, value) in ["R", "G", "B"].into_iter().zip(rgb8.iter_mut()) {\n                    ui.label(label);\n                    changed |= ui\n                        .add(egui::DragValue::new(value).range(0..=255))\n                        .changed();\n                }\n            });\n            if changed || state.source_transparency_policy.is_none() {\n                state.source_transparency_policy =\n                    Some(SourceTransparencyPolicy::FlattenSolidRgb16 {\n                        background_rgb: rgb8.map(|value| u16::from(value) * 257),\n                    });\n            }\n            if let Some(policy) = state.source_transparency_policy {\n                ui.small(format!("Recipe policy: {}", policy.label()));\n            }\n        } else {\n            ui.label(\n                egui::RichText::new("No flatten policy selected — conversion remains blocked")\n                    .color(egui::Color32::LIGHT_RED),\n            );\n        }\n    });\n    ui.add_space(4.0);\n}\n\n'''
+          marker = 'fn render_source_preflight(\n'
+          p = Path('src/ui/color_conversion.rs')
+          text = p.read_text(encoding='utf-8')
+          if text.count(marker) != 1:
+              raise SystemExit('render_source_preflight marker mismatch')
+          p.write_text(text.replace(marker, transparency_fn + marker, 1), encoding='utf-8', newline='\n')
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '    let recipe = ConversionRecipe {\n        source_transparency_policy: None,\n',
+              '    let recipe = ConversionRecipe {\n        source_transparency_policy: state.source_transparency_policy,\n',
+          )
+          replace_one(
+              'src/ui/color_conversion.rs',
+              '                        ("Recipe SHA-256", review.recipe_sha256),\n',
+              '                        (\n                            "Transparency policy",\n                            review\n                                .recipe\n                                .source_transparency_policy\n                                .map(SourceTransparencyPolicy::label)\n                                .unwrap_or_else(|| "No flattening".to_owned()),\n                        ),\n                        ("Recipe SHA-256", review.recipe_sha256),\n',
+          )
+
+          # Recipe identity regression.
+          recipe_test_marker = '''    #[test]\n    fn solver_policy_change_changes_recipe_identity() {'''
+          recipe_test = '''    #[test]\n    fn transparency_background_change_changes_recipe_identity() {\n        let first = recipe();\n        let mut second = first.clone();\n        second.source_transparency_policy = Some(\n            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {\n                background_rgb: [u16::MAX, u16::MAX, u16::MAX],\n            },\n        );\n        let mut third = second.clone();\n        third.source_transparency_policy = Some(\n            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {\n                background_rgb: [0, 0, 0],\n            },\n        );\n        assert_ne!(recipe_sha256(&first).unwrap(), recipe_sha256(&second).unwrap());\n        assert_ne!(recipe_sha256(&second).unwrap(), recipe_sha256(&third).unwrap());\n    }\n\n    #[test]\n    fn solver_policy_change_changes_recipe_identity() {'''
+          replace_one('src/conversion_recipe.rs', recipe_test_marker, recipe_test)
+          replace_one(
+              'src/conversion_recipe.rs',
+              '    fn schema_v2_custom_optimizer_requires_explicit_solver_config() {',
+              '    fn current_schema_custom_optimizer_requires_explicit_solver_config() {',
+          )
+
+          # Production worker remains intentionally TIFF-only in this slice.
+          ui = Path('src/ui/color_conversion.rs').read_text(encoding='utf-8')
+          if 'execution_supported: face.preview.is_tiff(),' not in ui:
+              raise SystemExit('PR301 must not remove the TIFF-only production execution guard')
+          if 'full-resolution production execution remains TIFF-only' not in ui:
+              raise SystemExit('PR301 must keep the explicit non-TIFF execution explanation')
+          '@ | python -
+          cargo fmt --all
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          if ($changed | Where-Object { $_ -like '.github/*' -or $_ -in @('Cargo.toml','Cargo.lock','VERSION') }) {
+            throw "Unexpected PR301 surface: $($changed -join ', ')"
+          }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src
+          git commit -m 'feat: persist explicit PNG alpha flatten policy (#301)'
+          git push origin HEAD:codex/png-alpha-flatten-policy
