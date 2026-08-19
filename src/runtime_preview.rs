@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::tiff_io::{self, ColorModel as TiffColorModel, PreviewFace, TiffMetadata};
 use windows_shade_editor::design_source::{
-    DesignSourceColorModel, DesignSourceDescriptor, SourceImageFormat,
+    DesignSourceColorModel, SourceImageFormat, SourceLossiness, TransparencyState,
 };
 use windows_shade_editor::design_source_preview::{
     DesignSourcePreview, OwnedDesignSourceDescriptor,
@@ -216,9 +216,23 @@ impl RuntimePreview {
 
     pub fn source_descriptor(&self) -> OwnedDesignSourceDescriptor {
         match self {
-            Self::Tiff(preview) => OwnedDesignSourceDescriptor::from_borrowed(
-                DesignSourceDescriptor::from_tiff_metadata(&preview.metadata),
-            ),
+            Self::Tiff(preview) => {
+                let color_model = match preview.metadata.color_model {
+                    TiffColorModel::Gray => DesignSourceColorModel::Gray,
+                    TiffColorModel::Rgb => DesignSourceColorModel::Rgb,
+                    TiffColorModel::Cmyk => DesignSourceColorModel::Cmyk,
+                    TiffColorModel::Other => DesignSourceColorModel::Other,
+                };
+                OwnedDesignSourceDescriptor {
+                    format: SourceImageFormat::Tiff,
+                    color_model,
+                    bit_depth: preview.metadata.bit_depth,
+                    channel_count: preview.metadata.samples_per_pixel,
+                    embedded_icc: preview.metadata.icc_profile.clone(),
+                    transparency: TransparencyState::None,
+                    lossiness: SourceLossiness::Lossless,
+                }
+            }
             Self::Design(preview) => preview.source.clone(),
         }
     }
