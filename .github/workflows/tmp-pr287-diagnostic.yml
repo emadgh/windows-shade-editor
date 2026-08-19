@@ -1,0 +1,87 @@
+name: Temporary PR287 compiler diagnostic
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr287-diagnostic-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Rebuild failed PR287 patch and publish compiler diagnostics only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'f4ea08c567249e145e49535180aeec52ec974ff8'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'Canonical PR284 head moved' }
+
+          git show origin/tmp/pr284-runtimeface-retry:.github/workflows/tmp-pr284-runtimeface-retry.yml | Out-File -Encoding utf8 retry-helper.yml
+          @'
+          from pathlib import Path
+          import re
+          text = Path('retry-helper.yml').read_text(encoding='utf-8-sig')
+          blocks = re.findall(r"          @'\n(.*?)          '@ \| python -", text, flags=re.S)
+          if len(blocks) < 2:
+              raise SystemExit(f'Expected at least two inline Python blocks, got {len(blocks)}')
+          for i, block in enumerate(blocks[:2], 1):
+              lines = block.splitlines()
+              script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+              Path(f'inline_{i}.py').write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          python inline_1.py
+          python ownership_patch.py
+          python inline_2.py
+
+          cargo fmt --all
+          $allowed = @(
+            'src/main.rs',
+            'src/workflow.rs',
+            'src/ui/adjustments.rs',
+            'src/ui/test_code_panel.rs',
+            'src/thumbnail.rs',
+            'src/color_management.rs',
+            'src/ui/color_conversion.rs'
+          )
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) {
+            if ($allowed -notcontains $file) { git checkout -- $file }
+          }
+
+          New-Item -ItemType Directory -Force diagnostics | Out-Null
+          cargo check --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath diagnostics/pr287-check-full.txt
+          $checkExit = $LASTEXITCODE
+          @'
+          from pathlib import Path
+          text = Path('diagnostics/pr287-check-full.txt').read_text(encoding='utf-8', errors='replace')
+          lines = text.splitlines()
+          selected = []
+          keep = False
+          for line in lines:
+              if line.startswith('error[') or line.startswith('error:'):
+                  keep = True
+              if keep:
+                  selected.append(line)
+                  if len(selected) >= 500:
+                      break
+          if not selected:
+              selected = lines[-500:]
+          Path('diagnostics/pr287-check.txt').write_text('\n'.join(selected) + '\n', encoding='utf-8', newline='\n')
+          '@ | python -
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add diagnostics/pr287-check.txt
+          git commit -m 'diagnostic: capture PR287 cargo check errors'
+          git push origin HEAD:tmp/pr287-diagnostic-output --force
+          exit $checkExit
