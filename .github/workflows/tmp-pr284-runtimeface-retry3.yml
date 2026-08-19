@@ -1,0 +1,158 @@
+name: Temporary guarded PR284 runtime source wiring retry3
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr284-runtimeface-retry3
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply strict ownership and source-neutral application patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'f4ea08c567249e145e49535180aeec52ec974ff8'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 canonical head moved' }
+
+          @'
+          from pathlib import Path
+          import re
+
+          p = Path('src/main.rs')
+          text = p.read_text(encoding='utf-8')
+          def one(old, new):
+              global text
+              c = text.count(old)
+              if c != 1:
+                  raise SystemExit(f'main ownership expected one match, got {c}: {old[:100]!r}')
+              text = text.replace(old, new, 1)
+          one('use tiff_io::PreviewFace;', 'use runtime_preview::{RuntimeColorModel, RuntimePreview, RuntimePreviewSource};')
+          one('    preview: Arc<PreviewFace>,', '    preview: Arc<RuntimePreview>,')
+          one('    preview: PreviewFace,', '    preview: RuntimePreview,')
+          pattern = r'    fn is_tiff_path\(path: &Path\) -> bool \{\n(?:        .*\n)+?    \}\n'
+          replacement = '''    fn is_design_source_path(path: &Path) -> bool {
+              runtime_preview::is_supported_design_source_path(path)
+          }
+          '''
+          text, n = re.subn(pattern, replacement, text, count=1)
+          if n != 1:
+              raise SystemExit(f'is_tiff_path regex count was {n}')
+          text = text.replace('Self::is_tiff_path(path)', 'Self::is_design_source_path(path)')
+          text = text.replace('self.launch_job("Opening TIFF"', 'self.launch_job("Opening design source"')
+          text = text.replace('"Opening TIFF",', '"Opening design source",')
+          text = text.replace('match tiff_io::load_preview(&path, max_dimension)', 'match RuntimePreview::load(&path, max_dimension)')
+          text = text.replace('match tiff_io::load_preview(&source, max_dimension)', 'match RuntimePreview::load(&source, max_dimension)')
+          text = text.replace('.add_filter("TIFF images", &["tif", "tiff"])', '.add_filter("Design images", &["tif", "tiff", "png", "jpg", "jpeg"])')
+          text = text.replace('project.ensure_channels(&preview.metadata.channel_names);', 'project.ensure_channels(preview.channel_names());')
+          text = text.replace('self.project\n                        .ensure_channels(&item.preview.metadata.channel_names);', 'self.project\n                        .ensure_channels(item.preview.channel_names());')
+          text = text.replace('let count = face.preview.metadata.channel_names.len();', 'let count = face.preview.channel_names().len();')
+          text = text.replace('.map(|face| face.preview.metadata.channel_names.clone())', '.map(|face| face.preview.channel_names().to_vec())')
+          text = text.replace('color_management::PreviewColorTransform::new(&preview.metadata, color_config)', 'color_management::PreviewColorTransform::new_for_runtime_preview(&preview, color_config)')
+          text = text.replace('color_management::PreviewColorTransform::new(\n                        &preview.metadata,', 'color_management::PreviewColorTransform::new_for_runtime_preview(\n                        &preview,')
+          text = text.replace('&preview.channels,', 'preview.channels(),')
+          p.write_text(text, encoding='utf-8', newline='\n')
+
+          p = Path('src/workflow.rs')
+          text = p.read_text(encoding='utf-8')
+          text = text.replace('face.preview.metadata.channel_names.len()', 'face.preview.channel_names().len()')
+          text = text.replace('tiff_io::load_preview(&path, max_dimension)', 'RuntimePreview::load(&path, max_dimension)')
+          text = text.replace('.add_filter("TIFF images", &["tif", "tiff"])', '.add_filter("Design images", &["tif", "tiff", "png", "jpg", "jpeg"])')
+          text = text.replace('app.project\n                    .ensure_channels(&item.preview.metadata.channel_names);', 'app.project\n                    .ensure_channels(item.preview.channel_names());')
+          text = text.replace('let preview = tiff_io::load_preview(&path, max_dimension)\n        .map_err(|err| format!("Cannot load replacement {}: {err}", path.display()))?;', 'let preview = RuntimePreview::load(&path, max_dimension)\n        .map_err(|err| format!("Cannot load replacement {}: {err}", path.display()))?;')
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Extract the audited comprehensive source-neutralization block from #287,
+          # then correct its one whitespace-sensitive viewport replacement before running it.
+          git show origin/tmp/pr284-runtimeface-retry:.github/workflows/tmp-pr284-runtimeface-retry.yml | Out-File -Encoding utf8 retry-helper.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          from pathlib import Path
+          import re
+          text = Path('retry-helper.yml').read_text(encoding='utf-8-sig')
+          blocks = re.findall(r"          @'\n(.*?)          '@ \| python -", text, flags=re.S)
+          if len(blocks) < 2:
+              raise SystemExit(f'Expected two Python blocks, got {len(blocks)}')
+          block = blocks[1]
+          lines = block.splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          # Replace the old whitespace-sensitive viewport meta block in the generated patcher.
+          pattern = re.compile(
+              r"\n\s*old = '''        let meta = face\.preview\.metadata\.clone\(\);.*?text = replace_once\(text, old, new, path\)\n",
+              flags=re.S,
+          )
+          replacement = '''
+          target = "        let meta = face.preview.metadata.clone();\\n        let dpi_info = face.dpi;"
+          if target not in text:
+              raise SystemExit("src/main.rs: current viewport metadata target missing")
+          text = text.replace(
+              target,
+              "        let (source_width, source_height) = face.preview.source_dimensions();\\n        let source_bit_depth = face.preview.bit_depth();\\n        let source_model = face.preview.color_model();\\n        let source_channel_count = face.preview.channel_count();\\n        let dpi_info = face.dpi;",
+              1,
+          )
+          '''
+          script, n = pattern.subn('\n' + replacement, script, count=1)
+          if n != 1:
+              raise SystemExit(f'Could not rewrite viewport metadata patch; count={n}')
+          Path('comprehensive_patch.py').write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python comprehensive_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          @'
+          from pathlib import Path
+          def add_after(path, needle, addition):
+              p = Path(path); text = p.read_text(encoding='utf-8')
+              if addition.strip() in text:
+                  return
+              if needle not in text:
+                  raise SystemExit(f'{path}: import anchor missing')
+              p.write_text(text.replace(needle, needle + addition, 1), encoding='utf-8', newline='\n')
+          add_after('src/workflow.rs', 'use super::*;\n', 'use crate::runtime_preview::RuntimePreviewSource;\n')
+          add_after('src/ui/adjustments.rs', 'use crate::*;\n', 'use crate::runtime_preview::RuntimePreviewSource;\n')
+          add_after('src/ui/test_code_panel.rs', 'use crate::*;\n', 'use crate::runtime_preview::RuntimePreviewSource;\n')
+
+          p = Path('src/thumbnail.rs'); text = p.read_text(encoding='utf-8')
+          text = text.replace('PreviewColorTransform::new(&face.metadata, PreviewColorConfig::from_project(project))', 'PreviewColorTransform::new_for_runtime_preview(face, PreviewColorConfig::from_project(project))')
+          text = text.replace('resize_rgba(face.width, face.height, &rgba, THUMBNAIL_MAX_DIMENSION)?', 'resize_rgba(face.width(), face.height(), &rgba, THUMBNAIL_MAX_DIMENSION)?')
+          p.write_text(text, encoding='utf-8', newline='\n')
+
+          p = Path('src/ui/test_code_panel.rs'); text = p.read_text(encoding='utf-8')
+          text = text.replace('                                    name.clone(),\n                                    display,', '                                    name.to_owned(),\n                                    display,')
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Remove-Item retry-helper.yml, comprehensive_patch.py -ErrorAction SilentlyContinue
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $allowed = @('src/main.rs','src/workflow.rs','src/ui/adjustments.rs','src/ui/test_code_panel.rs','src/thumbnail.rs','src/color_management.rs','src/ui/color_conversion.rs')
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) { if ($allowed -notcontains $file) { git checkout -- $file } }
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) { if ($allowed -notcontains $file) { throw "Unexpected patch surface: $file" } }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/workflow.rs src/ui/adjustments.rs src/ui/test_code_panel.rs src/thumbnail.rs src/color_management.rs src/ui/color_conversion.rs
+          git commit -m 'feat: wire RuntimePreview application and source-aware preflight (#281)'
+          git push origin HEAD:codex/design-source-runtime-wiring
