@@ -57,6 +57,7 @@ pub mod production_colorimetry;
 pub mod production_lab_transform;
 pub mod production_project;
 pub mod production_project_compat;
+pub mod production_project_disposition;
 pub mod production_target;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
