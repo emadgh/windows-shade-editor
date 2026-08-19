@@ -16,6 +16,7 @@ pub mod custom_optimizer_config;
 pub mod custom_optimizer_evidence;
 pub mod custom_optimizer_raster_transform;
 pub mod design_source;
+pub mod design_source_preview;
 pub mod device_characterization;
 pub mod device_characterization_model;
 pub mod device_characterization_package;
