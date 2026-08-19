@@ -59,10 +59,7 @@ mod tests {
         };
         let foreground = [50000, 40000, 30000];
         assert_eq!(composite_rgb_u16(foreground, u16::MAX, policy), foreground);
-        assert_eq!(
-            composite_rgb_u16(foreground, 0, policy),
-            [1000, 2000, 3000]
-        );
+        assert_eq!(composite_rgb_u16(foreground, 0, policy), [1000, 2000, 3000]);
     }
 
     #[test]

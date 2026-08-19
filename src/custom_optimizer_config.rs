@@ -99,8 +99,7 @@ impl ContinuityPreferenceConfig {
             || !(0.0..=1.0).contains(&self.max_normalized_channel_jump)
         {
             errors.push(
-                "Continuity max_normalized_channel_jump must be finite and in 0..=1."
-                    .to_owned(),
+                "Continuity max_normalized_channel_jump must be finite and in 0..=1.".to_owned(),
             );
         }
         if !self.dominant_channel_switch_penalty.is_finite()
@@ -204,17 +203,13 @@ impl CustomOptimizerSolverConfig {
             );
         }
         if !self.step_decay.is_finite() || !(0.1..=0.95).contains(&self.step_decay) {
-            errors.push(
-                "Custom Optimizer step_decay must be finite and in 0.1..=0.95."
-                    .to_owned(),
-            );
+            errors.push("Custom Optimizer step_decay must be finite and in 0.1..=0.95.".to_owned());
         }
         if !self.preference_delta_e00.is_finite()
             || !(0.0..=1.0).contains(&self.preference_delta_e00)
         {
             errors.push(
-                "Custom Optimizer preference_delta_e00 must be finite and in 0..=1.0."
-                    .to_owned(),
+                "Custom Optimizer preference_delta_e00 must be finite and in 0..=1.0.".to_owned(),
             );
         }
 
@@ -307,8 +302,14 @@ mod tests {
     #[test]
     fn default_config_is_current_and_valid_for_supported_nchannel_targets() {
         let config = CustomOptimizerSolverConfig::default();
-        assert_eq!(config.schema_version, CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION);
-        assert_eq!(config.objective_weights, Some(CustomOptimizerObjectiveWeights::default()));
+        assert_eq!(
+            config.schema_version,
+            CUSTOM_OPTIMIZER_SOLVER_CONFIG_SCHEMA_VERSION
+        );
+        assert_eq!(
+            config.objective_weights,
+            Some(CustomOptimizerObjectiveWeights::default())
+        );
         for channel_count in [1usize, 4, 8, 12] {
             assert!(config.validate(channel_count).is_ok());
         }

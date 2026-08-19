@@ -4,10 +4,7 @@ use eframe::egui;
 
 pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
     let ctrl_right_click = ui.ctx().input(|input| {
-        input.modifiers.ctrl
-            && input
-                .pointer
-                .button_clicked(egui::PointerButton::Secondary)
+        input.modifiers.ctrl && input.pointer.button_clicked(egui::PointerButton::Secondary)
     });
     if ctrl_right_click && match_color::target_snapshot().is_some() {
         match_color::set_preview_visible(true);
@@ -50,7 +47,10 @@ pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
             }
         }
         if ui
-            .add_enabled(target.as_ref().is_some_and(|item| item.is_available()), egui::Button::new("↗").small())
+            .add_enabled(
+                target.as_ref().is_some_and(|item| item.is_available()),
+                egui::Button::new("↗").small(),
+            )
             .on_hover_text("Reveal Reference file in Explorer")
             .clicked()
         {

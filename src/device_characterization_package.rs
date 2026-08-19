@@ -110,9 +110,18 @@ pub struct ValidatedCharacterizationPackage {
 pub enum CharacterizationTargetError {
     InvalidPackage(Vec<String>),
     MissingTargetCharacterization,
-    IdentityMismatch { target: String, package: String },
-    ChannelTopologyMismatch { target: Vec<String>, package: Vec<String> },
-    BitDepthMismatch { target: u8, package: u8 },
+    IdentityMismatch {
+        target: String,
+        package: String,
+    },
+    ChannelTopologyMismatch {
+        target: Vec<String>,
+        package: Vec<String>,
+    },
+    BitDepthMismatch {
+        target: u8,
+        package: u8,
+    },
     MissingChannelLimit(String),
     ChannelLimitExceedsMeasured {
         channel: String,
@@ -120,14 +129,20 @@ pub enum CharacterizationTargetError {
         measured: f32,
     },
     MissingTotalInkLimit,
-    TotalInkLimitExceedsMeasured { target: f32, measured: f32 },
+    TotalInkLimitExceedsMeasured {
+        target: f32,
+        measured: f32,
+    },
     PackageNotProductionValidated,
 }
 
 impl CharacterizationPackage {
     pub fn new(payload: CharacterizationPayload) -> Result<Self, Vec<String>> {
-        let id = payload_content_id(&payload)
-            .map_err(|err| vec![format!("Cannot fingerprint characterization payload: {err}")])?;
+        let id = payload_content_id(&payload).map_err(|err| {
+            vec![format!(
+                "Cannot fingerprint characterization payload: {err}"
+            )]
+        })?;
         let package = Self {
             schema_version: CHARACTERIZATION_PACKAGE_SCHEMA_VERSION,
             id,
@@ -226,9 +241,7 @@ pub fn load_characterization_package(
             path.display()
         )
     })?;
-    package
-        .validated()
-        .map_err(|errors| errors.join("\n"))
+    package.validated().map_err(|errors| errors.join("\n"))
 }
 
 /// Validate that a content-addressed measured package is safe for the selected
@@ -354,7 +367,12 @@ fn validate_payload(payload: &CharacterizationPayload, errors: &mut Vec<String>)
         }
     }
 
-    for (index, limit) in payload.measured_channel_max_coverage.iter().copied().enumerate() {
+    for (index, limit) in payload
+        .measured_channel_max_coverage
+        .iter()
+        .copied()
+        .enumerate()
+    {
         if !limit.is_finite() || !(0.0..=1.0).contains(&limit) || limit == 0.0 {
             errors.push(format!(
                 "Measured channel limit {} must be finite and in (0, 1].",
@@ -385,7 +403,10 @@ fn validate_required_context(
         ("machine ID", context.machine_id.as_str()),
         ("RIP name", context.rip_name.as_str()),
         ("RIP version", context.rip_version.as_str()),
-        ("linearization/calibration ID", context.linearization_id.as_str()),
+        (
+            "linearization/calibration ID",
+            context.linearization_id.as_str(),
+        ),
         ("substrate", context.substrate.as_str()),
     ] {
         if value.trim().is_empty() {
@@ -402,7 +423,10 @@ fn validate_measurement_metadata(
         ("instrument model", metadata.instrument_model.as_str()),
         ("illuminant", metadata.illuminant.as_str()),
         ("observer", metadata.observer.as_str()),
-        ("measurement condition", metadata.measurement_condition.as_str()),
+        (
+            "measurement condition",
+            metadata.measurement_condition.as_str(),
+        ),
     ] {
         if value.trim().is_empty() {
             errors.push(format!("Characterization {label} cannot be empty."));
@@ -673,10 +697,9 @@ mod tests {
 
     #[test]
     fn experimental_package_is_rejected_for_production_but_can_be_preflighted() {
-        let package = CharacterizationPackage::new(payload(
-            CharacterizationValidationLevel::Experimental,
-        ))
-        .unwrap();
+        let package =
+            CharacterizationPackage::new(payload(CharacterizationValidationLevel::Experimental))
+                .unwrap();
         let target = target(package.id.clone());
         assert_eq!(
             validate_characterization_for_target(&package, &target, true),

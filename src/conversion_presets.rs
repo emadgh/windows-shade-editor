@@ -251,7 +251,9 @@ impl SeparationPresetDefinition {
             schema_version: SEPARATION_PRESET_SCHEMA_VERSION,
             id: "builtin:balanced:v1".to_owned(),
             name: "Balanced".to_owned(),
-            notes: Some("No additional ink preference beyond the selected production transform.".to_owned()),
+            notes: Some(
+                "No additional ink preference beyond the selected production transform.".to_owned(),
+            ),
             origin: PresetOrigin::BuiltIn,
             target: PresetTargetBinding::from_target(target, engine_mode),
             strategy: SeparationStrategy::default(),
@@ -306,7 +308,7 @@ impl SeparationPresetDefinition {
 mod tests {
     use super::*;
     use crate::color_conversion::{
-        ConversionRenderingIntent, TargetChannelDefinition, CONVERSION_RECIPE_SCHEMA_VERSION,
+        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionRenderingIntent, TargetChannelDefinition,
     };
     use crate::conversion_recipe::recipe_sha256;
     use crate::model::IccProfileIdentity;
@@ -342,6 +344,7 @@ mod tests {
 
     fn recipe(engine_mode: ConversionEngineMode) -> ConversionRecipe {
         ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode,
             source_profile_identity: identity("source-v1"),
@@ -350,17 +353,15 @@ mod tests {
             black_point_compensation: false,
             strategy: SeparationStrategy::default(),
             custom_optimizer_solver: (engine_mode == ConversionEngineMode::CustomOptimizer)
-                                .then(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default),
+                .then(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default),
         }
     }
 
     #[test]
     fn same_named_replaced_icc_invalidates_preset_by_hash() {
         let base = recipe(ConversionEngineMode::Icc);
-        let preset = SeparationPresetDefinition::built_in_balanced(
-            &base.target,
-            ConversionEngineMode::Icc,
-        );
+        let preset =
+            SeparationPresetDefinition::built_in_balanced(&base.target, ConversionEngineMode::Icc);
         let mut changed = base.clone();
         changed.target.output_profile_identity = Some(identity("icc-v2"));
         assert_eq!(
@@ -372,10 +373,8 @@ mod tests {
     #[test]
     fn moving_same_verified_profile_does_not_invalidate_preset() {
         let base = recipe(ConversionEngineMode::Icc);
-        let preset = SeparationPresetDefinition::built_in_balanced(
-            &base.target,
-            ConversionEngineMode::Icc,
-        );
+        let preset =
+            SeparationPresetDefinition::built_in_balanced(&base.target, ConversionEngineMode::Icc);
         let mut moved = base.clone();
         moved.target.output_profile_path = Some(r"D:\Profiles\output.icc".to_owned());
         assert_eq!(

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::color_conversion::ConversionEngineMode;
 use crate::conversion_presets::{
-    PresetOrigin, SeparationPresetDefinition, SEPARATION_PRESET_SCHEMA_VERSION,
+    PresetOrigin, SEPARATION_PRESET_SCHEMA_VERSION, SeparationPresetDefinition,
 };
 
 pub const PRESET_LIBRARY_SCHEMA_VERSION: u32 = 1;
@@ -71,10 +71,7 @@ impl SeparationPresetLibrary {
         self.presets.iter().find(|preset| preset.id == id)
     }
 
-    pub fn insert(
-        &mut self,
-        preset: SeparationPresetDefinition,
-    ) -> Result<(), PresetLibraryError> {
+    pub fn insert(&mut self, preset: SeparationPresetDefinition) -> Result<(), PresetLibraryError> {
         validate_preset(&preset)?;
         if self.get(&preset.id).is_some() {
             return Err(PresetLibraryError::DuplicateId(preset.id));
@@ -280,7 +277,9 @@ fn validate_strategy(
     if !strategy.black_generation_strength.is_finite()
         || !(0.0..=1.0).contains(&strategy.black_generation_strength)
     {
-        return Err(invalid("Black generation strength must be finite and in 0..=1."));
+        return Err(invalid(
+            "Black generation strength must be finite and in 0..=1.",
+        ));
     }
     if !strategy.black_start.is_finite() || !(0.0..=1.0).contains(&strategy.black_start) {
         return Err(invalid("Black start must be finite and in 0..=1."));
@@ -289,19 +288,25 @@ fn validate_strategy(
         return Err(invalid("Black maximum must be finite and in 0..=1."));
     }
     if !strategy.neutral_chroma_threshold.is_finite() || strategy.neutral_chroma_threshold < 0.0 {
-        return Err(invalid("Neutral chroma threshold must be finite and non-negative."));
+        return Err(invalid(
+            "Neutral chroma threshold must be finite and non-negative.",
+        ));
     }
     if strategy
         .total_ink_limit
         .is_some_and(|value| !value.is_finite() || value <= 0.0)
     {
-        return Err(invalid("Strategy total ink limit must be finite and greater than zero."));
+        return Err(invalid(
+            "Strategy total ink limit must be finite and greater than zero.",
+        ));
     }
     if strategy
         .max_delta_e00
         .is_some_and(|value| !value.is_finite() || value < 0.0)
     {
-        return Err(invalid("Maximum Delta E00 must be finite and non-negative."));
+        return Err(invalid(
+            "Maximum Delta E00 must be finite and non-negative.",
+        ));
     }
     if let Some(black) = strategy.black_channel.as_deref() {
         if !target_names.contains(&black.trim().to_ascii_lowercase()) {
@@ -310,7 +315,9 @@ fn validate_strategy(
     }
     for (ink, bias) in &strategy.per_ink_bias {
         if !target_names.contains(&ink.trim().to_ascii_lowercase()) {
-            return Err(invalid("Ink-priority channel is not part of the target topology."));
+            return Err(invalid(
+                "Ink-priority channel is not part of the target topology.",
+            ));
         }
         if !bias.is_finite() || !(-1.0..=1.0).contains(bias) {
             return Err(invalid("Ink-priority value must be finite and in -1..=1."));
@@ -379,10 +386,8 @@ mod tests {
     #[test]
     fn import_export_never_grants_built_in_identity() {
         let target = target();
-        let built_in = SeparationPresetDefinition::built_in_balanced(
-            &target,
-            ConversionEngineMode::Icc,
-        );
+        let built_in =
+            SeparationPresetDefinition::built_in_balanced(&target, ConversionEngineMode::Icc);
         let json = serde_json::to_string(&built_in).unwrap();
         assert!(!json.contains("target.icc"));
 
@@ -394,10 +399,8 @@ mod tests {
     #[test]
     fn duplicate_ids_and_malformed_target_bindings_fail_closed() {
         let target = target();
-        let preset = SeparationPresetDefinition::built_in_balanced(
-            &target,
-            ConversionEngineMode::Icc,
-        );
+        let preset =
+            SeparationPresetDefinition::built_in_balanced(&target, ConversionEngineMode::Icc);
         let mut library = SeparationPresetLibrary::new();
         library.insert(preset.clone()).unwrap();
         assert_eq!(
@@ -407,10 +410,8 @@ mod tests {
             ))
         );
 
-        let mut malformed = SeparationPresetDefinition::built_in_balanced(
-            &target,
-            ConversionEngineMode::Icc,
-        );
+        let mut malformed =
+            SeparationPresetDefinition::built_in_balanced(&target, ConversionEngineMode::Icc);
         malformed.id = "user:bad".to_owned();
         malformed.target.channel_max_coverage.pop();
         assert_eq!(
@@ -437,13 +438,14 @@ mod tests {
 
     #[test]
     fn imported_non_finite_or_unknown_strategy_data_is_rejected() {
-        let mut preset = SeparationPresetDefinition::built_in_balanced(
-            &target(),
-            ConversionEngineMode::Icc,
-        );
+        let mut preset =
+            SeparationPresetDefinition::built_in_balanced(&target(), ConversionEngineMode::Icc);
         preset.id = "user:invalid".to_owned();
         preset.origin = PresetOrigin::User;
-        preset.strategy.per_ink_bias.insert("Orange".to_owned(), 0.4);
+        preset
+            .strategy
+            .per_ink_bias
+            .insert("Orange".to_owned(), 0.4);
         let mut library = SeparationPresetLibrary::new();
         assert!(matches!(
             library.insert(preset),

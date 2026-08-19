@@ -30,16 +30,16 @@ pub(crate) fn ui_history(app: &mut ShadeApp, ui: &mut egui::Ui) {
                 undo_clear = ui.small_button("Undo clear").clicked();
             }
             clear = ui
-                .add_enabled(
-                    app.history.len() > 1,
-                    egui::Button::new("Clear").small(),
-                )
+                .add_enabled(app.history.len() > 1, egui::Button::new("Clear").small())
                 .on_hover_text("Clear adjustment history")
                 .clicked();
         });
     });
     if let Some(name) = app.project.active_snapshot_name() {
-        ui.small(format!("{name} · {} saved steps max", app.settings.history_steps));
+        ui.small(format!(
+            "{name} · {} saved steps max",
+            app.settings.history_steps
+        ));
     } else {
         ui.small("Working adjustment history");
     }

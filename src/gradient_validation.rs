@@ -97,7 +97,11 @@ impl GradientCurvaturePolicy {
             self.max_total_ink_second_difference,
             &mut errors,
         );
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
@@ -119,9 +123,18 @@ pub enum GradientCurvatureViolation {
         value: f32,
         limit: f32,
     },
-    VectorL1SecondDifference { value: f32, limit: f32 },
-    VectorL2SecondDifference { value: f32, limit: f32 },
-    TotalInkSecondDifference { value: f32, limit: f32 },
+    VectorL1SecondDifference {
+        value: f32,
+        limit: f32,
+    },
+    VectorL2SecondDifference {
+        value: f32,
+        limit: f32,
+    },
+    TotalInkSecondDifference {
+        value: f32,
+        limit: f32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -197,11 +210,7 @@ pub fn analyze_gradient_curvature(
     let mut diagnostics = Vec::with_capacity(continuity.samples.len().saturating_sub(2));
     for triple in continuity.samples.windows(3) {
         diagnostics.push(diagnose_curvature(
-            &triple[0],
-            &triple[1],
-            &triple[2],
-            &maxima,
-            policy,
+            &triple[0], &triple[1], &triple[2], &maxima, policy,
         ));
     }
 
@@ -309,11 +318,13 @@ fn diagnose_curvature(
         .enumerate()
     {
         if value > policy.max_normalized_channel_second_difference {
-            violations.push(GradientCurvatureViolation::NormalizedChannelSecondDifference {
-                channel_index,
-                value,
-                limit: policy.max_normalized_channel_second_difference,
-            });
+            violations.push(
+                GradientCurvatureViolation::NormalizedChannelSecondDifference {
+                    channel_index,
+                    value,
+                    limit: policy.max_normalized_channel_second_difference,
+                },
+            );
         }
     }
     if vector_l1_second_difference > policy.max_vector_l1_second_difference {
@@ -446,7 +457,14 @@ mod tests {
         };
         let path = linear_lab_path(start, end, 3).expect("valid path");
         assert_eq!(path[0], start);
-        assert_eq!(path[1], LabColor { l: 50.0, a: 25.0, b: -25.0 });
+        assert_eq!(
+            path[1],
+            LabColor {
+                l: 50.0,
+                a: 25.0,
+                b: -25.0
+            }
+        );
         assert_eq!(path[2], end);
         assert_eq!(linear_lab_path(start, end, 3).unwrap(), path);
 
@@ -459,7 +477,14 @@ mod tests {
             Err(LabPathError::InvalidSampleCount { .. })
         ));
         assert_eq!(
-            linear_lab_path(LabColor { l: f64::NAN, ..start }, end, 3),
+            linear_lab_path(
+                LabColor {
+                    l: f64::NAN,
+                    ..start
+                },
+                end,
+                3
+            ),
             Err(LabPathError::NonFiniteEndpoint)
         );
         assert_eq!(

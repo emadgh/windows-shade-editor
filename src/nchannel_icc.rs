@@ -38,7 +38,8 @@ impl<const N: usize> ProductionNChannelTransform<N> {
         if source.color_space().channels() != expected_source_channels {
             return Err(format!(
                 "Source ICC declares {} channels but {:?} source data requires {expected_source_channels}.",
-                source.color_space().channels(), source_model
+                source.color_space().channels(),
+                source_model
             ));
         }
         if target.device_class() != ProfileClassSignature::OutputClass {
@@ -65,17 +66,11 @@ impl<const N: usize> ProductionNChannelTransform<N> {
                             Flags::BLACKPOINT_COMPENSATION,
                         )
                     } else {
-                        Transform::new(
-                            &source,
-                            PixelFormat::RGB_16,
-                            &target,
-                            output_format,
-                            intent,
-                        )
+                        Transform::new(&source, PixelFormat::RGB_16, &target, output_format, intent)
                     };
-                result
-                    .map(NChannelTransform::Rgb)
-                    .map_err(|err| format!("Cannot create production RGB→{N}C ICC transform: {err}"))?
+                result.map(NChannelTransform::Rgb).map_err(|err| {
+                    format!("Cannot create production RGB→{N}C ICC transform: {err}")
+                })?
             }
             IccSourceModel::Cmyk => {
                 let result: lcms2::LCMSResult<Transform<[u16; 4], [u16; N]>> =
@@ -97,9 +92,9 @@ impl<const N: usize> ProductionNChannelTransform<N> {
                             intent,
                         )
                     };
-                result
-                    .map(NChannelTransform::Cmyk)
-                    .map_err(|err| format!("Cannot create production CMYK→{N}C ICC transform: {err}"))?
+                result.map(NChannelTransform::Cmyk).map_err(|err| {
+                    format!("Cannot create production CMYK→{N}C ICC transform: {err}")
+                })?
             }
         };
 
@@ -134,7 +129,9 @@ impl<const N: usize> ProductionNChannelTransform<N> {
     ) -> Result<(), String> {
         validate_lengths(source.len(), destination.len())?;
         let NChannelTransform::Rgb(transform) = &self.transform else {
-            return Err(format!("This {N}-channel transform was not created for RGB source data."));
+            return Err(format!(
+                "This {N}-channel transform was not created for RGB source data."
+            ));
         };
         transform.transform_pixels(source, destination);
         Ok(())
@@ -147,7 +144,9 @@ impl<const N: usize> ProductionNChannelTransform<N> {
     ) -> Result<(), String> {
         validate_lengths(source.len(), destination.len())?;
         let NChannelTransform::Cmyk(transform) = &self.transform else {
-            return Err(format!("This {N}-channel transform was not created for CMYK source data."));
+            return Err(format!(
+                "This {N}-channel transform was not created for CMYK source data."
+            ));
         };
         transform.transform_pixels(source, destination);
         Ok(())
@@ -214,12 +213,16 @@ mod tests {
     fn supported_channel_counts_map_to_distinct_formats() {
         assert_eq!(nchannel_pixel_format::<5>().unwrap(), PixelFormat::CMYK5_16);
         assert_eq!(nchannel_pixel_format::<7>().unwrap(), PixelFormat::CMYK7_16);
-        assert_eq!(nchannel_pixel_format::<12>().unwrap(), PixelFormat::CMYK12_16);
+        assert_eq!(
+            nchannel_pixel_format::<12>().unwrap(),
+            PixelFormat::CMYK12_16
+        );
     }
 
     #[test]
     fn unsupported_channel_counts_are_rejected_before_profile_transform() {
-        let error = nchannel_pixel_format::<13>().expect_err("13C is not mapped by the pinned binding");
+        let error =
+            nchannel_pixel_format::<13>().expect_err("13C is not mapped by the pinned binding");
         assert!(error.contains("5..=12"));
     }
 

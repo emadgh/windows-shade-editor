@@ -40,9 +40,18 @@ pub enum InverseLutValidationReferenceError {
     MissingSolverConfig,
     MissingObjectiveWeights(Vec<String>),
     RecipeIdentity(String),
-    RecipeIdentityMismatch { expected: String, actual: String },
-    CharacterizationIdentityMismatch { expected: String, actual: String },
-    ChannelTopologyMismatch { expected: Vec<String>, actual: Vec<String> },
+    RecipeIdentityMismatch {
+        expected: String,
+        actual: String,
+    },
+    CharacterizationIdentityMismatch {
+        expected: String,
+        actual: String,
+    },
+    ChannelTopologyMismatch {
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
     ContinuityFieldSolverMismatch(String),
     Lookup(InverseLutLookupError),
     IndependentEvaluation(InverseLutValidationEvaluationError),
@@ -146,8 +155,8 @@ fn validate_runtime_recipe_binding(
     if recipe.engine_mode != ConversionEngineMode::CustomOptimizer {
         return Err(InverseLutValidationReferenceError::NotCustomOptimizerRecipe);
     }
-    let actual_recipe_sha = recipe_sha256(recipe)
-        .map_err(InverseLutValidationReferenceError::RecipeIdentity)?;
+    let actual_recipe_sha =
+        recipe_sha256(recipe).map_err(InverseLutValidationReferenceError::RecipeIdentity)?;
     if runtime.identity().recipe_sha256 != actual_recipe_sha {
         return Err(InverseLutValidationReferenceError::RecipeIdentityMismatch {
             expected: runtime.identity().recipe_sha256.clone(),
@@ -172,10 +181,12 @@ fn validate_runtime_model_binding(
         );
     }
     if runtime.identity().channel_names != model.identity().channel_names {
-        return Err(InverseLutValidationReferenceError::ChannelTopologyMismatch {
-            expected: runtime.identity().channel_names.clone(),
-            actual: model.identity().channel_names.clone(),
-        });
+        return Err(
+            InverseLutValidationReferenceError::ChannelTopologyMismatch {
+                expected: runtime.identity().channel_names.clone(),
+                actual: model.identity().channel_names.clone(),
+            },
+        );
     }
     Ok(())
 }
@@ -210,11 +221,9 @@ fn weights_from_objective(objective: CustomOptimizerObjectiveWeights) -> Candida
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_optimizer_config::{
-        ContinuityDistanceMetric, ContinuityPreferenceConfig,
-    };
+    use crate::custom_optimizer_config::{ContinuityDistanceMetric, ContinuityPreferenceConfig};
     use crate::inverse_lut_identity::{
-        InverseLutContinuitySeedMethod, INVERSE_LUT_JACOBI_FIELD_METHOD_MAX_ITERATIONS,
+        INVERSE_LUT_JACOBI_FIELD_METHOD_MAX_ITERATIONS, InverseLutContinuitySeedMethod,
     };
 
     fn positive_v2() -> CustomOptimizerSolverConfig {

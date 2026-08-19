@@ -85,7 +85,8 @@ fn exact_grid_node_returns_exact_stored_coverage() {
         let value = node as f32 / 10.0;
         coverages.extend([value, 1.0 - value, 0.2, 0.1]);
     }
-    let runtime = InverseLutRuntime::from_verified(artifact(vec![true; NODE_COUNT], coverages)).unwrap();
+    let runtime =
+        InverseLutRuntime::from_verified(artifact(vec![true; NODE_COUNT], coverages)).unwrap();
     assert_eq!(
         runtime
             .lookup(LabColor {
@@ -105,7 +106,8 @@ fn center_lookup_is_trilinear_average_of_eight_corners() {
         let value = node as f32 / 7.0;
         coverages.extend([value, 1.0 - value, 0.2, 0.1]);
     }
-    let runtime = InverseLutRuntime::from_verified(artifact(vec![true; NODE_COUNT], coverages)).unwrap();
+    let runtime =
+        InverseLutRuntime::from_verified(artifact(vec![true; NODE_COUNT], coverages)).unwrap();
     let value = runtime
         .lookup(LabColor {
             l: 50.0,

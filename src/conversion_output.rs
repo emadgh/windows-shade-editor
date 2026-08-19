@@ -257,14 +257,24 @@ fn windows_utf16_len(value: &OsStr) -> usize {
 
 #[cfg(windows)]
 fn is_reserved_windows_device_name(name: &str) -> bool {
-    let base = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let base = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
     matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || base
-            .strip_prefix("COM")
-            .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
-        || base
-            .strip_prefix("LPT")
-            .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+        || base.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+        || base.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
 }
 
 /// Lexical Windows comparison used even when the destination does not exist yet.
@@ -328,8 +338,7 @@ mod tests {
 
     #[test]
     fn default_filename_uses_sanitized_target_suffix() {
-        let name =
-            default_converted_filename(Path::new("Face01.png"), "Durst 7C / Nano").unwrap();
+        let name = default_converted_filename(Path::new("Face01.png"), "Durst 7C / Nano").unwrap();
         assert_eq!(name, PathBuf::from("Face01_Durst_7C___Nano.tif"));
     }
 
@@ -361,7 +370,11 @@ mod tests {
     #[test]
     fn relative_and_device_namespace_destinations_are_rejected() {
         let source = Path::new(r"C:\Designs\Face01.tif");
-        for destination in [r"Production\Face01.tif", r"C:Face01.tif", r"\\.\C:\Face01.tif"] {
+        for destination in [
+            r"Production\Face01.tif",
+            r"C:Face01.tif",
+            r"\\.\C:\Face01.tif",
+        ] {
             assert_eq!(
                 validate_conversion_output_path(source, Path::new(destination)),
                 Err(OutputPathError::MissingFileName),
@@ -418,10 +431,7 @@ mod tests {
         ));
         assert!(validate_conversion_output_path(source, &destination).is_ok());
 
-        let oversized_file = PathBuf::from(format!(
-            r"\\?\C:\Production\{}.tif",
-            "x".repeat(237)
-        ));
+        let oversized_file = PathBuf::from(format!(r"\\?\C:\Production\{}.tif", "x".repeat(237)));
         assert_eq!(
             validate_conversion_output_path(source, &oversized_file),
             Err(OutputPathError::MissingFileName)

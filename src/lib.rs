@@ -60,6 +60,7 @@ pub mod production_target;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
 pub mod separation_optimizer;
+pub mod source_transparency;
 #[path = "tiff_io.rs"]
 pub mod tiff_io;
 

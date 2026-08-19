@@ -3,11 +3,7 @@ use eframe::egui;
 
 const ZOOM_STRIP_BOTTOM_CLEARANCE: f32 = 30.0;
 
-fn zoom_strip_position(
-    viewport: egui::Rect,
-    panel_width: f32,
-    panel_height: f32,
-) -> egui::Pos2 {
+fn zoom_strip_position(viewport: egui::Rect, panel_width: f32, panel_height: f32) -> egui::Pos2 {
     egui::pos2(
         viewport.center().x - panel_width * 0.5,
         viewport.bottom() - panel_height - ZOOM_STRIP_BOTTOM_CLEARANCE,
@@ -105,16 +101,12 @@ mod tests {
 
     #[test]
     fn zoom_strip_reserves_bottom_scrollbar_clearance() {
-        let viewport = egui::Rect::from_min_max(
-            egui::pos2(100.0, 50.0),
-            egui::pos2(900.0, 700.0),
-        );
+        let viewport = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(900.0, 700.0));
         let panel_height = 32.0;
         let pos = zoom_strip_position(viewport, 360.0, panel_height);
         let strip_bottom = pos.y + panel_height;
         assert!(
-            (viewport.bottom() - strip_bottom - ZOOM_STRIP_BOTTOM_CLEARANCE).abs()
-                < f32::EPSILON
+            (viewport.bottom() - strip_bottom - ZOOM_STRIP_BOTTOM_CLEARANCE).abs() < f32::EPSILON
         );
         assert!(strip_bottom <= viewport.bottom() - 24.0);
     }

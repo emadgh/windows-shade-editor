@@ -14,7 +14,10 @@ pub fn recipe_sha256(recipe: &ConversionRecipe) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-pub fn recipe_matches_hash(recipe: &ConversionRecipe, expected_sha256: &str) -> Result<bool, String> {
+pub fn recipe_matches_hash(
+    recipe: &ConversionRecipe,
+    expected_sha256: &str,
+) -> Result<bool, String> {
     Ok(recipe_sha256(recipe)?.eq_ignore_ascii_case(expected_sha256.trim()))
 }
 
@@ -24,9 +27,9 @@ mod tests {
 
     use super::*;
     use crate::color_conversion::{
-        ConversionEngineMode, ConversionRenderingIntent, ConversionTargetDefinition,
-        SeparationStrategy, TargetChannelDefinition, CONVERSION_RECIPE_SCHEMA_VERSION,
-        LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION,
+        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionEngineMode, ConversionRenderingIntent,
+        ConversionTargetDefinition, LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION, SeparationStrategy,
+        TargetChannelDefinition,
     };
     use crate::model::IccProfileIdentity;
 
@@ -43,6 +46,7 @@ mod tests {
         bias.insert("Black".to_owned(), 0.8);
 
         ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::CustomOptimizer,
             source_profile_identity: identity("Adobe RGB", "source-hash"),
@@ -78,7 +82,9 @@ mod tests {
                 total_ink_limit: Some(1.4),
                 max_delta_e00: Some(2.0),
             },
-            custom_optimizer_solver: Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default()),
+            custom_optimizer_solver: Some(
+                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+            ),
         }
     }
 
@@ -86,7 +92,10 @@ mod tests {
     fn identical_recipe_has_identical_hash() {
         let first = recipe();
         let second = first.clone();
-        assert_eq!(recipe_sha256(&first).unwrap(), recipe_sha256(&second).unwrap());
+        assert_eq!(
+            recipe_sha256(&first).unwrap(),
+            recipe_sha256(&second).unwrap()
+        );
     }
 
     #[test]
@@ -94,7 +103,10 @@ mod tests {
         let first = recipe();
         let mut second = first.clone();
         second.strategy.black_generation_strength = 0.9;
-        assert_ne!(recipe_sha256(&first).unwrap(), recipe_sha256(&second).unwrap());
+        assert_ne!(
+            recipe_sha256(&first).unwrap(),
+            recipe_sha256(&second).unwrap()
+        );
     }
 
     #[test]
@@ -104,7 +116,10 @@ mod tests {
         second.strategy.per_ink_bias.clear();
         second.strategy.per_ink_bias.insert("Black".to_owned(), 0.8);
         second.strategy.per_ink_bias.insert("Blue".to_owned(), -0.5);
-        assert_eq!(recipe_sha256(&first).unwrap(), recipe_sha256(&second).unwrap());
+        assert_eq!(
+            recipe_sha256(&first).unwrap(),
+            recipe_sha256(&second).unwrap()
+        );
     }
 
     #[test]
@@ -118,7 +133,8 @@ mod tests {
         let mut legacy = recipe();
         legacy.schema_version = LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION;
         legacy.engine_mode = ConversionEngineMode::Icc;
-        legacy.target.output_profile_identity = Some(identity("Legacy output", "legacy-output-hash"));
+        legacy.target.output_profile_identity =
+            Some(identity("Legacy output", "legacy-output-hash"));
         legacy.target.output_profile_path = Some(r"C:\Color\Legacy.icc".to_owned());
         legacy.target.device_link_identity = None;
         legacy.target.device_link_path = None;
@@ -134,7 +150,9 @@ mod tests {
         let json = serde_json::to_string(&legacy).unwrap();
         assert!(!json.contains("custom_optimizer_solver"));
         let restored: ConversionRecipe = serde_json::from_str(&json).unwrap();
-        restored.validate().expect("restored legacy ICC recipe remains valid");
+        restored
+            .validate()
+            .expect("restored legacy ICC recipe remains valid");
         assert_eq!(before, recipe_sha256(&restored).unwrap());
     }
 
@@ -146,16 +164,53 @@ mod tests {
         let json = serde_json::to_string(&legacy).unwrap();
         assert!(!json.contains("custom_optimizer_solver"));
         let restored: ConversionRecipe = serde_json::from_str(&json).unwrap();
-        let errors = restored.validate().expect_err("legacy optimizer must be recaptured");
-        assert!(errors.iter().any(|error| error.contains("solver provenance")));
+        let errors = restored
+            .validate()
+            .expect_err("legacy optimizer must be recaptured");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("solver provenance"))
+        );
     }
 
     #[test]
-    fn schema_v2_custom_optimizer_requires_explicit_solver_config() {
+    fn current_schema_custom_optimizer_requires_explicit_solver_config() {
         let mut missing = recipe();
         missing.custom_optimizer_solver = None;
-        let errors = missing.validate().expect_err("schema-v2 optimizer needs solver config");
-        assert!(errors.iter().any(|error| error.contains("requires explicit solver")));
+        let errors = missing
+            .validate()
+            .expect_err("schema-v2 optimizer needs solver config");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("requires explicit solver"))
+        );
+    }
+
+    #[test]
+    fn transparency_background_change_changes_recipe_identity() {
+        let first = recipe();
+        let mut second = first.clone();
+        second.source_transparency_policy = Some(
+            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+                background_rgb: [u16::MAX, u16::MAX, u16::MAX],
+            },
+        );
+        let mut third = second.clone();
+        third.source_transparency_policy = Some(
+            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+                background_rgb: [0, 0, 0],
+            },
+        );
+        assert_ne!(
+            recipe_sha256(&first).unwrap(),
+            recipe_sha256(&second).unwrap()
+        );
+        assert_ne!(
+            recipe_sha256(&second).unwrap(),
+            recipe_sha256(&third).unwrap()
+        );
     }
 
     #[test]
@@ -167,18 +222,25 @@ mod tests {
             .as_mut()
             .expect("custom optimizer config")
             .initial_samples += 32;
-        assert_ne!(recipe_sha256(&first).unwrap(), recipe_sha256(&second).unwrap());
+        assert_ne!(
+            recipe_sha256(&first).unwrap(),
+            recipe_sha256(&second).unwrap()
+        );
     }
 
     #[test]
     fn icc_recipe_rejects_custom_optimizer_solver_state() {
         let mut invalid = legacy_icc_recipe();
         invalid.schema_version = CONVERSION_RECIPE_SCHEMA_VERSION;
-        invalid.custom_optimizer_solver = Some(
-            crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+        invalid.custom_optimizer_solver =
+            Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default());
+        let errors = invalid
+            .validate()
+            .expect_err("ICC must not carry optimizer solver state");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("ICC recipes must not carry"))
         );
-        let errors = invalid.validate().expect_err("ICC must not carry optimizer solver state");
-        assert!(errors.iter().any(|error| error.contains("ICC recipes must not carry")));
     }
-
 }

@@ -72,12 +72,8 @@ pub fn decode_jpeg_reader<R: Read>(reader: R) -> Result<DecodedJpegSource, Strin
         .ok_or_else(|| "JPEG decoder returned pixels without image metadata.".to_owned())?;
     let icc_profile = decoder.icc_profile();
     let coding_process = JpegCodingProcess::from(info.coding_process);
-    let (model, bit_depth, samples) = normalize_decoded_samples(
-        &pixels,
-        info.width,
-        info.height,
-        info.pixel_format,
-    )?;
+    let (model, bit_depth, samples) =
+        normalize_decoded_samples(&pixels, info.width, info.height, info.pixel_format)?;
 
     Ok(DecodedJpegSource {
         width: u32::from(info.width),
@@ -124,10 +120,7 @@ fn normalize_decoded_samples(
             pixels.len()
         ));
     }
-    let samples = pixels
-        .iter()
-        .map(|value| u16::from(*value) * 257)
-        .collect();
+    let samples = pixels.iter().map(|value| u16::from(*value) * 257).collect();
     Ok((model, 8, samples))
 }
 
@@ -171,15 +164,18 @@ mod tests {
         assert_eq!(decoded.model, JpegSourceModel::Rgb);
         assert_eq!(decoded.bit_depth, 8);
         assert_eq!(decoded.samples, [0, 0, 0]);
-        assert_eq!(decoded.icc_profile.as_deref(), Some(b"shade-test-icc".as_slice()));
+        assert_eq!(
+            decoded.icc_profile.as_deref(),
+            Some(b"shade-test-icc".as_slice())
+        );
         assert_eq!(decoded.coding_process, JpegCodingProcess::DctSequential);
         assert!(decoded.is_lossy());
     }
 
     #[test]
     fn grayscale_jpeg_is_one_design_channel_not_a_spot_channel() {
-        let decoded = decode_jpeg_reader(Cursor::new(fixture(GRAY_128_JPEG)))
-            .expect("decode grayscale JPEG");
+        let decoded =
+            decode_jpeg_reader(Cursor::new(fixture(GRAY_128_JPEG))).expect("decode grayscale JPEG");
         assert_eq!(decoded.model, JpegSourceModel::Gray);
         assert_eq!(decoded.bit_depth, 8);
         assert_eq!(decoded.samples, [128 * 257]);

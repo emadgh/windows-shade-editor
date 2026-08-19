@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use crate::color_conversion::{
     CONVERSION_RECIPE_SCHEMA_VERSION, ConversionEngineMode, ConversionRecipe,
-    ConversionRenderingIntent, ConversionTargetDefinition, SeparationStrategy, TargetChannelDefinition,
+    ConversionRenderingIntent, ConversionTargetDefinition, SeparationStrategy,
+    TargetChannelDefinition,
 };
 use crate::custom_optimizer_config::{
     ContinuityDistanceMetric, ContinuityPreferenceConfig, CustomOptimizerSolverConfig,
@@ -20,9 +21,9 @@ use crate::inverse_lut_artifact::load_inverse_lut_artifact;
 use crate::inverse_lut_continuity_builder::lab_grid_points;
 use crate::inverse_lut_identity::{
     INVERSE_LUT_BUILD_POLICY_SCHEMA_VERSION, InverseLutBuildPolicy,
-    InverseLutContinuityFieldMethod, InverseLutContinuitySeedMethod,
-    InverseLutInterpolationMethod, InverseLutNumericalPrecision, InverseLutOutputQuantization,
-    InverseLutValidityEncoding, LabGridSpec,
+    InverseLutContinuityFieldMethod, InverseLutContinuitySeedMethod, InverseLutInterpolationMethod,
+    InverseLutNumericalPrecision, InverseLutOutputQuantization, InverseLutValidityEncoding,
+    LabGridSpec,
 };
 use crate::inverse_lut_runtime::{
     InverseLutRuntime, build_inverse_lut_payload, publish_built_inverse_lut_if_absent,
@@ -42,9 +43,7 @@ fn package() -> ValidatedCharacterizationPackage {
                             - 16.0 * f64::from(brown)
                             - 10.0 * f64::from(beige)
                             - 42.0 * f64::from(black),
-                        a: -3.0 * f64::from(blue)
-                            + 7.0 * f64::from(brown)
-                            + 2.0 * f64::from(beige),
+                        a: -3.0 * f64::from(blue) + 7.0 * f64::from(brown) + 2.0 * f64::from(beige),
                         b: -12.0 * f64::from(blue)
                             + 8.0 * f64::from(brown)
                             + 4.0 * f64::from(beige),
@@ -122,6 +121,7 @@ fn fast_solver() -> CustomOptimizerSolverConfig {
 
 fn recipe(characterization_id: String) -> ConversionRecipe {
     ConversionRecipe {
+        source_transparency_policy: None,
         schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
         engine_mode: ConversionEngineMode::CustomOptimizer,
         source_profile_identity: IccProfileIdentity {
@@ -212,7 +212,10 @@ fn independent_builder_is_deterministic_and_round_trips_through_artifact_runtime
     publish_built_inverse_lut_if_absent(&destination, &first).unwrap();
     let loaded = load_inverse_lut_artifact(&destination).unwrap();
     let runtime = InverseLutRuntime::from_verified(loaded).unwrap();
-    assert_eq!(runtime.identity_content_id(), first.identity.content_id().unwrap());
+    assert_eq!(
+        runtime.identity_content_id(),
+        first.identity.content_id().unwrap()
+    );
 
     let (_shape, labs) = lab_grid_points(policy.grid).unwrap();
     let channel_count = recipe.target.channels.len();
@@ -247,7 +250,10 @@ fn positive_v2_builder_uses_versioned_continuity_field_contract() {
 
     let first = build_inverse_lut_payload(&recipe, &model, policy).unwrap();
     let second = build_inverse_lut_payload(&recipe, &model, policy).unwrap();
-    assert_eq!(first.identity.content_id().unwrap(), second.identity.content_id().unwrap());
+    assert_eq!(
+        first.identity.content_id().unwrap(),
+        second.identity.content_id().unwrap()
+    );
     assert_eq!(first.validity, second.validity);
     assert_eq!(first.coverages, second.coverages);
     assert_eq!(first.identity.build_policy.continuity_field, field);

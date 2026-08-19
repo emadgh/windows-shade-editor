@@ -627,12 +627,7 @@ mod tests {
         assert!(gamma_marker_fraction(0.5) > 0.5);
 
         let mut left = model::Levels::default();
-        apply_input_marker_drag(
-            &mut left,
-            LevelMarker::Gamma,
-            0.25,
-            TonalDisplayMode::Light,
-        );
+        apply_input_marker_drag(&mut left, LevelMarker::Gamma, 0.25, TonalDisplayMode::Light);
         assert!(left.gamma > 1.0);
         assert!(model::apply_levels(0.5, left) > 0.5);
 

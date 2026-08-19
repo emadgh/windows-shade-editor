@@ -5,9 +5,7 @@ use crate::device_characterization::{DeviceForwardModel, evaluate_characterized_
 use crate::gradient_continuity::{
     GradientContinuityPolicy, GradientSampleDiagnostic, build_report,
 };
-use crate::gradient_validation::{
-    GradientCurvaturePolicy, analyze_gradient_curvature,
-};
+use crate::gradient_validation::{GradientCurvaturePolicy, analyze_gradient_curvature};
 use crate::inverse_lut_holdout::{InverseLutHoldoutPath, InverseLutHoldoutPathKind};
 use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};
 use crate::inverse_lut_validation_reference::{
@@ -67,7 +65,10 @@ impl InverseLutPathValidationPolicy {
         }
         for (name, value) in [
             ("max_channel_jump", self.max_channel_jump),
-            ("max_normalized_channel_jump", self.max_normalized_channel_jump),
+            (
+                "max_normalized_channel_jump",
+                self.max_normalized_channel_jump,
+            ),
             ("max_vector_l1_jump", self.max_vector_l1_jump),
             ("max_vector_l2_jump", self.max_vector_l2_jump),
             ("max_total_ink_jump", self.max_total_ink_jump),
@@ -98,7 +99,11 @@ impl InverseLutPathValidationPolicy {
                 ));
             }
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     fn continuity_policy(self) -> GradientContinuityPolicy {
@@ -114,8 +119,7 @@ impl InverseLutPathValidationPolicy {
     fn curvature_policy(self) -> GradientCurvaturePolicy {
         GradientCurvaturePolicy {
             max_channel_second_difference: self.max_channel_second_difference,
-            max_normalized_channel_second_difference: self
-                .max_normalized_channel_second_difference,
+            max_normalized_channel_second_difference: self.max_normalized_channel_second_difference,
             max_vector_l1_second_difference: self.max_vector_l1_second_difference,
             max_vector_l2_second_difference: self.max_vector_l2_second_difference,
             max_total_ink_second_difference: self.max_total_ink_second_difference,
@@ -239,11 +243,17 @@ impl InverseLutPathDiagnostic {
                 .max_normalized_channel_second_difference
                 .unwrap_or(f64::INFINITY)
                 <= f64::from(policy.max_normalized_channel_second_difference)
-            && self.max_vector_l1_second_difference.unwrap_or(f64::INFINITY)
+            && self
+                .max_vector_l1_second_difference
+                .unwrap_or(f64::INFINITY)
                 <= f64::from(policy.max_vector_l1_second_difference)
-            && self.max_vector_l2_second_difference.unwrap_or(f64::INFINITY)
+            && self
+                .max_vector_l2_second_difference
+                .unwrap_or(f64::INFINITY)
                 <= f64::from(policy.max_vector_l2_second_difference)
-            && self.max_total_ink_second_difference.unwrap_or(f64::INFINITY)
+            && self
+                .max_total_ink_second_difference
+                .unwrap_or(f64::INFINITY)
                 <= f64::from(policy.max_total_ink_second_difference)
             && self.continuity_violation_count == Some(0)
             && self.curvature_violation_count == Some(0)
@@ -254,9 +264,17 @@ impl InverseLutPathDiagnostic {
 pub enum InverseLutPathValidationError {
     InvalidPolicy(Vec<String>),
     ReferenceContract(InverseLutValidationReferenceError),
-    CharacterizationIdentityMismatch { expected: String, actual: String },
-    ChannelTopologyMismatch { expected: Vec<String>, actual: Vec<String> },
-    EmptyPath { path_index: usize },
+    CharacterizationIdentityMismatch {
+        expected: String,
+        actual: String,
+    },
+    ChannelTopologyMismatch {
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+    EmptyPath {
+        path_index: usize,
+    },
     Lookup {
         path_index: usize,
         sample_index: usize,
@@ -333,13 +351,14 @@ pub fn analyze_inverse_lut_paths(
                     });
                 }
             };
-            let color = evaluate_characterized_color(model, target_lab, &coverages).map_err(
-                |error| InverseLutPathValidationError::ForwardModel {
-                    path_index,
-                    sample_index,
-                    error,
-                },
-            )?;
+            let color =
+                evaluate_characterized_color(model, target_lab, &coverages).map_err(|error| {
+                    InverseLutPathValidationError::ForwardModel {
+                        path_index,
+                        sample_index,
+                        error,
+                    }
+                })?;
             if !color.delta_e00.is_finite() || color.delta_e00 > f64::from(f32::MAX) {
                 return Err(InverseLutPathValidationError::InvalidDeltaE {
                     path_index,
@@ -361,7 +380,11 @@ pub fn analyze_inverse_lut_paths(
         let sample_count = u64::try_from(path.samples.len())
             .map_err(|_| InverseLutPathValidationError::CountOverflow)?;
         if unsupported_samples > 0 {
-            output.push(unsupported_path(path.kind.into(), sample_count, unsupported_samples));
+            output.push(unsupported_path(
+                path.kind.into(),
+                sample_count,
+                unsupported_samples,
+            ));
             continue;
         }
 
@@ -387,9 +410,7 @@ pub fn analyze_inverse_lut_paths(
             sample_count,
             unsupported_samples: 0,
             max_channel_jump: Some(f64::from(continuity.max_channel_jump)),
-            max_normalized_channel_jump: Some(f64::from(
-                continuity.max_normalized_channel_jump,
-            )),
+            max_normalized_channel_jump: Some(f64::from(continuity.max_normalized_channel_jump)),
             max_vector_l1_jump: Some(f64::from(continuity.max_vector_l1_jump)),
             max_vector_l2_jump: Some(f64::from(continuity.max_vector_l2_jump)),
             max_total_ink_jump: Some(f64::from(continuity.max_total_ink_jump)),
@@ -397,9 +418,7 @@ pub fn analyze_inverse_lut_paths(
                 u64::try_from(continuity.dominant_channel_switches)
                     .map_err(|_| InverseLutPathValidationError::CountOverflow)?,
             ),
-            max_channel_second_difference: Some(f64::from(
-                curvature.max_channel_second_difference,
-            )),
+            max_channel_second_difference: Some(f64::from(curvature.max_channel_second_difference)),
             max_normalized_channel_second_difference: Some(f64::from(
                 curvature.max_normalized_channel_second_difference,
             )),

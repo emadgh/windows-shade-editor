@@ -151,8 +151,8 @@ fn generate_cell_centers_and_fixed_paths_v1(
             // Evenly spread deterministic integer indices over the complete
             // lexicographic cell population. No RNG/seed or platform float
             // ordering participates in selection.
-            let linear = ((sample_index as u128) * (cell_count as u128) / (requested as u128))
-                as usize;
+            let linear =
+                ((sample_index as u128) * (cell_count as u128) / (requested as u128)) as usize;
             let bi = linear % b_cells;
             let remaining = linear / b_cells;
             let ai = remaining % a_cells;
@@ -276,9 +276,24 @@ mod tests {
             assert!(sample.l > grid.l_min && sample.l < grid.l_max);
             assert!(sample.a > grid.a_min && sample.a < grid.a_max);
             assert!(sample.b > grid.b_min && sample.b < grid.b_max);
-            assert!(!is_axis_grid_node(sample.l, grid.l_min, grid.l_max, grid.l_samples));
-            assert!(!is_axis_grid_node(sample.a, grid.a_min, grid.a_max, grid.a_samples));
-            assert!(!is_axis_grid_node(sample.b, grid.b_min, grid.b_max, grid.b_samples));
+            assert!(!is_axis_grid_node(
+                sample.l,
+                grid.l_min,
+                grid.l_max,
+                grid.l_samples
+            ));
+            assert!(!is_axis_grid_node(
+                sample.a,
+                grid.a_min,
+                grid.a_max,
+                grid.a_samples
+            ));
+            assert!(!is_axis_grid_node(
+                sample.b,
+                grid.b_min,
+                grid.b_max,
+                grid.b_samples
+            ));
         }
     }
 
@@ -327,7 +342,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            holdouts.paths.iter().map(|path| path.kind).collect::<Vec<_>>(),
+            holdouts
+                .paths
+                .iter()
+                .map(|path| path.kind)
+                .collect::<Vec<_>>(),
             vec![
                 InverseLutHoldoutPathKind::NeutralAxis,
                 InverseLutHoldoutPathKind::NearNeutralWarm,

@@ -110,7 +110,10 @@ mod tests {
     #[test]
     fn custom_optimizer_exposes_real_separation_controls() {
         let capabilities = capabilities_for_engine(ConversionEngineMode::CustomOptimizer);
-        assert_eq!(capabilities.black_generation, ControlAvailability::Available);
+        assert_eq!(
+            capabilities.black_generation,
+            ControlAvailability::Available
+        );
         assert_eq!(capabilities.per_ink_bias, ControlAvailability::Available);
         assert_eq!(capabilities.total_ink_limit, ControlAvailability::Available);
         assert!(capabilities.expert_separation_controls_available());

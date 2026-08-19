@@ -113,8 +113,7 @@ pub fn evaluate_inverse_lut_validation_sample(
         .map_err(InverseLutValidationEvaluationError::ForwardModel)?;
     let reference_color = evaluate_characterized_color(model, target_lab, reference_coverages)
         .map_err(InverseLutValidationEvaluationError::ForwardModel)?;
-    let lut_vs_reference_delta_e00 =
-        delta_e_2000(lut_color.predicted, reference_color.predicted);
+    let lut_vs_reference_delta_e00 = delta_e_2000(lut_color.predicted, reference_color.predicted);
 
     let (ink_l1, ink_l2, max_channel_deviation) =
         ink_deviation(&lut_coverages, reference_coverages)?;
@@ -122,13 +121,8 @@ pub fn evaluate_inverse_lut_validation_sample(
     let u8_quantization_l1 = quantization_l1(&lut_coverages, 8, quantization)?;
     let u16_quantization_l1 = quantization_l1(&lut_coverages, 16, quantization)?;
 
-    let lut_candidate = characterize_candidate(
-        &recipe.target,
-        model,
-        target_lab,
-        lut_coverages,
-    )
-    .map_err(|error| InverseLutValidationEvaluationError::ForwardModel(format!("{error:?}")))?;
+    let lut_candidate = characterize_candidate(&recipe.target, model, target_lab, lut_coverages)
+        .map_err(|error| InverseLutValidationEvaluationError::ForwardModel(format!("{error:?}")))?;
     let solver = recipe
         .custom_optimizer_solver
         .ok_or(InverseLutValidationEvaluationError::MissingSolverConfig)?;
@@ -160,10 +154,12 @@ fn validate_runtime_binding(
     let actual_recipe_sha = recipe_sha256(recipe)
         .map_err(|error| InverseLutValidationEvaluationError::ForwardModel(error.to_string()))?;
     if identity.recipe_sha256 != actual_recipe_sha {
-        return Err(InverseLutValidationEvaluationError::RecipeIdentityMismatch {
-            expected: identity.recipe_sha256.clone(),
-            actual: actual_recipe_sha,
-        });
+        return Err(
+            InverseLutValidationEvaluationError::RecipeIdentityMismatch {
+                expected: identity.recipe_sha256.clone(),
+                actual: actual_recipe_sha,
+            },
+        );
     }
     if identity.characterization_id != model.identity().id {
         return Err(
@@ -174,16 +170,20 @@ fn validate_runtime_binding(
         );
     }
     if identity.channel_names != model.identity().channel_names {
-        return Err(InverseLutValidationEvaluationError::ChannelTopologyMismatch {
-            expected: identity.channel_names.clone(),
-            actual: model.identity().channel_names.clone(),
-        });
+        return Err(
+            InverseLutValidationEvaluationError::ChannelTopologyMismatch {
+                expected: identity.channel_names.clone(),
+                actual: model.identity().channel_names.clone(),
+            },
+        );
     }
     if identity.target_bit_depth != recipe.target.bit_depth {
-        return Err(InverseLutValidationEvaluationError::TargetBitDepthMismatch {
-            expected: identity.target_bit_depth,
-            actual: recipe.target.bit_depth,
-        });
+        return Err(
+            InverseLutValidationEvaluationError::TargetBitDepthMismatch {
+                expected: identity.target_bit_depth,
+                actual: recipe.target.bit_depth,
+            },
+        );
     }
     Ok(())
 }
@@ -218,10 +218,12 @@ fn validate_recipe_and_model(
         .map(|channel| channel.name.clone())
         .collect::<Vec<_>>();
     if expected_channels != model.identity().channel_names {
-        return Err(InverseLutValidationEvaluationError::ChannelTopologyMismatch {
-            expected: expected_channels,
-            actual: model.identity().channel_names.clone(),
-        });
+        return Err(
+            InverseLutValidationEvaluationError::ChannelTopologyMismatch {
+                expected: expected_channels,
+                actual: model.identity().channel_names.clone(),
+            },
+        );
     }
     Ok(())
 }
@@ -268,17 +270,21 @@ fn validate_reference(
     expected: usize,
 ) -> Result<(), InverseLutValidationEvaluationError> {
     if reference_coverages.len() != expected {
-        return Err(InverseLutValidationEvaluationError::ReferenceTopologyMismatch {
-            expected,
-            actual: reference_coverages.len(),
-        });
+        return Err(
+            InverseLutValidationEvaluationError::ReferenceTopologyMismatch {
+                expected,
+                actual: reference_coverages.len(),
+            },
+        );
     }
     for (channel_index, value) in reference_coverages.iter().copied().enumerate() {
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-            return Err(InverseLutValidationEvaluationError::InvalidReferenceCoverage {
-                channel_index,
-                value,
-            });
+            return Err(
+                InverseLutValidationEvaluationError::InvalidReferenceCoverage {
+                    channel_index,
+                    value,
+                },
+            );
         }
     }
     Ok(())
@@ -289,10 +295,12 @@ fn ink_deviation(
     reference: &[f32],
 ) -> Result<(f64, f64, f64), InverseLutValidationEvaluationError> {
     if lut.len() != reference.len() {
-        return Err(InverseLutValidationEvaluationError::ReferenceTopologyMismatch {
-            expected: lut.len(),
-            actual: reference.len(),
-        });
+        return Err(
+            InverseLutValidationEvaluationError::ReferenceTopologyMismatch {
+                expected: lut.len(),
+                actual: reference.len(),
+            },
+        );
     }
     let mut l1 = 0.0f64;
     let mut l2_squared = 0.0f64;
@@ -348,9 +356,7 @@ fn unsupported_sample() -> InverseLutValidationSample {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_optimizer_config::{
-        ContinuityDistanceMetric, ContinuityPreferenceConfig,
-    };
+    use crate::custom_optimizer_config::{ContinuityDistanceMetric, ContinuityPreferenceConfig};
     use crate::inverse_lut_identity::InverseLutOutputQuantization;
 
     #[test]
@@ -391,14 +397,10 @@ mod tests {
     #[test]
     fn quantization_sensitivity_uses_the_versioned_rounding_policy() {
         let values = [0.12345f32, 0.5, 0.98765];
-        let u8 = quantization_l1(&values, 8, InverseLutOutputQuantization::ClampScaleRoundV1)
-            .unwrap();
-        let u16 = quantization_l1(
-            &values,
-            16,
-            InverseLutOutputQuantization::ClampScaleRoundV1,
-        )
-        .unwrap();
+        let u8 =
+            quantization_l1(&values, 8, InverseLutOutputQuantization::ClampScaleRoundV1).unwrap();
+        let u16 =
+            quantization_l1(&values, 16, InverseLutOutputQuantization::ClampScaleRoundV1).unwrap();
         assert!(u8 > 0.0);
         assert!(u16 > 0.0);
         assert!(u16 < u8);

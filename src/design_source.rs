@@ -276,7 +276,10 @@ mod tests {
         assert_eq!(source8.bit_depth, 8);
         assert_eq!(source8.channel_count, 3);
         assert_eq!(source8.transparency, TransparencyState::None);
-        assert!(source8.embedded_icc.is_none(), "sRGB chunk must not become an ICC assignment");
+        assert!(
+            source8.embedded_icc.is_none(),
+            "sRGB chunk must not become an ICC assignment"
+        );
 
         let png16_alpha = DecodedPngSource {
             width: 1,

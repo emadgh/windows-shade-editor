@@ -1,6 +1,4 @@
-use lcms2::{
-    CIExyY, ColorSpaceSignature, Flags, GlobalContext, PixelFormat, Profile, Transform,
-};
+use lcms2::{CIExyY, ColorSpaceSignature, Flags, GlobalContext, PixelFormat, Profile, Transform};
 
 use crate::color_conversion::ConversionRenderingIntent;
 use crate::icc_conversion::{
@@ -69,9 +67,9 @@ impl ProductionPcsLabTransform {
                         intent,
                     )
                 };
-                result
-                    .map(ProductionLabTransform::Rgb)
-                    .map_err(|err| format!("Cannot create production RGB→Lab ICC transform: {err}"))?
+                result.map(ProductionLabTransform::Rgb).map_err(|err| {
+                    format!("Cannot create production RGB→Lab ICC transform: {err}")
+                })?
             }
             IccSourceModel::Cmyk => {
                 let result = if black_point_compensation {
@@ -92,9 +90,9 @@ impl ProductionPcsLabTransform {
                         intent,
                     )
                 };
-                result
-                    .map(ProductionLabTransform::Cmyk)
-                    .map_err(|err| format!("Cannot create production CMYK→Lab ICC transform: {err}"))?
+                result.map(ProductionLabTransform::Cmyk).map_err(|err| {
+                    format!("Cannot create production CMYK→Lab ICC transform: {err}")
+                })?
             }
         };
 
@@ -125,7 +123,9 @@ impl ProductionPcsLabTransform {
     ) -> Result<(), String> {
         validate_chunk_lengths(source.len(), destination.len())?;
         let ProductionLabTransform::Rgb(transform) = &self.transform else {
-            return Err("This production Lab transform was not created for RGB source data.".to_owned());
+            return Err(
+                "This production Lab transform was not created for RGB source data.".to_owned(),
+            );
         };
         transform.transform_pixels(source, destination);
         validate_lab_chunk(destination)
@@ -138,7 +138,9 @@ impl ProductionPcsLabTransform {
     ) -> Result<(), String> {
         validate_chunk_lengths(source.len(), destination.len())?;
         let ProductionLabTransform::Cmyk(transform) = &self.transform else {
-            return Err("This production Lab transform was not created for CMYK source data.".to_owned());
+            return Err(
+                "This production Lab transform was not created for CMYK source data.".to_owned(),
+            );
         };
         transform.transform_pixels(source, destination);
         validate_lab_chunk(destination)

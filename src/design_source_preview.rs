@@ -154,11 +154,8 @@ impl DesignSourcePreview {
             );
         }
 
-        let (width, height, source_x, source_y) = preview_sampling_map(
-            source_width as usize,
-            source_height as usize,
-            max_dimension,
-        )?;
+        let (width, height, source_x, source_y) =
+            preview_sampling_map(source_width as usize, source_height as usize, max_dimension)?;
         let preview_pixels = width
             .checked_mul(height)
             .ok_or_else(|| "Design source preview dimensions are too large.".to_owned())?;

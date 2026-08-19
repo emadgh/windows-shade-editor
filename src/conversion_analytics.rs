@@ -126,7 +126,9 @@ impl ConversionUsageAccumulator {
             return Err("Analytics channel limits must be finite values in 0..=1.".to_owned());
         }
         if total_ink_limit.is_some_and(|limit| !limit.is_finite() || limit <= 0.0) {
-            return Err("Analytics total ink limit must be finite and greater than zero.".to_owned());
+            return Err(
+                "Analytics total ink limit must be finite and greater than zero.".to_owned(),
+            );
         }
         if black_index.is_some_and(|index| index >= channel_names.len()) {
             return Err("Analytics Black channel index is outside the target topology.".to_owned());
@@ -244,14 +246,12 @@ impl ConversionUsageAccumulator {
             })
             .collect::<Vec<_>>();
 
-        let neutral_black_share = if black_index.is_some()
-            && neutral_pixels > 0
-            && neutral_total_ink > f64::EPSILON
-        {
-            Some((neutral_black_ink / neutral_total_ink) as f32)
-        } else {
-            None
-        };
+        let neutral_black_share =
+            if black_index.is_some() && neutral_pixels > 0 && neutral_total_ink > f64::EPSILON {
+                Some((neutral_black_ink / neutral_total_ink) as f32)
+            } else {
+                None
+            };
 
         ConversionUsageReport {
             pixel_count,
@@ -309,41 +309,34 @@ pub fn analyze_conversion_tiff(
     let mut accumulator = ConversionUsageAccumulator::from_recipe(recipe)?;
     let channel_count = accumulator.channel_count();
     let mut working_pixel = vec![0u16; channel_count];
-    for_each_decoded_region(
-        path,
-        &info,
-        |_x, _y, width, height, samples| {
-            let pixels = usize::try_from(width)
-                .ok()
-                .and_then(|width| {
-                    usize::try_from(height)
-                        .ok()
-                        .and_then(|height| width.checked_mul(height))
-                })
-                .ok_or_else(|| "Analytics region dimensions overflow.".to_owned())?;
-            let expected_samples = pixels
-                .checked_mul(channel_count)
-                .ok_or_else(|| "Analytics region sample count overflow.".to_owned())?;
-            if samples.len() != expected_samples {
-                return Err(format!(
-                    "Analytics region contains {} samples; expected {expected_samples}.",
-                    samples.len()
-                ));
+    for_each_decoded_region(path, &info, |_x, _y, width, height, samples| {
+        let pixels = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or_else(|| "Analytics region dimensions overflow.".to_owned())?;
+        let expected_samples = pixels
+            .checked_mul(channel_count)
+            .ok_or_else(|| "Analytics region sample count overflow.".to_owned())?;
+        if samples.len() != expected_samples {
+            return Err(format!(
+                "Analytics region contains {} samples; expected {expected_samples}.",
+                samples.len()
+            ));
+        }
+        for pixel_index in 0..pixels {
+            let base = pixel_index * channel_count;
+            for channel in 0..channel_count {
+                working_pixel[channel] =
+                    working_sample_from_tiff(&info.metadata, channel, samples[base + channel]);
             }
-            for pixel_index in 0..pixels {
-                let base = pixel_index * channel_count;
-                for channel in 0..channel_count {
-                    working_pixel[channel] = working_sample_from_tiff(
-                        &info.metadata,
-                        channel,
-                        samples[base + channel],
-                    );
-                }
-                accumulator.observe_u16(&working_pixel, NeutralClassification::Unknown)?;
-            }
-            Ok(())
-        },
-    )?;
+            accumulator.observe_u16(&working_pixel, NeutralClassification::Unknown)?;
+        }
+        Ok(())
+    })?;
     Ok(accumulator.finish())
 }
 
@@ -424,6 +417,7 @@ mod tests {
 
     fn recipe() -> ConversionRecipe {
         ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::CustomOptimizer,
             source_profile_identity: IccProfileIdentity {
@@ -462,7 +456,9 @@ mod tests {
                 total_ink_limit: Some(1.4),
                 max_delta_e00: Some(2.0),
             },
-            custom_optimizer_solver: Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default()),
+            custom_optimizer_solver: Some(
+                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+            ),
         }
     }
 
@@ -497,13 +493,9 @@ mod tests {
 
     #[test]
     fn zero_channel_limit_counts_only_nonzero_coverage_as_hit() {
-        let mut analytics = ConversionUsageAccumulator::new(
-            vec!["Ink".to_owned()],
-            vec![Some(0.0)],
-            None,
-            None,
-        )
-        .unwrap();
+        let mut analytics =
+            ConversionUsageAccumulator::new(vec!["Ink".to_owned()], vec![Some(0.0)], None, None)
+                .unwrap();
         analytics
             .observe_u16(&[0], NeutralClassification::Unknown)
             .unwrap();
@@ -517,25 +509,16 @@ mod tests {
     fn neutral_black_share_requires_explicit_neutral_classification() {
         let mut unknown = ConversionUsageAccumulator::from_recipe(&recipe()).unwrap();
         unknown
-            .observe_u16(
-                &[1000, 1000, 1000, 20000],
-                NeutralClassification::Unknown,
-            )
+            .observe_u16(&[1000, 1000, 1000, 20000], NeutralClassification::Unknown)
             .unwrap();
         assert_eq!(unknown.finish().neutral_black_share, None);
 
         let mut classified = ConversionUsageAccumulator::from_recipe(&recipe()).unwrap();
         classified
-            .observe_u16(
-                &[1000, 1000, 1000, 20000],
-                NeutralClassification::Neutral,
-            )
+            .observe_u16(&[1000, 1000, 1000, 20000], NeutralClassification::Neutral)
             .unwrap();
         classified
-            .observe_u16(
-                &[30000, 1000, 1000, 1000],
-                NeutralClassification::Chromatic,
-            )
+            .observe_u16(&[30000, 1000, 1000, 1000], NeutralClassification::Chromatic)
             .unwrap();
         let share = classified.finish().neutral_black_share.unwrap();
         assert!(share > 0.85);
@@ -560,10 +543,12 @@ mod tests {
     fn histogram_memory_is_bounded_by_channel_count_not_image_size() {
         let analytics = ConversionUsageAccumulator::from_recipe(&recipe()).unwrap();
         assert_eq!(analytics.channel_histograms.len(), 4);
-        assert!(analytics
-            .channel_histograms
-            .iter()
-            .all(|histogram| histogram.len() == HISTOGRAM_BINS));
+        assert!(
+            analytics
+                .channel_histograms
+                .iter()
+                .all(|histogram| histogram.len() == HISTOGRAM_BINS)
+        );
         assert_eq!(analytics.total_histogram.len(), HISTOGRAM_BINS);
     }
 }

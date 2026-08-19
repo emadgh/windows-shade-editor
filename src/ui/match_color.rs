@@ -99,7 +99,9 @@ fn store_target(target: MatchColorTarget) {
     });
 }
 
-pub(crate) fn choose_target(max_preview_dimension: u32) -> Result<Option<MatchColorTarget>, String> {
+pub(crate) fn choose_target(
+    max_preview_dimension: u32,
+) -> Result<Option<MatchColorTarget>, String> {
     let Some(path) = rfd::FileDialog::new()
         .add_filter("TIFF images", &["tif", "tiff"])
         .set_title("Choose Reference / Match Color target")
@@ -173,7 +175,8 @@ pub(crate) fn apply_histogram_match_levels(
             report.zeroed_source_only_channels += 1;
         }
 
-        report.changed |= previous_enabled != adjustment.enabled || previous_levels != adjustment.levels;
+        report.changed |=
+            previous_enabled != adjustment.enabled || previous_levels != adjustment.levels;
     }
 
     report
@@ -187,10 +190,7 @@ fn zero_output_levels() -> Levels {
     }
 }
 
-pub(crate) fn fit_levels_from_histograms(
-    source: &[u32; 256],
-    target: &[u32; 256],
-) -> Levels {
+pub(crate) fn fit_levels_from_histograms(source: &[u32; 256], target: &[u32; 256]) -> Levels {
     if histogram_total(source) == 0 || histogram_total(target) == 0 {
         return Levels::default();
     }
@@ -347,14 +347,20 @@ pub(crate) fn draw_histogram_with_target(
         if let Some(bins) = original {
             let h = histogram_display_height(bins, index, rect.height());
             painter.line_segment(
-                [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
+                [
+                    egui::pos2(x, rect.bottom()),
+                    egui::pos2(x, rect.bottom() - h),
+                ],
                 egui::Stroke::new(1.0, original_color),
             );
         }
         if let Some(bins) = adjusted {
             let h = histogram_display_height(bins, index, rect.height());
             painter.line_segment(
-                [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
+                [
+                    egui::pos2(x, rect.bottom()),
+                    egui::pos2(x, rect.bottom() - h),
+                ],
                 egui::Stroke::new(1.0, adjusted_color),
             );
         }
@@ -381,7 +387,7 @@ pub(crate) fn draw_histogram_with_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{apply_levels, Curve};
+    use crate::model::{Curve, apply_levels};
 
     fn histogram(points: &[(u8, u32)]) -> [u32; 256] {
         let mut result = [0_u32; 256];
@@ -415,7 +421,9 @@ mod tests {
         let small = histogram(&[(32, 2), (128, 6), (220, 2)]);
         let large = histogram(&[(32, 200), (128, 600), (220, 200)]);
         assert!((histogram_peak_density(&small) - histogram_peak_density(&large)).abs() < 1e-6);
-        assert!((histogram_bin_density(&small, 128) - histogram_bin_density(&large, 128)).abs() < 1e-6);
+        assert!(
+            (histogram_bin_density(&small, 128) - histogram_bin_density(&large, 128)).abs() < 1e-6
+        );
     }
 
     #[test]
@@ -454,12 +462,8 @@ mod tests {
             adjustment
         });
 
-        let report = apply_histogram_match_levels(
-            &mut adjustments,
-            &names,
-            &source_histograms,
-            &target,
-        );
+        let report =
+            apply_histogram_match_levels(&mut adjustments, &names, &source_histograms, &target);
         assert_eq!(report.matched_channels, 2);
         assert_eq!(report.zeroed_source_only_channels, 1);
         assert_eq!(report.ignored_target_only_channels, 0);
@@ -483,12 +487,8 @@ mod tests {
         );
         let names = vec!["C".to_owned()];
         let mut adjustments = BTreeMap::new();
-        let report = apply_histogram_match_levels(
-            &mut adjustments,
-            &names,
-            &source_histograms,
-            &target,
-        );
+        let report =
+            apply_histogram_match_levels(&mut adjustments, &names, &source_histograms, &target);
         assert_eq!(report.matched_channels, 1);
         assert_eq!(report.ignored_target_only_channels, 1);
         assert_eq!(adjustments.len(), 1);

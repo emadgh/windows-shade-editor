@@ -694,6 +694,7 @@ mod tests {
 
     fn capture(output: &str) -> ConversionJobCapture {
         let recipe = ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::Icc,
             source_profile_identity: IccProfileIdentity {
@@ -840,12 +841,13 @@ mod tests {
         let expected = original.conversion_recipe_sha256.clone();
         let json = serde_json::to_vec(&original).unwrap();
         let restored: ConversionJobCapture = serde_json::from_slice(&json).unwrap();
-        restored.validate().expect("restored legacy ICC capture is valid");
+        restored
+            .validate()
+            .expect("restored legacy ICC capture is valid");
         assert_eq!(restored.conversion_recipe_sha256, expected);
         assert_eq!(
             crate::conversion_recipe::recipe_sha256(&restored.conversion_recipe).unwrap(),
             expected
         );
     }
-
 }

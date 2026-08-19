@@ -127,8 +127,7 @@ pub fn delta_e_2000(first: LabColor, second: LabColor) -> f64 {
             raw + 360.0
         }
     };
-    let delta_h_prime =
-        2.0 * (c1_prime * c2_prime).sqrt() * ((delta_h_degrees * PI / 360.0).sin());
+    let delta_h_prime = 2.0 * (c1_prime * c2_prime).sqrt() * ((delta_h_degrees * PI / 360.0).sin());
 
     let l_bar_prime = (first.l + second.l) * 0.5;
     let c_bar_prime = (c1_prime + c2_prime) * 0.5;
@@ -143,8 +142,7 @@ pub fn delta_e_2000(first: LabColor, second: LabColor) -> f64 {
         (h1_prime + h2_prime - 360.0) * 0.5
     };
 
-    let t = 1.0
-        - 0.17 * degrees_cos(h_bar_prime - 30.0)
+    let t = 1.0 - 0.17 * degrees_cos(h_bar_prime - 30.0)
         + 0.24 * degrees_cos(2.0 * h_bar_prime)
         + 0.32 * degrees_cos(3.0 * h_bar_prime + 6.0)
         - 0.20 * degrees_cos(4.0 * h_bar_prime - 63.0);
@@ -161,9 +159,7 @@ pub fn delta_e_2000(first: LabColor, second: LabColor) -> f64 {
     let l = delta_l_prime / s_l;
     let c = delta_c_prime / s_c;
     let h = delta_h_prime / s_h;
-    (l * l + c * c + h * h + r_t * c * h)
-        .max(0.0)
-        .sqrt()
+    (l * l + c * c + h * h + r_t * c * h).max(0.0).sqrt()
 }
 
 fn hue_degrees(b: f64, a_prime: f64) -> f64 {

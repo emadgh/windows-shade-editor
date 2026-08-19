@@ -63,7 +63,7 @@ pub fn decode_png_reader<R: BufRead + Seek>(reader: R) -> Result<DecodedPngSourc
             return Err(format!(
                 "PNG expansion returned unsupported {:?} output depth.",
                 depth
-            ))
+            ));
         }
     };
 
@@ -76,7 +76,7 @@ pub fn decode_png_reader<R: BufRead + Seek>(reader: R) -> Result<DecodedPngSourc
         ColorType::Rgb => (PngSourceModel::Rgb, 3usize, false),
         ColorType::Rgba => (PngSourceModel::Rgb, 3usize, true),
         ColorType::Indexed => {
-            return Err("PNG palette expansion did not produce RGB/RGBA output.".to_owned())
+            return Err("PNG palette expansion did not produce RGB/RGBA output.".to_owned());
         }
     };
     let output_channels = base_channels + usize::from(has_alpha);
@@ -106,7 +106,11 @@ pub fn decode_png_reader<R: BufRead + Seek>(reader: R) -> Result<DecodedPngSourc
     })
 }
 
-fn decode_samples(bytes: &[u8], bit_depth: u8, expected_samples: usize) -> Result<Vec<u16>, String> {
+fn decode_samples(
+    bytes: &[u8],
+    bit_depth: u8,
+    expected_samples: usize,
+) -> Result<Vec<u16>, String> {
     match bit_depth {
         8 => {
             if bytes.len() != expected_samples {
@@ -115,10 +119,7 @@ fn decode_samples(bytes: &[u8], bit_depth: u8, expected_samples: usize) -> Resul
                     bytes.len()
                 ));
             }
-            Ok(bytes
-                .iter()
-                .map(|value| u16::from(*value) * 257)
-                .collect())
+            Ok(bytes.iter().map(|value| u16::from(*value) * 257).collect())
         }
         16 => {
             let expected_bytes = expected_samples
@@ -135,7 +136,9 @@ fn decode_samples(bytes: &[u8], bit_depth: u8, expected_samples: usize) -> Resul
                 .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
                 .collect())
         }
-        _ => Err(format!("Unsupported normalized PNG bit depth: {bit_depth}.")),
+        _ => Err(format!(
+            "Unsupported normalized PNG bit depth: {bit_depth}."
+        )),
     }
 }
 
@@ -190,13 +193,7 @@ mod tests {
 
     #[test]
     fn grayscale_alpha_is_not_interpreted_as_two_printing_channels() {
-        let encoded = encode_png(
-            1,
-            1,
-            ColorType::GrayscaleAlpha,
-            BitDepth::Eight,
-            &[64, 192],
-        );
+        let encoded = encode_png(1, 1, ColorType::GrayscaleAlpha, BitDepth::Eight, &[64, 192]);
         let decoded = decode_png_reader(Cursor::new(encoded)).expect("decode GA PNG");
         assert_eq!(decoded.model, PngSourceModel::Gray);
         assert_eq!(decoded.samples, [64 * 257]);

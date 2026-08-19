@@ -514,6 +514,7 @@ mod tests {
 
     fn recipe() -> ConversionRecipe {
         ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::Icc,
             source_profile_identity: IccProfileIdentity {

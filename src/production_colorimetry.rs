@@ -55,7 +55,11 @@ impl ValidatedProductionPcsCompatibility {
                 }
             }
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn content_id(&self) -> Result<String, String> {

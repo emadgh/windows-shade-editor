@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::device_characterization::{
-    delta_e_2000, CharacterizationIdentity, DeviceForwardModel, LabColor,
+    CharacterizationIdentity, DeviceForwardModel, LabColor, delta_e_2000,
 };
 use crate::device_characterization_package::{
     CharacterizationValidationLevel, MeasuredLabColor, ValidatedCharacterizationPackage,
@@ -231,9 +231,8 @@ fn validate_model_settings(
         || config.max_support_distance <= 0.0
         || config.max_support_distance > 1.0
     {
-        errors.push(
-            "Local forward-model support distance must be finite and in (0, 1].".to_owned(),
-        );
+        errors
+            .push("Local forward-model support distance must be finite and in (0, 1].".to_owned());
     }
     for (name, value) in [
         ("mean ΔE00", policy.max_mean_delta_e00),
@@ -241,7 +240,9 @@ fn validate_model_settings(
         ("max ΔE00", policy.max_delta_e00),
     ] {
         if !value.is_finite() || value < 0.0 {
-            errors.push(format!("Forward-model {name} limit must be finite and non-negative."));
+            errors.push(format!(
+                "Forward-model {name} limit must be finite and non-negative."
+            ));
         }
     }
     if !policy.max_unsupported_fraction.is_finite()
@@ -312,7 +313,8 @@ fn predict_from_samples(
     if distances.len() < config.neighbor_count {
         return Err(format!(
             "Forward model has only {} usable samples; {} neighbors are required.",
-            distances.len(), config.neighbor_count
+            distances.len(),
+            config.neighbor_count
         ));
     }
 
@@ -332,7 +334,9 @@ fn predict_from_samples(
     for (distance, index) in selected.iter().copied() {
         let weight = 1.0 / distance.powf(config.distance_power);
         if !weight.is_finite() || weight <= 0.0 {
-            return Err("Forward-model interpolation produced an invalid sample weight.".to_owned());
+            return Err(
+                "Forward-model interpolation produced an invalid sample weight.".to_owned(),
+            );
         }
         let lab = samples[index].lab;
         weight_sum += weight;
@@ -363,12 +367,7 @@ fn leave_one_out_validation(
     let mut unsupported_count = 0usize;
 
     for (index, sample) in samples.iter().enumerate() {
-        match predict_from_samples(
-            samples,
-            &sample.normalized_coverages,
-            config,
-            Some(index),
-        ) {
+        match predict_from_samples(samples, &sample.normalized_coverages, config, Some(index)) {
             Ok(predicted) => errors.push(delta_e_2000(sample.lab, predicted)),
             Err(_) => unsupported_count += 1,
         }
@@ -409,8 +408,8 @@ fn percentile_nearest_rank(sorted: &[f64], quantile: f64) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::device_characterization_package::{
-        CharacterizationMeasurementMetadata, CharacterizationPackage,
-        CharacterizationPayload, CharacterizationProductionContext, CharacterizationSample,
+        CharacterizationMeasurementMetadata, CharacterizationPackage, CharacterizationPayload,
+        CharacterizationProductionContext, CharacterizationSample,
     };
 
     fn synthetic_lab(coverages: &[f32]) -> MeasuredLabColor {

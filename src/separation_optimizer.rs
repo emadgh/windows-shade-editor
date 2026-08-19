@@ -95,10 +95,12 @@ pub fn characterize_candidate(
         .ok_or(CharacterizedCandidateError::MissingTargetCharacterization)?;
 
     if target_characterization != model.identity().id {
-        return Err(CharacterizedCandidateError::CharacterizationIdentityMismatch {
-            target: target_characterization.to_owned(),
-            model: model.identity().id.clone(),
-        });
+        return Err(
+            CharacterizedCandidateError::CharacterizationIdentityMismatch {
+                target: target_characterization.to_owned(),
+                model: model.identity().id.clone(),
+            },
+        );
     }
 
     let target_channels = target
@@ -428,7 +430,10 @@ mod tests {
             vec![0.2, 0.1, 0.1, 1.1],
         )
         .unwrap_err();
-        assert!(matches!(error, CharacterizedCandidateError::ForwardModel(_)));
+        assert!(matches!(
+            error,
+            CharacterizedCandidateError::ForwardModel(_)
+        ));
     }
 
     #[test]
@@ -496,13 +501,9 @@ mod tests {
         strategy.per_ink_bias.insert("Blue".to_owned(), -0.8);
         strategy.per_ink_bias.insert("Black".to_owned(), 0.9);
 
-        let winner = choose_best_candidate(
-            &target(),
-            &strategy,
-            weights(2.0, 5.0, 8.0),
-            &candidates,
-        )
-        .unwrap();
+        let winner =
+            choose_best_candidate(&target(), &strategy, weights(2.0, 5.0, 8.0), &candidates)
+                .unwrap();
         assert_eq!(winner.0, 1);
         assert_eq!(winner.1.black_coverage, Some(0.32));
     }
@@ -525,13 +526,9 @@ mod tests {
         strategy.black_channel = Some("Black".to_owned());
         strategy.black_generation_strength = 1.0;
         strategy.neutral_chroma_threshold = 8.0;
-        let winner = choose_best_candidate(
-            &target(),
-            &strategy,
-            weights(10.0, 0.0, 100.0),
-            &candidates,
-        )
-        .unwrap();
+        let winner =
+            choose_best_candidate(&target(), &strategy, weights(10.0, 0.0, 100.0), &candidates)
+                .unwrap();
         assert_eq!(winner.0, 0);
     }
 

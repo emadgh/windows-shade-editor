@@ -61,7 +61,12 @@ pub(crate) fn ui_snapshots(app: &mut ShadeApp, ui: &mut egui::Ui) {
         app.flush_history_now();
         app.sync_history_to_active_snapshot();
         let id = app.project.create_snapshot();
-        if let Some(snapshot) = app.project.snapshots.iter().find(|snapshot| snapshot.id == id) {
+        if let Some(snapshot) = app
+            .project
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == id)
+        {
             app.snapshot_rename_id = Some(id);
             app.snapshot_rename_buffer = snapshot.name.clone();
         }
@@ -198,8 +203,8 @@ pub(crate) fn ui_snapshots(app: &mut ShadeApp, ui: &mut egui::Ui) {
             egui::TextEdit::singleline(&mut app.snapshot_rename_buffer)
                 .desired_width(f32::INFINITY),
         );
-        let enter = rename_response.has_focus()
-            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        let enter =
+            rename_response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
         if (rename_response.lost_focus() || enter)
             && app.snapshot_rename_buffer.trim() != active_name
         {
@@ -424,10 +429,8 @@ fn export_snapshot_group_dialog(app: &mut ShadeApp, snapshot_ids: Vec<u64>, labe
             &app.settings.export_folder_template,
             &context,
         );
-        let filename = export_batch::render_export_filename(
-            &app.settings.snapshot_export_template,
-            &context,
-        );
+        let filename =
+            export_batch::render_export_filename(&app.settings.snapshot_export_template, &context);
         let destination = folder.join(filename);
         collision_count += usize::from(destination.exists());
         candidates.push((snapshot.clone(), folder, destination));
@@ -447,7 +450,10 @@ fn export_snapshot_group_dialog(app: &mut ShadeApp, snapshot_ids: Vec<u64>, labe
     let mut queued = 0usize;
     for (snapshot, folder, destination) in candidates {
         if let Err(err) = std::fs::create_dir_all(&folder) {
-            app.report_error(format!("Cannot create export folder {}: {err}", folder.display()));
+            app.report_error(format!(
+                "Cannot create export folder {}: {err}",
+                folder.display()
+            ));
             return;
         }
         let destination = if conflict_policy == export_batch::ConflictPolicy::AutoNumber {

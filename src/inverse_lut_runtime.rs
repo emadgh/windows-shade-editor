@@ -17,7 +17,9 @@ use crate::inverse_lut_identity::{
     InverseLutBuildPolicy, InverseLutContinuityFieldMethod, InverseLutIdentityError,
     InverseLutIdentityRecord, InverseLutInterpolationMethod, quantize_normalized_coverage,
 };
-use crate::inverse_separation_solver::{InverseSolveError, InverseSolverStats, solve_inverse_separation};
+use crate::inverse_separation_solver::{
+    InverseSolveError, InverseSolverStats, solve_inverse_separation,
+};
 use crate::separation_optimizer::CandidateScoringWeights;
 
 const GRID_NODE_SNAP_EPSILON: f64 = 1.0e-10;
@@ -129,10 +131,10 @@ fn build_independent_payload(
     solver: crate::custom_optimizer_config::CustomOptimizerSolverConfig,
     weights: CandidateScoringWeights,
 ) -> Result<BuiltPayloadParts, InverseLutBuildError> {
-    let (_shape, labs) =
-        lab_grid_points(build_policy.grid).map_err(InverseLutBuildError::Grid)?;
+    let (_shape, labs) = lab_grid_points(build_policy.grid).map_err(InverseLutBuildError::Grid)?;
     let channel_count = recipe.target.channels.len();
-    let node_count = u64::try_from(labs.len()).map_err(|_| InverseLutBuildError::CounterOverflow)?;
+    let node_count =
+        u64::try_from(labs.len()).map_err(|_| InverseLutBuildError::CounterOverflow)?;
     let coverage_values = labs
         .len()
         .checked_mul(channel_count)
@@ -381,7 +383,9 @@ impl InverseLutRuntime {
                 artifact.identity_content_id
             )));
         }
-        if artifact.identity.build_policy.interpolation != InverseLutInterpolationMethod::TrilinearV1 {
+        if artifact.identity.build_policy.interpolation
+            != InverseLutInterpolationMethod::TrilinearV1
+        {
             return Err(InverseLutLookupError::InvalidArtifact(
                 "Unsupported inverse LUT runtime interpolation method.".to_owned(),
             ));
@@ -411,11 +415,8 @@ impl InverseLutRuntime {
             ));
         }
 
-        let actual_payload_sha256 = validate_and_hash_payload(
-            &artifact.validity,
-            &artifact.coverages,
-            channel_count,
-        )?;
+        let actual_payload_sha256 =
+            validate_and_hash_payload(&artifact.validity, &artifact.coverages, channel_count)?;
         if artifact.payload_sha256 != actual_payload_sha256 {
             return Err(InverseLutLookupError::InvalidArtifact(format!(
                 "Inverse LUT payload SHA-256 mismatch: expected {}, got {actual_payload_sha256}.",
@@ -576,10 +577,7 @@ impl AxisBracket {
         if self.low == self.high {
             [(self.low, 1.0), (self.low, 0.0)]
         } else {
-            [
-                (self.low, 1.0 - self.fraction),
-                (self.high, self.fraction),
-            ]
+            [(self.low, 1.0 - self.fraction), (self.high, self.fraction)]
         }
     }
 }

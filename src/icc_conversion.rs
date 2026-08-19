@@ -20,8 +20,9 @@ pub enum RuntimeIccProfile<'a> {
 impl RuntimeIccProfile<'_> {
     pub(crate) fn open(&self, role: &str) -> Result<Profile, String> {
         match self {
-            Self::Embedded(bytes) => Profile::new_icc(bytes)
-                .map_err(|err| format!("Cannot open {role} ICC profile from embedded bytes: {err}")),
+            Self::Embedded(bytes) => Profile::new_icc(bytes).map_err(|err| {
+                format!("Cannot open {role} ICC profile from embedded bytes: {err}")
+            }),
             Self::File(path) => Profile::new_file(path)
                 .map_err(|err| format!("Cannot open {role} ICC profile {}: {err}", path.display())),
         }
@@ -95,9 +96,9 @@ impl ProductionCmykTransform {
                         intent,
                     )
                 };
-                result
-                    .map(ProductionTransform::RgbToCmyk)
-                    .map_err(|err| format!("Cannot create production RGB→CMYK ICC transform: {err}"))?
+                result.map(ProductionTransform::RgbToCmyk).map_err(|err| {
+                    format!("Cannot create production RGB→CMYK ICC transform: {err}")
+                })?
             }
             IccSourceModel::Cmyk => {
                 let result = if black_point_compensation {
@@ -118,9 +119,9 @@ impl ProductionCmykTransform {
                         intent,
                     )
                 };
-                result
-                    .map(ProductionTransform::CmykToCmyk)
-                    .map_err(|err| format!("Cannot create production CMYK→CMYK ICC transform: {err}"))?
+                result.map(ProductionTransform::CmykToCmyk).map_err(|err| {
+                    format!("Cannot create production CMYK→CMYK ICC transform: {err}")
+                })?
             }
         };
 
@@ -153,7 +154,9 @@ impl ProductionCmykTransform {
     ) -> Result<(), String> {
         validate_chunk_lengths(source.len(), destination.len())?;
         let ProductionTransform::RgbToCmyk(transform) = &self.transform else {
-            return Err("This production transform was not created for RGB source data.".to_owned());
+            return Err(
+                "This production transform was not created for RGB source data.".to_owned(),
+            );
         };
         transform.transform_pixels(source, destination);
         Ok(())
@@ -169,14 +172,19 @@ impl ProductionCmykTransform {
     ) -> Result<(), String> {
         validate_chunk_lengths(source.len(), destination.len())?;
         let ProductionTransform::CmykToCmyk(transform) = &self.transform else {
-            return Err("This production transform was not created for CMYK source data.".to_owned());
+            return Err(
+                "This production transform was not created for CMYK source data.".to_owned(),
+            );
         };
         transform.transform_pixels(source, destination);
         Ok(())
     }
 }
 
-pub(crate) fn validate_chunk_lengths(source_len: usize, destination_len: usize) -> Result<(), String> {
+pub(crate) fn validate_chunk_lengths(
+    source_len: usize,
+    destination_len: usize,
+) -> Result<(), String> {
     if source_len != destination_len {
         return Err(format!(
             "ICC conversion chunk length mismatch: {source_len} source pixels, {destination_len} destination pixels."
