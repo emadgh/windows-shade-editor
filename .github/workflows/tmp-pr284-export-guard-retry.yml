@@ -1,0 +1,80 @@
+name: Temporary guarded PR284 export boundary acceptance retry
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr284-export-guard-retry
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply export boundary patch and update acceptance contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'ff637d832913c79fe026591ec149c36f4c0a2002'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 canonical head moved' }
+
+          git show origin/tmp/pr284-export-guard-workflow:.github/workflows/tmp-pr284-export-guard.yml | Out-File -Encoding utf8 pr297.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          from pathlib import Path
+          import re
+
+          text = Path('pr297.yml').read_text(encoding='utf-8-sig')
+          blocks = re.findall(r"          @'\n(.*?)          '@ \| python -", text, flags=re.S)
+          if len(blocks) != 1:
+              raise SystemExit(f'Expected exactly one PR297 Python patch block, got {len(blocks)}')
+          lines = blocks[0].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('pr297_patch.py').write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python pr297_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item pr297.yml, pr297_patch.py -ErrorAction SilentlyContinue
+
+          @'
+          from pathlib import Path
+
+          path = Path('src/production_acceptance.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '''            "The active Face source TIFF is missing",\n            "Export all requires every Accepted Face source TIFF to be available",\n            "status.is_rejected()",\n'''
+          new = '''            "The active Face source image is missing",\n            "Export all requires every Accepted Face source image to be available",\n            "TIFF-source-only in this version",\n            "TIFF round-trip validation requires a TIFF source Face",\n            "status.is_rejected()",\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'production_acceptance.rs: expected one legacy missing-face contract block, got {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $allowed = @('src/export_queue.rs','src/main.rs','src/runtime_preview.rs','src/render.rs','src/production_acceptance.rs')
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) { if ($allowed -notcontains $file) { git checkout -- $file } }
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) { if ($allowed -notcontains $file) { throw "Unexpected patch surface: $file" } }
+          if ($changed.Count -ne 5) { throw "Expected exactly 5 changed source files, got $($changed.Count): $($changed -join ', ')" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/export_queue.rs src/main.rs src/runtime_preview.rs src/render.rs src/production_acceptance.rs
+          git commit -m 'feat: guard TIFF-only export boundary and source preflight integration (#281)'
+          git push origin HEAD:codex/design-source-runtime-wiring
