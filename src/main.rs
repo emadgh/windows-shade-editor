@@ -38,6 +38,7 @@ mod runtime_preview;
 mod safe_fs;
 mod settings;
 mod snapshot_preview_cache;
+mod source_transparency;
 mod thumbnail;
 mod tiff_inspect;
 mod tiff_io;

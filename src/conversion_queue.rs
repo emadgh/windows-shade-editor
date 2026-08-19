@@ -694,6 +694,7 @@ mod tests {
 
     fn capture(output: &str) -> ConversionJobCapture {
         let recipe = ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::Icc,
             source_profile_identity: IccProfileIdentity {

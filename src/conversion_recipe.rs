@@ -43,6 +43,7 @@ mod tests {
         bias.insert("Black".to_owned(), 0.8);
 
         ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::CustomOptimizer,
             source_profile_identity: identity("Adobe RGB", "source-hash"),
@@ -151,11 +152,30 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_custom_optimizer_requires_explicit_solver_config() {
+    fn current_schema_custom_optimizer_requires_explicit_solver_config() {
         let mut missing = recipe();
         missing.custom_optimizer_solver = None;
         let errors = missing.validate().expect_err("schema-v2 optimizer needs solver config");
         assert!(errors.iter().any(|error| error.contains("requires explicit solver")));
+    }
+
+    #[test]
+    fn transparency_background_change_changes_recipe_identity() {
+        let first = recipe();
+        let mut second = first.clone();
+        second.source_transparency_policy = Some(
+            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+                background_rgb: [u16::MAX, u16::MAX, u16::MAX],
+            },
+        );
+        let mut third = second.clone();
+        third.source_transparency_policy = Some(
+            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+                background_rgb: [0, 0, 0],
+            },
+        );
+        assert_ne!(recipe_sha256(&first).unwrap(), recipe_sha256(&second).unwrap());
+        assert_ne!(recipe_sha256(&second).unwrap(), recipe_sha256(&third).unwrap());
     }
 
     #[test]

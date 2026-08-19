@@ -13,7 +13,7 @@ use windows_shade_editor::conversion_output::{
 };
 use windows_shade_editor::conversion_preflight::{
     ConversionPreflightReport, PreflightCode, PreflightSeverity, SourceProfileState,
-    build_conversion_preflight_for_source,
+    build_conversion_preflight_for_source_with_policy,
 };
 use windows_shade_editor::conversion_recipe::recipe_sha256;
 use windows_shade_editor::conversion_transaction::{
@@ -22,7 +22,9 @@ use windows_shade_editor::conversion_transaction::{
 use windows_shade_editor::conversion_workflow::{
     ConversionSaveGate, ConversionSourceState, conversion_save_gate,
 };
+use windows_shade_editor::design_source::{SourceLossiness, TransparencyState};
 use windows_shade_editor::model::IccProfileIdentity as ConversionIccProfileIdentity;
+use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 use windows_shade_editor::production_target::{
     ProductionTargetProfileInspection, validate_target_channel_names,
     verify_production_target_profile,
@@ -51,6 +53,7 @@ pub(crate) struct ColorConversionUiState {
     collision_policy: OutputCollisionPolicy,
     rendering_intent: ConversionRenderingIntent,
     black_point_compensation: bool,
+    source_transparency_policy: Option<SourceTransparencyPolicy>,
 }
 
 impl Default for ColorConversionUiState {
@@ -68,6 +71,7 @@ impl Default for ColorConversionUiState {
             collision_policy: OutputCollisionPolicy::Versioned,
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
+            source_transparency_policy: None,
         }
     }
 }
@@ -110,7 +114,10 @@ impl ColorConversionUiState {
 struct CurrentConversionSource {
     face_label: String,
     source_path: PathBuf,
+    source_format_label: &'static str,
     source_model: RuntimeColorModel,
+    transparency: TransparencyState,
+    lossiness: SourceLossiness,
     execution_supported: bool,
     color_model_label: &'static str,
     bit_depth: u8,
@@ -261,6 +268,7 @@ impl ShadeApp {
                             &mut assign_production_profile,
                             &mut clear_production_profile,
                         );
+                        render_transparency_policy(ui, state, &source);
                         render_source_preflight(
                             ui,
                             &source,
@@ -436,7 +444,19 @@ impl ShadeApp {
         let (profile, profile_label, production_profile_path, has_assigned_profile) =
             production_source_profile_state(&descriptor, source_model, face_ref);
         let profile_identity = profile.identity().cloned();
-        let report = build_conversion_preflight_for_source(&descriptor, profile, save_gate);
+        let transparency_policy = if self.color_conversion.source_key.as_deref()
+            == Some(face.path.as_path())
+        {
+            self.color_conversion.source_transparency_policy.as_ref()
+        } else {
+            None
+        };
+        let report = build_conversion_preflight_for_source_with_policy(
+            &descriptor,
+            profile,
+            save_gate,
+            transparency_policy,
+        );
 
         let face_label = self
             .project
@@ -454,7 +474,10 @@ impl ShadeApp {
         Some(CurrentConversionSource {
             face_label,
             source_path: face.path.clone(),
+            source_format_label: descriptor.format.label(),
             source_model,
+            transparency: descriptor.transparency,
+            lossiness: descriptor.lossiness,
             execution_supported: face.preview.is_tiff(),
             color_model_label: source_model.title(),
             bit_depth: descriptor.bit_depth,
@@ -651,7 +674,10 @@ fn render_source_summary(ui: &mut egui::Ui, source: &CurrentConversionSource) {
             for (label, value) in [
                 ("Face", source.face_label.clone()),
                 ("Source", source.source_path.display().to_string()),
+                ("Source format", source.source_format_label.to_owned()),
                 ("Color model", source.color_model_label.to_owned()),
+                ("Transparency", source.transparency.label().to_owned()),
+                ("Compression", source.lossiness.label().to_owned()),
                 ("Bit depth", format!("{}-bit", source.bit_depth)),
                 ("Channels", source.channel_count.to_string()),
                 ("Production Source ICC", source.profile_label.clone()),
@@ -702,6 +728,74 @@ fn render_source_profile_actions(
     if let Some(path) = source.production_profile_path.as_deref() {
         ui.small(format!("Assigned profile path: {path}"));
     }
+}
+
+fn render_transparency_policy(
+    ui: &mut egui::Ui,
+    state: &mut ColorConversionUiState,
+    source: &CurrentConversionSource,
+) {
+    if source.transparency == TransparencyState::None {
+        state.source_transparency_policy = None;
+        return;
+    }
+
+    ui.add_space(8.0);
+    ui.group(|ui| {
+        ui.strong("PNG transparency handling");
+        ui.small(
+            "Alpha is not an ink channel. Production conversion requires an explicit solid background; the source file is never modified.",
+        );
+
+        let mut enabled = state.source_transparency_policy.is_some();
+        if ui
+            .checkbox(&mut enabled, "Flatten alpha against an explicit solid RGB background")
+            .changed()
+        {
+            state.source_transparency_policy = if enabled {
+                Some(SourceTransparencyPolicy::FlattenSolidRgb16 {
+                    background_rgb: [u16::MAX; 3],
+                })
+            } else {
+                None
+            };
+        }
+
+        if enabled {
+            let background = state
+                .source_transparency_policy
+                .unwrap_or(SourceTransparencyPolicy::FlattenSolidRgb16 {
+                    background_rgb: [u16::MAX; 3],
+                })
+                .background_rgb();
+            let mut rgb8 = background.map(|value| ((u32::from(value) + 128) / 257) as u8);
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Background RGB");
+                for (label, value) in ["R", "G", "B"].into_iter().zip(rgb8.iter_mut()) {
+                    ui.label(label);
+                    changed |= ui
+                        .add(egui::DragValue::new(value).range(0..=255))
+                        .changed();
+                }
+            });
+            if changed || state.source_transparency_policy.is_none() {
+                state.source_transparency_policy =
+                    Some(SourceTransparencyPolicy::FlattenSolidRgb16 {
+                        background_rgb: rgb8.map(|value| u16::from(value) * 257),
+                    });
+            }
+            if let Some(policy) = state.source_transparency_policy {
+                ui.small(format!("Recipe policy: {}", policy.label()));
+            }
+        } else {
+            ui.label(
+                egui::RichText::new("No flatten policy selected — conversion remains blocked")
+                    .color(egui::Color32::LIGHT_RED),
+            );
+        }
+    });
+    ui.add_space(4.0);
 }
 
 fn render_source_preflight(
@@ -992,6 +1086,14 @@ fn render_target_setup(
                             "Production project",
                             review.production_project_path.display().to_string(),
                         ),
+                        (
+                            "Transparency policy",
+                            review
+                                .recipe
+                                .source_transparency_policy
+                                .map(SourceTransparencyPolicy::label)
+                                .unwrap_or_else(|| "No flattening".to_owned()),
+                        ),
                         ("Recipe SHA-256", review.recipe_sha256),
                     ] {
                         ui.strong(label);
@@ -1119,6 +1221,7 @@ fn build_target_setup_review(
             ConversionEngineMode::CustomOptimizer => (None, None, None, None),
         };
     let recipe = ConversionRecipe {
+        source_transparency_policy: state.source_transparency_policy,
         schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
         engine_mode: state.engine_mode,
         source_profile_identity,

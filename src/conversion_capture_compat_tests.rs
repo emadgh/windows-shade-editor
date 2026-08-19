@@ -16,6 +16,7 @@ const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 fn icc_recipe() -> ConversionRecipe {
     ConversionRecipe {
+        source_transparency_policy: None,
         schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
         engine_mode: ConversionEngineMode::Icc,
         source_profile_identity: IccProfileIdentity {
@@ -53,6 +54,7 @@ fn icc_recipe() -> ConversionRecipe {
 
 fn custom_optimizer_recipe() -> ConversionRecipe {
     ConversionRecipe {
+        source_transparency_policy: None,
         schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
         engine_mode: ConversionEngineMode::CustomOptimizer,
         source_profile_identity: IccProfileIdentity {
