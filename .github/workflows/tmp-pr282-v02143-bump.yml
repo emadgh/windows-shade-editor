@@ -1,9 +1,9 @@
-name: Temporary guarded PR282 v0.21.43 bump
+name: Temporary guarded PR284 v0.21.44 bump
 
 on:
   pull_request:
     branches:
-      - tmp/pr282-v02143-bump
+      - tmp/pr284-v02144-workflow
 
 permissions:
   contents: write
@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: codex/runtime-preview-neutral
+          ref: codex/design-source-runtime-wiring
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -23,22 +23,22 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $expectedHead = '3aac61a817d747c97599d193725de767708b7b45'
-          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR282 feature head moved' }
+          $expectedHead = '1a767187007dbcf762ac01951a393da5d2e9b1e0'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 feature head moved' }
           Copy-Item Cargo.lock "$env:RUNNER_TEMP/Cargo.lock.before"
           @'
           from pathlib import Path
           cargo = Path('Cargo.toml')
           text = cargo.read_text(encoding='utf-8')
-          old = 'version = "0.21.42"'
-          new = 'version = "0.21.43"'
+          old = 'version = "0.21.43"'
+          new = 'version = "0.21.44"'
           if text.count(old) != 1:
               raise SystemExit(f'Cargo.toml root version marker count was {text.count(old)}, expected 1')
           cargo.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
           version = Path('VERSION')
-          if version.read_text(encoding='utf-8').strip() != '0.21.42':
-              raise SystemExit('VERSION was not 0.21.42 at guarded head')
-          version.write_text('0.21.43\n', encoding='utf-8', newline='\n')
+          if version.read_text(encoding='utf-8').strip() != '0.21.43':
+              raise SystemExit('VERSION was not 0.21.43 at guarded head')
+          version.write_text('0.21.44\n', encoding='utf-8', newline='\n')
           '@ | python -
           cargo check --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -58,7 +58,7 @@ jobs:
                   raise SystemExit(f'Root lock version was {roots[0].get("version")}, expected {expected_version}')
               roots[0]['version'] = '__ROOT_VERSION__'
               return value
-          if scrub(before, '0.21.42') != scrub(after, '0.21.43'):
+          if scrub(before, '0.21.43') != scrub(after, '0.21.44'):
               raise SystemExit('Cargo.lock changed beyond the root package version')
           '@ | python -
           $changed = @(git diff --name-only)
@@ -73,5 +73,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add Cargo.toml Cargo.lock VERSION
-          git commit -m 'chore: finalize v0.21.43 source-neutral preview runtime'
-          git push origin HEAD:codex/runtime-preview-neutral
+          git commit -m 'chore: finalize v0.21.44 design-source runtime wiring (#281)'
+          git push origin HEAD:codex/design-source-runtime-wiring
