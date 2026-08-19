@@ -22,7 +22,9 @@ use windows_shade_editor::conversion_transaction::{
 use windows_shade_editor::conversion_workflow::{
     ConversionSaveGate, ConversionSourceState, conversion_save_gate,
 };
-use windows_shade_editor::design_source::{SourceLossiness, TransparencyState};
+use windows_shade_editor::design_source::{
+    DesignSourceColorModel, SourceImageFormat, SourceLossiness, TransparencyState,
+};
 use windows_shade_editor::model::IccProfileIdentity as ConversionIccProfileIdentity;
 use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 use windows_shade_editor::production_target::{
@@ -478,7 +480,7 @@ impl ShadeApp {
             source_model,
             transparency: descriptor.transparency,
             lossiness: descriptor.lossiness,
-            execution_supported: face.preview.is_tiff(),
+            execution_supported: production_execution_supported(descriptor.format, descriptor.color_model),
             color_model_label: source_model.title(),
             bit_depth: descriptor.bit_depth,
             channel_count: descriptor.channel_count,
@@ -555,7 +557,7 @@ impl ShadeApp {
     ) {
         if !source.execution_supported {
             self.report_error(
-                "This source can be preflighted, but production execution currently requires a TIFF Face.",
+                "Production execution supports RGB TIFF/PNG/JPEG and CMYK TIFF sources; this source topology is not executable.",
             );
             return;
         }
@@ -625,7 +627,7 @@ impl ShadeApp {
                     &progress,
                     Some(0.45),
                     "Capturing production conversion",
-                    "Hashing immutable source TIFF",
+                    "Hashing immutable source artwork",
                 );
                 let source_file_sha256 =
                     windows_shade_editor::icc_conversion_worker::sha256_file(&source_face_path)?;
@@ -1115,13 +1117,14 @@ fn render_target_setup(
                 .add_enabled(
                     executable,
                     egui::Button::new("Queue Production Conversion"),
-                )                .on_hover_text(if executable {
-            "Capture the exact saved Source state and add it to the persistent conversion queue."
-        } else if !source.execution_supported {
-            "PNG/JPEG source preflight is available, but full-resolution production execution remains TIFF-only in this version."
-        } else {
-            "Custom Optimizer execution requires its dedicated engine."
-        })
+                )
+                .on_hover_text(if executable {
+                    "Capture the exact saved Source state and add it to the persistent conversion queue."
+                } else if !source.execution_supported {
+                    "Production execution currently supports RGB TIFF/PNG/JPEG and CMYK TIFF sources."
+                } else {
+                    "Custom Optimizer execution requires its dedicated engine."
+                })
                 .clicked()
             {
                 *start_conversion = true;
@@ -1382,6 +1385,19 @@ fn recommended_output_path(
         .join(filename))
 }
 
+fn production_execution_supported(
+    format: SourceImageFormat,
+    model: DesignSourceColorModel,
+) -> bool {
+    matches!(
+        (format, model),
+        (SourceImageFormat::Tiff, DesignSourceColorModel::Rgb)
+            | (SourceImageFormat::Tiff, DesignSourceColorModel::Cmyk)
+            | (SourceImageFormat::Png, DesignSourceColorModel::Rgb)
+            | (SourceImageFormat::Jpeg, DesignSourceColorModel::Rgb)
+    )
+}
+
 fn conversion_color_model(model: RuntimeColorModel) -> ConversionColorModel {
     match model {
         RuntimeColorModel::Gray => ConversionColorModel::Gray,
@@ -1548,5 +1564,37 @@ mod tests {
             path,
             PathBuf::from(r"C:\Design\Production\Face01_Durst_7C.tif")
         );
+    }
+
+    #[test]
+    fn production_execution_support_matrix_keeps_non_rgb_non_tiff_fail_closed() {
+        assert!(production_execution_supported(
+            SourceImageFormat::Tiff,
+            DesignSourceColorModel::Rgb
+        ));
+        assert!(production_execution_supported(
+            SourceImageFormat::Tiff,
+            DesignSourceColorModel::Cmyk
+        ));
+        assert!(production_execution_supported(
+            SourceImageFormat::Png,
+            DesignSourceColorModel::Rgb
+        ));
+        assert!(production_execution_supported(
+            SourceImageFormat::Jpeg,
+            DesignSourceColorModel::Rgb
+        ));
+        assert!(!production_execution_supported(
+            SourceImageFormat::Png,
+            DesignSourceColorModel::Gray
+        ));
+        assert!(!production_execution_supported(
+            SourceImageFormat::Jpeg,
+            DesignSourceColorModel::Gray
+        ));
+        assert!(!production_execution_supported(
+            SourceImageFormat::Png,
+            DesignSourceColorModel::Cmyk
+        ));
     }
 }
