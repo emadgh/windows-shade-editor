@@ -1,23 +1,8 @@
 use crate::conversion_workflow::ConversionSaveGate;
+use crate::design_source::{DesignSourceColorModel, DesignSourceDescriptor};
 use crate::model::IccProfileIdentity;
-use crate::tiff_io::ColorModel;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SourceImageFormat {
-    Tiff,
-    Png,
-    Jpeg,
-}
-
-impl SourceImageFormat {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Tiff => "TIFF",
-            Self::Png => "PNG",
-            Self::Jpeg => "JPEG",
-        }
-    }
-}
+pub use crate::design_source::{SourceImageFormat, SourceLossiness, TransparencyState};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceProfileState {
@@ -39,13 +24,6 @@ impl SourceProfileState {
         self.identity()
             .is_some_and(|identity| !identity.sha256.trim().is_empty())
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransparencyState {
-    None,
-    PresentUnresolved,
-    Flattened,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,11 +58,30 @@ pub struct PreflightFinding {
 #[derive(Clone, Debug)]
 pub struct ConversionPreflightInput {
     pub format: SourceImageFormat,
-    pub color_model: ColorModel,
+    pub color_model: DesignSourceColorModel,
     pub bit_depth: u8,
     pub profile: SourceProfileState,
     pub save_gate: ConversionSaveGate,
     pub transparency: TransparencyState,
+    pub lossiness: SourceLossiness,
+}
+
+impl ConversionPreflightInput {
+    pub fn from_source(
+        source: &DesignSourceDescriptor<'_>,
+        profile: SourceProfileState,
+        save_gate: ConversionSaveGate,
+    ) -> Self {
+        Self {
+            format: source.format,
+            color_model: source.color_model,
+            bit_depth: source.bit_depth,
+            profile,
+            save_gate,
+            transparency: source.transparency,
+            lossiness: source.lossiness,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -118,15 +115,15 @@ pub fn build_conversion_preflight(input: &ConversionPreflightInput) -> Conversio
     let mut findings = Vec::new();
 
     match input.color_model {
-        ColorModel::Rgb => findings.push(PreflightFinding {
+        DesignSourceColorModel::Rgb => findings.push(PreflightFinding {
             code: PreflightCode::RgbNotProductionSeparated,
             severity: PreflightSeverity::Warning,
             title: "RGB source — not production separated",
             detail: "Convert this artwork to the target CMYK/Multichannel printing space before Shade Editor production output.".to_owned(),
             action: Some("Convert Color..."),
         }),
-        ColorModel::Cmyk => {}
-        ColorModel::Gray | ColorModel::Other => findings.push(PreflightFinding {
+        DesignSourceColorModel::Cmyk => {}
+        DesignSourceColorModel::Gray | DesignSourceColorModel::Other => findings.push(PreflightFinding {
             code: PreflightCode::UnsupportedSourceColorModel,
             severity: PreflightSeverity::Blocking,
             title: "Unsupported source color model",
@@ -138,12 +135,12 @@ pub fn build_conversion_preflight(input: &ConversionPreflightInput) -> Conversio
         }),
     }
 
-    if input.format == SourceImageFormat::Jpeg {
+    if input.format == SourceImageFormat::Jpeg && input.lossiness == SourceLossiness::Lossy {
         findings.push(PreflightFinding {
             code: PreflightCode::JpegLossySource,
             severity: PreflightSeverity::Warning,
-            title: "JPEG source — lossy image format",
-            detail: "JPEG can be used as design artwork, but compression artifacts may be carried into the production separation.".to_owned(),
+            title: "JPEG source — lossy image coding",
+            detail: "This JPEG uses lossy DCT coding. Compression artifacts may be carried into the production separation.".to_owned(),
             action: None,
         });
     }
@@ -240,14 +237,16 @@ mod tests {
     }
 
     fn ready_rgb() -> ConversionPreflightInput {
-        ConversionPreflightInput {
-            format: SourceImageFormat::Tiff,
-            color_model: ColorModel::Rgb,
-            bit_depth: 16,
-            profile: profile(),
-            save_gate: ConversionSaveGate::Ready,
-            transparency: TransparencyState::None,
-        }
+        let source = DesignSourceDescriptor::new(
+            SourceImageFormat::Tiff,
+            DesignSourceColorModel::Rgb,
+            16,
+            3,
+            None,
+            TransparencyState::None,
+            SourceLossiness::Lossless,
+        );
+        ConversionPreflightInput::from_source(&source, profile(), ConversionSaveGate::Ready)
     }
 
     #[test]
@@ -286,20 +285,64 @@ mod tests {
 
     #[test]
     fn unresolved_png_alpha_blocks_and_is_not_treated_as_ink() {
-        let mut input = ready_rgb();
-        input.format = SourceImageFormat::Png;
-        input.transparency = TransparencyState::PresentUnresolved;
+        let source = DesignSourceDescriptor::new(
+            SourceImageFormat::Png,
+            DesignSourceColorModel::Rgb,
+            16,
+            3,
+            None,
+            TransparencyState::PresentUnresolved,
+            SourceLossiness::Lossless,
+        );
+        let input = ConversionPreflightInput::from_source(
+            &source,
+            profile(),
+            ConversionSaveGate::Ready,
+        );
         let report = build_conversion_preflight(&input);
         assert!(report.contains(PreflightCode::UnresolvedTransparency));
         assert!(!report.can_convert());
     }
 
     #[test]
-    fn jpeg_is_allowed_but_warned_as_lossy() {
-        let mut input = ready_rgb();
-        input.format = SourceImageFormat::Jpeg;
+    fn dct_jpeg_is_warned_as_lossy() {
+        let source = DesignSourceDescriptor::new(
+            SourceImageFormat::Jpeg,
+            DesignSourceColorModel::Rgb,
+            8,
+            3,
+            None,
+            TransparencyState::None,
+            SourceLossiness::Lossy,
+        );
+        let input = ConversionPreflightInput::from_source(
+            &source,
+            profile(),
+            ConversionSaveGate::Ready,
+        );
         let report = build_conversion_preflight(&input);
         assert!(report.contains(PreflightCode::JpegLossySource));
+        assert!(report.can_convert());
+    }
+
+    #[test]
+    fn lossless_jpeg_is_not_falsely_warned_as_lossy() {
+        let source = DesignSourceDescriptor::new(
+            SourceImageFormat::Jpeg,
+            DesignSourceColorModel::Rgb,
+            8,
+            3,
+            None,
+            TransparencyState::None,
+            SourceLossiness::Lossless,
+        );
+        let input = ConversionPreflightInput::from_source(
+            &source,
+            profile(),
+            ConversionSaveGate::Ready,
+        );
+        let report = build_conversion_preflight(&input);
+        assert!(!report.contains(PreflightCode::JpegLossySource));
         assert!(report.can_convert());
     }
 
