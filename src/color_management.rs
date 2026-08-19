@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use windows_sys::Win32::UI::ColorSystem::{ENUM_TYPE_VERSION, ENUMTYPEW, EnumColorProfilesW};
 
 use crate::model::{IccProfileIdentity, PreviewRenderingIntent, ShadeProject};
+use crate::runtime_preview::{RuntimeColorModel, RuntimePreviewSource};
 use crate::settings::AppSettings;
 use crate::tiff_io::{ColorModel, TiffMetadata};
 
@@ -183,9 +184,9 @@ impl PreviewColorStatus {
         match self {
             Self::Pending => "Preview color management has not rendered this Face yet.".to_owned(),
             Self::Disabled => {
-                "Project color preview is disabled. TIFF data and metadata are unchanged.".to_owned()
+                "Project color preview is disabled. Source data and metadata are unchanged.".to_owned()
             }
-            Self::NoEmbeddedProfile => "This TIFF has no embedded ICC profile and no preview profile is assigned. Shade Editor is using its unmanaged display fallback.".to_owned(),
+            Self::NoEmbeddedProfile => "This source has no embedded ICC profile and no preview profile is assigned. Shade Editor is using its unmanaged display fallback.".to_owned(),
             Self::Applied {
                 description,
                 intent,
@@ -197,7 +198,7 @@ impl PreviewColorStatus {
                 gamut_warning,
             } => {
                 let source = match source {
-                    PreviewProfileSource::Embedded => "embedded TIFF profile".to_owned(),
+                    PreviewProfileSource::Embedded => "embedded source profile".to_owned(),
                     PreviewProfileSource::Assigned(path) => {
                         format!("assigned preview profile {}", path.display())
                     }
@@ -220,7 +221,7 @@ impl PreviewColorStatus {
                     (proof_description.as_ref(), proofing_intent.as_ref())
                 {
                     format!(
-                        "{} ({source}) → printer/RIP soft proof '{}' → {monitor} · source {} intent (automatic from source ICC header) · proof {} intent{bpc}{gamut}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
+                        "{} ({source}) → printer/RIP soft proof '{}' → {monitor} · source {} intent (automatic from source ICC header) · proof {} intent{bpc}{gamut}. Preview-only; source samples and metadata are unchanged.",
                         description,
                         proof,
                         intent.label(),
@@ -228,14 +229,14 @@ impl PreviewColorStatus {
                     )
                 } else {
                     format!(
-                        "{} ({source}) → {monitor} · {} intent (automatic from source ICC header){bpc}. Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.",
+                        "{} ({source}) → {monitor} · {} intent (automatic from source ICC header){bpc}. Preview-only; source samples and metadata are unchanged.",
                         description,
                         intent.label(),
                     )
                 }
             }
             Self::Fallback { reason, .. } => format!(
-                "The requested color-management transform could not be used ({reason}). Shade Editor fell back to the unmanaged display conversion; TIFF data is unchanged."
+                "The requested color-management transform could not be used ({reason}). Shade Editor fell back to the unmanaged display conversion; Source data is unchanged."
             ),
         }
     }
@@ -281,6 +282,25 @@ pub struct PreviewColorTransform {
 
 impl PreviewColorTransform {
     pub fn new(metadata: &TiffMetadata, config: PreviewColorConfig) -> Self {
+        Self::new_for_parts(
+            metadata.color_model.into(),
+            metadata.icc_profile.as_deref(),
+            config,
+        )
+    }
+
+    pub fn new_for_runtime_preview<P: RuntimePreviewSource + ?Sized>(
+        preview: &P,
+        config: PreviewColorConfig,
+    ) -> Self {
+        Self::new_for_parts(preview.color_model(), preview.embedded_icc(), config)
+    }
+
+    fn new_for_parts(
+        model: RuntimeColorModel,
+        embedded_icc: Option<&[u8]>,
+        config: PreviewColorConfig,
+    ) -> Self {
         if !config.enabled {
             return Self {
                 transform: None,
@@ -288,11 +308,11 @@ impl PreviewColorTransform {
             };
         }
 
-        let expected = match expected_color_space(metadata.color_model) {
+        let expected = match expected_runtime_color_space(model) {
             Some(value) => value,
             None => {
                 return Self::fallback(
-                    "unsupported TIFF base color model".to_owned(),
+                    "unsupported source base color model".to_owned(),
                     config
                         .assigned_profile_path
                         .as_deref()
@@ -325,7 +345,7 @@ impl PreviewColorTransform {
                     }
                 }
             } else {
-                let Some(icc) = metadata.icc_profile.as_deref() else {
+                let Some(icc) = embedded_icc else {
                     return Self {
                         transform: None,
                         status: PreviewColorStatus::NoEmbeddedProfile,
@@ -346,9 +366,9 @@ impl PreviewColorTransform {
         if actual != expected {
             return Self::fallback(
                 format!(
-                    "profile color space {} does not match TIFF {}",
+                    "profile color space {} does not match source {}",
                     color_space_label(actual),
-                    metadata.color_model.title(),
+                    model.title(),
                 ),
                 requested_label,
             );
@@ -478,11 +498,11 @@ impl PreviewColorTransform {
             }};
         }
 
-        let transform = match metadata.color_model {
-            ColorModel::Rgb => make_transform!(PixelFormat::RGB_16, Rgb),
-            ColorModel::Cmyk => make_transform!(PixelFormat::CMYK_16, Cmyk),
-            ColorModel::Gray => make_transform!(PixelFormat::GRAY_16, Gray),
-            ColorModel::Other => unreachable!(),
+        let transform = match model {
+            RuntimeColorModel::Rgb => make_transform!(PixelFormat::RGB_16, Rgb),
+            RuntimeColorModel::Cmyk => make_transform!(PixelFormat::CMYK_16, Cmyk),
+            RuntimeColorModel::Gray => make_transform!(PixelFormat::GRAY_16, Gray),
+            RuntimeColorModel::Other => unreachable!(),
         };
 
         match transform {
@@ -995,6 +1015,15 @@ fn expected_color_space(model: ColorModel) -> Option<ColorSpaceSignature> {
     }
 }
 
+fn expected_runtime_color_space(model: RuntimeColorModel) -> Option<ColorSpaceSignature> {
+    match model {
+        RuntimeColorModel::Rgb => Some(ColorSpaceSignature::RgbData),
+        RuntimeColorModel::Cmyk => Some(ColorSpaceSignature::CmykData),
+        RuntimeColorModel::Gray => Some(ColorSpaceSignature::GrayData),
+        RuntimeColorModel::Other => None,
+    }
+}
+
 fn color_space_label(space: ColorSpaceSignature) -> String {
     match space {
         ColorSpaceSignature::RgbData => "RGB".to_owned(),
@@ -1046,6 +1075,8 @@ fn to_lcms_intent(intent: PreviewRenderingIntent) -> Intent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_shade_editor::design_source_preview::DesignSourcePreview;
+    use windows_shade_editor::png_source::{DecodedPngSource, PngSourceModel};
 
     fn metadata(model: ColorModel, icc_profile: Option<Vec<u8>>) -> TiffMetadata {
         let base = match model {
@@ -1316,5 +1347,27 @@ mod tests {
             Some(PreviewRenderingIntent::AbsoluteColorimetric)
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn png_embedded_icc_uses_runtime_preview_contract() {
+        let profile = Profile::new_srgb();
+        let bytes = profile.icc().unwrap();
+        let decoded = DecodedPngSource {
+            width: 1,
+            height: 1,
+            bit_depth: 16,
+            model: PngSourceModel::Rgb,
+            samples: vec![100, 200, 300],
+            alpha: None,
+            icc_profile: Some(bytes),
+            declares_srgb: false,
+        };
+        let preview = DesignSourcePreview::from_png(&decoded, 512).expect("PNG preview");
+        let transform = PreviewColorTransform::new_for_runtime_preview(&preview, config());
+        assert!(matches!(
+            transform.status(),
+            PreviewColorStatus::Applied { .. }
+        ));
     }
 }
