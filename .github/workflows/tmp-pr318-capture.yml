@@ -1,7 +1,7 @@
 name: Temporary guarded PR318 capture disposition migration
 
 on:
-  pull_request:
+  push:
     branches:
       - tmp/pr318-capture-workflow
 
@@ -90,7 +90,6 @@ jobs:
           text = text.replace(marker, replacement, 1)
           tx.write_text(text, encoding='utf-8', newline='\n')
 
-          # Direct struct literals do not receive serde defaults at compile time.
           literal_pattern = re.compile(r'^(?P<indent>\s*)ConversionJobCapture \{\s*$', re.MULTILINE)
           touched = []
           for root in (Path('src'), Path('tests')):
