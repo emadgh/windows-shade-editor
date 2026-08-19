@@ -1,0 +1,41 @@
+name: Temporary PR301 helper workflow fix
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr301-helper-fix-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch-helper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: tmp/pr301-implementation-workflow
+          fetch-depth: 0
+      - name: Add binary module wiring to guarded helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/tmp-pr301-implementation.yml')
+          text = p.read_text(encoding='utf-8')
+          marker = "          # Recipe schema v3 + explicit source-transparency policy.\n"
+          if text.count(marker) != 1:
+              raise SystemExit(f'helper marker count was {text.count(marker)}, expected 1')
+          block = '''          # Binary crate also compiles shared source modules directly.\n          replace_one(\n              'src/main.rs',\n              'mod snapshot_preview_cache;\\nmod thumbnail;',\n              'mod snapshot_preview_cache;\\nmod source_transparency;\\nmod thumbnail;',\n          )\n\n'''
+          if "'mod snapshot_preview_cache;\\nmod source_transparency;\\nmod thumbnail;'" in text:
+              raise SystemExit('binary module wiring already present')
+          p.write_text(text.replace(marker, block + marker, 1), encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+          git diff -- .github/workflows/tmp-pr301-implementation.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/tmp-pr301-implementation.yml
+          git commit -m 'ci: fix PR301 binary module wiring'
+          git push origin HEAD:tmp/pr301-implementation-workflow
