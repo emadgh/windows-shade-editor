@@ -47,6 +47,10 @@ impl InstalledIccProfile {
         expected_color_space(model).is_some_and(|expected| expected == self.color_space)
     }
 
+    pub fn compatible_with_runtime(&self, model: RuntimeColorModel) -> bool {
+        expected_runtime_color_space(model).is_some_and(|expected| expected == self.color_space)
+    }
+
     pub fn is_output_profile(&self) -> bool {
         self.device_class == ProfileClassSignature::OutputClass
     }
@@ -594,6 +598,15 @@ impl PreviewColorTransform {
     }
 }
 
+pub fn embedded_profile_description_for_runtime<P: RuntimePreviewSource + ?Sized>(
+    source: &P,
+) -> Option<String> {
+    let icc = source.embedded_icc()?;
+    Profile::new_icc(icc)
+        .ok()
+        .map(|profile| profile_description(&profile))
+}
+
 pub fn embedded_profile_description(metadata: &TiffMetadata) -> Option<String> {
     let icc = metadata.icc_profile.as_deref()?;
     Profile::new_icc(icc)
@@ -683,6 +696,67 @@ pub fn inspect_profile(path: &Path) -> Result<InstalledIccProfile, String> {
 
 pub fn profile_identity(path: &Path) -> Result<IccProfileIdentity, String> {
     inspect_profile(path).map(|profile| profile.identity)
+}
+
+pub fn production_embedded_profile_identity_for_runtime(
+    model: RuntimeColorModel,
+    embedded_icc: Option<&[u8]>,
+) -> Result<Option<IccProfileIdentity>, String> {
+    let Some(bytes) = embedded_icc else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Err("Embedded production Source ICC payload is empty.".to_owned());
+    }
+    let profile = Profile::new_icc(bytes)
+        .map_err(|err| format!("Cannot open embedded production Source ICC: {err}"))?;
+    let Some(expected) = expected_runtime_color_space(model) else {
+        return Err(format!(
+            "{} source data is not supported by production Source ICC assignment.",
+            model.title()
+        ));
+    };
+    if profile.color_space() != expected {
+        return Err(format!(
+            "Embedded Source ICC color space {} does not match source {}.",
+            color_space_label(profile.color_space()),
+            model.title()
+        ));
+    }
+    Ok(Some(IccProfileIdentity {
+        description: profile_description(&profile),
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+    }))
+}
+
+pub fn inspect_production_source_profile_runtime(
+    path: &Path,
+    expected_identity: &IccProfileIdentity,
+    source_model: RuntimeColorModel,
+) -> Result<InstalledIccProfile, String> {
+    let profile = inspect_profile(path)?;
+    if !profile.compatible_with_runtime(source_model) {
+        return Err(format!(
+            "Assigned production Source ICC '{}' declares {} but the source Face is {}.",
+            profile.description,
+            profile.color_space_label(),
+            source_model.title()
+        ));
+    }
+    if expected_identity.sha256.trim().is_empty() {
+        return Err(
+            "Assigned production Source ICC has no stored SHA-256 identity. Reassign the profile."
+                .to_owned(),
+        );
+    }
+    if !profile.matches_identity(expected_identity) {
+        return Err(format!(
+            "Assigned production Source ICC at {} no longer matches stored profile '{}'. Reassign or relink the profile before conversion.",
+            path.display(),
+            expected_identity.description
+        ));
+    }
+    Ok(profile)
 }
 
 /// Inspect an embedded ICC for production source interpretation.

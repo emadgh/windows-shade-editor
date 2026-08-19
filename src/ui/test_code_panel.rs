@@ -1,3 +1,4 @@
+use crate::runtime_preview::RuntimePreviewSource;
 use crate::*;
 use eframe::egui;
 
@@ -21,7 +22,7 @@ pub(crate) fn ui_test_code(app: &mut ShadeApp, ui: &mut egui::Ui) {
         .faces
         .get(app.current_face)
         .filter(|face| face.available)
-        .map(|face| face.preview.metadata.channel_names.clone())
+        .map(|face| face.preview.channel_names().to_vec())
         .unwrap_or_default();
     let palette = app.project.channel_palette.clone();
     let fallback = app
@@ -81,7 +82,7 @@ pub(crate) fn ui_test_code(app: &mut ShadeApp, ui: &mut egui::Ui) {
                             changed |= ui
                                 .selectable_value(
                                     &mut app.project.test_code.channel,
-                                    name.clone(),
+                                    name.to_owned(),
                                     display,
                                 )
                                 .changed();

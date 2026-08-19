@@ -12,8 +12,8 @@ use windows_shade_editor::conversion_output::{
     validate_conversion_output_path,
 };
 use windows_shade_editor::conversion_preflight::{
-    ConversionPreflightInput, ConversionPreflightReport, PreflightCode, PreflightSeverity,
-    SourceImageFormat, SourceProfileState, TransparencyState, build_conversion_preflight,
+    ConversionPreflightReport, PreflightCode, PreflightSeverity, SourceProfileState,
+    build_conversion_preflight_for_source,
 };
 use windows_shade_editor::conversion_recipe::recipe_sha256;
 use windows_shade_editor::conversion_transaction::{
@@ -110,7 +110,8 @@ impl ColorConversionUiState {
 struct CurrentConversionSource {
     face_label: String,
     source_path: PathBuf,
-    source_model: tiff_io::ColorModel,
+    source_model: RuntimeColorModel,
+    execution_supported: bool,
     color_model_label: &'static str,
     bit_depth: u8,
     channel_count: usize,
@@ -163,8 +164,8 @@ impl ShadeApp {
         let supported_source = matches!(
             self.faces
                 .get(self.current_face)
-                .map(|face| face.preview.metadata.color_model),
-            Some(tiff_io::ColorModel::Rgb | tiff_io::ColorModel::Cmyk)
+                .map(|face| face.preview.color_model()),
+            Some(RuntimeColorModel::Rgb | RuntimeColorModel::Cmyk)
         );
 
         if is_rgb {
@@ -420,8 +421,12 @@ impl ShadeApp {
 
     fn current_conversion_source(&self) -> Option<CurrentConversionSource> {
         let face = self.faces.get(self.current_face)?;
-        let metadata = &face.preview.metadata;
-        let source_model = conversion_color_model(metadata.color_model);
+        if !face.available {
+            return None;
+        }
+        let owned_descriptor = face.preview.source_descriptor()?;
+        let descriptor = owned_descriptor.as_borrowed();
+        let source_model = face.preview.color_model();
         let save_gate = conversion_save_gate(ConversionSourceState {
             has_faces: !self.faces.is_empty(),
             has_saved_project_path: self.project_path.is_some(),
@@ -429,16 +434,9 @@ impl ShadeApp {
         });
         let face_ref = self.project.faces.get(self.current_face);
         let (profile, profile_label, production_profile_path, has_assigned_profile) =
-            production_source_profile_state(metadata, face_ref);
+            production_source_profile_state(&descriptor, source_model, face_ref);
         let profile_identity = profile.identity().cloned();
-        let report = build_conversion_preflight(&ConversionPreflightInput {
-            format: SourceImageFormat::Tiff,
-            color_model: source_model,
-            bit_depth: metadata.bit_depth,
-            profile,
-            save_gate,
-            transparency: TransparencyState::None,
-        });
+        let report = build_conversion_preflight_for_source(&descriptor, profile, save_gate);
 
         let face_label = self
             .project
@@ -456,10 +454,11 @@ impl ShadeApp {
         Some(CurrentConversionSource {
             face_label,
             source_path: face.path.clone(),
-            source_model: metadata.color_model,
-            color_model_label: metadata.color_model.title(),
-            bit_depth: metadata.bit_depth,
-            channel_count: metadata.samples_per_pixel,
+            source_model,
+            execution_supported: face.preview.is_tiff(),
+            color_model_label: source_model.title(),
+            bit_depth: descriptor.bit_depth,
+            channel_count: descriptor.channel_count,
             profile_identity,
             profile_label,
             production_profile_path,
@@ -474,7 +473,7 @@ impl ShadeApp {
         let Some(active_face) = self.faces.get(self.current_face) else {
             return;
         };
-        let source_model = active_face.preview.metadata.color_model;
+        let source_model = active_face.preview.color_model();
         let face_label = self
             .project
             .faces
@@ -483,7 +482,7 @@ impl ShadeApp {
             .unwrap_or_else(|| format!("Face {}", self.current_face + 1));
 
         match color_management::inspect_profile(&path) {
-            Ok(profile) if profile.compatible_with(source_model) => {
+            Ok(profile) if profile.compatible_with_runtime(source_model) => {
                 let assignment = model::ProductionSourceProfileAssignment {
                     path: path.to_string_lossy().into_owned(),
                     identity: profile.identity().clone(),
@@ -531,6 +530,12 @@ impl ShadeApp {
         source: &CurrentConversionSource,
         review: TargetSetupReview,
     ) {
+        if !source.execution_supported {
+            self.report_error(
+                "This source can be preflighted, but production execution currently requires a TIFF Face.",
+            );
+            return;
+        }
         if self.job.is_some() {
             self.report_info("Finish the current foreground operation before queueing conversion.");
             return;
@@ -999,20 +1004,22 @@ fn render_target_setup(
                     .color(egui::Color32::LIGHT_GREEN)
                     .strong(),
             );
-            let executable = matches!(
+            let engine_executable = matches!(
                 review.recipe.engine_mode,
                 ConversionEngineMode::Icc | ConversionEngineMode::DeviceLink
             );
+            let executable = engine_executable && source.execution_supported;
             if ui
                 .add_enabled(
                     executable,
                     egui::Button::new("Queue Production Conversion"),
-                )
-                .on_hover_text(if executable {
-                    "Capture the exact saved Source state and add it to the persistent conversion queue."
-                } else {
-                    "Custom Optimizer execution requires its dedicated engine."
-                })
+                )                .on_hover_text(if executable {
+            "Capture the exact saved Source state and add it to the persistent conversion queue."
+        } else if !source.execution_supported {
+            "PNG/JPEG source preflight is available, but full-resolution production execution remains TIFF-only in this version."
+        } else {
+            "Custom Optimizer execution requires its dedicated engine."
+        })
                 .clicked()
             {
                 *start_conversion = true;
@@ -1139,8 +1146,9 @@ fn build_target_setup_review(
         black_point_compensation: state.engine_mode == ConversionEngineMode::Icc
             && state.black_point_compensation,
         strategy: SeparationStrategy::default(),
-        custom_optimizer_solver: (state.engine_mode == ConversionEngineMode::CustomOptimizer)
-                            .then(windows_shade_editor::custom_optimizer_config::CustomOptimizerSolverConfig::default),
+        custom_optimizer_solver: (state.engine_mode == ConversionEngineMode::CustomOptimizer).then(
+            windows_shade_editor::custom_optimizer_config::CustomOptimizerSolverConfig::default,
+        ),
     };
     if let Err(recipe_errors) = recipe.validate() {
         errors.extend(recipe_errors);
@@ -1271,25 +1279,26 @@ fn recommended_output_path(
         .join(filename))
 }
 
-fn conversion_color_model(model: tiff_io::ColorModel) -> ConversionColorModel {
+fn conversion_color_model(model: RuntimeColorModel) -> ConversionColorModel {
     match model {
-        tiff_io::ColorModel::Gray => ConversionColorModel::Gray,
-        tiff_io::ColorModel::Rgb => ConversionColorModel::Rgb,
-        tiff_io::ColorModel::Cmyk => ConversionColorModel::Cmyk,
-        tiff_io::ColorModel::Other => ConversionColorModel::Other,
+        RuntimeColorModel::Gray => ConversionColorModel::Gray,
+        RuntimeColorModel::Rgb => ConversionColorModel::Rgb,
+        RuntimeColorModel::Cmyk => ConversionColorModel::Cmyk,
+        RuntimeColorModel::Other => ConversionColorModel::Other,
     }
 }
 
 fn production_source_profile_state(
-    metadata: &tiff_io::TiffMetadata,
+    descriptor: &windows_shade_editor::design_source::DesignSourceDescriptor<'_>,
+    source_model: RuntimeColorModel,
     face: Option<&model::FaceRef>,
 ) -> (SourceProfileState, String, Option<String>, bool) {
     if let Some(assignment) = face.and_then(|face| face.production_source_profile.as_ref()) {
         let path = PathBuf::from(&assignment.path);
-        return match color_management::inspect_production_source_profile(
+        return match color_management::inspect_production_source_profile_runtime(
             &path,
             &assignment.identity,
-            metadata.color_model,
+            source_model,
         ) {
             Ok(profile) => (
                 SourceProfileState::Assigned(conversion_profile_identity(profile.identity())),
@@ -1309,7 +1318,10 @@ fn production_source_profile_state(
         };
     }
 
-    match color_management::production_embedded_profile_identity(metadata) {
+    match color_management::production_embedded_profile_identity_for_runtime(
+        source_model,
+        descriptor.embedded_icc,
+    ) {
         Ok(Some(identity)) => (
             SourceProfileState::Embedded(conversion_profile_identity(&identity)),
             format!("Embedded: {}", identity.description),

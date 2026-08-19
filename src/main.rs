@@ -64,8 +64,8 @@ use palette::ChannelPalette;
 use project_lifecycle::{
     BackupRestoreCandidate, ProjectLifecycleController, ProjectTransition, TransitionRequest,
 };
+use runtime_preview::{RuntimeColorModel, RuntimePreview, RuntimePreviewSource};
 use settings::{AppSettings, TonalDisplayMode};
-use tiff_io::PreviewFace;
 use ui::curve_editor::{curves_ui, tonal_display_value};
 use ui::input_router;
 use update::{UpdateManager, UpdateStatus};
@@ -138,7 +138,7 @@ enum PendingSnapshotAction {
 struct RuntimeFace {
     path: PathBuf,
     available: bool,
-    preview: Arc<PreviewFace>,
+    preview: Arc<RuntimePreview>,
     dpi: dpi::DpiInfo,
     adjusted_histograms: Vec<[u32; 256]>,
     clipping: Vec<render::ChannelClippingStats>,
@@ -155,7 +155,7 @@ struct RuntimeFace {
 struct LoadedFace {
     path: PathBuf,
     available: bool,
-    preview: PreviewFace,
+    preview: RuntimePreview,
     dpi: dpi::DpiInfo,
 }
 
@@ -592,10 +592,8 @@ impl ShadeApp {
         }
     }
 
-    fn is_tiff_path(path: &Path) -> bool {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
+    fn is_design_source_path(path: &Path) -> bool {
+        runtime_preview::is_supported_design_source_path(path)
     }
 
     fn add_faces_paths(&mut self, paths: Vec<PathBuf>) {
@@ -604,14 +602,14 @@ impl ShadeApp {
         }
         let paths = paths
             .into_iter()
-            .filter(|path| Self::is_tiff_path(path))
+            .filter(|path| Self::is_design_source_path(path))
             .collect::<Vec<_>>();
         if paths.is_empty() {
             return;
         }
         let max_dimension = self.settings.max_preview_dimension;
         let default_dpi = self.settings.default_dpi;
-        self.launch_job("Opening TIFF", move |progress| {
+        self.launch_job("Opening design source", move |progress| {
             let total = paths.len().max(1);
             let mut faces = Vec::new();
             let mut errors = Vec::new();
@@ -619,13 +617,13 @@ impl ShadeApp {
                 Self::set_progress(
                     &progress,
                     Some(index as f32 / total as f32),
-                    "Opening TIFF",
+                    "Opening design source",
                     &path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                 );
-                match tiff_io::load_preview(&path, max_dimension) {
+                match RuntimePreview::load(&path, max_dimension) {
                     Ok(preview) => faces.push(LoadedFace {
                         dpi: dpi::read_dpi(&path, default_dpi),
                         path,
@@ -635,7 +633,7 @@ impl ShadeApp {
                     Err(err) => errors.push(format!("{}: {err}", path.display())),
                 }
             }
-            Self::set_progress(&progress, Some(1.0), "Opening TIFF", "Complete");
+            Self::set_progress(&progress, Some(1.0), "Opening design source", "Complete");
             JobResult::AddFaces { faces, errors }
         });
     }
@@ -645,7 +643,7 @@ impl ShadeApp {
             return;
         }
         let Some(paths) = rfd::FileDialog::new()
-            .add_filter("TIFF images", &["tif", "tiff"])
+            .add_filter("Design images", &["tif", "tiff", "png", "jpg", "jpeg"])
             .pick_files()
         else {
             return;
@@ -663,7 +661,7 @@ impl ShadeApp {
                 .dropped_files
                 .iter()
                 .filter_map(|file| file.path.clone())
-                .filter(|path| Self::is_tiff_path(path))
+                .filter(|path| Self::is_design_source_path(path))
                 .collect::<Vec<_>>()
         });
         if !paths.is_empty() {
@@ -717,9 +715,9 @@ impl ShadeApp {
                         .as_ref()
                         .and_then(|metadata| metadata.faces.get(index))
                         .cloned();
-                    match tiff_io::load_preview(&source, max_dimension) {
+                    match RuntimePreview::load(&source, max_dimension) {
                         Ok(preview) => {
-                            project.ensure_channels(&preview.metadata.channel_names);
+                            project.ensure_channels(preview.channel_names());
                             faces.push(LoadedFace {
                                 dpi: dpi::read_dpi(&source, default_dpi),
                                 path: source,
@@ -884,10 +882,40 @@ impl ShadeApp {
             && (self.project_dirty || self.project_path.is_none())
     }
 
+    fn active_face_is_tiff_export_source(&self) -> bool {
+        self.faces
+            .get(self.current_face)
+            .filter(|face| face.available)
+            .is_some_and(|face| face.preview.is_tiff())
+    }
+
+    fn accepted_faces_include_non_tiff_export_source(&self) -> bool {
+        self.faces.iter().enumerate().any(|(index, face)| {
+            !self
+                .project
+                .faces
+                .get(index)
+                .is_some_and(|project_face| project_face.status.is_rejected())
+                && face.available
+                && !face.preview.is_tiff()
+        })
+    }
+
     fn enqueue_export(&mut self, spec: export_queue::ExportQueueSpec) -> bool {
         if self.conversion_queue.has_pending() {
             self.report_error(
                 "Finish or cancel the active Production Conversion before queueing exports.",
+            );
+            return false;
+        }
+        if self
+            .faces
+            .iter()
+            .find(|face| face.path.as_path() == spec.source.as_path())
+            .is_some_and(|face| !face.preview.is_tiff())
+        {
+            self.report_error(
+                "Shade Editor Export currently requires a TIFF source Face. PNG/JPEG remain available for preview and Color Conversion preflight.",
             );
             return false;
         }
@@ -915,7 +943,13 @@ impl ShadeApp {
         }
         if !workflow::active_face_available(self) {
             self.report_error(
-                "The active Face source TIFF is missing. Relink it before exporting.",
+                "The active Face source image is missing. Relink it before exporting.",
+            );
+            return;
+        }
+        if !self.active_face_is_tiff_export_source() {
+            self.report_error(
+                "Export currently requires a TIFF source Face. PNG/JPEG design Faces can still be previewed and preflighted for Color Conversion.",
             );
             return;
         }
@@ -1273,7 +1307,13 @@ impl ShadeApp {
         }
         if !workflow::active_face_available(self) {
             self.report_error(
-                "The active Face source TIFF is missing. Relink it before validation.",
+                "The active Face source image is missing. Relink it before validation.",
+            );
+            return;
+        }
+        if !self.active_face_is_tiff_export_source() {
+            self.report_error(
+                "TIFF round-trip validation requires a TIFF source Face; PNG/JPEG validation is not routed through the TIFF production validator.",
             );
             return;
         }
@@ -1343,7 +1383,13 @@ impl ShadeApp {
                 .is_some_and(|item| item.status.is_rejected())
                 && !face.available
         }) {
-            self.report_error("Export all requires every Accepted Face source TIFF to be available. Relink missing Accepted Faces first.");
+            self.report_error("Export all requires every Accepted Face source image to be available. Relink missing Accepted Faces first.");
+            return;
+        }
+        if self.accepted_faces_include_non_tiff_export_source() {
+            self.report_error(
+                "Export All is TIFF-source-only in this version. No files were queued; remove/reject non-TIFF Faces or export TIFF Faces separately.",
+            );
             return;
         }
         if self.export.all_folder.trim().is_empty() {
@@ -1399,7 +1445,13 @@ impl ShadeApp {
                 .is_some_and(|item| item.status.is_rejected())
                 && !face.available
         }) {
-            self.report_error("Export all requires every Accepted Face source TIFF to be available. Relink missing Accepted Faces first.");
+            self.report_error("Export all requires every Accepted Face source image to be available. Relink missing Accepted Faces first.");
+            return;
+        }
+        if self.accepted_faces_include_non_tiff_export_source() {
+            self.report_error(
+                "Export All is TIFF-source-only in this version. No files were queued; remove/reject non-TIFF Faces or export TIFF Faces separately.",
+            );
             return;
         }
 
@@ -1727,7 +1779,13 @@ impl ShadeApp {
         }
         if !workflow::active_face_available(self) {
             self.report_error(
-                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",
+                "The active Face source image is missing. Relink it before exporting Snapshots.",
+            );
+            return;
+        }
+        if !self.active_face_is_tiff_export_source() {
+            self.report_error(
+                "Snapshot Export currently requires a TIFF source Face. PNG/JPEG design Faces can still be previewed and preflighted for Color Conversion.",
             );
             return;
         }
@@ -1806,7 +1864,13 @@ impl ShadeApp {
         }
         if !workflow::active_face_available(self) {
             self.report_error(
-                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",
+                "The active Face source image is missing. Relink it before exporting Snapshots.",
+            );
+            return;
+        }
+        if !self.active_face_is_tiff_export_source() {
+            self.report_error(
+                "Snapshot Export currently requires a TIFF source Face. PNG/JPEG design Faces can still be previewed and preflighted for Color Conversion.",
             );
             return;
         }
@@ -1929,7 +1993,7 @@ impl ShadeApp {
         }
     }
 
-    fn ensure_project_palette_for_model(&mut self, color_model: tiff_io::ColorModel) -> bool {
+    fn ensure_project_palette_for_model(&mut self, color_model: RuntimeColorModel) -> bool {
         if self.project.channel_palette.is_some() {
             return false;
         }
@@ -1937,8 +2001,8 @@ impl ShadeApp {
             .settings
             .default_project_palette()
             .or_else(|| match color_model {
-                tiff_io::ColorModel::Rgb => Some(palette::builtin_rgb()),
-                tiff_io::ColorModel::Cmyk => Some(palette::builtin_cmyk()),
+                RuntimeColorModel::Rgb => Some(palette::builtin_rgb()),
+                RuntimeColorModel::Cmyk => Some(palette::builtin_cmyk()),
                 _ => None,
             });
         if let Some(palette) = palette {
@@ -1975,11 +2039,10 @@ impl ShadeApp {
             JobResult::AddFaces { faces, errors } => {
                 let added = faces.len();
                 if let Some(first) = faces.first() {
-                    self.ensure_project_palette_for_model(first.preview.metadata.color_model);
+                    self.ensure_project_palette_for_model(first.preview.color_model());
                 }
                 for item in faces {
-                    self.project
-                        .ensure_channels(&item.preview.metadata.channel_names);
+                    self.project.ensure_channels(item.preview.channel_names());
                     let label = item
                         .path
                         .file_name()
@@ -2009,7 +2072,7 @@ impl ShadeApp {
                 }
                 if !errors.is_empty() {
                     self.report_error(format!(
-                        "Some TIFF files could not be loaded: {}",
+                        "Some design sources could not be loaded: {}",
                         errors.join(" | ")
                     ));
                 }
@@ -2030,7 +2093,7 @@ impl ShadeApp {
                     }
                     self.current_face = self.current_face.min(self.faces.len().saturating_sub(1));
                     if let Some(face) = self.faces.get(self.current_face) {
-                        let count = face.preview.metadata.channel_names.len();
+                        let count = face.preview.channel_names().len();
                         self.selected_channel = self.selected_channel.min(count.saturating_sub(1));
                         if self.solo_channel.is_some_and(|channel| channel >= count) {
                             self.solo_channel = None;
@@ -2071,7 +2134,7 @@ impl ShadeApp {
                     self.selected_channel = 0;
                     self.solo_channel = None;
                     if let Some(first) = self.faces.first() {
-                        let color_model = first.preview.metadata.color_model;
+                        let color_model = first.preview.color_model();
                         self.ensure_project_palette_for_model(color_model);
                     }
                     self.adjustment_scope = AdjustmentScope::All;
@@ -2088,7 +2151,7 @@ impl ShadeApp {
                     self.report_info(format!("Opened {}", payload.path.display()));
                     if !payload.errors.is_empty() {
                         self.report_error(format!(
-                            "Project opened with TIFF errors: {}",
+                            "Project opened with source errors: {}",
                             payload.errors.join(" | ")
                         ));
                     }
@@ -2133,7 +2196,7 @@ impl ShadeApp {
                     self.report_info("Recovered autosaved project state");
                     if !payload.errors.is_empty() {
                         self.report_error(format!(
-                            "Recovery opened with TIFF errors: {}",
+                            "Recovery opened with source errors: {}",
                             payload.errors.join(" | ")
                         ));
                     }
@@ -2272,8 +2335,8 @@ impl ShadeApp {
         };
         let estimated_bytes = face
             .preview
-            .width
-            .saturating_mul(face.preview.height)
+            .width()
+            .saturating_mul(face.preview.height())
             .saturating_mul(4);
         let entry = SnapshotPreviewEntry {
             texture,
@@ -2351,7 +2414,7 @@ impl ShadeApp {
             face.clipping = result.clipping;
             face.color_status = result.color_status;
             let image = egui::ColorImage::from_rgba_unmultiplied(
-                [face.preview.width, face.preview.height],
+                [face.preview.width(), face.preview.height()],
                 &result.rgba,
             );
             let options = egui::TextureOptions::LINEAR;
@@ -2364,7 +2427,7 @@ impl ShadeApp {
                 options,
             ));
             let original_image = egui::ColorImage::from_rgba_unmultiplied(
-                [face.preview.width, face.preview.height],
+                [face.preview.width(), face.preview.height()],
                 &result.original_rgba,
             );
             if let Some(texture) = &mut face.original_texture {
@@ -2379,7 +2442,7 @@ impl ShadeApp {
             face.original_rendered_solo = Some(solo_channel);
             if let Some(source_rgba) = result.embedded_original_rgba {
                 let source_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [face.preview.width, face.preview.height],
+                    [face.preview.width(), face.preview.height()],
                     &source_rgba,
                 );
                 if let Some(texture) = &mut face.embedded_original_texture {
@@ -2426,13 +2489,15 @@ impl ShadeApp {
         std::thread::spawn(move || {
             let outcome = worker_guard::catch_value("Preview render worker", || {
                 let (adjusted, clipping) = render::adjusted_planes_with_stats(&preview, &project);
-                let color =
-                    color_management::PreviewColorTransform::new(&preview.metadata, color_config);
+                let color = color_management::PreviewColorTransform::new_for_runtime_preview(
+                    &preview,
+                    color_config,
+                );
                 let rgba =
                     render::rgba_from_planes_with_color(&preview, &adjusted, solo_channel, &color);
                 let original_rgba = render::rgba_from_planes_with_color(
                     &preview,
-                    &preview.channels,
+                    preview.channels(),
                     solo_channel,
                     &color,
                 );
@@ -2444,27 +2509,28 @@ impl ShadeApp {
 
                 let (embedded_original_rgba, embedded_original_status) = if needs_embedded_original
                 {
-                    let embedded_color = color_management::PreviewColorTransform::new(
-                        &preview.metadata,
-                        PreviewColorConfig {
-                            enabled: true,
-                            intent: PreviewRenderingIntent::Perceptual,
-                            black_point_compensation: false,
-                            assigned_profile_path: None,
-                            assigned_profile_identity: None,
-                            soft_proof_enabled: false,
-                            proof_profile_path: None,
-                            proof_profile_identity: None,
-                            proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
-                            monitor_profile_path: None,
-                            monitor_profile_identity: None,
-                            gamut_warning: false,
-                        },
-                    );
+                    let embedded_color =
+                        color_management::PreviewColorTransform::new_for_runtime_preview(
+                            &preview,
+                            PreviewColorConfig {
+                                enabled: true,
+                                intent: PreviewRenderingIntent::Perceptual,
+                                black_point_compensation: false,
+                                assigned_profile_path: None,
+                                assigned_profile_identity: None,
+                                soft_proof_enabled: false,
+                                proof_profile_path: None,
+                                proof_profile_identity: None,
+                                proofing_intent: PreviewRenderingIntent::RelativeColorimetric,
+                                monitor_profile_path: None,
+                                monitor_profile_identity: None,
+                                gamut_warning: false,
+                            },
+                        );
                     let status = embedded_color.status().clone();
                     let source_rgba = render::rgba_from_planes_with_color(
                         &preview,
-                        &preview.channels,
+                        preview.channels(),
                         None,
                         &embedded_color,
                     );
@@ -2546,7 +2612,7 @@ impl ShadeApp {
         self.fit_requested = true;
         self.viewport_recenter = true;
         self.mark_project_dirty();
-        self.report_info("Face removed from project (source TIFF was not deleted)");
+        self.report_info("Face removed from project (source image was not deleted)");
     }
 
     fn remember_previous_shade(&mut self, path: &Path) {
@@ -3176,9 +3242,9 @@ impl ShadeApp {
                         .as_ref()
                         .and_then(|metadata| metadata.faces.get(index))
                         .cloned();
-                    match tiff_io::load_preview(&source, max_dimension) {
+                    match RuntimePreview::load(&source, max_dimension) {
                         Ok(preview) => {
-                            project.ensure_channels(&preview.metadata.channel_names);
+                            project.ensure_channels(preview.channel_names());
                             faces.push(LoadedFace {
                                 dpi: dpi::read_dpi(&source, default_dpi),
                                 path: source,
@@ -3493,7 +3559,7 @@ impl ShadeApp {
             .faces
             .get(self.current_face)
             .filter(|face| face.available)
-            .map(|face| face.preview.metadata.channel_names.clone())
+            .map(|face| face.preview.channel_names().to_vec())
             .unwrap_or_default();
         let palette = self.project.channel_palette.clone();
         let fallback = self
@@ -3602,7 +3668,9 @@ impl ShadeApp {
                         )
                         .changed();
                 });
-            ui.small("Default: top-left, 1 cm margin. Point size is converted using the TIFF DPI.");
+            ui.small(
+                "Default: top-left, 1 cm margin. Point size is converted using the source DPI.",
+            );
         });
         if changed {
             self.mark_project_dirty();
@@ -3783,8 +3851,8 @@ impl ShadeApp {
                         ui.add_space(6.0);
                     }
                     ui.heading("Shade Editor");
-                    ui.label("Open a .shade project or add TIFF faces.");
-                    if ui.button("Add TIFF faces").clicked() {
+                    ui.label("Open a .shade project or add TIFF, PNG or JPEG faces.");
+                    if ui.button("Add design faces").clicked() {
                         self.add_faces_dialog();
                     }
                 });
@@ -3797,7 +3865,10 @@ impl ShadeApp {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| face.path.display().to_string());
-        let meta = face.preview.metadata.clone();
+        let (source_width, source_height) = face.preview.source_dimensions();
+        let source_bit_depth = face.preview.bit_depth();
+        let source_model = face.preview.color_model();
+        let source_channel_count = face.preview.channel_count();
         let dpi_info = face.dpi;
         let color_status = face.color_status.clone();
         let embedded_original_status = face.embedded_original_status.clone();
@@ -3810,17 +3881,17 @@ impl ShadeApp {
         );
         let original_texture = face.original_texture.clone();
         let embedded_original_texture = face.embedded_original_texture.clone();
-        let (width_cm, height_cm) = physical_dimensions_cm(meta.width, meta.height, dpi_info);
+        let (width_cm, height_cm) = physical_dimensions_cm(source_width, source_height, dpi_info);
         ui.horizontal_wrapped(|ui| {
             ui.strong(file_name);
             ui.separator();
-            ui.label(format!("{}-bit", meta.bit_depth));
+            ui.label(format!("{}-bit", source_bit_depth));
             ui.label(format!(
                 "{} x {} cm",
                 format_cm_value(width_cm),
                 format_cm_value(height_cm)
             ));
-            ui.label(format!("{} x {} px", meta.width, meta.height));
+            ui.label(format!("{} x {} px", source_width, source_height));
             if dpi_info.has_physical_resolution {
                 ui.label(format!("{:.0} x {:.0} DPI", dpi_info.dpi_x, dpi_info.dpi_y));
             } else {
@@ -3829,8 +3900,8 @@ impl ShadeApp {
                     dpi_info.dpi_x, dpi_info.dpi_y
                 ));
             }
-            ui.label(meta.color_model.title());
-            ui.label(format!("{} channels", meta.samples_per_pixel));
+            ui.label(source_model.title());
+            ui.label(format!("{} channels", source_channel_count));
             let profile_text = if color_status.is_problem() {
                 egui::RichText::new(color_status.button_label()).color(egui::Color32::YELLOW)
             } else if color_status.is_managed() {
@@ -3849,7 +3920,7 @@ impl ShadeApp {
                 self.color.selected = self.project.preview_color.assigned_profile_path.clone();
             }
         });
-        ui.small("Hold right mouse: BEFORE adjustments with current color-management setup · Hold middle mouse: original TIFF samples with Embedded ICC only (cached, no assigned profile / RIP Soft Proof).");
+        ui.small("Hold right mouse: BEFORE adjustments with current color-management setup · Hold middle mouse: original source samples with Embedded ICC only (cached, no assigned profile / RIP Soft Proof).");
         ui.separator();
 
         let Some(texture) = texture else {
@@ -4080,10 +4151,11 @@ impl ShadeApp {
             self.color.show = false;
             return;
         };
-        let active_model = active_face.preview.metadata.color_model;
-        let embedded_name =
-            color_management::embedded_profile_description(&active_face.preview.metadata)
-                .unwrap_or_else(|| "No embedded ICC".to_owned());
+        let active_model = active_face.preview.color_model();
+        let embedded_name = color_management::embedded_profile_description_for_runtime(
+            active_face.preview.as_ref(),
+        )
+        .unwrap_or_else(|| "No embedded ICC".to_owned());
         let profiles = self.color.profiles.clone();
         let scan_error = self.color.scan_error.clone();
         let current_status = active_face.color_status.clone();
@@ -4119,7 +4191,7 @@ impl ShadeApp {
             .default_size([820.0, 760.0])
             .show(ctx, |ui| {
                 ui.heading("Color Management / ICC Preview");
-                ui.small("Source-profile assignment and Printer/RIP Soft Proof are display-only. TIFF samples, embedded ICC and Photoshop resources remain untouched by these preview settings.");
+                ui.small("Source-profile assignment and Printer/RIP Soft Proof are display-only. Source samples and metadata remain untouched by these preview settings.");
                 ui.add_space(5.0);
                 egui::Grid::new("preview-profile-current")
                     .num_columns(2)
@@ -4130,7 +4202,7 @@ impl ShadeApp {
                         ui.label(current_status.button_label())
                             .on_hover_text(current_status.detail());
                         ui.end_row();
-                        ui.strong("TIFF base model");
+                        ui.strong("Source base model");
                         ui.label(active_model.title());
                         ui.end_row();
                         ui.strong("Embedded profile");
@@ -4211,11 +4283,11 @@ impl ShadeApp {
                 let visible = profiles
                     .iter()
                     .filter(|profile| profile.matches_query(&query))
-                    .filter(|profile| show_incompatible || profile.compatible_with(active_model))
+                    .filter(|profile| show_incompatible || profile.compatible_with_runtime(active_model))
                     .collect::<Vec<_>>();
                 let compatible_paths = visible
                     .iter()
-                    .filter(|profile| profile.compatible_with(active_model))
+                    .filter(|profile| profile.compatible_with_runtime(active_model))
                     .map(|profile| profile.path.to_string_lossy().into_owned())
                     .collect::<Vec<_>>();
                 if query != original_query {
@@ -4257,7 +4329,7 @@ impl ShadeApp {
                     .show(ui, |ui| {
                         for profile in visible {
                             let path_text = profile.path.to_string_lossy().into_owned();
-                            let compatible = profile.compatible_with(active_model);
+                            let compatible = profile.compatible_with_runtime(active_model);
                             let label = format!(
                                 "{} · {} · {}",
                                 profile.description,
@@ -4286,7 +4358,7 @@ impl ShadeApp {
                 let can_assign = selected.as_deref().is_some_and(|path| {
                     profiles.iter().any(|profile| {
                         profile.path.to_string_lossy() == path
-                            && profile.compatible_with(active_model)
+                            && profile.compatible_with_runtime(active_model)
                     })
                 });
                 if ui
@@ -4416,7 +4488,7 @@ impl ShadeApp {
                         ui.checkbox(&mut gamut_warning, "Gamut warning");
                     });
                 });
-                ui.small("Gamut warning is active only with Printer/RIP Soft Proof. Middle-mouse source preview deliberately bypasses assigned source, proof and monitor profiles and uses only the TIFF embedded ICC.");
+                ui.small("Gamut warning is active only with Printer/RIP Soft Proof. Middle-mouse source preview deliberately bypasses assigned source, proof and monitor profiles and uses only the source embedded ICC.");
             });
 
         self.color.show = open;
@@ -4487,7 +4559,7 @@ impl ShadeApp {
                     }
                 }
                 Some(path) => match color_management::inspect_profile(&path) {
-                    Ok(profile) if profile.compatible_with(active_model) => {
+                    Ok(profile) if profile.compatible_with_runtime(active_model) => {
                         let path_text = path.to_string_lossy().into_owned();
                         if self.project.preview_color.assigned_profile_path.as_deref()
                             != Some(path_text.as_str())
@@ -5878,7 +5950,7 @@ fn build_project_file_metadata(
             .as_ref()
             .and_then(|meta| meta.modified().ok())
             .and_then(system_time_unix_ms);
-        let tiff = &face.preview.metadata;
+        let (source_width, source_height) = face.preview.source_dimensions();
         let label = project
             .faces
             .get(index)
@@ -5896,13 +5968,13 @@ fn build_project_file_metadata(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            width: tiff.width,
-            height: tiff.height,
-            bit_depth: tiff.bit_depth,
-            color_model: tiff.color_model.title().to_owned(),
-            channel_count: tiff.samples_per_pixel,
-            base_channel_count: tiff.base_channel_count,
-            channel_names: tiff.channel_names.clone(),
+            width: source_width,
+            height: source_height,
+            bit_depth: face.preview.bit_depth(),
+            color_model: face.preview.color_model().title().to_owned(),
+            channel_count: face.preview.channel_count(),
+            base_channel_count: face.preview.base_channel_count(),
+            channel_names: face.preview.channel_names().to_vec(),
             dpi_x: face.dpi.dpi_x,
             dpi_y: face.dpi.dpi_y,
             dpi_from_source: face.dpi.has_physical_resolution,
