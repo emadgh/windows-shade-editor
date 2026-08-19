@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime_preview::RuntimePreviewSource;
 
 pub(super) fn active_face_available(app: &ShadeApp) -> bool {
     app.faces
@@ -35,7 +36,12 @@ pub(super) fn update_active_snapshot(app: &mut ShadeApp) {
         .snapshots
         .iter()
         .find(|snapshot| snapshot.id == active_id)
-        .and_then(|snapshot| snapshot.exports.iter().max_by_key(|record| record.exported_at_unix_ms))
+        .and_then(|snapshot| {
+            snapshot
+                .exports
+                .iter()
+                .max_by_key(|record| record.exported_at_unix_ms)
+        })
         .cloned();
     let exported = exported_record.is_some();
     let dirty = !app.project.active_snapshot_matches();
@@ -256,7 +262,7 @@ fn select_channel_shortcut(app: &mut ShadeApp, channel: usize) {
         .faces
         .get(app.current_face)
         .filter(|face| face.available)
-        .is_some_and(|face| channel < face.preview.metadata.channel_names.len())
+        .is_some_and(|face| channel < face.preview.channel_names().len())
     {
         app.select_channel(channel, false);
     }
@@ -303,7 +309,7 @@ pub(super) fn rebuild_previews(app: &mut ShadeApp) {
                     });
                     continue;
                 }
-                let preview = tiff_io::load_preview(&path, max_dimension)
+                let preview = RuntimePreview::load(&path, max_dimension)
                     .map_err(|err| format!("{}: {err}", path.display()))?;
                 faces.push(LoadedFace {
                     dpi: dpi::read_dpi(&path, default_dpi),
@@ -337,7 +343,8 @@ pub(super) fn relink_current_face_dialog(app: &mut ShadeApp) {
         .as_ref()
         .and_then(|metadata| metadata.faces.get(index))
         .cloned();
-    let mut dialog = rfd::FileDialog::new().add_filter("TIFF images", &["tif", "tiff"]);
+    let mut dialog =
+        rfd::FileDialog::new().add_filter("Design images", &["tif", "tiff", "png", "jpg", "jpeg"]);
     if let Some(parent) = current_path.parent() {
         dialog = dialog.set_directory(parent);
     }
@@ -418,8 +425,7 @@ pub(super) fn apply_relinked_face(
     match result {
         Ok(item) => {
             if index < app.faces.len() && index < app.project.faces.len() {
-                app.project
-                    .ensure_channels(&item.preview.metadata.channel_names);
+                app.project.ensure_channels(item.preview.channel_names());
                 app.snapshot_preview_cache.clear();
                 app.project.faces[index].path = item.path.to_string_lossy().into_owned();
                 app.faces[index] = ShadeApp::make_runtime_face(item);
@@ -444,8 +450,7 @@ pub(super) fn apply_relinked_folder(
     let mut relinked = 0usize;
     for (index, item) in faces {
         if index < app.faces.len() && index < app.project.faces.len() {
-            app.project
-                .ensure_channels(&item.preview.metadata.channel_names);
+            app.project.ensure_channels(item.preview.channel_names());
             app.project.faces[index].path = item.path.to_string_lossy().into_owned();
             app.faces[index] = ShadeApp::make_runtime_face(item);
             relinked += 1;
@@ -478,7 +483,7 @@ pub(super) fn ui_missing_viewport(app: &mut ShadeApp, ui: &mut egui::Ui) -> bool
     let mut locate_folder = false;
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
-            ui.heading("Face source TIFF is missing");
+            ui.heading("Face source image is missing");
             ui.label(missing_path.display().to_string());
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -500,67 +505,12 @@ pub(super) fn placeholder_loaded_face(
     expected: Option<&model::FaceFileMetadata>,
     default_dpi: f64,
 ) -> LoadedFace {
+    let preview = runtime_preview::RuntimePreview::missing(&path, expected);
     LoadedFace {
         path,
         available: false,
-        preview: missing_face_preview(expected),
+        preview,
         dpi: missing_face_dpi(expected, default_dpi),
-    }
-}
-
-fn color_model_from_cached(value: &str) -> tiff_io::ColorModel {
-    match value.trim().to_ascii_uppercase().as_str() {
-        "RGB" => tiff_io::ColorModel::Rgb,
-        "CMYK" => tiff_io::ColorModel::Cmyk,
-        "GRAY" | "GREY" => tiff_io::ColorModel::Gray,
-        _ => tiff_io::ColorModel::Other,
-    }
-}
-
-fn missing_face_preview(expected: Option<&model::FaceFileMetadata>) -> PreviewFace {
-    let channel_names = expected
-        .map(|metadata| metadata.channel_names.clone())
-        .filter(|names| !names.is_empty())
-        .unwrap_or_else(|| vec!["Missing source".to_owned()]);
-    let samples_per_pixel = expected
-        .map(|metadata| metadata.channel_count)
-        .unwrap_or(channel_names.len())
-        .max(channel_names.len())
-        .max(1);
-    let mut names = channel_names;
-    while names.len() < samples_per_pixel {
-        names.push(format!("Channel {}", names.len() + 1));
-    }
-    names.truncate(samples_per_pixel);
-    let base_channel_count = expected
-        .map(|metadata| metadata.base_channel_count)
-        .unwrap_or(1)
-        .clamp(1, samples_per_pixel);
-    let metadata = tiff_io::TiffMetadata {
-        width: expected.map(|m| m.width).unwrap_or(1).max(1),
-        height: expected.map(|m| m.height).unwrap_or(1).max(1),
-        bit_depth: expected.map(|m| m.bit_depth).unwrap_or(8),
-        samples_per_pixel,
-        base_channel_count,
-        color_model: expected
-            .map(|m| color_model_from_cached(&m.color_model))
-            .unwrap_or(tiff_io::ColorModel::Other),
-        non_cmyk_separated: false,
-        channel_names: names,
-        channel_display_info: vec![None; samples_per_pixel],
-        compression: None,
-        predictor: None,
-        orientation: None,
-        icc_profile: None,
-        photoshop_resources: None,
-        photoshop_image_source_data: None,
-    };
-    PreviewFace {
-        metadata,
-        width: 1,
-        height: 1,
-        channels: (0..samples_per_pixel).map(|_| vec![0u16]).collect(),
-        histograms: vec![[0u32; 256]; samples_per_pixel],
     }
 }
 
@@ -596,54 +546,57 @@ fn missing_face_dpi(expected: Option<&model::FaceFileMetadata>, default_dpi: f64
 }
 
 fn verify_relink_metadata(
-    metadata: &tiff_io::TiffMetadata,
+    preview: &runtime_preview::RuntimePreview,
     expected: Option<&model::FaceFileMetadata>,
 ) -> Result<(), String> {
     let Some(expected) = expected else {
         return Ok(());
     };
     let mut bad = Vec::new();
-    if (metadata.width, metadata.height) != (expected.width, expected.height) {
+    let (width, height) = preview.source_dimensions();
+    if (width, height) != (expected.width, expected.height) {
         bad.push(format!(
             "dimensions expected {}x{}, got {}x{}",
-            expected.width, expected.height, metadata.width, metadata.height
+            expected.width, expected.height, width, height
         ));
     }
-    if metadata.bit_depth != expected.bit_depth {
+    if preview.bit_depth() != expected.bit_depth {
         bad.push(format!(
             "bit depth expected {}, got {}",
-            expected.bit_depth, metadata.bit_depth
+            expected.bit_depth,
+            preview.bit_depth()
         ));
     }
-    if metadata.color_model.title() != expected.color_model {
+    if preview.color_model().title() != expected.color_model {
         bad.push(format!(
             "color model expected {}, got {}",
             expected.color_model,
-            metadata.color_model.title()
+            preview.color_model().title()
         ));
     }
-    if metadata.samples_per_pixel != expected.channel_count
-        || metadata.base_channel_count != expected.base_channel_count
+    if preview.channel_count() != expected.channel_count
+        || preview.base_channel_count() != expected.base_channel_count
     {
         bad.push(format!(
             "channel layout expected {}/{} base, got {}/{} base",
             expected.channel_count,
             expected.base_channel_count,
-            metadata.samples_per_pixel,
-            metadata.base_channel_count
+            preview.channel_count(),
+            preview.base_channel_count()
         ));
     }
-    if metadata.channel_names != expected.channel_names {
+    if preview.channel_names() != expected.channel_names.as_slice() {
         bad.push(format!(
             "channel names/order expected {:?}, got {:?}",
-            expected.channel_names, metadata.channel_names
+            expected.channel_names,
+            preview.channel_names()
         ));
     }
     if bad.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "Replacement TIFF does not match cached Face metadata: {}",
+            "Replacement source does not match cached Face metadata: {}",
             bad.join("; ")
         ))
     }
@@ -655,9 +608,9 @@ fn load_relink_candidate(
     default_dpi: f64,
     expected: Option<&model::FaceFileMetadata>,
 ) -> Result<LoadedFace, String> {
-    let preview = tiff_io::load_preview(&path, max_dimension)
+    let preview = runtime_preview::RuntimePreview::load(&path, max_dimension)
         .map_err(|err| format!("Cannot load replacement {}: {err}", path.display()))?;
-    verify_relink_metadata(&preview.metadata, expected)?;
+    verify_relink_metadata(&preview, expected)?;
     Ok(LoadedFace {
         dpi: dpi::read_dpi(&path, default_dpi),
         path,

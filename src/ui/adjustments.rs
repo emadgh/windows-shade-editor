@@ -2,6 +2,7 @@ use super::actions::AdjustmentUiAction;
 use super::curve_editor::curves_ui;
 use super::levels_mixer::{levels_ui, mixer_ui};
 use super::match_color;
+use crate::runtime_preview::RuntimePreviewSource;
 use crate::*;
 use eframe::egui;
 
@@ -97,16 +98,20 @@ impl ShadeApp {
         };
         if !face.available {
             ui.heading("Channels");
-            ui.label("Source TIFF missing. Relink this Face to inspect channels and histograms.");
+            ui.label("Source image missing. Relink this Face to inspect channels and histograms.");
             return;
         }
-        let channel_names = face.preview.metadata.channel_names.clone();
-        let original_histograms = face.preview.histograms.clone();
+        let channel_names = face.preview.channel_names().to_vec();
+        let original_histograms = face.preview.histograms().to_vec();
         let adjusted_histograms = face.adjusted_histograms.clone();
         let clipping = face.clipping.clone();
-        let base_count = face.preview.metadata.base_channel_count;
-        let color_model = face.preview.metadata.color_model;
-        let photoshop_display = face.preview.metadata.channel_display_info.clone();
+        let base_count = face.preview.base_channel_count();
+        let color_model = face.preview.color_model();
+        let photoshop_display = face
+            .preview
+            .tiff_metadata()
+            .map(|metadata| metadata.channel_display_info.clone())
+            .unwrap_or_else(|| vec![None; channel_names.len()]);
         let mut match_target = match_color::target_snapshot();
         let mut target_overlay_visible = match_color::overlay_visible();
         if channel_names.is_empty() {
@@ -197,7 +202,7 @@ impl ShadeApp {
                     info.solidity * 100.0
                 ),
                 Some(_) => "Photoshop Alpha/auxiliary channel · click to select; click again to toggle solo preview.".to_owned(),
-                None => "Extra TIFF channel (Spot/Alpha type not declared) · click to select; click again to toggle solo preview.".to_owned(),
+                None => "Extra source channel (Spot/Alpha type not declared) · click to select; click again to toggle solo preview.".to_owned(),
             };
             let warning = if self.settings.show_clipping_warnings {
                 clipping
@@ -629,10 +634,10 @@ impl ShadeApp {
         };
         if !face.available {
             ui.heading("Adjustments");
-            ui.label("Source TIFF missing. Relink this Face before editing its channels.");
+            ui.label("Source image missing. Relink this Face before editing its channels.");
             return;
         }
-        let channel_names = face.preview.metadata.channel_names.clone();
+        let channel_names = face.preview.channel_names().to_vec();
         if channel_names.is_empty() {
             return;
         }
@@ -641,7 +646,7 @@ impl ShadeApp {
         let palette = self.project.channel_palette.clone();
         let output_display =
             channel_display_name(palette.as_ref(), &output_name, self.selected_channel);
-        let all_original_histograms = face.preview.histograms.clone();
+        let all_original_histograms = face.preview.histograms().to_vec();
         let all_adjusted_histograms = face.adjusted_histograms.clone();
         let active_original_histogram = all_original_histograms.get(self.selected_channel).copied();
         let active_adjusted_histogram = all_adjusted_histograms.get(self.selected_channel).copied();
