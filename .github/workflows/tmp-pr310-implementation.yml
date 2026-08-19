@@ -1,0 +1,729 @@
+name: Temporary guarded PR310 full-resolution non-TIFF source implementation
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr310-implementation-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/fullres-png-jpeg-production-source
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply source adapter, validate, publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '4afeeb0b32bee0b50b804150fe6fc618ed6dd02d'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR310 feature head moved' }
+          @'
+          from pathlib import Path
+
+          def replace_one(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: marker count {count}, expected 1: {old[:100]!r}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+
+          worker = Path('src/icc_conversion_worker.rs')
+
+          replace_one(
+              worker,
+              '''use crate::icc_conversion::{IccSourceModel, ProductionCmykTransform, RuntimeIccProfile};\nuse crate::model::ShadeProject;\nuse crate::nchannel_icc::ProductionNChannelTransform;\nuse crate::tiff_io::{self, ColorModel, StreamInfo};\nuse crate::{dpi, export};\n''',
+              '''use crate::icc_conversion::{IccSourceModel, ProductionCmykTransform, RuntimeIccProfile};\nuse crate::jpeg_source::{DecodedJpegSource, JpegSourceModel, decode_jpeg_source};\nuse crate::model::{MASTER_ADJUSTMENT_KEY, ShadeProject, apply_curve, apply_levels};\nuse crate::nchannel_icc::ProductionNChannelTransform;\nuse crate::png_source::{DecodedPngSource, PngSourceModel, decode_png_source};\nuse crate::source_transparency::{SourceTransparencyPolicy, composite_rgb_u16};\nuse crate::tiff_io::{self, ColorModel, StreamInfo};\nuse crate::{dpi, export};\n''',
+          )
+
+          replace_one(
+              worker,
+              '''        report(ConversionProgress::new(\n            ConversionPhase::Decode,\n            0.04,\n            "Inspecting streamable source topology",\n        ));\n        let stream = tiff_io::stream_info(&capture.source_face_path)?;\n        let source_model = source_model(&stream)?;\n        if !stream.streamable {\n            return Err(\n                "Production conversion requires a strip/tile-streamable TIFF source; full-image fallback is disabled to preserve bounded memory."\n                    .to_owned(),\n            );\n        }\n''',
+              '''        report(ConversionProgress::new(\n            ConversionPhase::Decode,\n            0.04,\n            "Inspecting production source topology",\n        ));\n        let source = ProductionSourceRaster::load(&capture.source_face_path)?;\n        let source_model = source.source_model()?;\n        source.validate_transparency_policy(&capture.conversion_recipe)?;\n''',
+          )
+          replace_one(
+              worker,
+              '                let source_icc = load_verified_source_icc(capture, &stream)?;\n',
+              '                let source_icc = load_verified_source_icc(capture, source.embedded_icc())?;\n',
+          )
+          replace_one(
+              worker,
+              '                } = load_verified_profiles(capture, &stream)?;\n',
+              '                } = load_verified_profiles(capture, source.embedded_icc())?;\n',
+          )
+          replace_one(
+              worker,
+              '''            &stream,\n            output_icc.as_deref(),\n            &mut transform,\n            self.default_dpi,\n''',
+              '''            &source,\n            output_icc.as_deref(),\n            &mut transform,\n            self.default_dpi,\n''',
+          )
+
+          source_adapter = r'''const DESIGN_SOURCE_ROWS_PER_STRIP: u32 = 64;
+
+#[derive(Debug)]
+enum ProductionSourceRaster {
+    Tiff(StreamInfo),
+    Png(DecodedPngSource),
+    Jpeg(DecodedJpegSource),
+}
+
+impl ProductionSourceRaster {
+    fn load(path: &Path) -> Result<Self, String> {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match extension.as_str() {
+            "tif" | "tiff" => {
+                let stream = tiff_io::stream_info(path)?;
+                if !stream.streamable {
+                    return Err(
+                        "Production conversion requires a strip/tile-streamable TIFF source; full-image TIFF fallback is disabled to preserve bounded memory."
+                            .to_owned(),
+                    );
+                }
+                Ok(Self::Tiff(stream))
+            }
+            "png" => decode_png_source(path).map(Self::Png),
+            "jpg" | "jpeg" => decode_jpeg_source(path).map(Self::Jpeg),
+            _ => Err(format!(
+                "Unsupported production source format for {}. Use RGB TIFF, PNG or JPEG, or CMYK TIFF.",
+                path.display()
+            )),
+        }
+    }
+
+    fn source_model(&self) -> Result<IccSourceModel, String> {
+        match self {
+            Self::Tiff(stream) => tiff_source_model(stream),
+            Self::Png(source) => match source.model {
+                PngSourceModel::Rgb => Ok(IccSourceModel::Rgb),
+                PngSourceModel::Gray => Err(
+                    "Production color conversion currently requires RGB PNG artwork; Gray PNG is not enabled for the production transform path."
+                        .to_owned(),
+                ),
+            },
+            Self::Jpeg(source) => match source.model {
+                JpegSourceModel::Rgb => Ok(IccSourceModel::Rgb),
+                JpegSourceModel::Gray => Err(
+                    "Production color conversion currently requires RGB JPEG artwork; Gray JPEG is not enabled for the production transform path."
+                        .to_owned(),
+                ),
+            },
+        }
+    }
+
+    fn embedded_icc(&self) -> Option<&[u8]> {
+        match self {
+            Self::Tiff(stream) => stream.metadata.icc_profile.as_deref(),
+            Self::Png(source) => source.icc_profile.as_deref(),
+            Self::Jpeg(source) => source.icc_profile.as_deref(),
+        }
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Tiff(stream) => (stream.metadata.width, stream.metadata.height),
+            Self::Png(source) => (source.width, source.height),
+            Self::Jpeg(source) => (source.width, source.height),
+        }
+    }
+
+    fn source_channels(&self) -> usize {
+        match self {
+            Self::Tiff(stream) => stream.metadata.samples_per_pixel,
+            Self::Png(source) => match source.model {
+                PngSourceModel::Gray => 1,
+                PngSourceModel::Rgb => 3,
+            },
+            Self::Jpeg(source) => match source.model {
+                JpegSourceModel::Gray => 1,
+                JpegSourceModel::Rgb => 3,
+            },
+        }
+    }
+
+    fn rows_per_strip(&self) -> u32 {
+        match self {
+            Self::Tiff(stream) => stream.rows_per_strip.max(1),
+            Self::Png(source) => source.height.min(DESIGN_SOURCE_ROWS_PER_STRIP).max(1),
+            Self::Jpeg(source) => source.height.min(DESIGN_SOURCE_ROWS_PER_STRIP).max(1),
+        }
+    }
+
+    fn orientation(&self) -> Option<u16> {
+        match self {
+            Self::Tiff(stream) => stream.metadata.orientation,
+            Self::Png(_) | Self::Jpeg(_) => None,
+        }
+    }
+
+    fn dpi(&self, path: &Path, default_dpi: f64) -> dpi::DpiInfo {
+        match self {
+            Self::Tiff(_) => dpi::read_dpi(path, default_dpi),
+            Self::Png(_) | Self::Jpeg(_) => dpi::DpiInfo::with_default(default_dpi),
+        }
+    }
+
+    fn validate_transparency_policy(&self, recipe: &ConversionRecipe) -> Result<(), String> {
+        let policy = recipe.source_transparency_policy;
+        match self {
+            Self::Png(source) if source.alpha.is_some() => {
+                if policy.is_none() {
+                    Err(
+                        "Captured PNG contains alpha but the conversion recipe has no explicit flatten background policy."
+                            .to_owned(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Png(_) => {
+                if policy.is_some() {
+                    Err(
+                        "Captured conversion recipe contains an alpha-flatten policy, but this PNG has no alpha plane."
+                            .to_owned(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Jpeg(_) => {
+                if policy.is_some() {
+                    Err(
+                        "Captured conversion recipe contains an alpha-flatten policy, but JPEG has no alpha plane."
+                            .to_owned(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Tiff(_) => {
+                if policy.is_some() {
+                    Err(
+                        "Captured conversion recipe contains a PNG alpha-flatten policy for a TIFF source."
+                            .to_owned(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+'''
+          replace_one(
+              worker,
+              'fn source_model(stream: &StreamInfo) -> Result<IccSourceModel, String> {\n',
+              source_adapter + 'fn tiff_source_model(stream: &StreamInfo) -> Result<IccSourceModel, String> {\n',
+          )
+
+          replace_one(
+              worker,
+              '''fn load_verified_source_icc(\n    capture: &ConversionJobCapture,\n    stream: &StreamInfo,\n) -> Result<Vec<u8>, String> {\n''',
+              '''fn load_verified_source_icc(\n    capture: &ConversionJobCapture,\n    embedded_icc: Option<&[u8]>,\n) -> Result<Vec<u8>, String> {\n''',
+          )
+          replace_one(
+              worker,
+              '''        CapturedSourceProfile::Embedded => {\n            stream.metadata.icc_profile.clone().ok_or_else(|| {\n                "Captured source expects an embedded ICC, but the TIFF has none.".to_owned()\n            })?\n        }\n''',
+              '''        CapturedSourceProfile::Embedded => embedded_icc\n            .map(ToOwned::to_owned)\n            .ok_or_else(|| {\n                "Captured source expects an embedded ICC, but the decoded source has none.".to_owned()\n            })?,\n''',
+          )
+          replace_one(
+              worker,
+              '''fn load_verified_profiles(\n    capture: &ConversionJobCapture,\n    stream: &StreamInfo,\n) -> Result<VerifiedConversionProfiles, String> {\n    let source_icc = load_verified_source_icc(capture, stream)?;\n''',
+              '''fn load_verified_profiles(\n    capture: &ConversionJobCapture,\n    embedded_icc: Option<&[u8]>,\n) -> Result<VerifiedConversionProfiles, String> {\n    let source_icc = load_verified_source_icc(capture, embedded_icc)?;\n''',
+          )
+
+          replace_one(
+              worker,
+              '''fn render_convert_and_commit(\n    capture: &ConversionJobCapture,\n    cancellation: &ConversionCancellation,\n    report: &mut dyn FnMut(ConversionProgress),\n    stream: &StreamInfo,\n    target_icc: Option<&[u8]>,\n''',
+              '''fn render_convert_and_commit(\n    capture: &ConversionJobCapture,\n    cancellation: &ConversionCancellation,\n    report: &mut dyn FnMut(ConversionProgress),\n    source: &ProductionSourceRaster,\n    target_icc: Option<&[u8]>,\n''',
+          )
+          replace_one(
+              worker,
+              '        render_adjusted_source_spool(capture, cancellation, report, stream, &spool_path)?;\n',
+              '        render_adjusted_source_spool(capture, cancellation, report, source, &spool_path)?;\n',
+          )
+          replace_one(
+              worker,
+              '''        let metadata = &stream.metadata;\n        let dpi = dpi::read_dpi(&capture.source_face_path, default_dpi);\n        let channel_names = capture\n''',
+              '''        let (source_width, source_height) = source.dimensions();\n        let dpi = source.dpi(&capture.source_face_path, default_dpi);\n        let channel_names = capture\n''',
+          )
+          replace_one(
+              worker,
+              '''            width: metadata.width,\n            height: metadata.height,\n            channel_names: &channel_names,\n            target_icc,\n            dpi_x: dpi.dpi_x,\n            dpi_y: dpi.dpi_y,\n            orientation: metadata.orientation,\n            rows_per_strip: stream.rows_per_strip.max(1),\n            force_bigtiff: false,\n            replace_existing: capture.output_policy == CapturedOutputPolicy::TransactionalReplace,\n        };\n        let source_channels = metadata.samples_per_pixel;\n        let width = metadata.width as usize;\n        let height = metadata.height.max(1) as f32;\n''',
+              '''            width: source_width,\n            height: source_height,\n            channel_names: &channel_names,\n            target_icc,\n            dpi_x: dpi.dpi_x,\n            dpi_y: dpi.dpi_y,\n            orientation: source.orientation(),\n            rows_per_strip: source.rows_per_strip(),\n            force_bigtiff: false,\n            replace_existing: capture.output_policy == CapturedOutputPolicy::TransactionalReplace,\n        };\n        let source_channels = source.source_channels();\n        let width = source_width as usize;\n        let height = source_height.max(1) as f32;\n''',
+          )
+
+          spool_dispatch = r'''fn render_adjusted_source_spool(
+    capture: &ConversionJobCapture,
+    cancellation: &ConversionCancellation,
+    report: &mut dyn FnMut(ConversionProgress),
+    source: &ProductionSourceRaster,
+    spool_path: &Path,
+) -> Result<(), String> {
+    match source {
+        ProductionSourceRaster::Tiff(stream) => {
+            render_adjusted_tiff_source_spool(capture, cancellation, report, stream, spool_path)
+        }
+        ProductionSourceRaster::Png(source) => render_adjusted_rgb_source_spool(
+            capture,
+            cancellation,
+            report,
+            source.width,
+            source.height,
+            &source.samples,
+            source.alpha.as_deref(),
+            spool_path,
+        ),
+        ProductionSourceRaster::Jpeg(source) => render_adjusted_rgb_source_spool(
+            capture,
+            cancellation,
+            report,
+            source.width,
+            source.height,
+            &source.samples,
+            None,
+            spool_path,
+        ),
+    }
+}
+
+fn render_adjusted_rgb_source_spool(
+    capture: &ConversionJobCapture,
+    cancellation: &ConversionCancellation,
+    report: &mut dyn FnMut(ConversionProgress),
+    width: u32,
+    height: u32,
+    samples: &[u16],
+    alpha: Option<&[u16]>,
+    spool_path: &Path,
+) -> Result<(), String> {
+    const CHANNELS: usize = 3;
+    cancellation.check_before_commit()?;
+    report(ConversionProgress::new(
+        ConversionPhase::SourceAdjustments,
+        0.08,
+        "Rendering saved RGB source adjustments to local spool",
+    ));
+    if width == 0 || height == 0 {
+        return Err("Decoded RGB design source dimensions must be non-zero.".to_owned());
+    }
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let pixel_count = width_usize
+        .checked_mul(height_usize)
+        .ok_or_else(|| "RGB production source pixel count overflow.".to_owned())?;
+    let expected_samples = pixel_count
+        .checked_mul(CHANNELS)
+        .ok_or_else(|| "RGB production source sample count overflow.".to_owned())?;
+    if samples.len() != expected_samples {
+        return Err(format!(
+            "Decoded RGB production source contains {} samples; expected {expected_samples}.",
+            samples.len()
+        ));
+    }
+    if let Some(alpha) = alpha {
+        if alpha.len() != pixel_count {
+            return Err(format!(
+                "Decoded PNG alpha contains {} samples; expected {pixel_count}.",
+                alpha.len()
+            ));
+        }
+    }
+    let policy = match (alpha.is_some(), capture.conversion_recipe.source_transparency_policy) {
+        (true, Some(policy)) => Some(policy),
+        (true, None) => {
+            return Err(
+                "PNG alpha requires the explicit flatten policy captured in the conversion recipe."
+                    .to_owned(),
+            );
+        }
+        (false, Some(_)) => {
+            return Err(
+                "Conversion recipe contains an alpha-flatten policy for a source without alpha."
+                    .to_owned(),
+            );
+        }
+        (false, None) => None,
+    };
+
+    let total_bytes = expected_samples
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| "RGB conversion source spool byte count overflow.".to_owned())?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(spool_path)
+        .map_err(|err| format!("Cannot create local RGB conversion source spool: {err}"))?;
+    file.set_len(
+        u64::try_from(total_bytes)
+            .map_err(|_| "RGB conversion source spool exceeds supported file size.".to_owned())?,
+    )
+    .map_err(|err| format!("Cannot size RGB conversion source spool: {err}"))?;
+    // SAFETY: this uniquely created file is exclusively owned for the mutable
+    // mapping's lifetime and is sized before mapping.
+    let mut mmap = unsafe {
+        MmapOptions::new()
+            .map_mut(&file)
+            .map_err(|err| format!("Cannot map RGB conversion source spool: {err}"))?
+    };
+    let project = capture.source_recipe.materialize_project();
+    let chunk_rows = DESIGN_SOURCE_ROWS_PER_STRIP as usize;
+    let mut processed_pixels = 0usize;
+
+    for start_row in (0..height_usize).step_by(chunk_rows) {
+        cancellation.check_before_commit()?;
+        let row_count = chunk_rows.min(height_usize - start_row);
+        let start_pixel = start_row
+            .checked_mul(width_usize)
+            .ok_or_else(|| "RGB production source row offset overflow.".to_owned())?;
+        let chunk_pixels = row_count
+            .checked_mul(width_usize)
+            .ok_or_else(|| "RGB production source chunk pixel count overflow.".to_owned())?;
+        let start_sample = start_pixel
+            .checked_mul(CHANNELS)
+            .ok_or_else(|| "RGB production source sample offset overflow.".to_owned())?;
+        let chunk_samples = chunk_pixels
+            .checked_mul(CHANNELS)
+            .ok_or_else(|| "RGB production source chunk sample count overflow.".to_owned())?;
+        let end_sample = start_sample
+            .checked_add(chunk_samples)
+            .ok_or_else(|| "RGB production source sample end overflow.".to_owned())?;
+        let input = samples
+            .get(start_sample..end_sample)
+            .ok_or_else(|| "Decoded RGB source does not contain the requested rows.".to_owned())?;
+        let mut adjusted = adjust_working_rgb(input, &project)?;
+        if let (Some(alpha), Some(policy)) = (alpha, policy) {
+            let alpha_end = start_pixel
+                .checked_add(chunk_pixels)
+                .ok_or_else(|| "PNG alpha row range overflow.".to_owned())?;
+            flatten_adjusted_rgb_in_place(
+                &mut adjusted,
+                alpha
+                    .get(start_pixel..alpha_end)
+                    .ok_or_else(|| "PNG alpha does not contain the requested rows.".to_owned())?,
+                policy,
+            )?;
+        }
+
+        let destination_start = start_sample
+            .checked_mul(2)
+            .ok_or_else(|| "RGB conversion spool byte offset overflow.".to_owned())?;
+        let destination_len = chunk_samples
+            .checked_mul(2)
+            .ok_or_else(|| "RGB conversion spool byte length overflow.".to_owned())?;
+        let destination_end = destination_start
+            .checked_add(destination_len)
+            .ok_or_else(|| "RGB conversion spool byte end overflow.".to_owned())?;
+        let destination = mmap
+            .get_mut(destination_start..destination_end)
+            .ok_or_else(|| "RGB conversion spool does not contain the requested byte range.".to_owned())?;
+        if destination.len() != adjusted.len().saturating_mul(2) {
+            return Err("RGB conversion spool sample/byte topology mismatch.".to_owned());
+        }
+        for (bytes, value) in destination.chunks_exact_mut(2).zip(adjusted.into_iter()) {
+            bytes.copy_from_slice(&value.to_ne_bytes());
+        }
+        processed_pixels = processed_pixels.saturating_add(chunk_pixels);
+        report(ConversionProgress::new(
+            ConversionPhase::SourceAdjustments,
+            0.08 + 0.40 * (processed_pixels as f32 / pixel_count.max(1) as f32),
+            format!("Rendered {processed_pixels}/{pixel_count} RGB source pixels"),
+        ));
+    }
+
+    if processed_pixels != pixel_count {
+        return Err(format!(
+            "Rendered {processed_pixels} RGB source pixels; expected {pixel_count}."
+        ));
+    }
+    mmap.flush()
+        .map_err(|err| format!("Cannot flush RGB conversion source spool: {err}"))?;
+    file.sync_all()
+        .map_err(|err| format!("Cannot sync RGB conversion source spool: {err}"))?;
+    Ok(())
+}
+
+fn adjust_working_rgb(input: &[u16], project: &ShadeProject) -> Result<Vec<u16>, String> {
+    const NAMES: [&str; 3] = ["Red", "Green", "Blue"];
+    if input.len() % 3 != 0 {
+        return Err(format!(
+            "RGB adjustment input contains {} samples, not divisible by 3 channels.",
+            input.len()
+        ));
+    }
+    let pixel_count = input.len() / 3;
+    let mut output = vec![0u16; input.len()];
+    let master = project
+        .adjustments
+        .get(MASTER_ADJUSTMENT_KEY)
+        .filter(|adjustment| adjustment.enabled);
+    let mut prepared = [0.0f32; 3];
+
+    for pixel in 0..pixel_count {
+        let base = pixel * 3;
+        for channel in 0..3 {
+            let adjustment = project
+                .adjustments
+                .get(NAMES[channel])
+                .filter(|adjustment| adjustment.enabled);
+            let mut value = input[base + channel] as f32 / 65535.0;
+            if let Some(adjustment) = adjustment {
+                value = apply_levels(value, adjustment.levels);
+            }
+            if let Some(master) = master {
+                value = apply_levels(value, master.levels);
+            }
+            prepared[channel] = value;
+        }
+        for out_channel in 0..3 {
+            let adjustment = project
+                .adjustments
+                .get(NAMES[out_channel])
+                .filter(|adjustment| adjustment.enabled);
+            let mut value = if let Some(adjustment) = adjustment {
+                let mut mixed = adjustment.mixer.constant;
+                for source_channel in 0..3 {
+                    let coefficient = adjustment
+                        .mixer
+                        .coefficients
+                        .get(NAMES[source_channel])
+                        .copied()
+                        .unwrap_or(if source_channel == out_channel { 1.0 } else { 0.0 });
+                    mixed += prepared[source_channel] * coefficient;
+                }
+                mixed
+            } else {
+                prepared[out_channel]
+            };
+            if let Some(adjustment) = adjustment {
+                value = apply_curve(value, adjustment.curve);
+            }
+            if let Some(master) = master {
+                value = apply_curve(value, master.curve);
+            }
+            output[base + out_channel] = (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+        }
+    }
+    Ok(output)
+}
+
+fn flatten_adjusted_rgb_in_place(
+    samples: &mut [u16],
+    alpha: &[u16],
+    policy: SourceTransparencyPolicy,
+) -> Result<(), String> {
+    if samples.len() % 3 != 0 {
+        return Err("Flatten RGB sample count is not divisible by three.".to_owned());
+    }
+    let pixel_count = samples.len() / 3;
+    if alpha.len() != pixel_count {
+        return Err(format!(
+            "Flatten alpha contains {} samples; expected {pixel_count}.",
+            alpha.len()
+        ));
+    }
+    for (pixel, alpha) in samples.chunks_exact_mut(3).zip(alpha.iter().copied()) {
+        let flattened = composite_rgb_u16([pixel[0], pixel[1], pixel[2]], alpha, policy);
+        pixel.copy_from_slice(&flattened);
+    }
+    Ok(())
+}
+
+'''
+          replace_one(
+              worker,
+              '''fn render_adjusted_source_spool(\n    capture: &ConversionJobCapture,\n    cancellation: &ConversionCancellation,\n    report: &mut dyn FnMut(ConversionProgress),\n    stream: &StreamInfo,\n    spool_path: &Path,\n) -> Result<(), String> {\n''',
+              spool_dispatch + '''fn render_adjusted_tiff_source_spool(\n    capture: &ConversionJobCapture,\n    cancellation: &ConversionCancellation,\n    report: &mut dyn FnMut(ConversionProgress),\n    stream: &StreamInfo,\n    spool_path: &Path,\n) -> Result<(), String> {\n''',
+          )
+
+          test_helpers = r'''    fn minimal_recipe(policy: Option<SourceTransparencyPolicy>) -> ConversionRecipe {
+        ConversionRecipe {
+            source_transparency_policy: policy,
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::Icc,
+            source_profile_identity: IccProfileIdentity {
+                description: "Source".to_owned(),
+                sha256: "a".repeat(64),
+            },
+            target: ConversionTargetDefinition {
+                name: "Target".to_owned(),
+                channels: Vec::new(),
+                bit_depth: 16,
+                output_profile_identity: None,
+                output_profile_path: None,
+                device_link_identity: None,
+                device_link_path: None,
+                characterization_id: None,
+                total_ink_limit: None,
+            },
+            rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
+            black_point_compensation: true,
+            strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
+        }
+    }
+
+    #[test]
+    fn rgb_working_adjustments_preserve_identity_without_project_edits() {
+        let project = ShadeProject::default();
+        let input = [0u16, 12345, u16::MAX, 32768, 22222, 11111];
+        assert_eq!(adjust_working_rgb(&input, &project).unwrap(), input);
+    }
+
+    #[test]
+    fn alpha_flatten_is_applied_after_saved_rgb_adjustments() {
+        let mut project = ShadeProject::default();
+        let mut red = crate::model::ChannelAdjustment::default();
+        red.levels.output_black = 0.5;
+        project.adjustments.insert("Red".to_owned(), red);
+        let mut adjusted = adjust_working_rgb(&[0, 0, 0], &project).unwrap();
+        assert!((i32::from(adjusted[0]) - 32768).abs() <= 1);
+        let policy = SourceTransparencyPolicy::FlattenSolidRgb16 {
+            background_rgb: [0, 0, 0],
+        };
+        flatten_adjusted_rgb_in_place(&mut adjusted, &[32768], policy).unwrap();
+        assert!((i32::from(adjusted[0]) - 16384).abs() <= 1);
+        assert_eq!(&adjusted[1..], &[0, 0]);
+    }
+
+    #[test]
+    fn production_source_policy_fails_closed_for_missing_or_stale_alpha_policy() {
+        let alpha_png = ProductionSourceRaster::Png(DecodedPngSource {
+            width: 1,
+            height: 1,
+            bit_depth: 16,
+            model: PngSourceModel::Rgb,
+            samples: vec![1, 2, 3],
+            alpha: Some(vec![32768]),
+            icc_profile: Some(vec![1, 2, 3]),
+            declares_srgb: false,
+        });
+        assert!(
+            alpha_png
+                .validate_transparency_policy(&minimal_recipe(None))
+                .is_err()
+        );
+        let policy = SourceTransparencyPolicy::FlattenSolidRgb16 {
+            background_rgb: [1000, 2000, 3000],
+        };
+        alpha_png
+            .validate_transparency_policy(&minimal_recipe(Some(policy)))
+            .unwrap();
+        assert_eq!(alpha_png.embedded_icc(), Some(&[1, 2, 3][..]));
+
+        let opaque_png = ProductionSourceRaster::Png(DecodedPngSource {
+            width: 1,
+            height: 1,
+            bit_depth: 8,
+            model: PngSourceModel::Rgb,
+            samples: vec![1, 2, 3],
+            alpha: None,
+            icc_profile: None,
+            declares_srgb: false,
+        });
+        assert!(
+            opaque_png
+                .validate_transparency_policy(&minimal_recipe(Some(policy)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn gray_non_tiff_sources_fail_before_production_transform_dispatch() {
+        let gray_png = ProductionSourceRaster::Png(DecodedPngSource {
+            width: 1,
+            height: 1,
+            bit_depth: 8,
+            model: PngSourceModel::Gray,
+            samples: vec![12345],
+            alpha: None,
+            icc_profile: None,
+            declares_srgb: false,
+        });
+        let error = gray_png.source_model().expect_err("Gray PNG must fail closed");
+        assert!(error.contains("RGB PNG"), "{error}");
+    }
+
+'''
+          replace_one(
+              worker,
+              '''    #[test]\n    fn runtime_dispatch_executes_captured_devicelink_without_source_icc_chain() {\n''',
+              test_helpers + '''    #[test]\n    fn runtime_dispatch_executes_captured_devicelink_without_source_icc_chain() {\n''',
+          )
+
+          ui = Path('src/ui/color_conversion.rs')
+          replace_one(
+              ui,
+              'use windows_shade_editor::design_source::{SourceLossiness, TransparencyState};\n',
+              'use windows_shade_editor::design_source::{\n    DesignSourceColorModel, SourceImageFormat, SourceLossiness, TransparencyState,\n};\n',
+          )
+          replace_one(
+              ui,
+              '''        if !source.execution_supported {\n            self.report_error(\n                "This source can be preflighted, but production execution currently requires a TIFF Face.",\n            );\n            return;\n        }\n''',
+              '''        if !source.execution_supported {\n            self.report_error(\n                "Production execution supports RGB TIFF/PNG/JPEG and CMYK TIFF sources; this source topology is not executable.",\n            );\n            return;\n        }\n''',
+          )
+          replace_one(
+              ui,
+              '                    "Hashing immutable source TIFF",\n',
+              '                    "Hashing immutable source artwork",\n',
+          )
+          replace_one(
+              ui,
+              '            execution_supported: face.preview.is_tiff(),\n',
+              '''            execution_supported: matches!(\n                (descriptor.format, descriptor.color_model),\n                (SourceImageFormat::Tiff, DesignSourceColorModel::Rgb)\n                    | (SourceImageFormat::Tiff, DesignSourceColorModel::Cmyk)\n                    | (SourceImageFormat::Png, DesignSourceColorModel::Rgb)\n                    | (SourceImageFormat::Jpeg, DesignSourceColorModel::Rgb)\n            ),\n''',
+          )
+          replace_one(
+              ui,
+              '            "PNG/JPEG source preflight is available, but full-resolution production execution remains TIFF-only in this version."\n',
+              '            "Production execution currently supports RGB TIFF/PNG/JPEG and CMYK TIFF sources."\n',
+          )
+
+          # Guard the ordinary Export boundary: no non-TIFF decode dependency is added there.
+          export_text = Path('src/export.rs').read_text(encoding='utf-8')
+          if 'decode_png_source' in export_text or 'decode_jpeg_source' in export_text:
+              raise SystemExit('ordinary Export unexpectedly gained PNG/JPEG decoding')
+          if 'let stream = stream_info(source)?;' not in export_text:
+              raise SystemExit('ordinary Export TIFF inspection boundary changed unexpectedly')
+
+          # Guard the old TIFF production region path remains present byte-for-byte apart from its function name.
+          worker_text = worker.read_text(encoding='utf-8')
+          for marker in [
+              'tiff_io::for_each_decoded_region(',
+              'let adjusted = export::adjusted_strip(input, metadata, &project);',
+              'ProductionSourceRaster::Png(source)',
+              'flatten_adjusted_rgb_in_place(',
+              'load_verified_source_icc(capture, source.embedded_icc())?',
+          ]:
+              if marker not in worker_text:
+                  raise SystemExit(f'missing PR310 implementation marker: {marker}')
+          ui_text = ui.read_text(encoding='utf-8')
+          if 'execution_supported: face.preview.is_tiff()' in ui_text:
+              raise SystemExit('legacy TIFF-only UI execution gate remains')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git status --short
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/icc_conversion_worker.rs src/ui/color_conversion.rs
+          git commit -m 'feat: execute full-resolution PNG JPEG production sources (#310)'
+          git push origin HEAD:codex/fullres-png-jpeg-production-source
