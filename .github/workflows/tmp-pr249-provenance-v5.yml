@@ -1,0 +1,123 @@
+name: Temporary guarded PR249 production provenance v5
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr249-provenance-v5
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout exact feature branch
+        uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-production-provenance
+          fetch-depth: 0
+          path: feature
+      - name: Checkout child-module patch source
+        uses: actions/checkout@v6
+        with:
+          ref: tmp/pr249-provenance-v3
+          path: patch-source
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply self-contained child provenance patch
+        shell: pwsh
+        working-directory: feature
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD).Trim() -ne '497caed0921ca9ef2abcbcb63d9611e29ad5846f') { throw 'PR249 feature head moved' }
+          python ..\patch-source\.github\patches\tmp_pr249_provenance_v3.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          @'
+          from pathlib import Path
+
+          def once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 occurrence, got {count}')
+              return text.replace(old, new, 1)
+
+          p = Path('src/color_conversion/production_provenance.rs')
+          text = p.read_text(encoding='utf-8')
+          text = once(
+              text,
+              'use crate::conversion_recipe::recipe_sha256;\nuse crate::production_colorimetry::ProductionPcsCompatibilityMethod;\n',
+              'use sha2::{Digest, Sha256};\n',
+              'remove library-only imports',
+          )
+          text = once(
+              text,
+              'pub const CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION: u32 = 1;\n',
+              '''pub const CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION: u32 = 1;\n\n#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]\n#[serde(rename_all = "snake_case")]\npub enum CustomOptimizerProductionPcsMethod {\n    IccPcsLabD50TwoDegreeV1,\n}\n''',
+              'local PCS method enum',
+          )
+          text = text.replace('ProductionPcsCompatibilityMethod', 'CustomOptimizerProductionPcsMethod')
+          marker = 'pub fn validate_production_provenance(provenance: &ProductionProvenance) -> Result<(), String> {\n'
+          helper = '''fn recipe_sha256(recipe: &super::ConversionRecipe) -> Result<String, String> {\n    let bytes = serde_json::to_vec(recipe)\n        .map_err(|error| format!("Cannot serialize conversion recipe for fingerprinting: {error}"))?;\n    Ok(format!("{:x}", Sha256::digest(bytes)))\n}\n\n'''
+          text = once(text, marker, helper + marker, 'local recipe fingerprint helper')
+          p.write_text(text, encoding='utf-8', newline='\n')
+
+          p = Path('src/custom_optimizer_evidence.rs')
+          text = p.read_text(encoding='utf-8')
+          text = once(
+              text,
+              '    CustomOptimizerProductionProvenance,\n};\n',
+              '    CustomOptimizerProductionPcsMethod, CustomOptimizerProductionProvenance,\n};\n',
+              'local PCS provenance import',
+          )
+          text = once(
+              text,
+              '            pcs_compatibility_method: self.pcs_compatibility_method,\n',
+              '''            pcs_compatibility_method: match self.pcs_compatibility_method {\n                ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1 => {\n                    CustomOptimizerProductionPcsMethod::IccPcsLabD50TwoDegreeV1\n                }\n            },\n''',
+              'PCS method mapping',
+          )
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | Set-Content .tmp-pr249-fixup.py -Encoding utf8
+          python .tmp-pr249-fixup.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-pr249-fixup.py
+
+          rustfmt --edition 2024 `
+            src/color_conversion.rs `
+            src/color_conversion/production_provenance.rs `
+            src/custom_optimizer_evidence.rs `
+            src/custom_optimizer_evidence_tests.rs `
+            src/conversion_transaction.rs `
+            src/production_project.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check locked Windows target
+        working-directory: feature
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+      - name: Run full locked tests
+        working-directory: feature
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Guard source surface and publish
+        shell: pwsh
+        working-directory: feature
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD).Trim() -ne '497caed0921ca9ef2abcbcb63d9611e29ad5846f') { throw 'Feature head moved during guarded run' }
+          $allowed = @(
+            'src/color_conversion.rs',
+            'src/color_conversion/production_provenance.rs',
+            'src/conversion_transaction.rs',
+            'src/custom_optimizer_evidence.rs',
+            'src/custom_optimizer_evidence_tests.rs',
+            'src/production_project.rs'
+          )
+          $changed = @(git status --short --untracked-files=all | ForEach-Object { $_.Substring(3) })
+          $unexpected = @($changed | Where-Object { $_ -notin $allowed })
+          if ($unexpected.Count -ne 0) { throw "Unexpected changed files: $($unexpected -join ', ')" }
+          if ($changed.Count -ne $allowed.Count) { throw "Expected exactly $($allowed.Count) files; got $($changed.Count): $($changed -join ', ')" }
+          git add -- $allowed
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Color Conversion: persist Custom Optimizer production provenance'
+          git push origin HEAD:codex/custom-optimizer-production-provenance
