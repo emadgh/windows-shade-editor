@@ -1,0 +1,57 @@
+name: Temporary guarded PR301 alpha policy implementation retry 2
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr301-implementation-retry2-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/png-alpha-flatten-policy
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Reuse guarded implementation with corrected binary module injection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch origin tmp/pr301-implementation-workflow:refs/remotes/origin/tmp/pr301-implementation-workflow
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git show origin/tmp/pr301-implementation-workflow:.github/workflows/tmp-pr301-implementation.yml | Out-File -FilePath "$env:RUNNER_TEMP/helper.yml" -Encoding utf8
+          @'
+          from pathlib import Path
+          import os
+
+          source = Path(os.environ['RUNNER_TEMP']).joinpath('helper.yml').read_text(encoding='utf-8-sig')
+          marker = "      - name: Apply alpha policy recipe and UI wiring, validate, publish\n        shell: pwsh\n        run: |\n"
+          if source.count(marker) != 1:
+              raise SystemExit(f'helper step marker count was {source.count(marker)}, expected 1')
+          tail = source.split(marker, 1)[1]
+          lines = tail.splitlines()
+          body = []
+          for line in lines:
+              if line.startswith('          '):
+                  body.append(line[10:])
+              elif not line.strip():
+                  body.append('')
+              else:
+                  break
+          script = '\n'.join(body) + '\n'
+          inject_marker = "# Recipe schema v3 + explicit source-transparency policy.\n"
+          if script.count(inject_marker) != 1:
+              raise SystemExit(f'implementation inject marker count was {script.count(inject_marker)}, expected 1')
+          block = """# Binary crate also compiles shared source modules directly.\nreplace_one(\n    'src/main.rs',\n    'mod snapshot_preview_cache;\\nmod thumbnail;',\n    'mod snapshot_preview_cache;\\nmod source_transparency;\\nmod thumbnail;',\n)\n\n"""
+          script = script.replace(inject_marker, block + inject_marker, 1)
+          out = Path(os.environ['RUNNER_TEMP']).joinpath('pr301-retry2.ps1')
+          out.write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          & "$env:RUNNER_TEMP/pr301-retry2.ps1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
