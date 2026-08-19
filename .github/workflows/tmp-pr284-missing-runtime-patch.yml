@@ -1,0 +1,337 @@
+name: Temporary guarded PR284 missing runtime patch
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr284-missing-runtime-patch
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Add source-neutral missing preview and metadata accessors
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '352efe39c35d5e6896dc6cb3402deac1a17d10ef'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 canonical head moved' }
+          @'
+          from pathlib import Path
+
+          p = Path('src/runtime_preview.rs')
+          text = p.read_text(encoding='utf-8')
+
+          def once(old, new):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected one match, got {count}: {old[:100]!r}')
+              text = text.replace(old, new, 1)
+
+          once(
+              'use crate::tiff_io::{self, ColorModel as TiffColorModel, PreviewFace, TiffMetadata};',
+              'use crate::model::FaceFileMetadata;\nuse crate::tiff_io::{self, ColorModel as TiffColorModel, PreviewFace, TiffMetadata};',
+          )
+
+          marker = '''/// Owned preview carrier used by application Faces. The TIFF variant retains the
+          /// real TIFF metadata needed for existing Spot/extra-channel behavior. The
+          /// Design variant owns normalized PNG/JPEG preview planes and source metadata
+          /// without fabricating TIFF state.
+          #[derive(Clone, Debug)]
+          pub enum RuntimePreview {
+              Tiff(PreviewFace),
+              Design(DesignSourcePreview),
+          }
+          '''
+          replacement = '''#[derive(Clone, Debug)]
+          pub struct MissingPreview {
+              source_format: Option<SourceImageFormat>,
+              source_width: u32,
+              source_height: u32,
+              bit_depth: u8,
+              base_channel_count: usize,
+              color_model: RuntimeColorModel,
+              channel_names: Vec<String>,
+              channels: Vec<Vec<u16>>,
+              histograms: Vec<[u32; 256]>,
+          }
+
+          impl MissingPreview {
+              fn from_cached(path: &Path, expected: Option<&FaceFileMetadata>) -> Self {
+                  let mut channel_names = expected
+                      .map(|metadata| metadata.channel_names.clone())
+                      .filter(|names| !names.is_empty())
+                      .unwrap_or_else(|| vec!["Missing source".to_owned()]);
+                  let channel_count = expected
+                      .map(|metadata| metadata.channel_count)
+                      .unwrap_or(channel_names.len())
+                      .max(channel_names.len())
+                      .max(1);
+                  while channel_names.len() < channel_count {
+                      channel_names.push(format!("Channel {}", channel_names.len() + 1));
+                  }
+                  channel_names.truncate(channel_count);
+                  let base_channel_count = expected
+                      .map(|metadata| metadata.base_channel_count)
+                      .unwrap_or(1)
+                      .clamp(1, channel_count);
+                  let color_model = expected
+                      .map(|metadata| runtime_color_model_from_cached(&metadata.color_model))
+                      .unwrap_or(RuntimeColorModel::Other);
+                  Self {
+                      source_format: source_format_from_path(path),
+                      source_width: expected.map(|metadata| metadata.width).unwrap_or(1).max(1),
+                      source_height: expected.map(|metadata| metadata.height).unwrap_or(1).max(1),
+                      bit_depth: expected.map(|metadata| metadata.bit_depth).unwrap_or(8),
+                      base_channel_count,
+                      color_model,
+                      channel_names,
+                      channels: (0..channel_count).map(|_| vec![0u16]).collect(),
+                      histograms: vec![[0u32; 256]; channel_count],
+                  }
+              }
+          }
+
+          impl RuntimePreviewSource for MissingPreview {
+              fn width(&self) -> usize { 1 }
+              fn height(&self) -> usize { 1 }
+              fn channel_names(&self) -> &[String] { &self.channel_names }
+              fn channels(&self) -> &[Vec<u16>] { &self.channels }
+              fn histograms(&self) -> &[[u32; 256]] { &self.histograms }
+              fn color_model(&self) -> RuntimeColorModel { self.color_model }
+              fn embedded_icc(&self) -> Option<&[u8]> { None }
+          }
+
+          /// Owned preview carrier used by application Faces. The TIFF variant retains the
+          /// real TIFF metadata needed for existing Spot/extra-channel behavior. The Design
+          /// variant owns normalized PNG/JPEG preview planes and source metadata without
+          /// fabricating TIFF state. Missing keeps cached project metadata without pretending
+          /// the unavailable source was a TIFF.
+          #[derive(Clone, Debug)]
+          pub enum RuntimePreview {
+              Tiff(PreviewFace),
+              Design(DesignSourcePreview),
+              Missing(MissingPreview),
+          }
+          '''
+          once(marker, replacement)
+
+          once(
+              '''    pub fn source_descriptor(&self) -> OwnedDesignSourceDescriptor {
+                  match self {
+                      Self::Tiff(preview) => {
+                          let color_model = match preview.metadata.color_model {
+                              TiffColorModel::Gray => DesignSourceColorModel::Gray,
+                              TiffColorModel::Rgb => DesignSourceColorModel::Rgb,
+                              TiffColorModel::Cmyk => DesignSourceColorModel::Cmyk,
+                              TiffColorModel::Other => DesignSourceColorModel::Other,
+                          };
+                          OwnedDesignSourceDescriptor {
+                              format: SourceImageFormat::Tiff,
+                              color_model,
+                              bit_depth: preview.metadata.bit_depth,
+                              channel_count: preview.metadata.samples_per_pixel,
+                              embedded_icc: preview.metadata.icc_profile.clone(),
+                              transparency: TransparencyState::None,
+                              lossiness: SourceLossiness::Lossless,
+                          }
+                      }
+                      Self::Design(preview) => preview.source.clone(),
+                  }
+              }
+          ''',
+              '''    pub fn source_descriptor(&self) -> Option<OwnedDesignSourceDescriptor> {
+                  match self {
+                      Self::Tiff(preview) => {
+                          let color_model = match preview.metadata.color_model {
+                              TiffColorModel::Gray => DesignSourceColorModel::Gray,
+                              TiffColorModel::Rgb => DesignSourceColorModel::Rgb,
+                              TiffColorModel::Cmyk => DesignSourceColorModel::Cmyk,
+                              TiffColorModel::Other => DesignSourceColorModel::Other,
+                          };
+                          Some(OwnedDesignSourceDescriptor {
+                              format: SourceImageFormat::Tiff,
+                              color_model,
+                              bit_depth: preview.metadata.bit_depth,
+                              channel_count: preview.metadata.samples_per_pixel,
+                              embedded_icc: preview.metadata.icc_profile.clone(),
+                              transparency: TransparencyState::None,
+                              lossiness: SourceLossiness::Lossless,
+                          })
+                      }
+                      Self::Design(preview) => Some(preview.source.clone()),
+                      Self::Missing(_) => None,
+                  }
+              }
+          ''',
+          )
+
+          once(
+              '''    pub fn source_dimensions(&self) -> (u32, u32) {
+                  match self {
+                      Self::Tiff(preview) => (preview.metadata.width, preview.metadata.height),
+                      Self::Design(preview) => (preview.source_width, preview.source_height),
+                  }
+              }
+          ''',
+              '''    pub fn source_dimensions(&self) -> (u32, u32) {
+                  match self {
+                      Self::Tiff(preview) => (preview.metadata.width, preview.metadata.height),
+                      Self::Design(preview) => (preview.source_width, preview.source_height),
+                      Self::Missing(preview) => (preview.source_width, preview.source_height),
+                  }
+              }
+
+              pub fn missing(path: &Path, expected: Option<&FaceFileMetadata>) -> Self {
+                  Self::Missing(MissingPreview::from_cached(path, expected))
+              }
+
+              pub fn source_format(&self) -> Option<SourceImageFormat> {
+                  match self {
+                      Self::Tiff(_) => Some(SourceImageFormat::Tiff),
+                      Self::Design(preview) => Some(preview.source.format),
+                      Self::Missing(preview) => preview.source_format,
+                  }
+              }
+
+              pub fn bit_depth(&self) -> u8 {
+                  match self {
+                      Self::Tiff(preview) => preview.metadata.bit_depth,
+                      Self::Design(preview) => preview.source.bit_depth,
+                      Self::Missing(preview) => preview.bit_depth,
+                  }
+              }
+
+              pub fn channel_count(&self) -> usize {
+                  self.channels().len()
+              }
+
+              pub fn base_channel_count(&self) -> usize {
+                  match self {
+                      Self::Tiff(preview) => preview.metadata.base_channel_count,
+                      Self::Design(preview) => preview.source.channel_count,
+                      Self::Missing(preview) => preview.base_channel_count,
+                  }
+              }
+          ''',
+          )
+
+          once(
+              '''    pub fn as_tiff(&self) -> Option<&PreviewFace> {
+                  match self {
+                      Self::Tiff(preview) => Some(preview),
+                      Self::Design(_) => None,
+                  }
+              }
+          ''',
+              '''    pub fn as_tiff(&self) -> Option<&PreviewFace> {
+                  match self {
+                      Self::Tiff(preview) => Some(preview),
+                      Self::Design(_) | Self::Missing(_) => None,
+                  }
+              }
+          ''',
+          )
+
+          # Add Missing delegation to every RuntimePreviewSource match arm.
+          replacements = [
+              ('Self::Design(preview) => preview.width(),\n        }', 'Self::Design(preview) => preview.width(),\n            Self::Missing(preview) => preview.width(),\n        }'),
+              ('Self::Design(preview) => preview.height(),\n        }', 'Self::Design(preview) => preview.height(),\n            Self::Missing(preview) => preview.height(),\n        }'),
+              ('Self::Design(preview) => preview.channel_names(),\n        }', 'Self::Design(preview) => preview.channel_names(),\n            Self::Missing(preview) => preview.channel_names(),\n        }'),
+              ('Self::Design(preview) => preview.channels(),\n        }', 'Self::Design(preview) => preview.channels(),\n            Self::Missing(preview) => preview.channels(),\n        }'),
+              ('Self::Design(preview) => preview.histograms(),\n        }', 'Self::Design(preview) => preview.histograms(),\n            Self::Missing(preview) => preview.histograms(),\n        }'),
+              ('Self::Design(preview) => preview.color_model(),\n        }', 'Self::Design(preview) => preview.color_model(),\n            Self::Missing(preview) => preview.color_model(),\n        }'),
+              ('Self::Design(preview) => preview.embedded_icc(),\n        }', 'Self::Design(preview) => preview.embedded_icc(),\n            Self::Missing(preview) => preview.embedded_icc(),\n        }'),
+              ('Self::Design(preview) => preview.alpha(),\n        }', 'Self::Design(preview) => preview.alpha(),\n            Self::Missing(preview) => preview.alpha(),\n        }'),
+              ('Self::Design(preview) => preview.tiff_metadata(),\n        }', 'Self::Design(preview) => preview.tiff_metadata(),\n            Self::Missing(preview) => preview.tiff_metadata(),\n        }'),
+          ]
+          for old, new in replacements:
+              once(old, new)
+
+          helper = '''
+          fn runtime_color_model_from_cached(value: &str) -> RuntimeColorModel {
+              match value.trim().to_ascii_lowercase().as_str() {
+                  "gray" | "greyscale" | "grayscale" => RuntimeColorModel::Gray,
+                  "rgb" => RuntimeColorModel::Rgb,
+                  "cmyk" => RuntimeColorModel::Cmyk,
+                  _ => RuntimeColorModel::Other,
+              }
+          }
+
+          '''
+          once('pub fn source_format_from_path(path: &Path) -> Option<SourceImageFormat> {', helper + 'pub fn source_format_from_path(path: &Path) -> Option<SourceImageFormat> {')
+
+          once(
+              '''        let descriptor = preview.source_descriptor();
+                  assert_eq!(descriptor.format, SourceImageFormat::Png);
+                  assert_eq!(descriptor.bit_depth, 16);
+                  assert_eq!(descriptor.channel_count, 3);''',
+              '''        let descriptor = preview.source_descriptor().expect("available descriptor");
+                  assert_eq!(descriptor.format, SourceImageFormat::Png);
+                  assert_eq!(descriptor.bit_depth, 16);
+                  assert_eq!(descriptor.channel_count, 3);''',
+          )
+
+          test = r'''
+
+              #[test]
+              fn missing_preview_uses_cached_metadata_without_tiff_identity() {
+                  let expected = FaceFileMetadata {
+                      width: 640,
+                      height: 480,
+                      bit_depth: 16,
+                      color_model: "RGB".to_owned(),
+                      channel_count: 3,
+                      base_channel_count: 3,
+                      channel_names: vec!["Red".into(), "Green".into(), "Blue".into()],
+                      ..FaceFileMetadata::default()
+                  };
+                  let preview = RuntimePreview::missing(Path::new("missing.png"), Some(&expected));
+                  assert_eq!(preview.source_format(), Some(SourceImageFormat::Png));
+                  assert_eq!(preview.source_dimensions(), (640, 480));
+                  assert_eq!(preview.bit_depth(), 16);
+                  assert_eq!(preview.channel_count(), 3);
+                  assert_eq!(preview.base_channel_count(), 3);
+                  assert_eq!(preview.color_model(), RuntimeColorModel::Rgb);
+                  assert_eq!(preview.channel_names(), ["Red", "Green", "Blue"]);
+                  assert!(preview.source_descriptor().is_none());
+                  assert!(preview.tiff_metadata().is_none());
+                  assert!(!preview.is_tiff());
+              }
+          '''
+          close = text.rfind('\n}')
+          if close < 0:
+              raise SystemExit('test module final brace not found')
+          text = text[:close] + test + text[close:]
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | python -
+
+          cargo fmt --all
+          $allowed = @('src/runtime_preview.rs')
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) {
+            if ($allowed -notcontains $file) { git checkout -- $file }
+          }
+          $changed = @(git diff --name-only)
+          if (($changed -join ',') -ne 'src/runtime_preview.rs') { throw "Unexpected patch surface: $($changed -join ', ')" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/runtime_preview.rs
+          git commit -m 'feat: add source-neutral missing preview state (#281)'
+          git push origin HEAD:codex/design-source-runtime-wiring
