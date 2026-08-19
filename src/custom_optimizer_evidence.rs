@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::color_conversion::production_provenance::{
+    CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION, CustomOptimizerProductionPcsMethod,
+    CustomOptimizerProductionProvenance,
+};
 use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use crate::conversion_recipe::recipe_sha256;
 use crate::device_characterization_model::{
@@ -198,9 +202,7 @@ impl CapturedCustomOptimizerEvidence {
                         self.calibration_manifest_content_id, actual
                     ))
                 }
-                Err(error) => {
-                    errors.push(format!("Cannot identify calibration manifest: {error}"))
-                }
+                Err(error) => errors.push(format!("Cannot identify calibration manifest: {error}")),
                 _ => {}
             }
         }
@@ -214,9 +216,7 @@ impl CapturedCustomOptimizerEvidence {
                         self.calibration_approval_content_id, actual
                     ))
                 }
-                Err(error) => {
-                    errors.push(format!("Cannot identify calibration approval: {error}"))
-                }
+                Err(error) => errors.push(format!("Cannot identify calibration approval: {error}")),
                 _ => {}
             }
         }
@@ -232,6 +232,38 @@ impl CapturedCustomOptimizerEvidence {
         } else {
             Err(errors)
         }
+    }
+
+    pub fn production_provenance(
+        &self,
+        conversion_recipe_sha256: &str,
+    ) -> Result<CustomOptimizerProductionProvenance, Vec<String>> {
+        self.validate()?;
+        if !is_bare_sha256(conversion_recipe_sha256) {
+            return Err(vec![
+                "Custom Optimizer production provenance requires a canonical captured recipe SHA-256."
+                    .to_owned(),
+            ]);
+        }
+        let provenance = CustomOptimizerProductionProvenance {
+            schema_version: CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION,
+            lut_identity_content_id: self.lut_identity_content_id.clone(),
+            lut_payload_sha256: self.lut_payload_sha256.clone(),
+            validation_report_content_id: self.validation_report_content_id.clone(),
+            characterization_id: self.characterization_id.clone(),
+            threshold_set_content_id: self.threshold_set_content_id.clone(),
+            calibration_manifest_content_id: self.calibration_manifest_content_id.clone(),
+            calibration_approval_content_id: self.calibration_approval_content_id.clone(),
+            pcs_compatibility_method: match self.pcs_compatibility_method {
+                ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1 => {
+                    CustomOptimizerProductionPcsMethod::IccPcsLabD50TwoDegreeV1
+                }
+            },
+            pcs_compatibility_content_id: self.pcs_compatibility_content_id.clone(),
+            conversion_recipe_sha256: conversion_recipe_sha256.to_owned(),
+        };
+        provenance.validate()?;
+        Ok(provenance)
     }
 }
 
@@ -251,13 +283,28 @@ pub enum CustomOptimizerEvidenceError {
     InvalidRecipe(Vec<String>),
     NotCustomOptimizerRecipe,
     LutLoad(String),
-    LutIdentityMismatch { expected: String, actual: String },
-    LutPayloadMismatch { expected: String, actual: String },
-    LutRecipeMismatch { expected: String, actual: String },
+    LutIdentityMismatch {
+        expected: String,
+        actual: String,
+    },
+    LutPayloadMismatch {
+        expected: String,
+        actual: String,
+    },
+    LutRecipeMismatch {
+        expected: String,
+        actual: String,
+    },
     ValidationLoad(String),
-    ValidationIdentityMismatch { expected: String, actual: String },
+    ValidationIdentityMismatch {
+        expected: String,
+        actual: String,
+    },
     CharacterizationLoad(String),
-    CharacterizationIdentityMismatch { expected: String, actual: String },
+    CharacterizationIdentityMismatch {
+        expected: String,
+        actual: String,
+    },
     CharacterizationTarget(CharacterizationTargetError),
     PcsCompatibility(ProductionPcsCompatibilityError),
     PcsMethodMismatch {
@@ -265,7 +312,10 @@ pub enum CustomOptimizerEvidenceError {
         actual: ProductionPcsCompatibilityMethod,
     },
     PcsIdentity(String),
-    PcsIdentityMismatch { expected: String, actual: String },
+    PcsIdentityMismatch {
+        expected: String,
+        actual: String,
+    },
     UnsupportedForwardModel(InverseLutForwardModelMethod),
     ForwardModelBuild(Vec<String>),
     Authorization(InverseLutProductionEligibilityError),
@@ -291,8 +341,8 @@ pub fn load_and_authorize_custom_optimizer_evidence(
     if recipe.engine_mode != ConversionEngineMode::CustomOptimizer {
         return Err(CustomOptimizerEvidenceError::NotCustomOptimizerRecipe);
     }
-    let actual_recipe_sha =
-        recipe_sha256(recipe).map_err(|error| CustomOptimizerEvidenceError::InvalidRecipe(vec![error]))?;
+    let actual_recipe_sha = recipe_sha256(recipe)
+        .map_err(|error| CustomOptimizerEvidenceError::InvalidRecipe(vec![error]))?;
 
     let lut = load_inverse_lut_artifact(&capture.lut_artifact_path)
         .map_err(CustomOptimizerEvidenceError::LutLoad)?;
@@ -327,10 +377,12 @@ pub fn load_and_authorize_custom_optimizer_evidence(
     let characterization = load_characterization_package(&capture.characterization_package_path)
         .map_err(CustomOptimizerEvidenceError::CharacterizationLoad)?;
     if characterization.identity().id != capture.characterization_id {
-        return Err(CustomOptimizerEvidenceError::CharacterizationIdentityMismatch {
-            expected: capture.characterization_id.clone(),
-            actual: characterization.identity().id.clone(),
-        });
+        return Err(
+            CustomOptimizerEvidenceError::CharacterizationIdentityMismatch {
+                expected: capture.characterization_id.clone(),
+                actual: characterization.identity().id.clone(),
+            },
+        );
     }
     validate_characterization_for_target(characterization.package(), &recipe.target, true)
         .map_err(CustomOptimizerEvidenceError::CharacterizationTarget)?;

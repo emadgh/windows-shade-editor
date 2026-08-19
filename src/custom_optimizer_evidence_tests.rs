@@ -219,7 +219,8 @@ fn calibration_manifest(
 ) -> InverseLutThresholdCalibrationManifest {
     InverseLutThresholdCalibrationManifest {
         schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_MANIFEST_SCHEMA_VERSION,
-        pcs_method: crate::production_colorimetry::ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
+        pcs_method:
+            crate::production_colorimetry::ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
         threshold_set_content_id: thresholds.content_id().unwrap(),
         observations: vec![
             InverseLutThresholdCalibrationObservation {
@@ -246,7 +247,8 @@ fn calibration_approval(
 ) -> InverseLutThresholdCalibrationApproval {
     InverseLutThresholdCalibrationApproval {
         schema_version: INVERSE_LUT_THRESHOLD_CALIBRATION_APPROVAL_SCHEMA_VERSION,
-        pcs_method: crate::production_colorimetry::ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
+        pcs_method:
+            crate::production_colorimetry::ProductionPcsCompatibilityMethod::IccPcsLabD50TwoDegreeV1,
         threshold_set_content_id: thresholds.content_id().unwrap(),
         calibration_manifest_content_id: manifest.content_id().unwrap(),
     }
@@ -385,4 +387,45 @@ fn exact_reopened_evidence_reaches_and_stops_at_empty_production_allowlist() {
             InverseLutProductionEligibilityError::CalibrationApprovalNotProductionApproved { .. }
         ))
     ));
+}
+
+#[test]
+fn production_provenance_copies_exact_validated_capture_identities() {
+    let fixture = file_fixture("production-provenance");
+    let recipe_sha = recipe_sha256(&fixture.recipe).unwrap();
+    let record = fixture.capture.production_provenance(&recipe_sha).unwrap();
+    assert_eq!(
+        record.lut_identity_content_id,
+        fixture.capture.lut_identity_content_id
+    );
+    assert_eq!(
+        record.lut_payload_sha256,
+        fixture.capture.lut_payload_sha256
+    );
+    assert_eq!(
+        record.validation_report_content_id,
+        fixture.capture.validation_report_content_id
+    );
+    assert_eq!(
+        record.characterization_id,
+        fixture.capture.characterization_id
+    );
+    assert_eq!(
+        record.threshold_set_content_id,
+        fixture.capture.threshold_set_content_id
+    );
+    assert_eq!(
+        record.calibration_manifest_content_id,
+        fixture.capture.calibration_manifest_content_id
+    );
+    assert_eq!(
+        record.calibration_approval_content_id,
+        fixture.capture.calibration_approval_content_id
+    );
+    assert_eq!(
+        record.pcs_compatibility_content_id,
+        fixture.capture.pcs_compatibility_content_id
+    );
+    assert_eq!(record.conversion_recipe_sha256, recipe_sha);
+    assert!(record.validate().is_ok());
 }

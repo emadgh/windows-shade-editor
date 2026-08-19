@@ -404,6 +404,24 @@ where
         ConversionPhase::OutputCommit.label(),
     ));
 
+    let custom_optimizer = match capture.custom_optimizer_evidence.as_ref() {
+        Some(evidence) => match evidence.production_provenance(&capture.conversion_recipe_sha256) {
+            Ok(provenance) => Some(provenance),
+            Err(errors) => {
+                return ConversionTransactionOutcome::OutputCommittedNeedsRecovery {
+                    committed_output,
+                    production_project_path: capture.production_project_path.clone(),
+                    production_project: None,
+                    error: format!(
+                        "Cannot persist Custom Optimizer production provenance: {}",
+                        errors.join(" ")
+                    ),
+                };
+            }
+        },
+        None => None,
+    };
+
     let provenance = ProductionProvenance {
         source: ConversionSourceRef {
             source_project_path: capture.source_project_path.display().to_string(),
@@ -412,6 +430,7 @@ where
             source_file_sha256: capture.source_file_sha256.clone(),
         },
         recipe: capture.conversion_recipe.clone(),
+        custom_optimizer,
         output_path: committed_output.path.display().to_string(),
         output_sha256: committed_output.sha256.clone(),
         converted_at_unix_ms: committed_output.converted_at_unix_ms,

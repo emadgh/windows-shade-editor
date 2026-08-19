@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod production_provenance;
+
 use serde::{Deserialize, Serialize};
 
 use crate::custom_optimizer_config::CustomOptimizerSolverConfig;
@@ -163,6 +165,8 @@ pub struct ConversionSourceRef {
 pub struct ProductionProvenance {
     pub source: ConversionSourceRef,
     pub recipe: ConversionRecipe,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_optimizer: Option<production_provenance::CustomOptimizerProductionProvenance>,
     pub output_path: String,
     pub output_sha256: String,
     pub converted_at_unix_ms: i64,
@@ -439,7 +443,9 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
             strategy,
-            custom_optimizer_solver: Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default()),
+            custom_optimizer_solver: Some(
+                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+            ),
         };
 
         assert!(recipe.validate().is_ok());
@@ -469,7 +475,11 @@ mod tests {
         };
 
         let errors = recipe.validate().expect_err("duplicate channel must fail");
-        assert!(errors.iter().any(|error| error.contains("Duplicate target channel")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Duplicate target channel"))
+        );
     }
 
     #[test]
@@ -487,8 +497,14 @@ mod tests {
             custom_optimizer_solver: None,
         };
 
-        let errors = recipe.validate().expect_err("target path must be reproducible");
-        assert!(errors.iter().any(|error| error.contains("external target profile path")));
+        let errors = recipe
+            .validate()
+            .expect_err("target path must be reproducible");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("external target profile path"))
+        );
     }
 
     #[test]
@@ -522,12 +538,18 @@ mod tests {
             rendering_intent: ConversionRenderingIntent::Perceptual,
             black_point_compensation: false,
             strategy: SeparationStrategy::default(),
-            custom_optimizer_solver: Some(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default()),
+            custom_optimizer_solver: Some(
+                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+            ),
         };
 
         let errors = recipe
             .validate()
             .expect_err("custom optimizer without characterization must fail");
-        assert!(errors.iter().any(|error| error.contains("characterization")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("characterization"))
+        );
     }
 }
