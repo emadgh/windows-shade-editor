@@ -1,0 +1,559 @@
+name: Temporary guarded PR284 runtime source wiring retry
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr284-runtimeface-retry
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply ownership patch and source-neutralize remaining application surfaces
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'f4ea08c567249e145e49535180aeec52ec974ff8'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 canonical head moved' }
+
+          # Reuse the already pattern-validated ownership/loader patch from helper #286.
+          git show origin/tmp/pr284-runtimeface-patch:.github/workflows/tmp-pr284-runtimeface-patch.yml | Out-File -Encoding utf8 old-helper.yml
+          @'
+          from pathlib import Path
+          text = Path('old-helper.yml').read_text(encoding='utf-8-sig')
+          start = text.index("          @'\n") + len("          @'\n")
+          end = text.index("          '@ | python -", start)
+          lines = text[start:end].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('ownership_patch.py').write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          python ownership_patch.py
+
+          @'
+          from pathlib import Path
+
+          def load(path):
+              return Path(path).read_text(encoding='utf-8')
+
+          def save(path, text):
+              Path(path).write_text(text, encoding='utf-8', newline='\n')
+
+          def replace_once(text, old, new, path):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one match, got {count}: {old[:100]!r}')
+              return text.replace(old, new, 1)
+
+          # ---- workflow.rs: no synthetic TIFF placeholder; generic relink verification ----
+          path = 'src/workflow.rs'
+          text = load(path)
+          start = text.index('pub(super) fn placeholder_loaded_face(')
+          end = text.index('\nfn missing_face_dpi(', start)
+          replacement = '''pub(super) fn placeholder_loaded_face(
+              path: PathBuf,
+              expected: Option<&model::FaceFileMetadata>,
+              default_dpi: f64,
+          ) -> LoadedFace {
+              let preview = runtime_preview::RuntimePreview::missing(&path, expected);
+              LoadedFace {
+                  path,
+                  available: false,
+                  preview,
+                  dpi: missing_face_dpi(expected, default_dpi),
+              }
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+          start = text.index('fn verify_relink_metadata(')
+          end = text.index('\nfn find_named_file_recursive(', start)
+          replacement = '''fn verify_relink_metadata(
+              preview: &runtime_preview::RuntimePreview,
+              expected: Option<&model::FaceFileMetadata>,
+          ) -> Result<(), String> {
+              let Some(expected) = expected else {
+                  return Ok(());
+              };
+              let mut bad = Vec::new();
+              let (width, height) = preview.source_dimensions();
+              if (width, height) != (expected.width, expected.height) {
+                  bad.push(format!(
+                      "dimensions expected {}x{}, got {}x{}",
+                      expected.width, expected.height, width, height
+                  ));
+              }
+              if preview.bit_depth() != expected.bit_depth {
+                  bad.push(format!(
+                      "bit depth expected {}, got {}",
+                      expected.bit_depth,
+                      preview.bit_depth()
+                  ));
+              }
+              if preview.color_model().title() != expected.color_model {
+                  bad.push(format!(
+                      "color model expected {}, got {}",
+                      expected.color_model,
+                      preview.color_model().title()
+                  ));
+              }
+              if preview.channel_count() != expected.channel_count
+                  || preview.base_channel_count() != expected.base_channel_count
+              {
+                  bad.push(format!(
+                      "channel layout expected {}/{} base, got {}/{} base",
+                      expected.channel_count,
+                      expected.base_channel_count,
+                      preview.channel_count(),
+                      preview.base_channel_count()
+                  ));
+              }
+              if preview.channel_names() != expected.channel_names.as_slice() {
+                  bad.push(format!(
+                      "channel names/order expected {:?}, got {:?}",
+                      expected.channel_names,
+                      preview.channel_names()
+                  ));
+              }
+              if bad.is_empty() {
+                  Ok(())
+              } else {
+                  Err(format!(
+                      "Replacement source does not match cached Face metadata: {}",
+                      bad.join("; ")
+                  ))
+              }
+          }
+
+          fn load_relink_candidate(
+              path: PathBuf,
+              max_dimension: u32,
+              default_dpi: f64,
+              expected: Option<&model::FaceFileMetadata>,
+          ) -> Result<LoadedFace, String> {
+              let preview = runtime_preview::RuntimePreview::load(&path, max_dimension)
+                  .map_err(|err| format!("Cannot load replacement {}: {err}", path.display()))?;
+              verify_relink_metadata(&preview, expected)?;
+              Ok(LoadedFace {
+                  dpi: dpi::read_dpi(&path, default_dpi),
+                  path,
+                  available: true,
+                  preview,
+              })
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+          text = text.replace('Face source TIFF is missing', 'Face source image is missing')
+          text = text.replace('face.preview.metadata.channel_names.len()', 'face.preview.channel_names().len()')
+          text = text.replace('&item.preview.metadata.channel_names', 'item.preview.channel_names()')
+          save(path, text)
+
+          # ---- adjustments UI ----
+          path = 'src/ui/adjustments.rs'
+          text = load(path)
+          text = text.replace('Source TIFF missing.', 'Source image missing.')
+          text = text.replace('let channel_names = face.preview.metadata.channel_names.clone();', 'let channel_names = face.preview.channel_names().to_vec();')
+          text = text.replace('let original_histograms = face.preview.histograms.clone();', 'let original_histograms = face.preview.histograms().to_vec();')
+          text = text.replace('let base_count = face.preview.metadata.base_channel_count;', 'let base_count = face.preview.base_channel_count();')
+          text = text.replace('let color_model = face.preview.metadata.color_model;', 'let color_model = face.preview.color_model();')
+          text = text.replace(
+              'let photoshop_display = face.preview.metadata.channel_display_info.clone();',
+              'let photoshop_display = face.preview.tiff_metadata().map(|metadata| metadata.channel_display_info.clone()).unwrap_or_else(|| vec![None; channel_names.len()]);',
+          )
+          text = text.replace('let all_original_histograms = face.preview.histograms.clone();', 'let all_original_histograms = face.preview.histograms().to_vec();')
+          text = text.replace('Extra TIFF channel', 'Extra source channel')
+          save(path, text)
+
+          # ---- test-code channel list ----
+          path = 'src/ui/test_code_panel.rs'
+          text = load(path).replace(
+              '.map(|face| face.preview.metadata.channel_names.clone())',
+              '.map(|face| face.preview.channel_names().to_vec())',
+          )
+          save(path, text)
+
+          # ---- thumbnail uses runtime preview contract ----
+          path = 'src/thumbnail.rs'
+          text = load(path)
+          text = text.replace('use crate::tiff_io::PreviewFace;', 'use crate::runtime_preview::RuntimePreviewSource;')
+          text = text.replace(
+              'pub fn build_project_thumbnail(\n    face: &PreviewFace,',
+              'pub fn build_project_thumbnail<P: RuntimePreviewSource + ?Sized>(\n    face: &P,',
+          )
+          text = text.replace(
+              'let color = color_management::PreviewColorTransform::new(&face.metadata, color_config);',
+              'let color = color_management::PreviewColorTransform::new_for_runtime_preview(face, color_config);',
+          )
+          text = text.replace('resize_rgba(face.width, face.height, &rgba, max_dimension)', 'resize_rgba(face.width(), face.height(), &rgba, max_dimension)')
+          save(path, text)
+
+          # ---- color_management: runtime compatibility + embedded/production ICC helpers ----
+          path = 'src/color_management.rs'
+          text = load(path)
+          old = '''    pub fn compatible_with(&self, model: ColorModel) -> bool {
+                  expected_color_space(model).is_some_and(|expected| expected == self.color_space)
+              }
+          '''
+          new = old + '''
+              pub fn compatible_with_runtime(&self, model: RuntimeColorModel) -> bool {
+                  expected_runtime_color_space(model)
+                      .is_some_and(|expected| expected == self.color_space)
+              }
+          '''
+          text = replace_once(text, old, new, path)
+          marker = 'pub fn embedded_profile_description(metadata: &TiffMetadata) -> Option<String> {'
+          insert = '''pub fn embedded_profile_description_for_runtime<P: RuntimePreviewSource + ?Sized>(
+              source: &P,
+          ) -> Option<String> {
+              let icc = source.embedded_icc()?;
+              Profile::new_icc(icc)
+                  .ok()
+                  .map(|profile| profile_description(&profile))
+          }
+
+          '''
+          text = replace_once(text, marker, insert + marker, path)
+          marker = '/// Inspect an embedded ICC for production source interpretation.\n'
+          insert = '''pub fn production_embedded_profile_identity_for_runtime(
+              model: RuntimeColorModel,
+              embedded_icc: Option<&[u8]>,
+          ) -> Result<Option<IccProfileIdentity>, String> {
+              let Some(bytes) = embedded_icc else {
+                  return Ok(None);
+              };
+              if bytes.is_empty() {
+                  return Err("Embedded production Source ICC payload is empty.".to_owned());
+              }
+              let profile = Profile::new_icc(bytes)
+                  .map_err(|err| format!("Cannot open embedded production Source ICC: {err}"))?;
+              let Some(expected) = expected_runtime_color_space(model) else {
+                  return Err(format!(
+                      "{} source data is not supported by production Source ICC assignment.",
+                      model.title()
+                  ));
+              };
+              if profile.color_space() != expected {
+                  return Err(format!(
+                      "Embedded Source ICC color space {} does not match source {}.",
+                      color_space_label(profile.color_space()),
+                      model.title()
+                  ));
+              }
+              Ok(Some(IccProfileIdentity {
+                  description: profile_description(&profile),
+                  sha256: format!("{:x}", Sha256::digest(bytes)),
+              }))
+          }
+
+          pub fn inspect_production_source_profile_runtime(
+              path: &Path,
+              expected_identity: &IccProfileIdentity,
+              source_model: RuntimeColorModel,
+          ) -> Result<InstalledIccProfile, String> {
+              let profile = inspect_profile(path)?;
+              if !profile.compatible_with_runtime(source_model) {
+                  return Err(format!(
+                      "Assigned production Source ICC '{}' declares {} but the source Face is {}.",
+                      profile.description,
+                      profile.color_space_label(),
+                      source_model.title()
+                  ));
+              }
+              if expected_identity.sha256.trim().is_empty() {
+                  return Err(
+                      "Assigned production Source ICC has no stored SHA-256 identity. Reassign the profile."
+                          .to_owned(),
+                  );
+              }
+              if !profile.matches_identity(expected_identity) {
+                  return Err(format!(
+                      "Assigned production Source ICC at {} no longer matches stored profile '{}'. Reassign or relink the profile before conversion.",
+                      path.display(),
+                      expected_identity.description
+                  ));
+              }
+              Ok(profile)
+          }
+
+          '''
+          text = replace_once(text, marker, insert + marker, path)
+          save(path, text)
+
+          # ---- main.rs generic UI/runtime metadata ----
+          path = 'src/main.rs'
+          text = load(path)
+          text = text.replace('fn ensure_project_palette_for_model(&mut self, color_model: tiff_io::ColorModel)', 'fn ensure_project_palette_for_model(&mut self, color_model: RuntimeColorModel)')
+          text = text.replace('tiff_io::ColorModel::Rgb => Some(palette::builtin_rgb())', 'RuntimeColorModel::Rgb => Some(palette::builtin_rgb())')
+          text = text.replace('tiff_io::ColorModel::Cmyk => Some(palette::builtin_cmyk())', 'RuntimeColorModel::Cmyk => Some(palette::builtin_cmyk())')
+          text = text.replace('first.preview.metadata.color_model', 'first.preview.color_model()')
+          text = text.replace('&item.preview.metadata.channel_names', 'item.preview.channel_names()')
+          text = text.replace('face.preview.metadata.channel_names.len()', 'face.preview.channel_names().len()')
+          text = text.replace('"Some TIFF files could not be loaded:', '"Some design sources could not be loaded:')
+          text = text.replace('"Project opened with TIFF errors:', '"Project opened with source errors:')
+          text = text.replace('"Recovery opened with TIFF errors:', '"Recovery opened with source errors:')
+          text = text.replace('.width\n            .saturating_mul(face.preview.height)', '.width()\n            .saturating_mul(face.preview.height())')
+          text = text.replace('ui.label("Open a .shade project or add TIFF faces.");', 'ui.label("Open a .shade project or add TIFF, PNG or JPEG faces.");')
+          text = text.replace('if ui.button("Add TIFF faces").clicked()', 'if ui.button("Add design faces").clicked()')
+          old = '''        let meta = face.preview.metadata.clone();
+              let dpi_info = face.dpi;'''
+          new = '''        let (source_width, source_height) = face.preview.source_dimensions();
+              let source_bit_depth = face.preview.bit_depth();
+              let source_model = face.preview.color_model();
+              let source_channel_count = face.preview.channel_count();
+              let dpi_info = face.dpi;'''
+          text = replace_once(text, old, new, path)
+          text = text.replace('physical_dimensions_cm(meta.width, meta.height, dpi_info)', 'physical_dimensions_cm(source_width, source_height, dpi_info)')
+          text = text.replace('format!("{}-bit", meta.bit_depth)', 'format!("{}-bit", source_bit_depth)')
+          text = text.replace('format!("{} x {} px", meta.width, meta.height)', 'format!("{} x {} px", source_width, source_height)')
+          text = text.replace('ui.label(meta.color_model.title());', 'ui.label(source_model.title());')
+          text = text.replace('ui.label(format!("{} channels", meta.samples_per_pixel));', 'ui.label(format!("{} channels", source_channel_count));')
+          text = text.replace('original TIFF samples with Embedded ICC only', 'original source samples with Embedded ICC only')
+          text = text.replace('the TIFF embedded ICC', 'the source embedded ICC')
+          text = text.replace('let active_model = active_face.preview.metadata.color_model;', 'let active_model = active_face.preview.color_model();')
+          old = '''        let embedded_name =
+                  color_management::embedded_profile_description(&active_face.preview.metadata)
+                      .unwrap_or_else(|| "No embedded ICC".to_owned());'''
+          new = '''        let embedded_name =
+                  color_management::embedded_profile_description_for_runtime(active_face.preview.as_ref())
+                      .unwrap_or_else(|| "No embedded ICC".to_owned());'''
+          text = replace_once(text, old, new, path)
+          text = text.replace('profile.compatible_with(active_model)', 'profile.compatible_with_runtime(active_model)')
+          text = text.replace('ui.strong("TIFF base model");', 'ui.strong("Source base model");')
+          text = text.replace('TIFF samples, embedded ICC and Photoshop resources remain untouched', 'Source samples and metadata remain untouched')
+          text = text.replace('uses only the TIFF embedded ICC', 'uses only the source embedded ICC')
+          old = '        let tiff = &face.preview.metadata;\n'
+          text = replace_once(text, old, '        let (source_width, source_height) = face.preview.source_dimensions();\n', path)
+          text = text.replace('width: tiff.width,', 'width: source_width,')
+          text = text.replace('height: tiff.height,', 'height: source_height,')
+          text = text.replace('bit_depth: tiff.bit_depth,', 'bit_depth: face.preview.bit_depth(),')
+          text = text.replace('color_model: tiff.color_model.title().to_owned(),', 'color_model: face.preview.color_model().title().to_owned(),')
+          text = text.replace('channel_count: tiff.samples_per_pixel,', 'channel_count: face.preview.channel_count(),')
+          text = text.replace('base_channel_count: tiff.base_channel_count,', 'base_channel_count: face.preview.base_channel_count(),')
+          text = text.replace('channel_names: tiff.channel_names.clone(),', 'channel_names: face.preview.channel_names().to_vec(),')
+          save(path, text)
+
+          # ---- Color Conversion uses actual owned design-source descriptor ----
+          path = 'src/ui/color_conversion.rs'
+          text = load(path)
+          old = '''use windows_shade_editor::conversion_preflight::{
+              ConversionPreflightInput, ConversionPreflightReport, PreflightCode, PreflightSeverity,
+              SourceImageFormat, SourceProfileState, TransparencyState, build_conversion_preflight,
+          };'''
+          new = '''use windows_shade_editor::conversion_preflight::{
+              ConversionPreflightReport, PreflightCode, PreflightSeverity, SourceProfileState,
+              build_conversion_preflight_for_source,
+          };'''
+          text = replace_once(text, old, new, path)
+          text = text.replace('source_model: tiff_io::ColorModel,', 'source_model: RuntimeColorModel,\n    execution_supported: bool,')
+          old = '''        let supported_source = matches!(
+                  self.faces
+                      .get(self.current_face)
+                      .map(|face| face.preview.metadata.color_model),
+                  Some(tiff_io::ColorModel::Rgb | tiff_io::ColorModel::Cmyk)
+              );'''
+          new = '''        let supported_source = matches!(
+                  self.faces
+                      .get(self.current_face)
+                      .map(|face| face.preview.color_model()),
+                  Some(RuntimeColorModel::Rgb | RuntimeColorModel::Cmyk)
+              );'''
+          text = replace_once(text, old, new, path)
+          start = text.index('    fn current_conversion_source(&self) -> Option<CurrentConversionSource> {')
+          end = text.index('\n    fn assign_production_source_profile(', start)
+          replacement = '''    fn current_conversion_source(&self) -> Option<CurrentConversionSource> {
+              let face = self.faces.get(self.current_face)?;
+              if !face.available {
+                  return None;
+              }
+              let owned_descriptor = face.preview.source_descriptor()?;
+              let descriptor = owned_descriptor.as_borrowed();
+              let source_model = face.preview.color_model();
+              let save_gate = conversion_save_gate(ConversionSourceState {
+                  has_faces: !self.faces.is_empty(),
+                  has_saved_project_path: self.project_path.is_some(),
+                  has_unsaved_changes: self.project_dirty,
+              });
+              let face_ref = self.project.faces.get(self.current_face);
+              let (profile, profile_label, production_profile_path, has_assigned_profile) =
+                  production_source_profile_state(&descriptor, source_model, face_ref);
+              let profile_identity = profile.identity().cloned();
+              let report = build_conversion_preflight_for_source(&descriptor, profile, save_gate);
+
+              let face_label = self
+                  .project
+                  .faces
+                  .get(self.current_face)
+                  .map(|item| item.label.clone())
+                  .filter(|label| !label.trim().is_empty())
+                  .or_else(|| {
+                      face.path
+                          .file_name()
+                          .map(|name| name.to_string_lossy().into_owned())
+                  })
+                  .unwrap_or_else(|| format!("Face {}", self.current_face + 1));
+
+              Some(CurrentConversionSource {
+                  face_label,
+                  source_path: face.path.clone(),
+                  source_model,
+                  execution_supported: face.preview.is_tiff(),
+                  color_model_label: source_model.title(),
+                  bit_depth: descriptor.bit_depth,
+                  channel_count: descriptor.channel_count,
+                  profile_identity,
+                  profile_label,
+                  production_profile_path,
+                  has_assigned_profile,
+                  snapshot_id: self.project.active_snapshot_id,
+                  save_gate,
+                  report,
+              })
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+          text = text.replace('let source_model = active_face.preview.metadata.color_model;', 'let source_model = active_face.preview.color_model();')
+          text = text.replace('profile.compatible_with(source_model)', 'profile.compatible_with_runtime(source_model)')
+          text = text.replace('fn conversion_color_model(model: tiff_io::ColorModel)', 'fn conversion_color_model(model: RuntimeColorModel)')
+          text = text.replace('tiff_io::ColorModel::Gray => ConversionColorModel::Gray', 'RuntimeColorModel::Gray => ConversionColorModel::Gray')
+          text = text.replace('tiff_io::ColorModel::Rgb => ConversionColorModel::Rgb', 'RuntimeColorModel::Rgb => ConversionColorModel::Rgb')
+          text = text.replace('tiff_io::ColorModel::Cmyk => ConversionColorModel::Cmyk', 'RuntimeColorModel::Cmyk => ConversionColorModel::Cmyk')
+          text = text.replace('tiff_io::ColorModel::Other => ConversionColorModel::Other', 'RuntimeColorModel::Other => ConversionColorModel::Other')
+          start = text.index('fn production_source_profile_state(')
+          end = text.index('\nfn conversion_profile_identity(', start)
+          replacement = '''fn production_source_profile_state(
+              descriptor: &windows_shade_editor::design_source::DesignSourceDescriptor<'_>,
+              source_model: RuntimeColorModel,
+              face: Option<&model::FaceRef>,
+          ) -> (SourceProfileState, String, Option<String>, bool) {
+              if let Some(assignment) = face.and_then(|face| face.production_source_profile.as_ref()) {
+                  let path = PathBuf::from(&assignment.path);
+                  return match color_management::inspect_production_source_profile_runtime(
+                      &path,
+                      &assignment.identity,
+                      source_model,
+                  ) {
+                      Ok(profile) => (
+                          SourceProfileState::Assigned(conversion_profile_identity(profile.identity())),
+                          format!("Assigned: {}", profile.description),
+                          Some(assignment.path.clone()),
+                          true,
+                      ),
+                      Err(err) => (
+                          SourceProfileState::Invalid(err),
+                          format!("Assigned profile invalid: {}", assignment.identity.description),
+                          Some(assignment.path.clone()),
+                          true,
+                      ),
+                  };
+              }
+
+              match color_management::production_embedded_profile_identity_for_runtime(
+                  source_model,
+                  descriptor.embedded_icc,
+              ) {
+                  Ok(Some(identity)) => (
+                      SourceProfileState::Embedded(conversion_profile_identity(&identity)),
+                      format!("Embedded: {}", identity.description),
+                      None,
+                      false,
+                  ),
+                  Ok(None) => (
+                      SourceProfileState::Missing,
+                      "Missing production Source ICC".to_owned(),
+                      None,
+                      false,
+                  ),
+                  Err(err) => (
+                      SourceProfileState::Invalid(err),
+                      "Embedded production Source ICC is invalid".to_owned(),
+                      None,
+                      false,
+                  ),
+              }
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+          old = '''            let executable = matches!(
+                      review.recipe.engine_mode,
+                      ConversionEngineMode::Icc | ConversionEngineMode::DeviceLink
+                  );'''
+          new = '''            let engine_executable = matches!(
+                      review.recipe.engine_mode,
+                      ConversionEngineMode::Icc | ConversionEngineMode::DeviceLink
+                  );
+                  let executable = engine_executable && source.execution_supported;'''
+          text = replace_once(text, old, new, path)
+          old = '''                .on_hover_text(if executable {
+                      "Capture the exact saved Source state and add it to the persistent conversion queue."
+                  } else {
+                      "Custom Optimizer execution requires its dedicated engine."
+                  })'''
+          new = '''                .on_hover_text(if executable {
+                      "Capture the exact saved Source state and add it to the persistent conversion queue."
+                  } else if !source.execution_supported {
+                      "PNG/JPEG source preflight is available, but full-resolution production execution remains TIFF-only in this version."
+                  } else {
+                      "Custom Optimizer execution requires its dedicated engine."
+                  })'''
+          text = replace_once(text, old, new, path)
+          old = '''    fn capture_conversion_job(
+                  &mut self,
+                  source: &CurrentConversionSource,
+                  review: TargetSetupReview,
+              ) {
+                  if self.job.is_some() {'''
+          new = '''    fn capture_conversion_job(
+                  &mut self,
+                  source: &CurrentConversionSource,
+                  review: TargetSetupReview,
+              ) {
+                  if !source.execution_supported {
+                      self.report_error(
+                          "This source can be preflighted, but production execution currently requires a TIFF Face.",
+                      );
+                      return;
+                  }
+                  if self.job.is_some() {'''
+          text = replace_once(text, old, new, path)
+          save(path, text)
+          '@ | python -
+
+          Remove-Item old-helper.yml, ownership_patch.py -ErrorAction SilentlyContinue
+          cargo fmt --all
+          $allowed = @(
+            'src/main.rs',
+            'src/workflow.rs',
+            'src/ui/adjustments.rs',
+            'src/ui/test_code_panel.rs',
+            'src/thumbnail.rs',
+            'src/color_management.rs',
+            'src/ui/color_conversion.rs'
+          )
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) {
+            if ($allowed -notcontains $file) { git checkout -- $file }
+          }
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) {
+            if ($allowed -notcontains $file) { throw "Unexpected patch surface: $file" }
+          }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/workflow.rs src/ui/adjustments.rs src/ui/test_code_panel.rs src/thumbnail.rs src/color_management.rs src/ui/color_conversion.rs
+          git commit -m 'feat: wire runtime Faces and source-aware conversion preflight (#281)'
+          git push origin HEAD:codex/design-source-runtime-wiring
