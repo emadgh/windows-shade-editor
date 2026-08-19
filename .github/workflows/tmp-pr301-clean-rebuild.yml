@@ -1,0 +1,76 @@
+name: Temporary guarded PR301 clean semantic rebuild
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr301-clean-rebuild-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/png-alpha-flatten-policy-clean
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Reuse validated implementation without repository-wide rustfmt churn
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch origin tmp/pr301-implementation-workflow:refs/remotes/origin/tmp/pr301-implementation-workflow
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git show origin/tmp/pr301-implementation-workflow:.github/workflows/tmp-pr301-implementation.yml | Out-File -FilePath "$env:RUNNER_TEMP/helper.yml" -Encoding utf8
+          @'
+          from pathlib import Path
+          import os
+
+          source = Path(os.environ['RUNNER_TEMP']).joinpath('helper.yml').read_text(encoding='utf-8-sig')
+          marker = "      - name: Apply alpha policy recipe and UI wiring, validate, publish\n        shell: pwsh\n        run: |\n"
+          if source.count(marker) != 1:
+              raise SystemExit(f'helper step marker count was {source.count(marker)}, expected 1')
+          tail = source.split(marker, 1)[1]
+          lines = tail.splitlines()
+          body = []
+          for line in lines:
+              if line.startswith('          '):
+                  body.append(line[10:])
+              elif not line.strip():
+                  body.append('')
+              else:
+                  break
+          script = '\n'.join(body) + '\n'
+
+          old_head = "$expectedHead = 'e9fb9bfa8a821c80a9c68b2a065749f9c4977a35'"
+          new_head = "$expectedHead = '88781742214a64ede83ff829e6cc156aa93ea0b2'"
+          if script.count(old_head) != 1:
+              raise SystemExit(f'expected-head marker count was {script.count(old_head)}, expected 1')
+          script = script.replace(old_head, new_head, 1)
+
+          inject_marker = "# Recipe schema v3 + explicit source-transparency policy.\n"
+          if script.count(inject_marker) != 1:
+              raise SystemExit(f'implementation inject marker count was {script.count(inject_marker)}, expected 1')
+          block = """# Binary crate also compiles shared source modules directly.\nreplace_one(\n    'src/main.rs',\n    'mod snapshot_preview_cache;\\nmod thumbnail;',\n    'mod snapshot_preview_cache;\\nmod source_transparency;\\nmod thumbnail;',\n)\n\n"""
+          script = script.replace(inject_marker, block + inject_marker, 1)
+
+          fmt_marker = 'cargo fmt --all\n'
+          if script.count(fmt_marker) != 1:
+              raise SystemExit(f'cargo fmt marker count was {script.count(fmt_marker)}, expected 1')
+          script = script.replace(fmt_marker, "Write-Host 'Skipping repository-wide rustfmt to preserve semantic-only diff'\n", 1)
+
+          old_push = 'git push origin HEAD:codex/png-alpha-flatten-policy\n'
+          new_push = 'git push origin HEAD:codex/png-alpha-flatten-policy-clean\n'
+          if script.count(old_push) != 1:
+              raise SystemExit(f'push destination marker count was {script.count(old_push)}, expected 1')
+          script = script.replace(old_push, new_push, 1)
+
+          out = Path(os.environ['RUNNER_TEMP']).joinpath('pr301-clean.ps1')
+          out.write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          & "$env:RUNNER_TEMP/pr301-clean.ps1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
