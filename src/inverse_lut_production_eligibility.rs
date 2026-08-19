@@ -4,7 +4,12 @@ use sha2::{Digest, Sha256};
 use crate::color_conversion::ConversionRecipe;
 use crate::conversion_recipe::recipe_sha256;
 use crate::device_characterization::DeviceForwardModel;
+use crate::device_characterization_model::ValidatedLocalForwardModel;
 use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
+use crate::inverse_lut_identity::{
+    InverseLutForwardModelIdentity, InverseLutForwardModelMethod,
+    InverseLutLocalForwardModelConfigIdentity,
+};
 use crate::inverse_lut_runtime::{InverseLutLookupError, InverseLutRuntime};
 use crate::inverse_lut_threshold_set::{
     InverseLutCalibrationSolverFamily, InverseLutThresholdCalibrationApproval,
@@ -180,6 +185,10 @@ pub enum InverseLutProductionEligibilityError {
         lut: Vec<String>,
         model: Vec<String>,
     },
+    ForwardModelMismatch {
+        lut: InverseLutForwardModelIdentity,
+        model: InverseLutForwardModelIdentity,
+    },
 }
 
 /// Revalidate every production-critical binding and mint eligibility evidence.
@@ -197,7 +206,7 @@ pub fn validate_inverse_lut_production_eligibility(
     calibration_approval: &InverseLutThresholdCalibrationApproval,
     pcs_compatibility: &ValidatedProductionPcsCompatibility,
     recipe: &ConversionRecipe,
-    model: &dyn DeviceForwardModel,
+    model: &ValidatedLocalForwardModel,
 ) -> Result<InverseLutProductionEligibility, InverseLutProductionEligibilityError> {
     let runtime = InverseLutRuntime::from_verified(lut.clone())
         .map_err(InverseLutProductionEligibilityError::InvalidLut)?;
@@ -325,6 +334,17 @@ pub fn validate_inverse_lut_production_eligibility(
                 model: model.identity().channel_names.clone(),
             },
         );
+    }
+
+    let actual_forward_model = InverseLutForwardModelIdentity {
+        method: InverseLutForwardModelMethod::LocalInverseDistanceWeightedV1,
+        config: InverseLutLocalForwardModelConfigIdentity::from_runtime(model.config()),
+    };
+    if runtime.identity().forward_model != actual_forward_model {
+        return Err(InverseLutProductionEligibilityError::ForwardModelMismatch {
+            lut: runtime.identity().forward_model,
+            model: actual_forward_model,
+        });
     }
 
     if calibration_manifest.threshold_set_content_id != threshold_set_content_id {
