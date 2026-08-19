@@ -1,0 +1,185 @@
+name: Temporary guarded PR245 capture contract v2
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr245-capture-contract-v2
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-evidence-capture
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Add backward-compatible Custom Optimizer capture evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'c7d8cbbd6248f239d3e613c31de680661100036a'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) {
+            throw "Expected feature head $expectedHead, got $actualHead"
+          }
+
+          @'
+          from pathlib import Path
+
+          def once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 occurrence, got {count}')
+              return text.replace(old, new, 1)
+
+          p = Path('src/conversion_transaction.rs')
+          text = p.read_text(encoding='utf-8')
+
+          text = once(
+              text,
+              '    ConversionRecipe, ConversionSourceRef, ProductionProvenance, ProjectRole,\n',
+              '    ConversionEngineMode, ConversionRecipe, ConversionSourceRef, ProductionProvenance,\n    ProjectRole,\n',
+              'conversion engine import',
+          )
+          text = once(
+              text,
+              'use crate::conversion_recipe::recipe_sha256;\n',
+              'use crate::conversion_recipe::recipe_sha256;\nuse crate::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;\n',
+              'custom optimizer evidence import',
+          )
+          text = once(
+              text,
+              '    pub conversion_recipe_sha256: String,\n    pub output_policy: CapturedOutputPolicy,\n',
+              '    pub conversion_recipe_sha256: String,\n    #[serde(default, skip_serializing_if = "Option::is_none")]\n    pub custom_optimizer_evidence: Option<CapturedCustomOptimizerEvidence>,\n    pub output_policy: CapturedOutputPolicy,\n',
+              'capture evidence field',
+          )
+          text = once(
+              text,
+              '            conversion_recipe_sha256,\n            output_policy,\n',
+              '            conversion_recipe_sha256,\n            custom_optimizer_evidence: None,\n            output_policy,\n',
+              'standard capture evidence default',
+          )
+
+          validate_marker = '    pub fn validate(&self) -> Result<(), String> {'
+          if text.count(validate_marker) != 1:
+              raise SystemExit(f'validate marker count {text.count(validate_marker)}')
+          custom_constructor = '''    #[allow(clippy::too_many_arguments)]
+          pub fn capture_custom_optimizer(
+              source_project: &ShadeProject,
+              source_project_path: PathBuf,
+              source_project_file_sha256: String,
+              source_face_path: PathBuf,
+              source_snapshot_id: Option<u64>,
+              source_file_sha256: String,
+              source_profile: CapturedSourceProfile,
+              conversion_recipe: ConversionRecipe,
+              custom_optimizer_evidence: CapturedCustomOptimizerEvidence,
+              output_policy: CapturedOutputPolicy,
+              output_tiff_path: PathBuf,
+              production_project_path: PathBuf,
+              production_project_name: String,
+              output_face_label: String,
+          ) -> Result<Self, String> {
+              let conversion_recipe_sha256 = recipe_sha256(&conversion_recipe)?;
+              let capture = Self {
+                  source_project_path,
+                  source_project_file_sha256,
+                  source_face_path,
+                  source_snapshot_id,
+                  source_file_sha256,
+                  source_profile,
+                  source_recipe: ExportRecipe::from_project(source_project),
+                  conversion_recipe,
+                  conversion_recipe_sha256,
+                  custom_optimizer_evidence: Some(custom_optimizer_evidence),
+                  output_policy,
+                  output_tiff_path,
+                  production_project_path,
+                  production_project_name,
+                  output_face_label,
+              };
+              capture.validate()?;
+              Ok(capture)
+          }
+
+          '''.replace('          ', '')
+          text = text.replace(validate_marker, custom_constructor + validate_marker, 1)
+
+          output_marker = '        validate_conversion_output_path(&self.source_face_path, &self.output_tiff_path)\n'
+          if text.count(output_marker) != 1:
+              raise SystemExit(f'output validation marker count {text.count(output_marker)}')
+          evidence_gate = '''        match (
+              self.conversion_recipe.engine_mode,
+              self.custom_optimizer_evidence.as_ref(),
+          ) {
+              (ConversionEngineMode::CustomOptimizer, Some(evidence)) => {
+                  evidence.validate().map_err(|errors| {
+                      format!(
+                          "Invalid captured Custom Optimizer evidence: {}",
+                          errors.join(" ")
+                      )
+                  })?;
+              }
+              (ConversionEngineMode::CustomOptimizer, None) => {
+                  return Err(
+                      "Custom Optimizer conversion capture requires immutable production evidence."
+                          .to_owned(),
+                  );
+              }
+              (_, Some(_)) => {
+                  return Err(
+                      "ICC/DeviceLink conversion capture cannot carry Custom Optimizer evidence."
+                          .to_owned(),
+                  );
+              }
+              (_, None) => {}
+          }
+          '''.replace('          ', '')
+          text = text.replace(output_marker, evidence_gate + output_marker, 1)
+
+          p.write_text(text, encoding='utf-8', newline='\n')
+          '@ | Set-Content -Path .tmp-pr245-capture-v2.py -Encoding utf8
+          python .tmp-pr245-capture-v2.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .tmp-pr245-capture-v2.py
+
+          rustfmt --edition 2024 src/conversion_transaction.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check locked Windows target
+        shell: pwsh
+        run: |
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run full locked tests
+        shell: pwsh
+        run: |
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Guard source surface and publish
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only)
+          $expected = @('src/conversion_transaction.rs')
+          $changedKey = (($changed | Sort-Object) -join "`n")
+          $expectedKey = (($expected | Sort-Object) -join "`n")
+          if ($changedKey -ne $expectedKey) {
+            throw "Unexpected patch surface: $($changed -join ', ')"
+          }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/conversion_transaction.rs
+          git commit -m 'feat(color-conversion): capture immutable Custom Optimizer evidence'
+          git push origin HEAD:codex/custom-optimizer-evidence-capture
