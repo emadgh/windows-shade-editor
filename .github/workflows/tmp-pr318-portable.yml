@@ -1,0 +1,52 @@
+name: Temporary guarded PR318 portable Production paths
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr318-portable-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: tmp/pr318-portable-workflow
+          path: helper
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/append-existing-production-transaction
+          fetch-depth: 0
+          path: work
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Fix portable Production paths, validate, publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location work
+          $expected = '519758be87a0dc7d1dfff942d17518a54bd9118d'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR318 head moved before portable-path fix' }
+          Set-Location ..
+          python helper/tools/tmp_pr318_portable_path_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Location work
+          $changed = @(git diff --name-only)
+          $allowed = @('src/production_project_compat.rs', 'src/conversion_transaction_disposition.rs')
+          if ($changed.Count -ne 2) { throw "Portable-path fix changed $($changed.Count) files: $($changed -join ', ')" }
+          foreach ($file in $changed) {
+            if ($allowed -notcontains $file) { throw "Unexpected portable-path file $file" }
+          }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/production_project_compat.rs src/conversion_transaction_disposition.rs
+          git commit -m 'fix: resolve portable Production Face paths during append (#321)'
+          git push origin HEAD:codex/append-existing-production-transaction
