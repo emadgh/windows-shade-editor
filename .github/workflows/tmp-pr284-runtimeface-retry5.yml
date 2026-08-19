@@ -1,0 +1,100 @@
+name: Temporary guarded PR284 runtime source wiring retry5
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr284-runtimeface-retry5
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply audited source-neutral wiring with exact viewport input normalization
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'f4ea08c567249e145e49535180aeec52ec974ff8'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 canonical head moved' }
+
+          git show origin/tmp/pr284-runtimeface-retry3:.github/workflows/tmp-pr284-runtimeface-retry3.yml | Out-File -Encoding utf8 retry3.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          from pathlib import Path
+          import re
+          text = Path('retry3.yml').read_text(encoding='utf-8-sig')
+          blocks = re.findall(r"          @'\n(.*?)          '@ \| python -", text, flags=re.S)
+          if len(blocks) < 3:
+              raise SystemExit(f'Expected at least 3 Python blocks in retry3, got {len(blocks)}')
+          for name, block in [('ownership.py', blocks[0]), ('finalfix.py', blocks[-1])]:
+              lines = block.splitlines()
+              script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+              Path(name).write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python ownership.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Normalize only the temporary worktree to the exact input shape expected
+          # by the already-audited comprehensive patch. rustfmt restores Rust indentation later.
+          @'
+          from pathlib import Path
+          p = Path('src/main.rs')
+          text = p.read_text(encoding='utf-8')
+          old = "        let meta = face.preview.metadata.clone();\n        let dpi_info = face.dpi;"
+          new = "        let meta = face.preview.metadata.clone();\n    let dpi_info = face.dpi;"
+          if text.count(old) != 1:
+              raise SystemExit(f'viewport metadata normalization count was {text.count(old)}, expected 1')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git show origin/tmp/pr284-runtimeface-retry:.github/workflows/tmp-pr284-runtimeface-retry.yml | Out-File -Encoding utf8 retry-helper.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          from pathlib import Path
+          import re
+          text = Path('retry-helper.yml').read_text(encoding='utf-8-sig')
+          blocks = re.findall(r"          @'\n(.*?)          '@ \| python -", text, flags=re.S)
+          if len(blocks) < 2:
+              raise SystemExit(f'Expected two Python blocks in comprehensive helper, got {len(blocks)}')
+          block = blocks[1]
+          lines = block.splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('comprehensive.py').write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python comprehensive.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python finalfix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Remove-Item retry3.yml, retry-helper.yml, ownership.py, comprehensive.py, finalfix.py -ErrorAction SilentlyContinue
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $allowed = @('src/main.rs','src/workflow.rs','src/ui/adjustments.rs','src/ui/test_code_panel.rs','src/thumbnail.rs','src/color_management.rs','src/ui/color_conversion.rs')
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) { if ($allowed -notcontains $file) { git checkout -- $file } }
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) { if ($allowed -notcontains $file) { throw "Unexpected patch surface: $file" } }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/workflow.rs src/ui/adjustments.rs src/ui/test_code_panel.rs src/thumbnail.rs src/color_management.rs src/ui/color_conversion.rs
+          git commit -m 'feat: wire RuntimePreview application and source-aware preflight (#281)'
+          git push origin HEAD:codex/design-source-runtime-wiring
