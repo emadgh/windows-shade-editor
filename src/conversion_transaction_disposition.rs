@@ -8,8 +8,8 @@ use crate::conversion_transaction::{
 use crate::icc_conversion_worker::{FilesystemIccConversionBackend, sha256_file};
 use crate::model::ShadeProject;
 use crate::production_project_compat::{
-    AppendConvertedFaceSpec, append_converted_face_to_production_project,
-    validate_existing_production_project_for_append,
+    AppendConvertedFaceSpec, append_converted_face_to_production_project_at_path,
+    validate_existing_production_project_for_append_at_path,
 };
 use crate::production_project_disposition::ProductionProjectDisposition;
 
@@ -149,8 +149,9 @@ where
                 }
 
                 let incoming = generated_project.production_provenance[0].clone();
-                let compatibility = validate_existing_production_project_for_append(
+                let compatibility = validate_existing_production_project_for_append_at_path(
                     &loaded.project,
+                    path,
                     self.source_project_path,
                     &incoming,
                 )?;
@@ -162,8 +163,9 @@ where
                 }
 
                 let mut appended = loaded.project;
-                append_converted_face_to_production_project(
+                append_converted_face_to_production_project_at_path(
                     &mut appended,
+                    path,
                     AppendConvertedFaceSpec {
                         source_project_path: self.source_project_path,
                         output_face_label: &generated_project.faces[0].label,
