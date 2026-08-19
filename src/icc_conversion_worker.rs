@@ -15,6 +15,10 @@ use crate::conversion_transaction::{
     CapturedOutputPolicy, CapturedSourceProfile, CommittedConversionOutput, ConversionCancellation,
     ConversionJobCapture, ConversionPhase, ConversionProgress, ConversionTransactionBackend,
 };
+use crate::custom_optimizer_evidence::load_and_authorize_custom_optimizer_evidence;
+use crate::custom_optimizer_raster_transform::{
+    MAX_CUSTOM_OPTIMIZER_RASTER_CHUNK_PIXELS, ProductionCustomOptimizerRasterTransform,
+};
 use crate::devicelink_conversion::ProductionDeviceLinkTransform;
 use crate::icc_conversion::{IccSourceModel, ProductionCmykTransform, RuntimeIccProfile};
 use crate::model::ShadeProject;
@@ -83,13 +87,64 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
             );
         }
 
-        let profiles = load_verified_profiles(capture, &stream)?;
-        let transform = RuntimeProductionTransform::new(
-            source_model,
-            &profiles.source_icc,
-            &profiles.transform_icc,
-            &capture.conversion_recipe,
-        )?;
+        let (output_icc, mut transform) = match capture.conversion_recipe.engine_mode {
+            ConversionEngineMode::CustomOptimizer => {
+                report(ConversionProgress::new(
+                    ConversionPhase::CaptureValidation,
+                    0.05,
+                    "Reopening and authorizing Custom Optimizer production evidence",
+                ));
+                let source_icc = load_verified_source_icc(capture, &stream)?;
+                let evidence = capture.custom_optimizer_evidence.as_ref().ok_or_else(|| {
+                    "Custom Optimizer conversion capture is missing immutable production evidence."
+                        .to_owned()
+                })?;
+                let loaded = load_and_authorize_custom_optimizer_evidence(
+                    evidence,
+                    &capture.conversion_recipe,
+                )
+                .map_err(|error| {
+                    format!("Custom Optimizer production evidence rejected: {error:?}")
+                })?;
+                let transform = ProductionCustomOptimizerRasterTransform::authorize(
+                    source_model,
+                    &source_icc,
+                    &loaded.lut,
+                    &loaded.validation,
+                    &evidence.threshold_set,
+                    &evidence.calibration_manifest,
+                    &evidence.calibration_approval,
+                    &loaded.pcs_compatibility,
+                    &capture.conversion_recipe,
+                    &loaded.model,
+                )
+                .map_err(|error| {
+                    format!("Cannot authorize Custom Optimizer raster transform: {error:?}")
+                })?;
+                if transform.eligibility() != &loaded.eligibility {
+                    return Err(
+                "Custom Optimizer raster authorization identity changed after evidence reload."
+                    .to_owned(),
+            );
+                }
+                (None, RuntimeProductionTransform::Custom(transform))
+            }
+            ConversionEngineMode::Icc | ConversionEngineMode::DeviceLink => {
+                let VerifiedConversionProfiles {
+                    source_icc,
+                    transform_icc,
+                    embed_output_icc,
+                } = load_verified_profiles(capture, &stream)?;
+                let transform = RuntimeProductionTransform::new(
+                    source_model,
+                    &source_icc,
+                    &transform_icc,
+                    &capture.conversion_recipe,
+                )?;
+                let output_icc = embed_output_icc.then_some(transform_icc);
+                (output_icc, transform)
+            }
+        };
         if transform.output_channels() != capture.conversion_recipe.target.channels.len() {
             return Err(
                 "Runtime production transform topology does not match the captured target."
@@ -102,10 +157,8 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
             cancellation,
             report,
             &stream,
-            profiles
-                .embed_output_icc
-                .then_some(profiles.transform_icc.as_slice()),
-            &transform,
+            output_icc.as_deref(),
+            &mut transform,
             self.default_dpi,
         )?;
 
@@ -160,10 +213,10 @@ struct VerifiedConversionProfiles {
     embed_output_icc: bool,
 }
 
-fn load_verified_profiles(
+fn load_verified_source_icc(
     capture: &ConversionJobCapture,
     stream: &StreamInfo,
-) -> Result<VerifiedConversionProfiles, String> {
+) -> Result<Vec<u8>, String> {
     let source_icc = match &capture.source_profile {
         CapturedSourceProfile::Embedded => {
             stream.metadata.icc_profile.clone().ok_or_else(|| {
@@ -182,6 +235,14 @@ fn load_verified_profiles(
         &capture.conversion_recipe.source_profile_identity.sha256,
         "Source ICC",
     )?;
+    Ok(source_icc)
+}
+
+fn load_verified_profiles(
+    capture: &ConversionJobCapture,
+    stream: &StreamInfo,
+) -> Result<VerifiedConversionProfiles, String> {
+    let source_icc = load_verified_source_icc(capture, stream)?;
 
     let (target_path, target_identity, label, embed_as_output) =
         match capture.conversion_recipe.engine_mode {
@@ -234,7 +295,7 @@ fn render_convert_and_commit(
     report: &mut dyn FnMut(ConversionProgress),
     stream: &StreamInfo,
     target_icc: Option<&[u8]>,
-    transform: &RuntimeProductionTransform,
+    transform: &mut RuntimeProductionTransform,
     default_dpi: f64,
 ) -> Result<(), String> {
     let spool_path = conversion_spool_path()?;
@@ -289,7 +350,7 @@ fn render_convert_and_commit(
                     cancellation.check_before_commit()?;
                     let input =
                         source_rows(source_samples, start_row, row_count, width, source_channels)?;
-                    transform.transform(input, output)?;
+                    transform.transform_u16_bounded(input, output, source_channels)?;
                     report(ConversionProgress::new(
                         ConversionPhase::ColorConversion,
                         0.52 + 0.34 * (start_row.saturating_add(row_count) as f32 / height),
@@ -305,11 +366,7 @@ fn render_convert_and_commit(
                     cancellation.check_before_commit()?;
                     let input =
                         source_rows(source_samples, start_row, row_count, width, source_channels)?;
-                    let mut converted = vec![0u16; output.len()];
-                    transform.transform(input, &mut converted)?;
-                    for (destination, source) in output.iter_mut().zip(converted) {
-                        *destination = (source >> 8) as u8;
-                    }
+                    transform.transform_u8_bounded(input, output, source_channels)?;
                     report(ConversionProgress::new(
                         ConversionPhase::ColorConversion,
                         0.52 + 0.34 * (start_row.saturating_add(row_count) as f32 / height),
@@ -433,6 +490,7 @@ fn render_adjusted_source_spool(
 }
 
 enum RuntimeProductionTransform {
+    Custom(ProductionCustomOptimizerRasterTransform),
     Cmyk(ProductionCmykTransform),
     N5(ProductionNChannelTransform<5>),
     N6(ProductionNChannelTransform<6>),
@@ -525,6 +583,7 @@ impl RuntimeProductionTransform {
 
     fn output_channels(&self) -> usize {
         match self {
+            Self::Custom(transform) => transform.output_channels(),
             Self::Cmyk(_) => 4,
             Self::N5(_) => 5,
             Self::N6(_) => 6,
@@ -548,6 +607,9 @@ impl RuntimeProductionTransform {
 
     fn transform(&self, source: &[u16], destination: &mut [u16]) -> Result<(), String> {
         match self {
+            Self::Custom(_) => Err(
+                "Custom Optimizer requires bit-depth-specific bounded raster dispatch.".to_owned(),
+            ),
             Self::Cmyk(transform) => transform_cmyk(transform, source, destination),
             Self::N5(transform) => transform_n(transform, source, destination),
             Self::N6(transform) => transform_n(transform, source, destination),
@@ -568,6 +630,120 @@ impl RuntimeProductionTransform {
             Self::LinkN12(transform) => transform_link(transform, source, destination),
         }
     }
+
+    fn transform_u16_bounded(
+        &mut self,
+        source: &[u16],
+        destination: &mut [u16],
+        source_channels: usize,
+    ) -> Result<(), String> {
+        if let Self::Custom(transform) = self {
+            let target_channels = transform.output_channels();
+            transform_custom_optimizer_bounded(
+                source,
+                destination,
+                source_channels,
+                target_channels,
+                |source_chunk, destination_chunk| {
+                    transform
+                        .transform_u16_chunk(source_chunk, destination_chunk)
+                        .map_err(|error| {
+                            format!("Custom Optimizer u16 raster chunk failed: {error:?}")
+                        })
+                },
+            )
+        } else {
+            self.transform(source, destination)
+        }
+    }
+
+    fn transform_u8_bounded(
+        &mut self,
+        source: &[u16],
+        destination: &mut [u8],
+        source_channels: usize,
+    ) -> Result<(), String> {
+        if let Self::Custom(transform) = self {
+            let target_channels = transform.output_channels();
+            transform_custom_optimizer_bounded(
+                source,
+                destination,
+                source_channels,
+                target_channels,
+                |source_chunk, destination_chunk| {
+                    transform
+                        .transform_u8_chunk(source_chunk, destination_chunk)
+                        .map_err(|error| {
+                            format!("Custom Optimizer u8 raster chunk failed: {error:?}")
+                        })
+                },
+            )
+        } else {
+            let mut converted = vec![0u16; destination.len()];
+            self.transform(source, &mut converted)?;
+            for (destination, source) in destination.iter_mut().zip(converted) {
+                *destination = (source >> 8) as u8;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn transform_custom_optimizer_bounded<T, F>(
+    source: &[u16],
+    destination: &mut [T],
+    source_channels: usize,
+    target_channels: usize,
+    mut transform_chunk: F,
+) -> Result<(), String>
+where
+    F: FnMut(&[u16], &mut [T]) -> Result<(), String>,
+{
+    if source_channels == 0 || target_channels == 0 {
+        return Err("Custom Optimizer chunk topology cannot contain zero channels.".to_owned());
+    }
+    if source.len() % source_channels != 0 {
+        return Err(format!(
+            "Custom Optimizer source window has {} samples, not divisible by {} source channels.",
+            source.len(),
+            source_channels
+        ));
+    }
+    let pixels = source.len() / source_channels;
+    let expected_destination = pixels
+        .checked_mul(target_channels)
+        .ok_or_else(|| "Custom Optimizer destination sample count overflow.".to_owned())?;
+    if destination.len() != expected_destination {
+        return Err(format!(
+            "Custom Optimizer destination window has {} samples; expected {expected_destination}.",
+            destination.len()
+        ));
+    }
+
+    let mut start_pixel = 0usize;
+    while start_pixel < pixels {
+        let end_pixel = start_pixel
+            .saturating_add(MAX_CUSTOM_OPTIMIZER_RASTER_CHUNK_PIXELS)
+            .min(pixels);
+        let source_start = start_pixel
+            .checked_mul(source_channels)
+            .ok_or_else(|| "Custom Optimizer source chunk offset overflow.".to_owned())?;
+        let source_end = end_pixel
+            .checked_mul(source_channels)
+            .ok_or_else(|| "Custom Optimizer source chunk end overflow.".to_owned())?;
+        let destination_start = start_pixel
+            .checked_mul(target_channels)
+            .ok_or_else(|| "Custom Optimizer destination chunk offset overflow.".to_owned())?;
+        let destination_end = end_pixel
+            .checked_mul(target_channels)
+            .ok_or_else(|| "Custom Optimizer destination chunk end overflow.".to_owned())?;
+        transform_chunk(
+            &source[source_start..source_end],
+            &mut destination[destination_start..destination_end],
+        )?;
+        start_pixel = end_pixel;
+    }
+    Ok(())
 }
 
 fn transform_cmyk(
@@ -820,6 +996,56 @@ mod tests {
         assert!(FilesystemIccConversionBackend::new(f64::NAN).is_err());
         assert!(FilesystemIccConversionBackend::new(0.0).is_err());
         assert!(FilesystemIccConversionBackend::new(220.0).is_ok());
+    }
+
+    #[test]
+    fn custom_optimizer_bounded_adapter_splits_oversized_seven_channel_window() {
+        let pixels = MAX_CUSTOM_OPTIMIZER_RASTER_CHUNK_PIXELS * 2 + 17;
+        let source_channels = 3usize;
+        let target_channels = 7usize;
+        let source = vec![0u16; pixels * source_channels];
+        let mut destination = vec![0u8; pixels * target_channels];
+        let mut chunk_pixels = Vec::new();
+
+        transform_custom_optimizer_bounded(
+            &source,
+            &mut destination,
+            source_channels,
+            target_channels,
+            |source_chunk, destination_chunk| {
+                let chunk = source_chunk.len() / source_channels;
+                assert!(chunk <= MAX_CUSTOM_OPTIMIZER_RASTER_CHUNK_PIXELS);
+                assert_eq!(destination_chunk.len(), chunk * target_channels);
+                chunk_pixels.push(chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            chunk_pixels,
+            vec![
+                MAX_CUSTOM_OPTIMIZER_RASTER_CHUNK_PIXELS,
+                MAX_CUSTOM_OPTIMIZER_RASTER_CHUNK_PIXELS,
+                17,
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_optimizer_bounded_adapter_rejects_mismatched_topology() {
+        let source = [0u16; 7];
+        let mut destination = [0u16; 14];
+        assert!(
+            transform_custom_optimizer_bounded(
+                &source,
+                &mut destination,
+                3,
+                7,
+                |_source, _destination| Ok(()),
+            )
+            .is_err()
+        );
     }
 
     #[test]
