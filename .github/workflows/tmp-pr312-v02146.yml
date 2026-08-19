@@ -1,0 +1,83 @@
+name: Temporary guarded PR312 v0.21.46 bump
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr312-v02146-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/fullres-png-jpeg-production-source
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Regenerate verify and publish version identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'cfc85f0242e04768fe7b0c2ce22e9d15b0452a31'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR312 source head moved' }
+          @'
+          from pathlib import Path
+          import subprocess
+          import tomllib
+
+          old = '0.21.45'
+          new = '0.21.46'
+
+          version = Path('VERSION')
+          if version.read_text(encoding='utf-8').strip() != old:
+              raise SystemExit('VERSION is not exact v0.21.45')
+          version.write_text(new + '\n', encoding='utf-8', newline='\n')
+
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text(encoding='utf-8')
+          marker = f'version = "{old}"'
+          if text.count(marker) != 1:
+              raise SystemExit(f'Cargo.toml package version marker count was {text.count(marker)}')
+          cargo.write_text(text.replace(marker, f'version = "{new}"', 1), encoding='utf-8', newline='\n')
+
+          lock = Path('Cargo.lock')
+          text = lock.read_text(encoding='utf-8')
+          marker = f'[[package]]\nname = "windows-shade-editor"\nversion = "{old}"'
+          if text.count(marker) != 1:
+              raise SystemExit(f'Cargo.lock root marker count was {text.count(marker)}')
+          lock.write_text(
+              text.replace(marker, f'[[package]]\nname = "windows-shade-editor"\nversion = "{new}"', 1),
+              encoding='utf-8',
+              newline='\n',
+          )
+
+          before = tomllib.loads(subprocess.check_output(['git', 'show', 'HEAD:Cargo.lock'], text=True))
+          after = tomllib.loads(lock.read_text(encoding='utf-8'))
+          def strip_root_version(doc):
+              packages = doc.get('package', [])
+              matches = [package for package in packages if package.get('name') == 'windows-shade-editor']
+              if len(matches) != 1:
+                  raise SystemExit(f'expected one root lock package, found {len(matches)}')
+              matches[0].pop('version', None)
+              return doc
+          if strip_root_version(before) != strip_root_version(after):
+              raise SystemExit('Cargo.lock changed beyond the root package version')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          $expected = @('Cargo.lock', 'Cargo.toml', 'VERSION')
+          if (@(Compare-Object $changed $expected).Count -ne 0) { throw "Unexpected version diff: $($changed -join ', ')" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: finalize v0.21.46 full-resolution PNG JPEG production sources (#310)'
+          git push origin HEAD:codex/fullres-png-jpeg-production-source
