@@ -1,0 +1,62 @@
+name: Temporary guarded PR249 production provenance v3
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr249-provenance-v3
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-production-provenance
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply child-module provenance patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "497caed0921ca9ef2abcbcb63d9611e29ad5846f"
+          git show origin/tmp/pr249-provenance-v3:.github/patches/tmp_pr249_provenance_v3.py > .tmp-pr249.py
+          python .tmp-pr249.py
+          rm .tmp-pr249.py
+          rustfmt --edition 2024 \
+            src/color_conversion.rs \
+            src/color_conversion/production_provenance.rs \
+            src/custom_optimizer_evidence.rs \
+            src/custom_optimizer_evidence_tests.rs \
+            src/conversion_transaction.rs \
+            src/production_project.rs
+      - name: Check locked Windows target
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+      - name: Run full locked tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Guard source surface and publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD).Trim() -ne '497caed0921ca9ef2abcbcb63d9611e29ad5846f') { throw 'Feature head moved during guarded run' }
+          $allowed = @(
+            'src/color_conversion.rs',
+            'src/color_conversion/production_provenance.rs',
+            'src/conversion_transaction.rs',
+            'src/custom_optimizer_evidence.rs',
+            'src/custom_optimizer_evidence_tests.rs',
+            'src/production_project.rs'
+          )
+          $changed = @(git status --short | ForEach-Object { $_.Substring(3) })
+          $unexpected = @($changed | Where-Object { $_ -notin $allowed })
+          if ($unexpected.Count -ne 0) { throw "Unexpected changed files: $($unexpected -join ', ')" }
+          if ($changed.Count -ne $allowed.Count) { throw "Expected exactly $($allowed.Count) files; got $($changed.Count): $($changed -join ', ')" }
+          git add -- $allowed
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Color Conversion: persist Custom Optimizer production provenance'
+          git push origin HEAD:codex/custom-optimizer-production-provenance
