@@ -1,0 +1,106 @@
+name: Temporary guarded PR284 RuntimeFace patch
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr284-runtimeface-patch
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Move application Face ownership to RuntimePreview
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'f4ea08c567249e145e49535180aeec52ec974ff8'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 canonical head moved' }
+          @'
+          from pathlib import Path
+
+          def patch(path, replacements):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              for old, new in replacements:
+                  count = text.count(old)
+                  if count == 0:
+                      raise SystemExit(f'{path}: no match for {old[:100]!r}')
+                  text = text.replace(old, new)
+              p.write_text(text, encoding='utf-8', newline='\n')
+
+          main = Path('src/main.rs')
+          text = main.read_text(encoding='utf-8')
+          def once(old, new):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'src/main.rs: expected one match, got {count}: {old[:100]!r}')
+              text = text.replace(old, new, 1)
+
+          once('use tiff_io::PreviewFace;', 'use runtime_preview::{RuntimeColorModel, RuntimePreview, RuntimePreviewSource};')
+          once('    preview: Arc<PreviewFace>,', '    preview: Arc<RuntimePreview>,')
+          once('    preview: PreviewFace,', '    preview: RuntimePreview,')
+          once(
+              '''    fn is_tiff_path(path: &Path) -> bool {
+                  path.extension()
+                      .and_then(|ext| ext.to_str())
+                      .is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
+              }
+          ''',
+              '''    fn is_design_source_path(path: &Path) -> bool {
+                  runtime_preview::is_supported_design_source_path(path)
+              }
+          ''',
+          )
+          text = text.replace('Self::is_tiff_path(path)', 'Self::is_design_source_path(path)')
+          text = text.replace('self.launch_job("Opening TIFF"', 'self.launch_job("Opening design source"')
+          text = text.replace('"Opening TIFF",', '"Opening design source",')
+          text = text.replace('match tiff_io::load_preview(&path, max_dimension)', 'match RuntimePreview::load(&path, max_dimension)')
+          text = text.replace('match tiff_io::load_preview(&source, max_dimension)', 'match RuntimePreview::load(&source, max_dimension)')
+          text = text.replace('.add_filter("TIFF images", &["tif", "tiff"])', '.add_filter("Design images", &["tif", "tiff", "png", "jpg", "jpeg"])')
+          text = text.replace('project.ensure_channels(&preview.metadata.channel_names);', 'project.ensure_channels(preview.channel_names());')
+          text = text.replace('self.project\n                        .ensure_channels(&item.preview.metadata.channel_names);', 'self.project\n                        .ensure_channels(item.preview.channel_names());')
+          text = text.replace('let count = face.preview.metadata.channel_names.len();', 'let count = face.preview.channel_names().len();')
+          text = text.replace('.map(|face| face.preview.metadata.channel_names.clone())', '.map(|face| face.preview.channel_names().to_vec())')
+          text = text.replace('color_management::PreviewColorTransform::new(&preview.metadata, color_config)', 'color_management::PreviewColorTransform::new_for_runtime_preview(&preview, color_config)')
+          text = text.replace('color_management::PreviewColorTransform::new(\n                        &preview.metadata,', 'color_management::PreviewColorTransform::new_for_runtime_preview(\n                        &preview,')
+          text = text.replace('&preview.channels,', 'preview.channels(),')
+          main.write_text(text, encoding='utf-8', newline='\n')
+
+          workflow = Path('src/workflow.rs')
+          text = workflow.read_text(encoding='utf-8')
+          text = text.replace('face.preview.metadata.channel_names.len()', 'face.preview.channel_names().len()')
+          text = text.replace('tiff_io::load_preview(&path, max_dimension)', 'RuntimePreview::load(&path, max_dimension)')
+          text = text.replace('.add_filter("TIFF images", &["tif", "tiff"])', '.add_filter("Design images", &["tif", "tiff", "png", "jpg", "jpeg"])')
+          text = text.replace('app.project\n                    .ensure_channels(&item.preview.metadata.channel_names);', 'app.project\n                    .ensure_channels(item.preview.channel_names());')
+          text = text.replace('let preview = tiff_io::load_preview(&path, max_dimension)\n        .map_err(|err| format!("Cannot load replacement {}: {err}", path.display()))?;', 'let preview = RuntimePreview::load(&path, max_dimension)\n        .map_err(|err| format!("Cannot load replacement {}: {err}", path.display()))?;')
+          workflow.write_text(text, encoding='utf-8', newline='\n')
+          '@ | python -
+
+          cargo fmt --all
+          $allowed = @('src/main.rs', 'src/workflow.rs')
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) {
+            if ($allowed -notcontains $file) { git checkout -- $file }
+          }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/workflow.rs
+          git commit -m 'feat: move application Faces to RuntimePreview (#281)'
+          git push origin HEAD:codex/design-source-runtime-wiring
