@@ -44,6 +44,7 @@ pub mod inverse_lut_validation_eval;
 pub mod inverse_lut_validation_reference;
 pub mod inverse_lut_validation_runner;
 pub mod inverse_separation_solver;
+pub mod jpeg_source;
 pub mod model;
 pub mod nchannel_icc;
 #[path = "palette.rs"]
