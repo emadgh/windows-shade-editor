@@ -1,0 +1,72 @@
+---
+   |                                  ^^^^^^^^
+
+error[E0615]: attempted to take value of method `width` on type `Arc<runtime_preview::RuntimePreview>`
+    --> src\main.rs:2351:31
+     |
+2351 |                 [face.preview.width, face.preview.height],
+     |                               ^^^^^ method, not a field
+     |
+help: use parentheses to call the method
+     |
+2351 |                 [face.preview.width(), face.preview.height],
+     |                                    ++
+
+error[E0615]: attempted to take value of method `height` on type `Arc<runtime_preview::RuntimePreview>`
+    --> src\main.rs:2351:51
+     |
+2351 |                 [face.preview.width, face.preview.height],
+     |                                                   ^^^^^^ method, not a field
+     |
+help: use parentheses to call the method
+     |
+2351 |                 [face.preview.width, face.preview.height()],
+     |                                                         ++
+
+error[E0615]: attempted to take value of method `width` on type `Arc<runtime_preview::RuntimePreview>`
+    --> src\main.rs:2364:31
+     |
+2364 |                 [face.preview.width, face.preview.height],
+     |                               ^^^^^ method, not a field
+     |
+help: use parentheses to call the method
+     |
+2364 |                 [face.preview.width(), face.preview.height],
+     |                                    ++
+
+error[E0615]: attempted to take value of method `height` on type `Arc<runtime_preview::RuntimePreview>`
+    --> src\main.rs:2364:51
+     |
+2364 |                 [face.preview.width, face.preview.height],
+     |                                                   ^^^^^^ method, not a field
+     |
+help: use parentheses to call the method
+     |
+2364 |                 [face.preview.width, face.preview.height()],
+     |                                                         ++
+
+error[E0615]: attempted to take value of method `width` on type `Arc<runtime_preview::RuntimePreview>`
+    --> src\main.rs:2379:35
+     |
+2379 |                     [face.preview.width, face.preview.height],
+     |                                   ^^^^^ method, not a field
+     |
+help: use parentheses to call the method
+     |
+2379 |                     [face.preview.width(), face.preview.height],
+     |                                        ++
+
+error[E0615]: attempted to take value of method `height` on type `Arc<runtime_preview::RuntimePreview>`
+    --> src\main.rs:2379:55
+     |
+2379 |                     [face.preview.width, face.preview.height],
+     |                                                       ^^^^^^ method, not a field
+     |
+help: use parentheses to call the method
+     |
+2379 |                     [face.preview.width, face.preview.height()],
+     |                                                             ++
+
+For more information about this error, try `rustc --explain E0615`.
+warning: `windows-shade-editor` (bin "ShadeEditor") generated 2 warnings
+error: could not compile `windows-shade-editor` (bin "ShadeEditor") due to 6 previous errors; 2 warnings emitted
