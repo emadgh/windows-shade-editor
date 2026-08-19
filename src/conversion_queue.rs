@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 use crate::conversion_transaction::{
     CommittedConversionOutput, CompletedConversionTransaction, ConversionCancellation,
     ConversionJobCapture, ConversionPhase, ConversionTransactionOutcome,
-    run_conversion_transaction,
 };
+use crate::conversion_transaction_disposition::run_conversion_transaction_with_disposition;
 use crate::icc_conversion_worker::FilesystemIccConversionBackend;
 use crate::icc_conversion_worker::sha256_file;
 use crate::model::ShadeProject;
 use crate::production_project::link_source_project_to_production;
+use crate::production_project_disposition::ProductionProjectDisposition;
 use crate::safe_fs;
 
 const QUEUE_FORMAT_VERSION: u32 = 1;
@@ -59,6 +60,8 @@ pub struct ConversionRecoveryRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct QueuedConversionSpec {
     capture: ConversionJobCapture,
+    #[serde(default)]
+    production_project_disposition: ProductionProjectDisposition,
     default_dpi: f64,
 }
 
@@ -216,7 +219,21 @@ impl ConversionQueue {
         capture: ConversionJobCapture,
         default_dpi: f64,
     ) -> Result<u64, String> {
+        self.enqueue_with_production_project_disposition(
+            capture,
+            ProductionProjectDisposition::CreateNew,
+            default_dpi,
+        )
+    }
+
+    pub fn enqueue_with_production_project_disposition(
+        &mut self,
+        capture: ConversionJobCapture,
+        production_project_disposition: ProductionProjectDisposition,
+        default_dpi: f64,
+    ) -> Result<u64, String> {
         capture.validate()?;
+        production_project_disposition.validate()?;
         if !default_dpi.is_finite() || default_dpi <= 0.0 {
             return Err("Conversion fallback DPI must be finite and positive.".to_owned());
         }
@@ -240,6 +257,7 @@ impl ConversionQueue {
             id,
             QueuedConversionSpec {
                 capture,
+                production_project_disposition,
                 default_dpi,
             },
             ConversionQueueStatus::Waiting,
@@ -447,6 +465,7 @@ impl ConversionQueue {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let capture = spec.capture;
+            let production_project_disposition = spec.production_project_disposition;
             let worker_tx = tx.clone();
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let mut backend = match FilesystemIccConversionBackend::new(spec.default_dpi) {
@@ -458,14 +477,20 @@ impl ConversionQueue {
                         };
                     }
                 };
-                run_conversion_transaction(&capture, &cancellation, &mut backend, |progress| {
+                run_conversion_transaction_with_disposition(
+                    &capture,
+                    &production_project_disposition,
+                    &cancellation,
+                    &mut backend,
+                    |progress| {
                     let _ = worker_tx.send(ConversionQueueEvent::Progress {
                         id,
                         phase: progress.phase.label().to_owned(),
                         fraction: progress.fraction,
                         detail: progress.detail,
                     });
-                })
+                },
+                )
             }))
             .unwrap_or_else(|payload| {
                 ConversionTransactionOutcome::FailedBeforeCommit {
@@ -846,6 +871,57 @@ mod tests {
         assert_eq!(
             crate::conversion_recipe::recipe_sha256(&restored.conversion_recipe).unwrap(),
             expected
+        );
+    }
+
+
+    #[test]
+    fn queued_spec_without_project_disposition_defaults_to_create_new() {
+        let spec = QueuedConversionSpec {
+            capture: capture(r"C:\Production\legacy.tif"),
+            production_project_disposition: ProductionProjectDisposition::CreateNew,
+            default_dpi: 220.0,
+        };
+        let mut value = serde_json::to_value(&spec).unwrap();
+        value
+            .as_object_mut()
+            .expect("queued spec object")
+            .remove("production_project_disposition");
+        let restored: QueuedConversionSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.production_project_disposition,
+            ProductionProjectDisposition::CreateNew
+        );
+    }
+
+    #[test]
+    fn enqueue_with_append_disposition_persists_exact_destination_intent() {
+        let mut queue = ConversionQueue::new();
+        let key = crate::production_project_compat::ProductionCompatibilityKey {
+            engine_mode: ConversionEngineMode::Icc,
+            output_profile_sha256: Some(HASH.to_owned()),
+            device_link_sha256: None,
+            characterization_id: None,
+            channel_names: vec![
+                "Cyan".to_owned(),
+                "Magenta".to_owned(),
+                "Yellow".to_owned(),
+                "Black".to_owned(),
+            ],
+            bit_depth: 16,
+        };
+        let disposition = ProductionProjectDisposition::append_existing(HASH.to_owned(), &key)
+            .unwrap();
+        queue
+            .enqueue_with_production_project_disposition(
+                capture(r"C:\Production\append.tif"),
+                disposition.clone(),
+                220.0,
+            )
+            .unwrap();
+        assert_eq!(
+            queue.items[0].spec.production_project_disposition,
+            disposition
         );
     }
 
