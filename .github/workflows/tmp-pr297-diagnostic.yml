@@ -57,22 +57,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           New-Item -ItemType Directory -Force diagnostics | Out-Null
-          $checkLines = @(cargo check --locked --target x86_64-pc-windows-msvc 2>&1)
+          cargo check --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object diagnostics/pr297-check.raw.txt
           $checkCode = $LASTEXITCODE
-          $testLines = @()
           $testCode = 0
+          Set-Content diagnostics/pr297-test.raw.txt ''
           if ($checkCode -eq 0) {
-            $testLines = @(cargo test --locked --target x86_64-pc-windows-msvc 2>&1)
+            cargo test --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object diagnostics/pr297-test.raw.txt
             $testCode = $LASTEXITCODE
           }
 
           @'
-          import os
           import re
           from pathlib import Path
 
-          check = os.environ.get('PR297_CHECK_LOG', '').splitlines()
-          test = os.environ.get('PR297_TEST_LOG', '').splitlines()
+          check = Path('diagnostics/pr297-check.raw.txt').read_text(encoding='utf-8', errors='replace').splitlines()
+          test = Path('diagnostics/pr297-test.raw.txt').read_text(encoding='utf-8', errors='replace').splitlines()
+          status = Path('diagnostics/pr297-status.txt').read_text(encoding='utf-8').strip()
           lines = ['=== cargo check ==='] + check + ['=== cargo test ==='] + test
           needles = [
               r'error(?:\[E\d+\])?:', r'error\[E\d+\]', r'could not compile',
@@ -84,7 +84,7 @@ jobs:
                   for j in range(max(0, i - 4), min(len(lines), i + 16)):
                       keep.add(j)
           if not keep:
-              out = ['No compiler/test failure pattern matched.', f'check_exit={os.environ.get("PR297_CHECK_CODE")}', f'test_exit={os.environ.get("PR297_TEST_CODE")}']
+              out = ['No compiler/test failure pattern matched.']
           else:
               out = []
               last = -2
@@ -93,16 +93,13 @@ jobs:
                       out.append('---')
                   out.append(lines[i])
                   last = i
-              out += [f'check_exit={os.environ.get("PR297_CHECK_CODE")}', f'test_exit={os.environ.get("PR297_TEST_CODE")}']
+          out.append(status)
           Path('diagnostics/pr297-errors.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
           '@ | Set-Content diagnostics/filter.py
-
-          $env:PR297_CHECK_LOG = ($checkLines -join "`n")
-          $env:PR297_TEST_LOG = ($testLines -join "`n")
-          $env:PR297_CHECK_CODE = "$checkCode"
-          $env:PR297_TEST_CODE = "$testCode"
+          Set-Content diagnostics/pr297-status.txt "check_exit=$checkCode test_exit=$testCode"
           python diagnostics/filter.py
-          Remove-Item diagnostics/filter.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item diagnostics/filter.py, diagnostics/pr297-check.raw.txt, diagnostics/pr297-test.raw.txt, diagnostics/pr297-status.txt
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
