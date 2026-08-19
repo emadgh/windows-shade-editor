@@ -1,0 +1,50 @@
+name: Temporary guarded PR318 queue disposition wiring
+
+on:
+  push:
+    branches:
+      - tmp/pr318-queue-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: tmp/pr318-queue-workflow
+          path: helper
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/append-existing-production-transaction
+          fetch-depth: 0
+          path: work
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Patch queue, validate, publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location work
+          $expected = '18dfbd1c3bd5950944a606a8b26716b85ed357b8'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR318 head moved before queue wiring' }
+          Set-Location ..
+          python helper/tools/tmp_pr318_queue_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Location work
+          $changed = @(git diff --name-only)
+          if ($changed.Count -ne 1 -or $changed[0] -ne 'src/conversion_queue.rs') {
+            throw "Queue wiring changed unexpected files: $($changed -join ', ')"
+          }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/conversion_queue.rs
+          git commit -m 'feat: persist Production project disposition in conversion queue (#316)'
+          git push origin HEAD:codex/append-existing-production-transaction
