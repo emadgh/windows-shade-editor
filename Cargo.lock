@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "windows-shade-editor"
-version = "0.21.34"
+version = "0.21.35"
 dependencies = [
  "base64",
  "chrono",

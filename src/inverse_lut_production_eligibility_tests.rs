@@ -7,7 +7,7 @@ use crate::color_conversion::{
 };
 use crate::conversion_recipe::recipe_sha256;
 use crate::custom_optimizer_config::CustomOptimizerSolverConfig;
-use crate::device_characterization::{CharacterizationIdentity, DeviceForwardModel, LabColor};
+use crate::device_characterization_model::{LocalForwardModelConfig, ValidatedLocalForwardModel};
 use crate::inverse_lut_artifact::VerifiedInverseLutArtifact;
 use crate::inverse_lut_identity::{
     INVERSE_LUT_BUILD_POLICY_SCHEMA_VERSION, INVERSE_LUT_IDENTITY_SCHEMA_VERSION,
@@ -41,7 +41,7 @@ const NODE_COUNT: usize = 8;
 const CHANNEL_COUNT: usize = 4;
 
 fn characterization_id() -> String {
-    format!("sha256:{}", "1".repeat(64))
+    crate::color_conversion_test_support::characterization_id()
 }
 
 fn channels() -> Vec<String> {
@@ -283,7 +283,7 @@ fn validate_with_calibration(
     threshold_set: &InverseLutValidationThresholdSet,
     pcs: &ValidatedProductionPcsCompatibility,
     recipe: &ConversionRecipe,
-    model: &dyn DeviceForwardModel,
+    model: &ValidatedLocalForwardModel,
 ) -> Result<InverseLutProductionEligibility, InverseLutProductionEligibilityError> {
     let manifest = calibration_manifest(recipe, lut, validation, threshold_set);
     let approval = calibration_approval(threshold_set, &manifest);
@@ -299,38 +299,6 @@ fn validate_with_calibration(
     )
 }
 
-struct FixtureModel {
-    identity: CharacterizationIdentity,
-}
-
-impl FixtureModel {
-    fn new() -> Self {
-        Self {
-            identity: CharacterizationIdentity {
-                id: characterization_id(),
-                channel_names: channels(),
-            },
-        }
-    }
-}
-
-impl DeviceForwardModel for FixtureModel {
-    fn identity(&self) -> &CharacterizationIdentity {
-        &self.identity
-    }
-
-    fn predict_lab(&self, coverages: &[f32]) -> Result<LabColor, String> {
-        if coverages.len() != CHANNEL_COUNT {
-            return Err("fixture topology mismatch".to_owned());
-        }
-        Ok(LabColor {
-            l: 50.0,
-            a: 0.0,
-            b: 0.0,
-        })
-    }
-}
-
 #[test]
 fn exact_bindings_still_fail_closed_until_calibration_approval_is_allowlisted() {
     let recipe = recipe();
@@ -338,7 +306,7 @@ fn exact_bindings_still_fail_closed_until_calibration_approval_is_allowlisted() 
     let validation = validation(&recipe, &lut);
     let pcs = pcs_compatibility();
     let thresholds = threshold_set();
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
 
     assert!(matches!(
         validate_with_calibration(&lut, &validation, &thresholds, &pcs, &recipe, &model),
@@ -355,7 +323,7 @@ fn stale_report_for_another_payload_cannot_authorize_lut() {
     validation.report_content_id = validation.report.content_id().unwrap();
     let pcs = pcs_compatibility();
     let thresholds = threshold_set();
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
 
     assert!(matches!(
         validate_with_calibration(&lut, &validation, &thresholds, &pcs, &recipe, &model),
@@ -370,7 +338,7 @@ fn stale_report_for_another_recipe_cannot_authorize_lut() {
     let validation = validation(&recipe, &lut);
     let pcs = pcs_compatibility();
     let thresholds = threshold_set();
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
     let mut changed_recipe = recipe.clone();
     changed_recipe.black_point_compensation = !changed_recipe.black_point_compensation;
     assert!(changed_recipe.validate().is_ok());
@@ -398,7 +366,7 @@ fn mismatched_reference_method_cannot_authorize_lut() {
     validation.report_content_id = validation.report.content_id().unwrap();
     let pcs = pcs_compatibility();
     let thresholds = threshold_set();
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
 
     assert!(matches!(
         validate_with_calibration(&lut, &validation, &thresholds, &pcs, &recipe, &model),
@@ -414,7 +382,7 @@ fn pcs_evidence_for_another_characterization_cannot_authorize_lut() {
     let mut pcs = pcs_compatibility();
     let thresholds = threshold_set();
     pcs.characterization_id = format!("sha256:{}", "8".repeat(64));
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
 
     assert!(matches!(
         validate_with_calibration(&lut, &validation, &thresholds, &pcs, &recipe, &model),
@@ -430,7 +398,7 @@ fn malformed_pcs_evidence_fails_before_threshold_gate() {
     let mut pcs = pcs_compatibility();
     let thresholds = threshold_set();
     pcs.canonical_illuminant = "D65".to_owned();
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
 
     assert!(matches!(
         validate_with_calibration(&lut, &validation, &thresholds, &pcs, &recipe, &model),
@@ -446,7 +414,7 @@ fn stale_threshold_set_cannot_authorize_report() {
     let pcs = pcs_compatibility();
     let mut thresholds = threshold_set();
     thresholds.policy.max_delta_e00 += 0.25;
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
 
     assert!(matches!(
         validate_with_calibration(&lut, &validation, &thresholds, &pcs, &recipe, &model,),
@@ -461,7 +429,7 @@ fn calibration_manifest_must_include_exact_current_report_observation() {
     let validation = validation(&recipe, &lut);
     let pcs = pcs_compatibility();
     let thresholds = threshold_set();
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
     let mut manifest = calibration_manifest(&recipe, &lut, &validation, &thresholds);
     manifest.observations[0].validation_report_content_id = prefixed_id('e');
     let approval = calibration_approval(&thresholds, &manifest);
@@ -488,7 +456,7 @@ fn calibration_approval_must_bind_exact_manifest() {
     let validation = validation(&recipe, &lut);
     let pcs = pcs_compatibility();
     let thresholds = threshold_set();
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
     let manifest = calibration_manifest(&recipe, &lut, &validation, &thresholds);
     let mut approval = calibration_approval(&thresholds, &manifest);
     approval.calibration_manifest_content_id = prefixed_id('e');
@@ -509,13 +477,32 @@ fn calibration_approval_must_bind_exact_manifest() {
 }
 
 #[test]
+fn same_characterization_with_different_forward_model_config_cannot_authorize_lut() {
+    let recipe = recipe();
+    let lut = lut(&recipe);
+    let validation = validation(&recipe, &lut);
+    let pcs = pcs_compatibility();
+    let thresholds = threshold_set();
+    let model = crate::color_conversion_test_support::local_model(LocalForwardModelConfig {
+        neighbor_count: 3,
+        distance_power: 2.0,
+        max_support_distance: 0.5,
+    });
+
+    assert!(matches!(
+        validate_with_calibration(&lut, &validation, &thresholds, &pcs, &recipe, &model),
+        Err(InverseLutProductionEligibilityError::ForwardModelMismatch { .. })
+    ));
+}
+
+#[test]
 fn forged_lut_payload_is_rehashed_before_eligibility() {
     let recipe = recipe();
     let mut lut = lut(&recipe);
     let validation = validation(&recipe, &lut);
     let pcs = pcs_compatibility();
     let thresholds = threshold_set();
-    let model = FixtureModel::new();
+    let model = crate::color_conversion_test_support::default_local_model();
     lut.coverages[0] = 0.75;
 
     assert!(matches!(
