@@ -1,0 +1,67 @@
+name: Temporary PR293 compiler diagnostic
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr293-diagnostic-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Reconstruct retry6 and capture only cargo-check diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git show origin/tmp/pr284-runtimeface-retry6:.github/workflows/tmp-pr284-runtimeface-retry6.yml | Out-File -Encoding utf8 retry6.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          from pathlib import Path
+          text = Path('retry6.yml').read_text(encoding='utf-8-sig')
+          marker = '        run: |\n'
+          start = text.index(marker) + len(marker)
+          lines = text[start:].splitlines()
+          script_lines = [line[10:] if line.startswith('          ') else line for line in lines]
+          script = '\n'.join(script_lines) + '\n'
+          check = 'cargo check --locked --target x86_64-pc-windows-msvc\n'
+          pos = script.index(check)
+          diagnostic_tail = r'''New-Item -ItemType Directory -Force diagnostics | Out-Null
+          cargo check --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath diagnostics/pr293-check-full.txt
+          $checkExit = $LASTEXITCODE
+          @'
+          from pathlib import Path
+          text = Path('diagnostics/pr293-check-full.txt').read_text(encoding='utf-8', errors='replace')
+          lines = text.splitlines()
+          selected = []
+          for index, line in enumerate(lines):
+              if line.startswith('error[') or line.startswith('error:'):
+                  selected.extend(lines[index:min(index + 14, len(lines))])
+                  selected.append('---')
+              if len(selected) >= 600:
+                  break
+          if not selected:
+              selected = lines[-500:]
+          Path('diagnostics/pr293-check.txt').write_text('\n'.join(selected) + '\n', encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add diagnostics/pr293-check.txt
+          git commit -m 'diagnostic: capture retry6 cargo check errors'
+          git push origin HEAD:tmp/pr293-diagnostic-output --force
+          exit $checkExit
+          '''
+          Path('retry6-diagnostic.ps1').write_text(script[:pos] + diagnostic_tail, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File retry6-diagnostic.ps1
