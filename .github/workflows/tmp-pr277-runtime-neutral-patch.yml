@@ -1,0 +1,303 @@
+name: Temporary guarded PR277 runtime-neutral patch
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr277-runtime-neutral-patch
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/runtime-preview-neutral
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Patch render and ICC preview boundary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '5370148e732599e1cfa6d1be73df3114a2366f8c'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR277 feature head moved' }
+          @'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one match, found {count}: {old[:80]!r}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+
+          replace_once('src/main.rs', 'mod render;\nmod safe_fs;', 'mod render;\nmod runtime_preview;\nmod safe_fs;')
+
+          replace_once(
+              'src/render.rs',
+              'use crate::tiff_io::{self, ColorModel, PreviewFace};',
+              'use crate::runtime_preview::{RuntimeColorModel, RuntimePreviewSource};\nuse crate::tiff_io::{self, PreviewFace};',
+          )
+          replace_once(
+              'src/render.rs',
+              'pub fn adjusted_planes(face: &PreviewFace, project: &ShadeProject) -> Vec<Vec<u16>> {',
+              'pub fn adjusted_planes<P: RuntimePreviewSource + ?Sized>(\n    face: &P,\n    project: &ShadeProject,\n) -> Vec<Vec<u16>> {',
+          )
+          replace_once(
+              'src/render.rs',
+              'pub fn adjusted_planes_with_stats(\n    face: &PreviewFace,\n    project: &ShadeProject,\n) -> (Vec<Vec<u16>>, Vec<ChannelClippingStats>) {',
+              'pub fn adjusted_planes_with_stats<P: RuntimePreviewSource + ?Sized>(\n    face: &P,\n    project: &ShadeProject,\n) -> (Vec<Vec<u16>>, Vec<ChannelClippingStats>) {',
+          )
+          replace_once('src/render.rs', 'let channel_count = face.channels.len();', 'let channel_count = face.channels().len();')
+          replace_once('src/render.rs', 'let pixel_count = face.channels[0].len();', 'let pixel_count = face.channels()[0].len();')
+          replace_once('src/render.rs', 'let names = &face.metadata.channel_names;', 'let names = face.channel_names();')
+          replace_once('src/render.rs', 'let raw = face.channels[channel][pixel] as f32 / 65535.0;', 'let raw = face.channels()[channel][pixel] as f32 / 65535.0;')
+          replace_once(
+              'src/render.rs',
+              'pub fn rgba_from_planes(\n    face: &PreviewFace,\n    planes: &[Vec<u16>],\n    solo_channel: Option<usize>,\n) -> Vec<u8> {',
+              'pub fn rgba_from_planes<P: RuntimePreviewSource + ?Sized>(\n    face: &P,\n    planes: &[Vec<u16>],\n    solo_channel: Option<usize>,\n) -> Vec<u8> {',
+          )
+          replace_once(
+              'src/render.rs',
+              'pub fn rgba_from_planes_with_color(\n    face: &PreviewFace,\n    planes: &[Vec<u16>],\n    solo_channel: Option<usize>,\n    color: &PreviewColorTransform,\n) -> Vec<u8> {',
+              'pub fn rgba_from_planes_with_color<P: RuntimePreviewSource + ?Sized>(\n    face: &P,\n    planes: &[Vec<u16>],\n    solo_channel: Option<usize>,\n    color: &PreviewColorTransform,\n) -> Vec<u8> {',
+          )
+          replace_once(
+              'src/render.rs',
+              'fn rgba_from_planes_impl(\n    face: &PreviewFace,\n    planes: &[Vec<u16>],\n    solo_channel: Option<usize>,\n    color: Option<&PreviewColorTransform>,\n) -> Vec<u8> {',
+              'fn rgba_from_planes_impl<P: RuntimePreviewSource + ?Sized>(\n    face: &P,\n    planes: &[Vec<u16>],\n    solo_channel: Option<usize>,\n    color: Option<&PreviewColorTransform>,\n) -> Vec<u8> {',
+          )
+          replace_once('src/render.rs', 'let width = face.width;\n    let height = face.height;', 'let width = face.width();\n    let height = face.height();')
+          replace_once(
+              'src/render.rs',
+              'let invert = tiff_io::solo_channel_uses_ink_coverage(&face.metadata, channel);',
+              'let invert = face.tiff_metadata().is_some_and(|metadata| {\n            tiff_io::solo_channel_uses_ink_coverage(metadata, channel)\n        });',
+          )
+          replace_once('src/render.rs', 'match face.metadata.color_model {', 'match face.color_model() {')
+          replace_once('src/render.rs', '        ColorModel::Rgb if planes.len() >= 3 => {', '        RuntimeColorModel::Rgb if planes.len() >= 3 => {')
+          replace_once('src/render.rs', '        ColorModel::Cmyk if planes.len() >= 4 => {', '        RuntimeColorModel::Cmyk if planes.len() >= 4 => {')
+          replace_once('src/render.rs', '        ColorModel::Gray if !planes.is_empty() => {', '        RuntimeColorModel::Gray if !planes.is_empty() => {')
+          replace_once('src/render.rs', '        ColorModel::Other if has_declared_spot_channels(face, planes.len()) => {', '        RuntimeColorModel::Other if has_declared_spot_channels(face, planes.len()) => {')
+          replace_once(
+              'src/render.rs',
+              '''fn has_declared_spot_channels(face: &PreviewFace, channel_count: usize) -> bool {
+              face.metadata
+                  .channel_display_info
+                  .iter()
+                  .take(channel_count)
+                  .flatten()
+                  .any(|info| info.is_spot())
+          }''',
+              '''fn has_declared_spot_channels<P: RuntimePreviewSource + ?Sized>(
+              face: &P,
+              channel_count: usize,
+          ) -> bool {
+              let Some(metadata) = face.tiff_metadata() else {
+                  return false;
+              };
+              metadata
+                  .channel_display_info
+                  .iter()
+                  .take(channel_count)
+                  .flatten()
+                  .any(|info| info.is_spot())
+          }''',
+          )
+          replace_once(
+              'src/render.rs',
+              '''fn composite_extra_channels(
+              face: &PreviewFace,
+              planes: &[Vec<u16>],
+              pixel: usize,
+              rgb: &mut [f32; 3],
+          ) {
+              let first_extra = face.metadata.base_channel_count.min(planes.len());''',
+              '''fn composite_extra_channels<P: RuntimePreviewSource + ?Sized>(
+              face: &P,
+              planes: &[Vec<u16>],
+              pixel: usize,
+              rgb: &mut [f32; 3],
+          ) {
+              let Some(metadata) = face.tiff_metadata() else {
+                  return;
+              };
+              let first_extra = metadata.base_channel_count.min(planes.len());''',
+          )
+          replace_once(
+              'src/render.rs',
+              '''let display = face
+                      .metadata
+                      .channel_display_info''',
+              '''let display = metadata
+                      .channel_display_info''',
+          )
+          replace_once(
+              'src/render.rs',
+              'tiff_io::extra_channel_preview_coverage(&face.metadata, channel_index, plane[pixel])',
+              'tiff_io::extra_channel_preview_coverage(metadata, channel_index, plane[pixel])',
+          )
+          replace_once(
+              'src/render.rs',
+              'use crate::tiff_io::{PhotoshopChannelDisplay, TiffMetadata};',
+              'use crate::tiff_io::{ColorModel, PhotoshopChannelDisplay, TiffMetadata};\n    use windows_shade_editor::design_source_preview::DesignSourcePreview;\n    use windows_shade_editor::png_source::{DecodedPngSource, PngSourceModel};',
+          )
+          render = Path('src/render.rs')
+          text = render.read_text(encoding='utf-8')
+          test = r'''
+
+              #[test]
+              fn png_design_preview_uses_shared_adjustment_and_rgb_render_boundary() {
+                  let decoded = DecodedPngSource {
+                      width: 1,
+                      height: 1,
+                      bit_depth: 16,
+                      model: PngSourceModel::Rgb,
+                      samples: vec![u16::MAX, 32768, 0],
+                      alpha: Some(vec![12345]),
+                      icc_profile: None,
+                      declares_srgb: false,
+                  };
+                  let preview = DesignSourcePreview::from_png(&decoded, 512).expect("PNG preview");
+                  let project = ShadeProject::default();
+                  let (planes, stats) = adjusted_planes_with_stats(&preview, &project);
+                  assert_eq!(planes, preview.channels);
+                  assert_eq!(stats.len(), 3);
+                  assert_eq!(rgba_from_planes(&preview, &planes, None), vec![255, 128, 0, 255]);
+                  assert_eq!(preview.alpha.as_deref(), Some(&[12345][..]));
+              }
+          '''
+          close = text.rfind('\n}')
+          if close < 0:
+              raise SystemExit('src/render.rs: final module brace not found')
+          text = text[:close] + test + text[close:]
+          render.write_text(text, encoding='utf-8', newline='\n')
+
+          replace_once(
+              'src/color_management.rs',
+              'use crate::settings::AppSettings;\nuse crate::tiff_io::{ColorModel, TiffMetadata};',
+              'use crate::runtime_preview::{RuntimeColorModel, RuntimePreviewSource};\nuse crate::settings::AppSettings;\nuse crate::tiff_io::{ColorModel, TiffMetadata};',
+          )
+          color = Path('src/color_management.rs')
+          text = color.read_text(encoding='utf-8')
+          start = text.index('    pub fn new(metadata: &TiffMetadata, config: PreviewColorConfig) -> Self {')
+          end = text.index('\n    fn fallback(', start)
+          old_fn = text[start:end]
+          body = old_fn.replace(
+              '    pub fn new(metadata: &TiffMetadata, config: PreviewColorConfig) -> Self {',
+              '    fn new_for_parts(\n        model: RuntimeColorModel,\n        embedded_icc: Option<&[u8]>,\n        config: PreviewColorConfig,\n    ) -> Self {',
+              1,
+          )
+          body = body.replace('expected_color_space(metadata.color_model)', 'expected_runtime_color_space(model)')
+          body = body.replace('"unsupported TIFF base color model"', '"unsupported source base color model"')
+          body = body.replace('let Some(icc) = metadata.icc_profile.as_deref() else {', 'let Some(icc) = embedded_icc else {')
+          body = body.replace(
+              '"profile color space {} does not match TIFF {}",\n                    color_space_label(actual),\n                    metadata.color_model.title(),',
+              '"profile color space {} does not match source {}",\n                    color_space_label(actual),\n                    model.title(),',
+          )
+          body = body.replace('let transform = match metadata.color_model {', 'let transform = match model {')
+          body = body.replace('            ColorModel::Rgb => make_transform!(PixelFormat::RGB_16, Rgb),', '            RuntimeColorModel::Rgb => make_transform!(PixelFormat::RGB_16, Rgb),')
+          body = body.replace('            ColorModel::Cmyk => make_transform!(PixelFormat::CMYK_16, Cmyk),', '            RuntimeColorModel::Cmyk => make_transform!(PixelFormat::CMYK_16, Cmyk),')
+          body = body.replace('            ColorModel::Gray => make_transform!(PixelFormat::GRAY_16, Gray),', '            RuntimeColorModel::Gray => make_transform!(PixelFormat::GRAY_16, Gray),')
+          body = body.replace('            ColorModel::Other => unreachable!(),', '            RuntimeColorModel::Other => unreachable!(),')
+          wrappers = '''    pub fn new(metadata: &TiffMetadata, config: PreviewColorConfig) -> Self {
+              Self::new_for_parts(
+                  metadata.color_model.into(),
+                  metadata.icc_profile.as_deref(),
+                  config,
+              )
+          }
+
+              pub fn new_for_runtime_preview<P: RuntimePreviewSource + ?Sized>(
+                  preview: &P,
+                  config: PreviewColorConfig,
+              ) -> Self {
+                  Self::new_for_parts(preview.color_model(), preview.embedded_icc(), config)
+              }
+
+          '''
+          text = text[:start] + wrappers + body + text[end:]
+          old = '''fn expected_color_space(model: ColorModel) -> Option<ColorSpaceSignature> {
+              match model {
+                  ColorModel::Rgb => Some(ColorSpaceSignature::RgbData),
+                  ColorModel::Cmyk => Some(ColorSpaceSignature::CmykData),
+                  ColorModel::Gray => Some(ColorSpaceSignature::GrayData),
+                  ColorModel::Other => None,
+              }
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('src/color_management.rs: expected_color_space block changed')
+          new = old + '''
+          fn expected_runtime_color_space(model: RuntimeColorModel) -> Option<ColorSpaceSignature> {
+              match model {
+                  RuntimeColorModel::Rgb => Some(ColorSpaceSignature::RgbData),
+                  RuntimeColorModel::Cmyk => Some(ColorSpaceSignature::CmykData),
+                  RuntimeColorModel::Gray => Some(ColorSpaceSignature::GrayData),
+                  RuntimeColorModel::Other => None,
+              }
+          }
+          '''
+          text = text.replace(old, new, 1)
+          text = text.replace('This TIFF has no embedded ICC profile and no preview profile is assigned.', 'This source has no embedded ICC profile and no preview profile is assigned.')
+          text = text.replace('embedded TIFF profile', 'embedded source profile')
+          text = text.replace('TIFF data and metadata are unchanged.', 'Source data and metadata are unchanged.')
+          text = text.replace('TIFF data is unchanged.', 'Source data is unchanged.')
+          text = text.replace('Preview-only; TIFF samples, embedded ICC and Photoshop metadata are unchanged.', 'Preview-only; source samples and metadata are unchanged.')
+          marker = 'mod tests {\n    use super::*;'
+          if text.count(marker) != 1:
+              raise SystemExit('src/color_management.rs: test module marker changed')
+          text = text.replace(
+              marker,
+              marker + '\n    use windows_shade_editor::design_source_preview::DesignSourcePreview;\n    use windows_shade_editor::png_source::{DecodedPngSource, PngSourceModel};',
+              1,
+          )
+          test = r'''
+
+              #[test]
+              fn png_embedded_icc_uses_runtime_preview_contract() {
+                  let profile = Profile::new_srgb();
+                  let bytes = profile.icc().unwrap();
+                  let decoded = DecodedPngSource {
+                      width: 1,
+                      height: 1,
+                      bit_depth: 16,
+                      model: PngSourceModel::Rgb,
+                      samples: vec![100, 200, 300],
+                      alpha: None,
+                      icc_profile: Some(bytes),
+                      declares_srgb: false,
+                  };
+                  let preview = DesignSourcePreview::from_png(&decoded, 512).expect("PNG preview");
+                  let transform = PreviewColorTransform::new_for_runtime_preview(&preview, config());
+                  assert!(matches!(transform.status(), PreviewColorStatus::Applied { .. }));
+              }
+          '''
+          close = text.rfind('\n}')
+          if close < 0:
+              raise SystemExit('src/color_management.rs: final module brace not found')
+          text = text[:close] + test + text[close:]
+          color.write_text(text, encoding='utf-8', newline='\n')
+          '@ | python -
+          cargo fmt --all
+          $changed = @(git diff --name-only)
+          $allowed = @('src/main.rs', 'src/render.rs', 'src/color_management.rs', 'src/runtime_preview.rs')
+          foreach ($file in $changed) {
+            if ($allowed -notcontains $file) { throw "Unexpected patch surface: $file" }
+          }
+          if ($changed.Count -lt 3) { throw "Expected runtime-neutral patch to modify at least three files, got $($changed -join ', ')" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/render.rs src/color_management.rs src/runtime_preview.rs
+          git commit -m 'feat: make preview render and ICC boundary source-neutral (#277)'
+          git push origin HEAD:codex/runtime-preview-neutral
