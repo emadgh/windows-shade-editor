@@ -1,0 +1,142 @@
+name: Temporary guarded PR284 export boundary and runtime preflight tests
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr284-export-guard-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply TIFF-only export boundary and integration tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'ff637d832913c79fe026591ec149c36f4c0a2002'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 canonical head moved' }
+          @'
+          from pathlib import Path
+
+          def replace_exact(path, old, new, expected=1):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != expected:
+                  raise SystemExit(f'{path}: expected {expected} matches, got {count}: {old[:100]!r}')
+              text = text.replace(old, new, expected)
+              p.write_text(text, encoding='utf-8', newline='\n')
+
+          # ---- export_queue.rs: fail closed both when queued and when a restored row starts ----
+          replace_exact(
+              'src/export_queue.rs',
+              '''    ) -> Result<u64, String> {\n        validate_destination(&spec.destination, &protected_sources)?;\n''',
+              '''    ) -> Result<u64, String> {\n        validate_tiff_export_source(&spec.source)?;\n        validate_destination(&spec.destination, &protected_sources)?;\n'''
+          )
+          replace_exact(
+              'src/export_queue.rs',
+              '''        let preflight = validate_destination(&queued.export.destination, &queued.protected_sources)\n            .and_then(|_| {\n''',
+              '''        let preflight = validate_tiff_export_source(&queued.export.source)\n            .and_then(|_| validate_destination(&queued.export.destination, &queued.protected_sources))\n            .and_then(|_| {\n'''
+          )
+          replace_exact(
+              'src/export_queue.rs',
+              '''fn validate_destination(destination: &Path, sources: &[PathBuf]) -> Result<(), String> {\n''',
+              '''fn validate_tiff_export_source(source: &Path) -> Result<(), String> {\n    let is_tiff = source\n        .extension()\n        .and_then(|extension| extension.to_str())\n        .is_some_and(|extension| {\n            extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff")\n        });\n    if is_tiff {\n        Ok(())\n    } else {\n        Err(format!(\n            "Shade Editor Export currently accepts TIFF source Faces only. PNG/JPEG remain available for preview and Color Conversion preflight: {}",\n            source.display()\n        ))\n    }\n}\n\nfn validate_destination(destination: &Path, sources: &[PathBuf]) -> Result<(), String> {\n'''
+          )
+          replace_exact(
+              'src/export_queue.rs',
+              '''    #[test]\n    fn non_finite_progress_is_sanitized() {\n        assert_eq!(finite_progress(f32::NAN), 0.0);\n        assert_eq!(finite_progress(f32::INFINITY), 0.0);\n        assert_eq!(finite_progress(-1.0), 0.0);\n        assert_eq!(finite_progress(2.0), 1.0);\n    }\n}\n''',
+              '''    #[test]\n    fn tiff_only_export_source_guard_is_case_insensitive() {\n        assert!(validate_tiff_export_source(Path::new("face.tif")).is_ok());\n        assert!(validate_tiff_export_source(Path::new("face.TIFF")).is_ok());\n        for source in ["face.png", "face.JPG", "face.jpeg", "face.webp"] {\n            let error = validate_tiff_export_source(Path::new(source))\n                .expect_err("non-TIFF export source must fail closed");\n            assert!(error.contains("TIFF source Faces only"), "{error}");\n        }\n    }\n\n    #[test]\n    fn project_queue_rejects_non_tiff_before_source_io() {\n        let mut queue = ExportQueue::new();\n        let mut item = spec("out.tif");\n        item.source = PathBuf::from("definitely-missing-source.png");\n        let error = queue\n            .enqueue_for_project(item, Vec::new(), 91)\n            .expect_err("PNG must be rejected before fingerprint IO");\n        assert!(error.contains("TIFF source Faces only"), "{error}");\n        assert!(queue.items().is_empty());\n    }\n\n    #[test]\n    fn non_finite_progress_is_sanitized() {\n        assert_eq!(finite_progress(f32::NAN), 0.0);\n        assert_eq!(finite_progress(f32::INFINITY), 0.0);\n        assert_eq!(finite_progress(-1.0), 0.0);\n        assert_eq!(finite_progress(2.0), 1.0);\n    }\n}\n'''
+          )
+
+          # ---- main.rs: explicit UI/runtime blocking and no partial Export All ----
+          replace_exact(
+              'src/main.rs',
+              '''    fn enqueue_export(&mut self, spec: export_queue::ExportQueueSpec) -> bool {\n''',
+              '''    fn active_face_is_tiff_export_source(&self) -> bool {\n        self.faces\n            .get(self.current_face)\n            .filter(|face| face.available)\n            .is_some_and(|face| face.preview.is_tiff())\n    }\n\n    fn accepted_faces_include_non_tiff_export_source(&self) -> bool {\n        self.faces.iter().enumerate().any(|(index, face)| {\n            !self\n                .project\n                .faces\n                .get(index)\n                .is_some_and(|project_face| project_face.status.is_rejected())\n                && face.available\n                && !face.preview.is_tiff()\n        })\n    }\n\n    fn enqueue_export(&mut self, spec: export_queue::ExportQueueSpec) -> bool {\n'''
+          )
+          replace_exact(
+              'src/main.rs',
+              '''        let protected_sources = self\n            .faces\n''',
+              '''        if self\n            .faces\n            .iter()\n            .find(|face| face.path.as_path() == spec.source.as_path())\n            .is_some_and(|face| !face.preview.is_tiff())\n        {\n            self.report_error(\n                "Shade Editor Export currently requires a TIFF source Face. PNG/JPEG remain available for preview and Color Conversion preflight.",\n            );\n            return false;\n        }\n        let protected_sources = self\n            .faces\n'''
+          )
+          replace_exact(
+              'src/main.rs',
+              '''        if !workflow::active_face_available(self) {\n            self.report_error(\n                "The active Face source TIFF is missing. Relink it before exporting.",\n            );\n            return;\n        }\n''',
+              '''        if !workflow::active_face_available(self) {\n            self.report_error(\n                "The active Face source image is missing. Relink it before exporting.",\n            );\n            return;\n        }\n        if !self.active_face_is_tiff_export_source() {\n            self.report_error(\n                "Export currently requires a TIFF source Face. PNG/JPEG design Faces can still be previewed and preflighted for Color Conversion.",\n            );\n            return;\n        }\n'''
+          )
+          replace_exact(
+              'src/main.rs',
+              '''        if !workflow::active_face_available(self) {\n            self.report_error(\n                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",\n            );\n            return;\n        }\n''',
+              '''        if !workflow::active_face_available(self) {\n            self.report_error(\n                "The active Face source image is missing. Relink it before exporting Snapshots.",\n            );\n            return;\n        }\n        if !self.active_face_is_tiff_export_source() {\n            self.report_error(\n                "Snapshot Export currently requires a TIFF source Face. PNG/JPEG design Faces can still be previewed and preflighted for Color Conversion.",\n            );\n            return;\n        }\n''',
+              expected=2
+          )
+          availability = '''        if self.faces.iter().enumerate().any(|(index, face)| {\n            !self\n                .project\n                .faces\n                .get(index)\n                .is_some_and(|item| item.status.is_rejected())\n                && !face.available\n        }) {\n            self.report_error("Export all requires every Accepted Face source TIFF to be available. Relink missing Accepted Faces first.");\n            return;\n        }\n'''
+          availability_new = '''        if self.faces.iter().enumerate().any(|(index, face)| {\n            !self\n                .project\n                .faces\n                .get(index)\n                .is_some_and(|item| item.status.is_rejected())\n                && !face.available\n        }) {\n            self.report_error("Export all requires every Accepted Face source image to be available. Relink missing Accepted Faces first.");\n            return;\n        }\n        if self.accepted_faces_include_non_tiff_export_source() {\n            self.report_error(\n                "Export All is TIFF-source-only in this version. No files were queued; remove/reject non-TIFF Faces or export TIFF Faces separately.",\n            );\n            return;\n        }\n'''
+          replace_exact('src/main.rs', availability, availability_new, expected=2)
+          replace_exact(
+              'src/main.rs',
+              '''        if !workflow::active_face_available(self) {\n            self.report_error(\n                "The active Face source TIFF is missing. Relink it before validation.",\n            );\n            return;\n        }\n''',
+              '''        if !workflow::active_face_available(self) {\n            self.report_error(\n                "The active Face source image is missing. Relink it before validation.",\n            );\n            return;\n        }\n        if !self.active_face_is_tiff_export_source() {\n            self.report_error(\n                "TIFF round-trip validation requires a TIFF source Face; PNG/JPEG validation is not routed through the TIFF production validator.",\n            );\n            return;\n        }\n'''
+          )
+          replace_exact(
+              'src/main.rs',
+              'self.report_info("Face removed from project (source TIFF was not deleted)");',
+              'self.report_info("Face removed from project (source image was not deleted)");'
+          )
+          replace_exact(
+              'src/main.rs',
+              'ui.small("Default: top-left, 1 cm margin. Point size is converted using the TIFF DPI.");',
+              'ui.small("Default: top-left, 1 cm margin. Point size is converted using the source DPI.");'
+          )
+
+          # ---- runtime_preview.rs: integration tests from carrier -> descriptor -> preflight ----
+          replace_exact(
+              'src/runtime_preview.rs',
+              '''    use windows_shade_editor::png_source::{DecodedPngSource, PngSourceModel};\n''',
+              '''    use windows_shade_editor::conversion_preflight::{\n        PreflightCode, SourceProfileState, build_conversion_preflight_for_source,\n    };\n    use windows_shade_editor::conversion_workflow::ConversionSaveGate;\n    use windows_shade_editor::jpeg_source::{\n        DecodedJpegSource, JpegCodingProcess, JpegSourceModel,\n    };\n    use windows_shade_editor::png_source::{DecodedPngSource, PngSourceModel};\n'''
+          )
+          replace_exact(
+              'src/runtime_preview.rs',
+              '''    #[test]\n    fn missing_preview_uses_cached_metadata_without_tiff_identity() {\n''',
+              '''    #[test]\n    fn png_alpha_runtime_descriptor_blocks_production_preflight() {\n        let decoded = DecodedPngSource {\n            width: 1,\n            height: 1,\n            bit_depth: 16,\n            model: PngSourceModel::Rgb,\n            samples: vec![100, 200, 300],\n            alpha: Some(vec![u16::MAX / 2]),\n            icc_profile: None,\n            declares_srgb: true,\n        };\n        let runtime = RuntimePreview::Design(\n            DesignSourcePreview::from_png(&decoded, 512).expect("PNG runtime preview"),\n        );\n        let descriptor = runtime.source_descriptor().expect("PNG descriptor");\n        assert_eq!(descriptor.format, SourceImageFormat::Png);\n        assert_eq!(descriptor.transparency, TransparencyState::PresentUnresolved);\n        assert_eq!(runtime.channels().len(), 3);\n        assert!(runtime.alpha().is_some());\n        let report = build_conversion_preflight_for_source(\n            &descriptor.as_borrowed(),\n            SourceProfileState::Missing,\n            ConversionSaveGate::Ready,\n        );\n        assert!(report.contains(PreflightCode::UnresolvedTransparency));\n        assert!(!report.can_convert());\n    }\n\n    #[test]\n    fn jpeg_runtime_descriptor_preserves_coding_process_lossiness_for_preflight() {\n        let build = |coding_process| {\n            let decoded = DecodedJpegSource {\n                width: 1,\n                height: 1,\n                bit_depth: 8,\n                model: JpegSourceModel::Rgb,\n                samples: vec![1, 2, 3],\n                icc_profile: None,\n                coding_process,\n            };\n            RuntimePreview::Design(\n                DesignSourcePreview::from_jpeg(&decoded, 512).expect("JPEG runtime preview"),\n            )\n        };\n\n        let lossy = build(JpegCodingProcess::DctProgressive);\n        let lossy_descriptor = lossy.source_descriptor().expect("lossy JPEG descriptor");\n        assert_eq!(lossy_descriptor.lossiness, SourceLossiness::Lossy);\n        let lossy_report = build_conversion_preflight_for_source(\n            &lossy_descriptor.as_borrowed(),\n            SourceProfileState::Missing,\n            ConversionSaveGate::Ready,\n        );\n        assert!(lossy_report.contains(PreflightCode::JpegLossySource));\n\n        let lossless = build(JpegCodingProcess::Lossless);\n        let lossless_descriptor = lossless\n            .source_descriptor()\n            .expect("lossless JPEG descriptor");\n        assert_eq!(lossless_descriptor.lossiness, SourceLossiness::Lossless);\n        let lossless_report = build_conversion_preflight_for_source(\n            &lossless_descriptor.as_borrowed(),\n            SourceProfileState::Missing,\n            ConversionSaveGate::Ready,\n        );\n        assert!(!lossless_report.contains(PreflightCode::JpegLossySource));\n    }\n\n    #[test]\n    fn tiff_runtime_carrier_preserves_preview_and_descriptor_parity() {\n        let metadata = TiffMetadata {\n            width: 2,\n            height: 1,\n            bit_depth: 16,\n            samples_per_pixel: 3,\n            base_channel_count: 3,\n            color_model: TiffColorModel::Rgb,\n            non_cmyk_separated: false,\n            channel_names: vec!["Red".into(), "Green".into(), "Blue".into()],\n            channel_display_info: vec![None; 3],\n            compression: None,\n            predictor: None,\n            orientation: None,\n            icc_profile: Some(vec![9, 8, 7]),\n            photoshop_resources: None,\n            photoshop_image_source_data: None,\n        };\n        let original = PreviewFace {\n            metadata,\n            width: 2,\n            height: 1,\n            channels: vec![vec![1, 2], vec![3, 4], vec![5, 6]],\n            histograms: vec![[0; 256]; 3],\n        };\n        let expected_channels = original.channels.clone();\n        let runtime = RuntimePreview::Tiff(original);\n        let descriptor = runtime.source_descriptor().expect("TIFF descriptor");\n        assert_eq!(descriptor.format, SourceImageFormat::Tiff);\n        assert_eq!(descriptor.color_model, DesignSourceColorModel::Rgb);\n        assert_eq!(descriptor.bit_depth, 16);\n        assert_eq!(descriptor.channel_count, 3);\n        assert_eq!(descriptor.embedded_icc.as_deref(), Some(&[9, 8, 7][..]));\n        assert_eq!(descriptor.transparency, TransparencyState::None);\n        assert_eq!(descriptor.lossiness, SourceLossiness::Lossless);\n        assert_eq!(runtime.source_dimensions(), (2, 1));\n        assert_eq!(runtime.width(), 2);\n        assert_eq!(runtime.height(), 1);\n        assert_eq!(runtime.channels(), expected_channels.as_slice());\n        assert_eq!(runtime.channel_names(), ["Red", "Green", "Blue"]);\n        assert!(runtime.tiff_metadata().is_some());\n        assert!(runtime.as_tiff().is_some());\n        assert!(runtime.is_tiff());\n    }\n\n    #[test]\n    fn missing_preview_uses_cached_metadata_without_tiff_identity() {\n'''
+          )
+
+          # Keep PreviewFace import test-only after renderer became source-neutral.
+          replace_exact(
+              'src/render.rs',
+              '''use crate::tiff_io::{self, PreviewFace};\n''',
+              '''use crate::tiff_io;\n#[cfg(test)]\nuse crate::tiff_io::PreviewFace;\n'''
+          )
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $allowed = @('src/export_queue.rs','src/main.rs','src/runtime_preview.rs','src/render.rs')
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) { if ($allowed -notcontains $file) { git checkout -- $file } }
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) { if ($allowed -notcontains $file) { throw "Unexpected patch surface: $file" } }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/export_queue.rs src/main.rs src/runtime_preview.rs src/render.rs
+          git commit -m 'feat: guard TIFF-only export boundary and source preflight integration (#281)'
+          git push origin HEAD:codex/design-source-runtime-wiring
