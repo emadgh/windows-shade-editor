@@ -162,11 +162,19 @@ pub struct ExportQueueItem {
 }
 
 #[derive(Clone, Debug)]
+pub struct SnapshotExportProvenance {
+    pub test_code: String,
+    pub adjustment_sha256: String,
+    pub destination: PathBuf,
+}
+
+#[derive(Clone, Debug)]
 pub struct ExportQueueCompletion {
     pub id: u64,
     pub project_session_id: u64,
     pub result: Result<String, String>,
     pub mark: Option<ExportQueueMark>,
+    pub provenance: Option<SnapshotExportProvenance>,
 }
 
 enum ExportQueueEvent {
@@ -180,6 +188,7 @@ enum ExportQueueEvent {
         project_session_id: u64,
         result: Result<String, String>,
         mark: Option<ExportQueueMark>,
+        provenance: Option<SnapshotExportProvenance>,
     },
 }
 
@@ -726,6 +735,7 @@ impl ExportQueue {
                     project_session_id,
                     result,
                     mark,
+                    provenance,
                 } => {
                     self.active_id = None;
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
@@ -748,6 +758,7 @@ impl ExportQueue {
                         project_session_id,
                         result,
                         mark,
+                        provenance,
                     });
                     changed = true;
                     if self.stop_after_current {
@@ -809,6 +820,7 @@ impl ExportQueue {
                             project_session_id: session_id,
                             result: Ok("Skipped · destination already exists".to_owned()),
                             mark: None,
+                            provenance: None,
                         });
                     });
                     return true;
@@ -872,6 +884,11 @@ impl ExportQueue {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let mark = spec.mark.clone();
+            let provenance = mark.as_ref().map(|_| SnapshotExportProvenance {
+                test_code: spec.recipe.exported_test_code(),
+                adjustment_sha256: spec.recipe.adjustment_sha256(),
+                destination: spec.destination.clone(),
+            });
             let result = worker_guard::catch_result("Export worker", || {
                 let validate_after_export = spec.validate_after_export;
                 let progress_tx = tx.clone();
@@ -915,11 +932,13 @@ impl ExportQueue {
                 })
             });
             let mark = result.as_ref().ok().and(mark);
+            let provenance = result.as_ref().ok().and(provenance);
             let _ = tx.send(ExportQueueEvent::Finished {
                 id,
                 project_session_id: session_id,
                 result,
                 mark,
+                provenance,
             });
         });
         true
@@ -942,6 +961,7 @@ impl ExportQueue {
                 project_session_id: session_id,
                 result: Err(err),
                 mark: None,
+                provenance: None,
             });
         });
         true

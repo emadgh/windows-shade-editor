@@ -332,6 +332,12 @@ pub struct SnapshotExportRecord {
     pub face_key: String,
     pub folder: String,
     pub exported_at_unix_ms: i64,
+    #[serde(default)]
+    pub test_code: String,
+    #[serde(default)]
+    pub adjustment_sha256: String,
+    #[serde(default)]
+    pub destination: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -647,16 +653,39 @@ impl ShadeProject {
         folder: String,
         exported_at_unix_ms: i64,
     ) -> bool {
+        self.record_snapshot_export_with_identity(
+            id,
+            face_key,
+            folder,
+            exported_at_unix_ms,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    }
+
+    /// Append a committed Snapshot export to durable history. Do not replace
+    /// older records: previously used codes/states remain auditable.
+    pub fn record_snapshot_export_with_identity(
+        &mut self,
+        id: u64,
+        face_key: String,
+        folder: String,
+        exported_at_unix_ms: i64,
+        test_code: String,
+        adjustment_sha256: String,
+        destination: String,
+    ) -> bool {
         let Some(snapshot) = self.snapshots.iter_mut().find(|snapshot| snapshot.id == id) else {
             return false;
         };
-        snapshot
-            .exports
-            .retain(|record| record.face_key != face_key);
         snapshot.exports.push(SnapshotExportRecord {
             face_key,
             folder,
             exported_at_unix_ms,
+            test_code,
+            adjustment_sha256,
+            destination,
         });
         true
     }
@@ -1052,32 +1081,52 @@ mod tests {
         assert_eq!(project.effective_test_code_text(), "Manual");
     }
     #[test]
-    fn snapshot_export_history_is_per_face_and_replaceable() {
+    fn snapshot_export_history_preserves_prior_codes_and_returns_latest_per_face() {
         let mut project = ShadeProject::default();
         let id = project.create_snapshot();
-        assert!(project.record_snapshot_export(
+        assert!(project.record_snapshot_export_with_identity(
             id,
             "face-a.tif".to_owned(),
             r"C:\exports\one".to_owned(),
             100,
+            "TEST-41".to_owned(),
+            "a".repeat(64),
+            r"C:\exports\one\TEST-41.tif".to_owned(),
         ));
-        assert_eq!(
-            project
-                .snapshot_export_for_face(id, "face-a.tif")
-                .unwrap()
-                .folder,
-            r"C:\exports\one"
-        );
-        assert!(project.record_snapshot_export(
+        let first = project
+            .snapshot_export_for_face(id, "face-a.tif")
+            .expect("first committed export");
+        assert_eq!(first.test_code, "TEST-41");
+        assert_eq!(first.adjustment_sha256, "a".repeat(64));
+        assert_eq!(first.destination, r"C:\exports\one\TEST-41.tif");
+
+        assert!(project.record_snapshot_export_with_identity(
             id,
             "face-a.tif".to_owned(),
             r"C:\exports\two".to_owned(),
             200,
+            "TEST-42".to_owned(),
+            "b".repeat(64),
+            r"C:\exports\two\TEST-42.tif".to_owned(),
         ));
-        let record = project.snapshot_export_for_face(id, "face-a.tif").unwrap();
-        assert_eq!(record.folder, r"C:\exports\two");
-        assert_eq!(record.exported_at_unix_ms, 200);
-        assert_eq!(project.snapshots[0].exports.len(), 1);
+
+        let snapshot = project
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == id)
+            .expect("snapshot");
+        assert_eq!(snapshot.exports.len(), 2);
+        assert_eq!(snapshot.exports[0].test_code, "TEST-41");
+        assert_eq!(snapshot.exports[1].test_code, "TEST-42");
+
+        let latest = project
+            .snapshot_export_for_face(id, "face-a.tif")
+            .expect("latest committed export");
+        assert_eq!(latest.folder, r"C:\exports\two");
+        assert_eq!(latest.exported_at_unix_ms, 200);
+        assert_eq!(latest.test_code, "TEST-42");
+        assert_eq!(latest.adjustment_sha256, "b".repeat(64));
+        assert_eq!(latest.destination, r"C:\exports\two\TEST-42.tif");
     }
 
     #[test]

@@ -39,21 +39,31 @@ fn percent_to_coefficient(value: i32) -> f32 {
 
 fn gamma_marker_fraction(gamma: f32) -> f32 {
     let gamma = gamma.clamp(0.1, 4.0);
-    if gamma <= 1.0 {
-        0.5 * (gamma / 0.1).ln() / 10.0_f32.ln()
+    // Conventional Levels behavior: left lightens (gamma > 1), right darkens.
+    if gamma >= 1.0 {
+        0.5 - 0.5 * gamma.ln() / 4.0_f32.ln()
     } else {
-        0.5 + 0.5 * gamma.ln() / 4.0_f32.ln()
+        0.5 + 0.5 * (1.0 / gamma).ln() / 10.0_f32.ln()
     }
 }
 
 fn gamma_from_marker_fraction(fraction: f32) -> f32 {
     let fraction = fraction.clamp(0.0, 1.0);
     if fraction <= 0.5 {
-        0.1 * 10.0_f32.powf(fraction * 2.0)
+        4.0_f32.powf((0.5 - fraction) * 2.0)
     } else {
-        4.0_f32.powf((fraction - 0.5) * 2.0)
+        10.0_f32.powf(-(fraction - 0.5) * 2.0)
     }
     .clamp(0.1, 4.0)
+}
+
+fn histogram_height_at_peak_normalized(
+    histogram: &[u32; 256],
+    index: usize,
+    graph_height: f32,
+) -> f32 {
+    let peak = histogram.iter().copied().max().unwrap_or(0).max(1) as f32;
+    histogram[index] as f32 / peak * graph_height
 }
 
 fn display_to_working(value: f32, mode: TonalDisplayMode) -> f32 {
@@ -101,21 +111,13 @@ fn draw_levels_histogram(
             egui::Stroke::new(0.5, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
     }
-    let max_value = before
-        .into_iter()
-        .flat_map(|bins| bins.iter())
-        .chain(after.into_iter().flat_map(|bins| bins.iter()))
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .max(1) as f32;
     for index in 0..256 {
         let x = egui::lerp(
             rect.x_range(),
             tonal_display_value(index as f32 / 255.0, display_mode),
         );
         if let Some(bins) = before {
-            let h = bins[index] as f32 / max_value * rect.height();
+            let h = histogram_height_at_peak_normalized(bins, index, rect.height());
             painter.line_segment(
                 [
                     egui::pos2(x, rect.bottom()),
@@ -125,7 +127,7 @@ fn draw_levels_histogram(
             );
         }
         if let Some(bins) = after {
-            let h = bins[index] as f32 / max_value * rect.height();
+            let h = histogram_height_at_peak_normalized(bins, index, rect.height());
             painter.line_segment(
                 [
                     egui::pos2(x, rect.bottom()),
@@ -489,13 +491,19 @@ fn mixer_percent_row(
                     egui::Label::new(label).truncate()
                 };
                 ui.add_sized([layout.label_width, 20.0], label_widget);
-                ui.add_sized(
-                    [layout.slider_width, 20.0],
-                    egui::Slider::new(&mut percent, min_percent..=max_percent)
-                        .step_by(1.0)
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
+                ui.scope(|ui| {
+                    // `Slider` uses `spacing.slider_width` for its actual track. Merely
+                    // wrapping it in add_sized leaves the default short track in place.
+                    // Bind the widget's own desired track width to the responsive row.
+                    ui.spacing_mut().slider_width = layout.slider_width;
+                    ui.add_sized(
+                        [layout.slider_width, 20.0],
+                        egui::Slider::new(&mut percent, min_percent..=max_percent)
+                            .step_by(1.0)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                });
                 ui.add_sized(
                     [layout.value_width, 20.0],
                     egui::DragValue::new(&mut percent)
@@ -610,6 +618,44 @@ mod tests {
             let round_trip = gamma_from_marker_fraction(gamma_marker_fraction(gamma));
             assert!((round_trip - gamma).abs() < 0.0001);
         }
+    }
+
+    #[test]
+    fn gamma_marker_direction_matches_conventional_levels() {
+        assert!(gamma_marker_fraction(2.0) < 0.5);
+        assert_eq!(gamma_marker_fraction(1.0), 0.5);
+        assert!(gamma_marker_fraction(0.5) > 0.5);
+
+        let mut left = model::Levels::default();
+        apply_input_marker_drag(
+            &mut left,
+            LevelMarker::Gamma,
+            0.25,
+            TonalDisplayMode::Light,
+        );
+        assert!(left.gamma > 1.0);
+        assert!(model::apply_levels(0.5, left) > 0.5);
+
+        let mut right = model::Levels::default();
+        apply_input_marker_drag(
+            &mut right,
+            LevelMarker::Gamma,
+            0.75,
+            TonalDisplayMode::Light,
+        );
+        assert!(right.gamma < 1.0);
+        assert!(model::apply_levels(0.5, right) < 0.5);
+    }
+
+    #[test]
+    fn histogram_series_each_normalize_their_own_peak_to_full_height() {
+        let mut weak = [0_u32; 256];
+        weak[120] = 10;
+        let mut strong = [0_u32; 256];
+        strong[120] = 10_000;
+        let height = 118.0;
+        assert!((histogram_height_at_peak_normalized(&weak, 120, height) - height).abs() < 0.001);
+        assert!((histogram_height_at_peak_normalized(&strong, 120, height) - height).abs() < 0.001);
     }
 
     #[test]

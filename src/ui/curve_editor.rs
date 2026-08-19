@@ -71,6 +71,11 @@ fn tonal_working_value(value: f32, mode: TonalDisplayMode) -> f32 {
     tonal_display_value(value, mode)
 }
 
+fn curve_histogram_height(histogram: &[u32; 256], index: usize, graph_height: f32) -> f32 {
+    let peak = histogram.iter().copied().max().unwrap_or(0).max(1) as f32;
+    histogram[index] as f32 / peak * graph_height
+}
+
 fn curve_histogram_colors(
     ui: &egui::Ui,
     accent: Option<egui::Color32>,
@@ -329,14 +334,6 @@ fn curve_editor_graph(
         egui::StrokeKind::Inside,
     );
     if histogram_before.is_some() || histogram_after.is_some() {
-        let max_value = histogram_before
-            .into_iter()
-            .chain(histogram_after)
-            .flat_map(|bins| bins.iter())
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .max(1) as f32;
         let (before_base, after_base) = curve_histogram_colors(ui, accent, neutral_histogram);
         let before_color = before_base.gamma_multiply(0.32);
         let after_color = after_base.gamma_multiply(0.56);
@@ -345,12 +342,12 @@ fn curve_editor_graph(
             (histogram_after, after_color),
         ] {
             if let Some(bins) = bins {
-                for (index, value) in bins.iter().enumerate() {
+                for (index, _) in bins.iter().enumerate() {
                     let x = egui::lerp(
                         rect.x_range(),
                         tonal_display_value(index as f32 / 255.0, display_mode),
                     );
-                    let h = *value as f32 / max_value * rect.height();
+                    let h = curve_histogram_height(bins, index, rect.height());
                     painter.line_segment(
                         [
                             egui::pos2(x, rect.bottom()),
@@ -580,5 +577,21 @@ mod tonal_curve_interaction_tests {
         );
         assert!((curve.midpoint_input - (0.5 - 1.0 / 255.0)).abs() < 1e-5);
         assert!((curve.midpoint - (0.5 - 10.0 / 255.0)).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod curve_histogram_normalization_tests {
+    use super::curve_histogram_height;
+
+    #[test]
+    fn each_curve_histogram_series_reaches_full_graph_height_at_its_peak() {
+        let mut weak = [0_u32; 256];
+        weak[64] = 3;
+        let mut strong = [0_u32; 256];
+        strong[64] = 30_000;
+        let height = 240.0;
+        assert!((curve_histogram_height(&weak, 64, height) - height).abs() < 0.001);
+        assert!((curve_histogram_height(&strong, 64, height) - height).abs() < 0.001);
     }
 }

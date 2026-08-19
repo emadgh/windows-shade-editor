@@ -1,4 +1,5 @@
 use crate::model::{ChannelAdjustment, Levels};
+use crate::render;
 use crate::settings::TonalDisplayMode;
 use crate::tiff_io;
 use eframe::egui;
@@ -11,6 +12,9 @@ pub(crate) struct MatchColorTarget {
     pub path: PathBuf,
     pub channel_names: Vec<String>,
     pub histograms: Vec<[u32; 256]>,
+    pub preview_width: usize,
+    pub preview_height: usize,
+    pub preview_rgba: Vec<u8>,
 }
 
 impl MatchColorTarget {
@@ -20,6 +24,10 @@ impl MatchColorTarget {
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| self.path.display().to_string())
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.path.is_file()
     }
 }
 
@@ -35,6 +43,7 @@ pub(crate) struct MatchColorReport {
 struct MatchColorState {
     target: Option<MatchColorTarget>,
     overlay_visible: bool,
+    preview_visible: bool,
 }
 
 static MATCH_COLOR_STATE: OnceLock<Mutex<MatchColorState>> = OnceLock::new();
@@ -64,10 +73,21 @@ pub(crate) fn set_overlay_visible(visible: bool) {
     });
 }
 
+pub(crate) fn preview_visible() -> bool {
+    with_state(|state| state.preview_visible && state.target.is_some())
+}
+
+pub(crate) fn set_preview_visible(visible: bool) {
+    with_state(|state| {
+        state.preview_visible = visible && state.target.is_some();
+    });
+}
+
 pub(crate) fn clear_target() {
     with_state(|state| {
         state.target = None;
         state.overlay_visible = false;
+        state.preview_visible = false;
     });
 }
 
@@ -75,13 +95,14 @@ fn store_target(target: MatchColorTarget) {
     with_state(|state| {
         state.target = Some(target);
         state.overlay_visible = true;
+        state.preview_visible = false;
     });
 }
 
 pub(crate) fn choose_target(max_preview_dimension: u32) -> Result<Option<MatchColorTarget>, String> {
     let Some(path) = rfd::FileDialog::new()
         .add_filter("TIFF images", &["tif", "tiff"])
-        .set_title("Choose Match Color target")
+        .set_title("Choose Reference / Match Color target")
         .pick_file()
     else {
         return Ok(None);
@@ -92,19 +113,32 @@ pub(crate) fn choose_target(max_preview_dimension: u32) -> Result<Option<MatchCo
     })
 }
 
+pub(crate) fn load_reference(
+    path: &Path,
+    max_preview_dimension: u32,
+) -> Result<MatchColorTarget, String> {
+    let target = load_target(path, max_preview_dimension)?;
+    store_target(target.clone());
+    Ok(target)
+}
+
 fn load_target(path: &Path, max_preview_dimension: u32) -> Result<MatchColorTarget, String> {
     let preview = tiff_io::load_preview(path, max_preview_dimension)
-        .map_err(|err| format!("Cannot load Match Color target '{}': {err}", path.display()))?;
+        .map_err(|err| format!("Cannot load Reference image '{}': {err}", path.display()))?;
     if preview.histograms.is_empty() {
         return Err(format!(
-            "Match Color target '{}' has no readable channel histograms.",
+            "Reference image '{}' has no readable channel histograms.",
             path.display()
         ));
     }
+    let preview_rgba = render::rgba_from_planes(&preview, &preview.channels, None);
     Ok(MatchColorTarget {
         path: path.to_path_buf(),
         channel_names: preview.metadata.channel_names,
         histograms: preview.histograms,
+        preview_width: preview.width,
+        preview_height: preview.height,
+        preview_rgba,
     })
 }
 
@@ -135,8 +169,6 @@ pub(crate) fn apply_histogram_match_levels(
             adjustment.levels = fit_levels_from_histograms(source_histogram, target_histogram);
             report.matched_channels += 1;
         } else {
-            // Source-only separations must contribute no ink after Match Color.
-            // Keep Curve/Mixer intact so the operation stays isolated to Levels.
             adjustment.levels = zero_output_levels();
             report.zeroed_source_only_channels += 1;
         }
@@ -163,7 +195,6 @@ pub(crate) fn fit_levels_from_histograms(
         return Levels::default();
     }
 
-    // Robust endpoints avoid letting a handful of clipped pixels dominate the fit.
     let source_low = histogram_quantile(source, 0.01);
     let source_high = histogram_quantile(source, 0.99);
     let target_low = histogram_quantile(target, 0.01);
@@ -180,8 +211,6 @@ pub(crate) fn fit_levels_from_histograms(
     }
 
     if source_high - source_low < epsilon {
-        // A nearly flat source cannot reproduce a distribution through Levels alone.
-        // Mapping it to the target median is the least surprising editable result.
         return Levels {
             output_black: target_mid,
             output_white: target_mid,
@@ -204,7 +233,6 @@ pub(crate) fn fit_levels_from_histograms(
         }
     }
 
-    // Levels uses y = x^(1/gamma), so the least-squares log-space slope is 1/gamma.
     let gamma = if sum_xx > f32::EPSILON {
         let inverse_gamma = sum_xy / sum_xx;
         if inverse_gamma.is_finite() && inverse_gamma > 0.0 {
@@ -257,12 +285,7 @@ fn histogram_peak_density(histogram: &[u32; 256]) -> f32 {
     if total <= 0.0 {
         return 0.0;
     }
-    histogram
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0) as f32
-        / total
+    histogram.iter().copied().max().unwrap_or(0) as f32 / total
 }
 
 fn histogram_bin_density(histogram: &[u32; 256], index: usize) -> f32 {
@@ -272,6 +295,11 @@ fn histogram_bin_density(histogram: &[u32; 256], index: usize) -> f32 {
     } else {
         histogram[index] as f32 / total
     }
+}
+
+fn histogram_display_height(histogram: &[u32; 256], index: usize, graph_height: f32) -> f32 {
+    let peak = histogram_peak_density(histogram).max(f32::EPSILON);
+    histogram_bin_density(histogram, index) / peak * graph_height
 }
 
 pub(crate) fn target_overlay_color(ui: &egui::Ui) -> egui::Color32 {
@@ -294,6 +322,13 @@ pub(crate) fn draw_histogram_with_target(
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    for step in 1..4 {
+        let x = egui::lerp(rect.x_range(), step as f32 / 4.0);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(0.5, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
+    }
     painter.rect_stroke(
         rect,
         2.0,
@@ -301,15 +336,6 @@ pub(crate) fn draw_histogram_with_target(
         egui::StrokeKind::Inside,
     );
 
-    // Histograms can come from differently-sized images. Compare probability
-    // density rather than raw pixel counts so the target overlay keeps its true shape.
-    let max_density = original
-        .into_iter()
-        .chain(adjusted)
-        .chain(target)
-        .map(histogram_peak_density)
-        .fold(0.0_f32, f32::max)
-        .max(f32::EPSILON);
     let original_color = ui.visuals().weak_text_color();
     let adjusted_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
 
@@ -319,14 +345,14 @@ pub(crate) fn draw_histogram_with_target(
             super::curve_editor::tonal_display_value(index as f32 / 255.0, display_mode),
         );
         if let Some(bins) = original {
-            let h = histogram_bin_density(bins, index) / max_density * rect.height();
+            let h = histogram_display_height(bins, index, rect.height());
             painter.line_segment(
                 [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
                 egui::Stroke::new(1.0, original_color),
             );
         }
         if let Some(bins) = adjusted {
-            let h = histogram_bin_density(bins, index) / max_density * rect.height();
+            let h = histogram_display_height(bins, index, rect.height());
             painter.line_segment(
                 [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
                 egui::Stroke::new(1.0, adjusted_color),
@@ -341,7 +367,7 @@ pub(crate) fn draw_histogram_with_target(
                     rect.x_range(),
                     super::curve_editor::tonal_display_value(index as f32 / 255.0, display_mode),
                 );
-                let h = histogram_bin_density(bins, index) / max_density * rect.height();
+                let h = histogram_display_height(bins, index, rect.height());
                 egui::pos2(x, rect.bottom() - h)
             })
             .collect::<Vec<_>>();
@@ -365,6 +391,17 @@ mod tests {
         result
     }
 
+    fn target(path: &str, names: Vec<String>, histograms: Vec<[u32; 256]>) -> MatchColorTarget {
+        MatchColorTarget {
+            path: PathBuf::from(path),
+            channel_names: names,
+            histograms,
+            preview_width: 1,
+            preview_height: 1,
+            preview_rgba: vec![255, 255, 255, 255],
+        }
+    }
+
     #[test]
     fn identical_histograms_fit_near_identity_levels() {
         let source = histogram(&[(8, 3), (64, 20), (128, 40), (192, 20), (245, 3)]);
@@ -382,20 +419,29 @@ mod tests {
     }
 
     #[test]
+    fn histogram_display_normalizes_each_series_to_its_own_peak() {
+        let weak = histogram(&[(128, 4)]);
+        let strong = histogram(&[(128, 4000)]);
+        let height = 105.0;
+        assert!((histogram_display_height(&weak, 128, height) - height).abs() < 0.001);
+        assert!((histogram_display_height(&strong, 128, height) - height).abs() < 0.001);
+    }
+
+    #[test]
     fn source_only_channels_are_zeroed_and_target_only_channels_are_ignored() {
         let source_histograms = vec![
             histogram(&[(32, 10), (128, 30), (220, 10)]),
             histogram(&[(64, 20), (180, 20)]),
             histogram(&[(100, 40)]),
         ];
-        let target = MatchColorTarget {
-            path: PathBuf::from("target.tif"),
-            channel_names: vec!["C".into(), "M".into()],
-            histograms: vec![
+        let target = target(
+            "target.tif",
+            vec!["C".into(), "M".into()],
+            vec![
                 histogram(&[(24, 10), (120, 30), (210, 10)]),
                 histogram(&[(40, 20), (160, 20)]),
             ],
-        };
+        );
         let names = vec!["C".to_owned(), "M".to_owned(), "Spot".to_owned()];
         let mut adjustments = BTreeMap::new();
         adjustments.entry("C".to_owned()).or_insert_with(|| {
@@ -427,14 +473,14 @@ mod tests {
     #[test]
     fn target_only_channels_do_not_create_source_adjustments() {
         let source_histograms = vec![histogram(&[(80, 20), (160, 20)])];
-        let target = MatchColorTarget {
-            path: PathBuf::from("target-five-channel.tif"),
-            channel_names: vec!["C".into(), "M".into()],
-            histograms: vec![
+        let target = target(
+            "target-five-channel.tif",
+            vec!["C".into(), "M".into()],
+            vec![
                 histogram(&[(60, 20), (150, 20)]),
                 histogram(&[(20, 10), (220, 10)]),
             ],
-        };
+        );
         let names = vec!["C".to_owned()];
         let mut adjustments = BTreeMap::new();
         let report = apply_histogram_match_levels(

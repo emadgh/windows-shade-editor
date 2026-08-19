@@ -7,6 +7,7 @@ use eframe::egui;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum FaceUiAction {
     RenameProject(String),
+    AddFacesDialog,
     Select(usize),
     SetStatus {
         index: usize,
@@ -23,7 +24,6 @@ pub(crate) enum NavigationUiAction {
     OpenProjectDialog,
     OpenRecent(PathBuf),
     ShowProjectView,
-    AddFacesDialog,
     QuickSave,
     Save,
     SaveAs,
@@ -87,6 +87,7 @@ impl ShadeApp {
                     self.mark_project_dirty();
                 }
             }
+            FaceUiAction::AddFacesDialog => self.add_faces_dialog(),
             FaceUiAction::Select(index) => {
                 if index >= self.faces.len() {
                     return;
@@ -147,7 +148,6 @@ impl ShadeApp {
                 self.request_project_transition(ProjectTransition::Open(path), Some(ctx));
             }
             NavigationUiAction::ShowProjectView => self.project_view.open = true,
-            NavigationUiAction::AddFacesDialog => self.add_faces_dialog(),
             NavigationUiAction::QuickSave => {
                 self.quick_save_project();
             }
@@ -311,7 +311,10 @@ impl ShadeApp {
             AdjustmentUiAction::SelectProjectPalette(palette) => {
                 self.select_project_palette(palette);
             }
-            AdjustmentUiAction::ShowComposite => self.show_composite(),
+            AdjustmentUiAction::ShowComposite => {
+                self.adjustment_scope = AdjustmentScope::All;
+                self.show_composite();
+            }
             AdjustmentUiAction::SelectChannel(index) => self.select_channel(index, true),
             AdjustmentUiAction::PersistSettings => self.save_settings_quietly(),
             AdjustmentUiAction::InvalidatePreviews => self.mark_all_previews_dirty(),
@@ -339,6 +342,7 @@ mod tests {
                 status: model::FaceStatus::Rejected,
             }
         );
+        assert_eq!(FaceUiAction::AddFacesDialog, FaceUiAction::AddFacesDialog);
     }
 
     #[test]
