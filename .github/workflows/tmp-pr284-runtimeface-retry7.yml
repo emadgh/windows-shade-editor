@@ -1,0 +1,54 @@
+name: Temporary guarded PR284 runtime source wiring retry7
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr284-runtimeface-retry7
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Reuse retry6 and fix final RuntimePreview dimension call sites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git show origin/tmp/pr284-runtimeface-retry6:.github/workflows/tmp-pr284-runtimeface-retry6.yml | Out-File -Encoding utf8 retry6.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          from pathlib import Path
+
+          text = Path('retry6.yml').read_text(encoding='utf-8-sig')
+          marker = '        run: |\n'
+          if text.count(marker) != 1:
+              raise SystemExit(f'Expected one run block in retry6, got {text.count(marker)}')
+          body = text.split(marker, 1)[1]
+          lines = body.splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          anchor = "Remove-Item retry3.yml, retry-helper.yml, ownership.py, comprehensive.py, finalfix.py -ErrorAction SilentlyContinue\n"
+          if script.count(anchor) != 1:
+              raise SystemExit(f'Expected one cleanup anchor, got {script.count(anchor)}')
+          fix = r'''$mainText = Get-Content src/main.rs -Raw
+          $needle = 'face.preview.width, face.preview.height'
+          $replacement = 'face.preview.width(), face.preview.height()'
+          $count = ([regex]::Matches($mainText, [regex]::Escape($needle))).Count
+          if ($count -ne 3) { throw "Expected exactly 3 RuntimePreview dimension field call sites, got $count" }
+          $mainText = $mainText.Replace($needle, $replacement)
+          Set-Content src/main.rs -Value $mainText -NoNewline
+          '''
+          script = script.replace(anchor, fix + anchor, 1)
+          Path('retry7.ps1').write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File retry7.ps1
+          exit $LASTEXITCODE
