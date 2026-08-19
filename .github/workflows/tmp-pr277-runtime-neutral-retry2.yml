@@ -1,0 +1,65 @@
+name: Temporary guarded PR277 runtime-neutral retry2
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr277-runtime-neutral-retry2
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/runtime-preview-neutral
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Apply runtime-neutral patch after Arc compatibility fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '68ad5b39cd18a647668c472e6e9fa440b3df76d5'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR277 feature head moved' }
+
+          git show origin/tmp/pr277-runtime-neutral-patch:.github/workflows/tmp-pr277-runtime-neutral-patch.yml | Out-File -Encoding utf8 old-helper.yml
+          @'
+          from pathlib import Path
+          text = Path('old-helper.yml').read_text(encoding='utf-8-sig')
+          start = text.index("          @'\n") + len("          @'\n")
+          end = text.index("          '@ | python -", start)
+          lines = text[start:end].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('apply_patch.py').write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          python apply_patch.py
+
+          cargo fmt --all
+          $allowed = @('src/main.rs', 'src/render.rs', 'src/color_management.rs', 'src/runtime_preview.rs')
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) {
+            if ($allowed -notcontains $file) { git checkout -- $file }
+          }
+          Remove-Item old-helper.yml, apply_patch.py -ErrorAction SilentlyContinue
+
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) {
+            if ($allowed -notcontains $file) { throw "Unexpected patch surface after cleanup: $file" }
+          }
+          if ($changed.Count -lt 3) { throw "Expected runtime-neutral patch to modify at least three files, got $($changed -join ', ')" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/render.rs src/color_management.rs src/runtime_preview.rs
+          git commit -m 'feat: make preview render and ICC boundary source-neutral (#277)'
+          git push origin HEAD:codex/runtime-preview-neutral
