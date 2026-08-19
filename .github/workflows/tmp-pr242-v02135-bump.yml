@@ -1,0 +1,97 @@
+name: Temporary guarded PR242 v0.21.35 bump
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr242-v02135-bump
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-forward-model-binding-main-refresh
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Regenerate verify and publish version identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '138f94ccb34a938040152d3502c8411dd348d2d2'
+          $actualHead = (git rev-parse HEAD).Trim()
+          if ($actualHead -ne $expectedHead) {
+            throw "Expected feature head $expectedHead, got $actualHead"
+          }
+
+          Copy-Item Cargo.lock "$env:RUNNER_TEMP/Cargo.lock.before"
+
+          @'
+          from pathlib import Path
+
+          cargo = Path("Cargo.toml")
+          text = cargo.read_text(encoding="utf-8")
+          old = 'version = "0.21.34"'
+          new = 'version = "0.21.35"'
+          if text.count(old) != 1:
+              raise SystemExit(f"Cargo.toml root version marker count was {text.count(old)}, expected 1")
+          cargo.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+
+          version = Path("VERSION")
+          if version.read_text(encoding="utf-8").strip() != "0.21.34":
+              raise SystemExit("VERSION was not 0.21.34 at guarded head")
+          version.write_text("0.21.35\n", encoding="utf-8", newline="\n")
+          '@ | python -
+
+          cargo check --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          @'
+          import copy
+          import os
+          import tomllib
+          from pathlib import Path
+
+          before = tomllib.loads(Path(os.environ['RUNNER_TEMP']).joinpath('Cargo.lock.before').read_text(encoding='utf-8'))
+          after = tomllib.loads(Path('Cargo.lock').read_text(encoding='utf-8'))
+
+          def scrub(value, expected_version):
+              value = copy.deepcopy(value)
+              roots = [p for p in value.get('package', []) if p.get('name') == 'windows-shade-editor']
+              if len(roots) != 1:
+                  raise SystemExit(f'Expected exactly one root package in Cargo.lock, got {len(roots)}')
+              if roots[0].get('version') != expected_version:
+                  raise SystemExit(f'Root lock version was {roots[0].get("version")}, expected {expected_version}')
+              roots[0]['version'] = '__ROOT_VERSION__'
+              return value
+
+          if scrub(before, '0.21.34') != scrub(after, '0.21.35'):
+              raise SystemExit('Cargo.lock changed beyond the root package version')
+          '@ | python -
+
+          $changed = @(git diff --name-only)
+          $expectedFiles = @('Cargo.lock', 'Cargo.toml', 'VERSION')
+          $changedKey = (($changed | Sort-Object) -join "`n")
+          $expectedKey = (($expectedFiles | Sort-Object) -join "`n")
+          if ($changedKey -ne $expectedKey) {
+            throw "Unexpected version-bump surface: $($changed -join ', ')"
+          }
+
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: finalize v0.21.35 exact forward-model eligibility binding'
+          git push origin HEAD:codex/custom-optimizer-forward-model-binding-main-refresh
