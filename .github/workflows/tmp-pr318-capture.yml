@@ -1,0 +1,173 @@
+name: Temporary guarded PR318 capture disposition migration
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr318-capture-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/append-existing-production-transaction
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Add immutable Production disposition to capture, validate and publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = '5dbe9a9231c6dc936e73c80f14e341fcced3fca8'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR318 head moved before capture migration' }
+
+          @'
+          from pathlib import Path
+          import re
+
+          tx = Path('src/conversion_transaction.rs')
+          text = tx.read_text(encoding='utf-8')
+
+          old = 'use crate::production_project::{ProductionProjectSpec, build_production_project};\n'
+          new = old + 'use crate::production_project_disposition::ProductionProjectDisposition;\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'production_project import marker count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_optimizer_evidence: Option<CapturedCustomOptimizerEvidence>,
+    pub output_policy: CapturedOutputPolicy,
+'''
+          new = '''    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_optimizer_evidence: Option<CapturedCustomOptimizerEvidence>,
+    #[serde(default)]
+    pub production_project_disposition: ProductionProjectDisposition,
+    pub output_policy: CapturedOutputPolicy,
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'capture field marker count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          for old, new in [
+              ('            custom_optimizer_evidence: None,\n            output_policy,',
+               '            custom_optimizer_evidence: None,\n            production_project_disposition: ProductionProjectDisposition::CreateNew,\n            output_policy,'),
+              ('            custom_optimizer_evidence: Some(custom_optimizer_evidence),\n            output_policy,',
+               '            custom_optimizer_evidence: Some(custom_optimizer_evidence),\n            production_project_disposition: ProductionProjectDisposition::CreateNew,\n            output_policy,'),
+          ]:
+              if text.count(old) != 1:
+                  raise SystemExit(f'constructor marker count={text.count(old)} for {old[:48]!r}')
+              text = text.replace(old, new, 1)
+
+          marker = '    pub fn validate(&self) -> Result<(), String> {\n'
+          builder = '''    pub fn with_production_project_disposition(
+        mut self,
+        disposition: ProductionProjectDisposition,
+    ) -> Result<Self, String> {
+        self.production_project_disposition = disposition;
+        self.validate()?;
+        Ok(self)
+    }
+
+'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'validate marker count={text.count(marker)}')
+          text = text.replace(marker, builder + marker, 1)
+
+          marker = '''        validate_conversion_output_path(&self.source_face_path, &self.output_tiff_path)
+            .map_err(|err| err.to_string())?;
+'''
+          replacement = '''        self.production_project_disposition.validate()?;
+        validate_conversion_output_path(&self.source_face_path, &self.output_tiff_path)
+            .map_err(|err| err.to_string())?;
+'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'output-validation marker count={text.count(marker)}')
+          text = text.replace(marker, replacement, 1)
+          tx.write_text(text, encoding='utf-8', newline='\n')
+
+          # Direct struct literals do not receive serde defaults at compile time.
+          literal_pattern = re.compile(r'^(?P<indent>\s*)ConversionJobCapture \{\s*$', re.MULTILINE)
+          touched = []
+          for root in (Path('src'), Path('tests')):
+              for path in root.rglob('*.rs'):
+                  if path == tx:
+                      continue
+                  original = path.read_text(encoding='utf-8')
+                  matches = list(literal_pattern.finditer(original))
+                  if not matches:
+                      continue
+                  updated = literal_pattern.sub(
+                      lambda m: m.group(0) + '\n' + m.group('indent') + '    production_project_disposition: crate::production_project_disposition::ProductionProjectDisposition::CreateNew,',
+                      original,
+                  )
+                  path.write_text(updated, encoding='utf-8', newline='\n')
+                  touched.append((path.as_posix(), len(matches)))
+          print('migrated direct capture literals:', touched)
+
+          compat = Path('src/conversion_capture_compat_tests.rs')
+          text = compat.read_text(encoding='utf-8')
+          old = '''    let restored: ConversionJobCapture = serde_json::from_slice(&bytes).unwrap();
+    assert!(restored.custom_optimizer_evidence.is_none());
+    assert!(restored.validate().is_ok());
+}
+'''
+          new = '''    let restored: ConversionJobCapture = serde_json::from_slice(&bytes).unwrap();
+    assert!(restored.custom_optimizer_evidence.is_none());
+    assert_eq!(
+        restored.production_project_disposition,
+        crate::production_project_disposition::ProductionProjectDisposition::CreateNew
+    );
+    assert!(restored.validate().is_ok());
+}
+
+#[test]
+fn legacy_capture_json_without_production_disposition_defaults_to_create_new() {
+    let capture = capture_with_recipe(icc_recipe()).unwrap();
+    let mut value = serde_json::to_value(&capture).unwrap();
+    value
+        .as_object_mut()
+        .expect("capture object")
+        .remove("production_project_disposition");
+    let restored: ConversionJobCapture = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        restored.production_project_disposition,
+        crate::production_project_disposition::ProductionProjectDisposition::CreateNew
+    );
+    restored.validate().unwrap();
+}
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'compat test marker count={text.count(old)}')
+          compat.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $allowed = @(
+            'src/conversion_transaction.rs',
+            'src/conversion_capture_compat_tests.rs',
+            'src/conversion_queue.rs',
+            'src/ui/color_conversion.rs',
+            'src/main.rs',
+            'src/icc_conversion_worker.rs',
+            'tests/non_tiff_production_source.rs'
+          )
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) {
+            if ($allowed -notcontains $file) { throw "Unexpected capture-migration file $file" }
+          }
+
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- $changed
+          git commit -m 'feat: persist Production project disposition in conversion capture (#316)'
+          git push origin HEAD:codex/append-existing-production-transaction
