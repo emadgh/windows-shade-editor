@@ -113,8 +113,10 @@ mod tests {
             "verify_relink_metadata",
             "load_relink_candidate",
             "find_named_file_recursive",
-            "The active Face source TIFF is missing",
-            "Export all requires every Accepted Face source TIFF to be available",
+            "The active Face source image is missing",
+            "Export all requires every Accepted Face source image to be available",
+            "TIFF-source-only in this version",
+            "TIFF round-trip validation requires a TIFF source Face",
             "status.is_rejected()",
             "excluded {rejected_count} Rejected Face(s)",
         ] {

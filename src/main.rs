@@ -882,10 +882,40 @@ impl ShadeApp {
             && (self.project_dirty || self.project_path.is_none())
     }
 
+    fn active_face_is_tiff_export_source(&self) -> bool {
+        self.faces
+            .get(self.current_face)
+            .filter(|face| face.available)
+            .is_some_and(|face| face.preview.is_tiff())
+    }
+
+    fn accepted_faces_include_non_tiff_export_source(&self) -> bool {
+        self.faces.iter().enumerate().any(|(index, face)| {
+            !self
+                .project
+                .faces
+                .get(index)
+                .is_some_and(|project_face| project_face.status.is_rejected())
+                && face.available
+                && !face.preview.is_tiff()
+        })
+    }
+
     fn enqueue_export(&mut self, spec: export_queue::ExportQueueSpec) -> bool {
         if self.conversion_queue.has_pending() {
             self.report_error(
                 "Finish or cancel the active Production Conversion before queueing exports.",
+            );
+            return false;
+        }
+        if self
+            .faces
+            .iter()
+            .find(|face| face.path.as_path() == spec.source.as_path())
+            .is_some_and(|face| !face.preview.is_tiff())
+        {
+            self.report_error(
+                "Shade Editor Export currently requires a TIFF source Face. PNG/JPEG remain available for preview and Color Conversion preflight.",
             );
             return false;
         }
@@ -913,7 +943,13 @@ impl ShadeApp {
         }
         if !workflow::active_face_available(self) {
             self.report_error(
-                "The active Face source TIFF is missing. Relink it before exporting.",
+                "The active Face source image is missing. Relink it before exporting.",
+            );
+            return;
+        }
+        if !self.active_face_is_tiff_export_source() {
+            self.report_error(
+                "Export currently requires a TIFF source Face. PNG/JPEG design Faces can still be previewed and preflighted for Color Conversion.",
             );
             return;
         }
@@ -1271,7 +1307,13 @@ impl ShadeApp {
         }
         if !workflow::active_face_available(self) {
             self.report_error(
-                "The active Face source TIFF is missing. Relink it before validation.",
+                "The active Face source image is missing. Relink it before validation.",
+            );
+            return;
+        }
+        if !self.active_face_is_tiff_export_source() {
+            self.report_error(
+                "TIFF round-trip validation requires a TIFF source Face; PNG/JPEG validation is not routed through the TIFF production validator.",
             );
             return;
         }
@@ -1341,7 +1383,13 @@ impl ShadeApp {
                 .is_some_and(|item| item.status.is_rejected())
                 && !face.available
         }) {
-            self.report_error("Export all requires every Accepted Face source TIFF to be available. Relink missing Accepted Faces first.");
+            self.report_error("Export all requires every Accepted Face source image to be available. Relink missing Accepted Faces first.");
+            return;
+        }
+        if self.accepted_faces_include_non_tiff_export_source() {
+            self.report_error(
+                "Export All is TIFF-source-only in this version. No files were queued; remove/reject non-TIFF Faces or export TIFF Faces separately.",
+            );
             return;
         }
         if self.export.all_folder.trim().is_empty() {
@@ -1397,7 +1445,13 @@ impl ShadeApp {
                 .is_some_and(|item| item.status.is_rejected())
                 && !face.available
         }) {
-            self.report_error("Export all requires every Accepted Face source TIFF to be available. Relink missing Accepted Faces first.");
+            self.report_error("Export all requires every Accepted Face source image to be available. Relink missing Accepted Faces first.");
+            return;
+        }
+        if self.accepted_faces_include_non_tiff_export_source() {
+            self.report_error(
+                "Export All is TIFF-source-only in this version. No files were queued; remove/reject non-TIFF Faces or export TIFF Faces separately.",
+            );
             return;
         }
 
@@ -1725,7 +1779,13 @@ impl ShadeApp {
         }
         if !workflow::active_face_available(self) {
             self.report_error(
-                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",
+                "The active Face source image is missing. Relink it before exporting Snapshots.",
+            );
+            return;
+        }
+        if !self.active_face_is_tiff_export_source() {
+            self.report_error(
+                "Snapshot Export currently requires a TIFF source Face. PNG/JPEG design Faces can still be previewed and preflighted for Color Conversion.",
             );
             return;
         }
@@ -1804,7 +1864,13 @@ impl ShadeApp {
         }
         if !workflow::active_face_available(self) {
             self.report_error(
-                "The active Face source TIFF is missing. Relink it before exporting Snapshots.",
+                "The active Face source image is missing. Relink it before exporting Snapshots.",
+            );
+            return;
+        }
+        if !self.active_face_is_tiff_export_source() {
+            self.report_error(
+                "Snapshot Export currently requires a TIFF source Face. PNG/JPEG design Faces can still be previewed and preflighted for Color Conversion.",
             );
             return;
         }
@@ -2546,7 +2612,7 @@ impl ShadeApp {
         self.fit_requested = true;
         self.viewport_recenter = true;
         self.mark_project_dirty();
-        self.report_info("Face removed from project (source TIFF was not deleted)");
+        self.report_info("Face removed from project (source image was not deleted)");
     }
 
     fn remember_previous_shade(&mut self, path: &Path) {
@@ -3602,7 +3668,9 @@ impl ShadeApp {
                         )
                         .changed();
                 });
-            ui.small("Default: top-left, 1 cm margin. Point size is converted using the TIFF DPI.");
+            ui.small(
+                "Default: top-left, 1 cm margin. Point size is converted using the source DPI.",
+            );
         });
         if changed {
             self.mark_project_dirty();

@@ -1,7 +1,9 @@
 use crate::color_management::PreviewColorTransform;
 use crate::model::{Curve, Levels, MASTER_ADJUSTMENT_KEY, ShadeProject, apply_curve, apply_levels};
 use crate::runtime_preview::{RuntimeColorModel, RuntimePreviewSource};
-use crate::tiff_io::{self, PreviewFace};
+use crate::tiff_io;
+#[cfg(test)]
+use crate::tiff_io::PreviewFace;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChannelClippingStats {

@@ -372,6 +372,7 @@ impl ExportQueue {
         protected_sources: Vec<PathBuf>,
         project_session_id: u64,
     ) -> Result<u64, String> {
+        validate_tiff_export_source(&spec.source)?;
         validate_destination(&spec.destination, &protected_sources)?;
         let key = path_safety::path_key(&spec.destination);
         if self.reserved_destination_keys().contains(&key) {
@@ -796,7 +797,10 @@ impl ExportQueue {
         let id = self.items[index].id;
         let session_id = queued.project_session_id;
 
-        let preflight = validate_destination(&queued.export.destination, &queued.protected_sources)
+        let preflight = validate_tiff_export_source(&queued.export.source)
+            .and_then(|_| {
+                validate_destination(&queued.export.destination, &queued.protected_sources)
+            })
             .and_then(|_| {
                 if let Some(fingerprint) = &queued.source_fingerprint {
                     fingerprint.verify(&queued.export.source)?;
@@ -989,6 +993,23 @@ fn queue_persistence_path() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("ShadeEditor")
         .join("export-queue.json")
+}
+
+fn validate_tiff_export_source(source: &Path) -> Result<(), String> {
+    let is_tiff = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff")
+        });
+    if is_tiff {
+        Ok(())
+    } else {
+        Err(format!(
+            "Shade Editor Export currently accepts TIFF source Faces only. PNG/JPEG remain available for preview and Color Conversion preflight: {}",
+            source.display()
+        ))
+    }
 }
 
 fn validate_destination(destination: &Path, sources: &[PathBuf]) -> Result<(), String> {
@@ -1218,6 +1239,29 @@ mod tests {
                 .status,
             ExportQueueStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn tiff_only_export_source_guard_is_case_insensitive() {
+        assert!(validate_tiff_export_source(Path::new("face.tif")).is_ok());
+        assert!(validate_tiff_export_source(Path::new("face.TIFF")).is_ok());
+        for source in ["face.png", "face.JPG", "face.jpeg", "face.webp"] {
+            let error = validate_tiff_export_source(Path::new(source))
+                .expect_err("non-TIFF export source must fail closed");
+            assert!(error.contains("TIFF source Faces only"), "{error}");
+        }
+    }
+
+    #[test]
+    fn project_queue_rejects_non_tiff_before_source_io() {
+        let mut queue = ExportQueue::new();
+        let mut item = spec("out.tif");
+        item.source = PathBuf::from("definitely-missing-source.png");
+        let error = queue
+            .enqueue_for_project(item, Vec::new(), 91)
+            .expect_err("PNG must be rejected before fingerprint IO");
+        assert!(error.contains("TIFF source Faces only"), "{error}");
+        assert!(queue.items().is_empty());
     }
 
     #[test]

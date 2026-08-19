@@ -469,6 +469,13 @@ pub fn is_supported_design_source_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_shade_editor::conversion_preflight::{
+        PreflightCode, SourceProfileState, build_conversion_preflight_for_source,
+    };
+    use windows_shade_editor::conversion_workflow::ConversionSaveGate;
+    use windows_shade_editor::jpeg_source::{
+        DecodedJpegSource, JpegCodingProcess, JpegSourceModel,
+    };
     use windows_shade_editor::png_source::{DecodedPngSource, PngSourceModel};
 
     #[test]
@@ -561,6 +568,124 @@ mod tests {
         assert_eq!(preview.alpha(), Some(&[7, 8][..]));
         assert!(preview.tiff_metadata().is_none());
         assert!(!preview.is_tiff());
+    }
+
+    #[test]
+    fn png_alpha_runtime_descriptor_blocks_production_preflight() {
+        let decoded = DecodedPngSource {
+            width: 1,
+            height: 1,
+            bit_depth: 16,
+            model: PngSourceModel::Rgb,
+            samples: vec![100, 200, 300],
+            alpha: Some(vec![u16::MAX / 2]),
+            icc_profile: None,
+            declares_srgb: true,
+        };
+        let runtime = RuntimePreview::Design(
+            DesignSourcePreview::from_png(&decoded, 512).expect("PNG runtime preview"),
+        );
+        let descriptor = runtime.source_descriptor().expect("PNG descriptor");
+        assert_eq!(descriptor.format, SourceImageFormat::Png);
+        assert_eq!(
+            descriptor.transparency,
+            TransparencyState::PresentUnresolved
+        );
+        assert_eq!(runtime.channels().len(), 3);
+        assert!(runtime.alpha().is_some());
+        let report = build_conversion_preflight_for_source(
+            &descriptor.as_borrowed(),
+            SourceProfileState::Missing,
+            ConversionSaveGate::Ready,
+        );
+        assert!(report.contains(PreflightCode::UnresolvedTransparency));
+        assert!(!report.can_convert());
+    }
+
+    #[test]
+    fn jpeg_runtime_descriptor_preserves_coding_process_lossiness_for_preflight() {
+        let build = |coding_process| {
+            let decoded = DecodedJpegSource {
+                width: 1,
+                height: 1,
+                bit_depth: 8,
+                model: JpegSourceModel::Rgb,
+                samples: vec![1, 2, 3],
+                icc_profile: None,
+                coding_process,
+            };
+            RuntimePreview::Design(
+                DesignSourcePreview::from_jpeg(&decoded, 512).expect("JPEG runtime preview"),
+            )
+        };
+
+        let lossy = build(JpegCodingProcess::DctProgressive);
+        let lossy_descriptor = lossy.source_descriptor().expect("lossy JPEG descriptor");
+        assert_eq!(lossy_descriptor.lossiness, SourceLossiness::Lossy);
+        let lossy_report = build_conversion_preflight_for_source(
+            &lossy_descriptor.as_borrowed(),
+            SourceProfileState::Missing,
+            ConversionSaveGate::Ready,
+        );
+        assert!(lossy_report.contains(PreflightCode::JpegLossySource));
+
+        let lossless = build(JpegCodingProcess::Lossless);
+        let lossless_descriptor = lossless
+            .source_descriptor()
+            .expect("lossless JPEG descriptor");
+        assert_eq!(lossless_descriptor.lossiness, SourceLossiness::Lossless);
+        let lossless_report = build_conversion_preflight_for_source(
+            &lossless_descriptor.as_borrowed(),
+            SourceProfileState::Missing,
+            ConversionSaveGate::Ready,
+        );
+        assert!(!lossless_report.contains(PreflightCode::JpegLossySource));
+    }
+
+    #[test]
+    fn tiff_runtime_carrier_preserves_preview_and_descriptor_parity() {
+        let metadata = TiffMetadata {
+            width: 2,
+            height: 1,
+            bit_depth: 16,
+            samples_per_pixel: 3,
+            base_channel_count: 3,
+            color_model: TiffColorModel::Rgb,
+            non_cmyk_separated: false,
+            channel_names: vec!["Red".into(), "Green".into(), "Blue".into()],
+            channel_display_info: vec![None; 3],
+            compression: None,
+            predictor: None,
+            orientation: None,
+            icc_profile: Some(vec![9, 8, 7]),
+            photoshop_resources: None,
+            photoshop_image_source_data: None,
+        };
+        let original = PreviewFace {
+            metadata,
+            width: 2,
+            height: 1,
+            channels: vec![vec![1, 2], vec![3, 4], vec![5, 6]],
+            histograms: vec![[0; 256]; 3],
+        };
+        let expected_channels = original.channels.clone();
+        let runtime = RuntimePreview::Tiff(original);
+        let descriptor = runtime.source_descriptor().expect("TIFF descriptor");
+        assert_eq!(descriptor.format, SourceImageFormat::Tiff);
+        assert_eq!(descriptor.color_model, DesignSourceColorModel::Rgb);
+        assert_eq!(descriptor.bit_depth, 16);
+        assert_eq!(descriptor.channel_count, 3);
+        assert_eq!(descriptor.embedded_icc.as_deref(), Some(&[9, 8, 7][..]));
+        assert_eq!(descriptor.transparency, TransparencyState::None);
+        assert_eq!(descriptor.lossiness, SourceLossiness::Lossless);
+        assert_eq!(runtime.source_dimensions(), (2, 1));
+        assert_eq!(runtime.width(), 2);
+        assert_eq!(runtime.height(), 1);
+        assert_eq!(runtime.channels(), expected_channels.as_slice());
+        assert_eq!(runtime.channel_names(), ["Red", "Green", "Blue"]);
+        assert!(runtime.tiff_metadata().is_some());
+        assert!(runtime.as_tiff().is_some());
+        assert!(runtime.is_tiff());
     }
 
     #[test]
