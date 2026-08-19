@@ -1,0 +1,112 @@
+name: Temporary PR297 error-only diagnostic
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr297-diagnostic-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/design-source-runtime-wiring
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Reconstruct PR297 patch and capture errors only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = 'ff637d832913c79fe026591ec149c36f4c0a2002'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR284 canonical head moved' }
+
+          git show origin/tmp/pr284-export-guard-workflow:.github/workflows/tmp-pr284-export-guard.yml | Out-File -Encoding utf8 pr297.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          from pathlib import Path
+          import re
+
+          text = Path('pr297.yml').read_text(encoding='utf-8-sig')
+          blocks = re.findall(r"          @'\n(.*?)          '@ \| python -", text, flags=re.S)
+          if len(blocks) != 1:
+              raise SystemExit(f'Expected exactly one Python patch block, got {len(blocks)}')
+          lines = blocks[0].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('pr297_patch.py').write_text(script, encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python pr297_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item pr297.yml, pr297_patch.py -ErrorAction SilentlyContinue
+
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $allowed = @('src/export_queue.rs','src/main.rs','src/runtime_preview.rs','src/render.rs')
+          $allChanged = @(git diff --name-only)
+          foreach ($file in $allChanged) { if ($allowed -notcontains $file) { git checkout -- $file } }
+          $changed = @(git diff --name-only)
+          foreach ($file in $changed) { if ($allowed -notcontains $file) { throw "Unexpected patch surface: $file" } }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          New-Item -ItemType Directory -Force diagnostics | Out-Null
+          $checkLines = @(cargo check --locked --target x86_64-pc-windows-msvc 2>&1)
+          $checkCode = $LASTEXITCODE
+          $testLines = @()
+          $testCode = 0
+          if ($checkCode -eq 0) {
+            $testLines = @(cargo test --locked --target x86_64-pc-windows-msvc 2>&1)
+            $testCode = $LASTEXITCODE
+          }
+
+          @'
+          import os
+          import re
+          from pathlib import Path
+
+          check = os.environ.get('PR297_CHECK_LOG', '').splitlines()
+          test = os.environ.get('PR297_TEST_LOG', '').splitlines()
+          lines = ['=== cargo check ==='] + check + ['=== cargo test ==='] + test
+          needles = [
+              r'error(?:\[E\d+\])?:', r'error\[E\d+\]', r'could not compile',
+              r'FAILED', r'failures:', r'panicked at', r'test result: FAILED',
+          ]
+          keep = set()
+          for i, line in enumerate(lines):
+              if any(re.search(pattern, line, re.I) for pattern in needles):
+                  for j in range(max(0, i - 4), min(len(lines), i + 16)):
+                      keep.add(j)
+          if not keep:
+              out = ['No compiler/test failure pattern matched.', f'check_exit={os.environ.get("PR297_CHECK_CODE")}', f'test_exit={os.environ.get("PR297_TEST_CODE")}']
+          else:
+              out = []
+              last = -2
+              for i in sorted(keep):
+                  if i > last + 1:
+                      out.append('---')
+                  out.append(lines[i])
+                  last = i
+              out += [f'check_exit={os.environ.get("PR297_CHECK_CODE")}', f'test_exit={os.environ.get("PR297_TEST_CODE")}']
+          Path('diagnostics/pr297-errors.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
+          '@ | Set-Content diagnostics/filter.py
+
+          $env:PR297_CHECK_LOG = ($checkLines -join "`n")
+          $env:PR297_TEST_LOG = ($testLines -join "`n")
+          $env:PR297_CHECK_CODE = "$checkCode"
+          $env:PR297_TEST_CODE = "$testCode"
+          python diagnostics/filter.py
+          Remove-Item diagnostics/filter.py
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B tmp/pr297-errors-output
+          git add diagnostics/pr297-errors.txt
+          git commit -m 'chore: capture PR297 compiler test failures'
+          git push --force origin HEAD:tmp/pr297-errors-output
