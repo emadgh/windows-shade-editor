@@ -1,0 +1,63 @@
+---
+test conversion_recipe::tests::solver_policy_change_changes_recipe_identity ... ok
+test conversion_queue::tests::recovered_waiting_work_requires_explicit_resume ... ok
+test conversion_tiff::tests::cmyk_u8_tiff_round_trips_standard_ink_set_and_samples ... ok
+test conversion_queue::tests::completed_conversion_links_only_the_unchanged_source_project ... ok
+test conversion_tiff::tests::failed_render_never_replaces_existing_destination ... ok
+test conversion_tiff::tests::devicelink_output_round_trips_without_mislabeling_link_as_output_icc ... ok
+test conversion_tiff::tests::huge_layout_selects_bigtiff_without_allocating_pixels ... ok
+test conversion_tiff::tests::invalid_channel_topology_is_rejected_before_writing ... ok
+test conversion_tiff::tests::five_channel_u8_round_trips_as_direct_coverage_base_inks ... ok
+test conversion_tiff::tests::forced_bigtiff_round_trips_ink_names_without_large_allocation ... ok
+test conversion_transaction::tests::cancellation_after_output_commit_finishes_project_save_boundary ... ok
+test conversion_transaction::tests::cancellation_before_worker_never_reaches_commit ... ok
+test conversion_transaction::tests::capture_freezes_source_adjustments_and_round_trips ... ok
+test conversion_transaction::tests::project_save_failure_preserves_recoverable_committed_output_and_project ... ok
+test conversion_transaction::tests::source_path_and_project_extension_are_validated ... ok
+test conversion_transaction::tests::successful_commit_builds_and_saves_clean_production_project ... ok
+test conversion_transaction::tests::tampered_recipe_is_rejected_before_backend_runs ... ok
+test conversion_transaction::tests::worker_failure_before_commit_never_saves_project ... ok
+test conversion_workflow::tests::clean_saved_source_can_start_conversion ... ok
+test conversion_workflow::tests::conversion_requires_a_source_face ... ok
+---
+test production_acceptance::tests::greater_than_four_gib_layout_is_reasoned_about_without_allocating_pixels ... ok
+test png_source::tests::rgba16_preserves_precision_and_separates_alpha ... ok
+test production_acceptance::tests::production_fixture_matrix_remains_in_the_test_suite ... ok
+test production_acceptance::tests::standard_windows_ci_keeps_shell_and_schema_validation_required ... ok
+test production_acceptance::tests::missing_face_relink_safety_paths_remain_wired ... FAILED
+test production_colorimetry::tests::canonical_d50_two_degree_passes_and_binds_characterization_identity ... ok
+test production_colorimetry::tests::accepted_two_degree_aliases_are_frozen_by_v1_tests ... ok
+test production_colorimetry::tests::compatibility_content_identity_binds_method_and_characterization ... ok
+test production_colorimetry::tests::d50_case_and_whitespace_normalization_is_explicit ... ok
+test production_colorimetry::tests::d65_fails_before_production_lut_execution ... ok
+test production_colorimetry::tests::ten_degree_observer_fails_before_production_lut_execution ... ok
+test production_lab_transform::tests::chunk_length_and_source_variant_are_strict ... ok
+test production_colorimetry::tests::unknown_aliases_fail_instead_of_being_inferred ... ok
+test production_lab_transform::tests::source_profile_model_mismatch_fails_before_transform_creation ... ok
+test production_project::tests::legacy_project_without_lineage_fields_remains_standalone ... ok
+test production_project::tests::mismatched_provenance_output_is_rejected ... ok
+test production_lab_transform::tests::rgb_srgb_white_black_and_red_transform_to_finite_d50_lab ... ok
+test production_project::tests::source_link_is_upserted_without_touching_adjustments ... ok
+test production_project::tests::production_project_has_target_channels_without_source_adjustments ... ok
+test production_target::tests::display_profile_is_rejected_as_production_output_target ... ok
+---
+test tiff_io::tests::valid_non_cmyk_separated_declaration_uses_every_sample_as_a_base_ink ... ok
+test tiff_conformance_tests::identity_export_preserves_spot_names_icc_photoshop_resources_and_dpi ... ok
+test conversion_output::tests::local_drive_unc_and_verbatim_unc_destinations_are_supported ... ok
+
+failures:
+
+---- production_acceptance::tests::missing_face_relink_safety_paths_remain_wired stdout ----
+
+thread 'production_acceptance::tests::missing_face_relink_safety_paths_remain_wired' (8124) panicked at src\production_acceptance.rs:121:13:
+missing required missing-Face/relink guard: The active Face source TIFF is missing
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    production_acceptance::tests::missing_face_relink_safety_paths_remain_wired
+
+test result: FAILED. 365 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.75s
+
+error: test failed, to rerun pass `--lib`
+check_exit=0 test_exit=101
