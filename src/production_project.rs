@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::color_conversion::production_provenance::validate_production_provenance;
 use crate::color_conversion::{LinkedProjectRef, ProductionProvenance, ProjectRole};
 use crate::model::{FaceRef, FaceStatus, ShadeProject};
 
@@ -17,6 +18,7 @@ pub struct ProductionProjectSpec<'a> {
 /// Build a new Production project without carrying source-domain adjustments,
 /// snapshots, preview ICC choices or test-code state into the target ink space.
 pub fn build_production_project(spec: ProductionProjectSpec<'_>) -> Result<ShadeProject, String> {
+    validate_production_provenance(&spec.provenance)?;
     spec.provenance
         .recipe
         .validate()
@@ -107,9 +109,9 @@ fn paths_match(recorded: &str, actual: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::color_conversion::{
-        ConversionEngineMode, ConversionRecipe, ConversionRenderingIntent, ConversionSourceRef,
-        ConversionTargetDefinition, SeparationStrategy, TargetChannelDefinition,
-        CONVERSION_RECIPE_SCHEMA_VERSION,
+        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionEngineMode, ConversionRecipe,
+        ConversionRenderingIntent, ConversionSourceRef, ConversionTargetDefinition,
+        SeparationStrategy, TargetChannelDefinition,
     };
     use crate::model::{ChannelAdjustment, IccProfileIdentity};
 
@@ -156,6 +158,7 @@ mod tests {
                 strategy: SeparationStrategy::default(),
                 custom_optimizer_solver: None,
             },
+            custom_optimizer: None,
             output_path: output.display().to_string(),
             output_sha256: "output-hash".to_owned(),
             converted_at_unix_ms: 1234,
