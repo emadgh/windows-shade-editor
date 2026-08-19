@@ -1,0 +1,79 @@
+name: Temporary guarded PR259 filesystem worker
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr259-worker-guard
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact feature branch
+        uses: actions/checkout@v6
+        with:
+          ref: codex/custom-optimizer-filesystem-worker
+          fetch-depth: 0
+          path: feature
+
+      - name: Checkout validated patch source
+        uses: actions/checkout@v6
+        with:
+          ref: tmp/pr259-worker-guard
+          path: patch-source
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Apply filesystem worker patch
+        working-directory: feature
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '46258762debc29f0ab2d7503e2ac619d6f396928'
+          if ((git rev-parse HEAD).Trim() -ne $expectedHead) { throw 'PR259 feature head moved' }
+          python ..\patch-source\.github\patches\tmp_pr259_worker.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustfmt --edition 2024 `
+            src/custom_optimizer_conversion_worker.rs `
+            src/icc_conversion_worker.rs `
+            src/conversion_queue.rs `
+            src/lib.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check locked Windows target
+        working-directory: feature
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+
+      - name: Run full locked tests
+        working-directory: feature
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Guard source surface and publish
+        working-directory: feature
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHead = '46258762debc29f0ab2d7503e2ac619d6f396928'
+          $remoteHead = (git ls-remote origin refs/heads/codex/custom-optimizer-filesystem-worker).Split("`t")[0].Trim()
+          if ($remoteHead -ne $expectedHead) { throw "PR259 feature branch moved: $remoteHead" }
+          $actual = @(git diff --name-only $expectedHead | Sort-Object)
+          $expected = @(
+            'src/conversion_queue.rs',
+            'src/custom_optimizer_conversion_worker.rs',
+            'src/icc_conversion_worker.rs',
+            'src/lib.rs'
+          ) | Sort-Object
+          if (($actual -join "`n") -ne ($expected -join "`n")) {
+            throw "Unexpected PR259 source surface:`n$($actual -join "`n")"
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- $expected
+          git commit -m "Color Conversion: wire Custom Optimizer filesystem worker"
+          git push origin HEAD:codex/custom-optimizer-filesystem-worker
