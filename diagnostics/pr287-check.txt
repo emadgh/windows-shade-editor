@@ -1,0 +1,356 @@
+error[E0609]: no field `metadata` on type `&P`
+  --> src\thumbnail.rs:17:42
+   |
+11 | pub fn build_project_thumbnail<P: RuntimePreviewSource + ?Sized>(
+   |                                - type parameter 'P' declared here
+...
+17 |         PreviewColorTransform::new(&face.metadata, PreviewColorConfig::from_project(project));
+   |                                          ^^^^^^^^ unknown field
+
+error[E0615]: attempted to take value of method `width` on type `&P`
+  --> src\thumbnail.rs:20:26
+   |
+20 |         resize_rgba(face.width, face.height, &rgba, THUMBNAIL_MAX_DIMENSION)?;
+   |                          ^^^^^ method, not a field
+   |
+help: use parentheses to call the method
+   |
+20 |         resize_rgba(face.width(), face.height, &rgba, THUMBNAIL_MAX_DIMENSION)?;
+   |                               ++
+
+error[E0615]: attempted to take value of method `height` on type `&P`
+  --> src\thumbnail.rs:20:38
+   |
+20 |         resize_rgba(face.width, face.height, &rgba, THUMBNAIL_MAX_DIMENSION)?;
+   |                                      ^^^^^^ method, not a field
+   |
+help: use parentheses to call the method
+   |
+20 |         resize_rgba(face.width, face.height(), &rgba, THUMBNAIL_MAX_DIMENSION)?;
+   |                                            ++
+
+error[E0599]: no method named `channel_names` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+   --> src\ui\adjustments.rs:103:42
+    |
+103 |         let channel_names = face.preview.channel_names().to_vec();
+    |                                          ^^^^^^^^^^^^^
+    |
+   ::: src\runtime_preview.rs:66:8
+    |
+ 66 |     fn channel_names(&self) -> &[String];
+    |        ------------- the method is available for `Arc<tiff_io::PreviewFace>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `channel_names` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+help: there is a method `channels` with a similar name
+    |
+103 -         let channel_names = face.preview.channel_names().to_vec();
+103 +         let channel_names = face.preview.channels().to_vec();
+    |
+
+error[E0599]: no method named `histograms` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+   --> src\ui\adjustments.rs:104:48
+    |
+104 |         let original_histograms = face.preview.histograms().to_vec();
+    |                                                ^^^^^^^^^^ field, not a method
+    |
+   ::: src\runtime_preview.rs:68:8
+    |
+ 68 |     fn histograms(&self) -> &[[u32; 256]];
+    |        ---------- the method is available for `Arc<tiff_io::PreviewFace>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: remove the arguments
+    |
+104 -         let original_histograms = face.preview.histograms().to_vec();
+104 +         let original_histograms = face.preview.histograms.to_vec();
+    |
+help: trait `RuntimePreviewSource` which provides `histograms` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+
+error[E0599]: no method named `base_channel_count` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+   --> src\ui\adjustments.rs:107:39
+    |
+107 |         let base_count = face.preview.base_channel_count();
+    |                                       ^^^^^^^^^^^^^^^^^^ method not found in `Arc<tiff_io::PreviewFace>`
+
+error[E0599]: no method named `color_model` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+   --> src\ui\adjustments.rs:108:40
+    |
+108 |         let color_model = face.preview.color_model();
+    |                                        ^^^^^^^^^^^ method not found in `Arc<tiff_io::PreviewFace>`
+    |
+   ::: src\runtime_preview.rs:69:8
+    |
+ 69 |     fn color_model(&self) -> RuntimeColorModel;
+    |        ----------- the method is available for `Arc<tiff_io::PreviewFace>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `color_model` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+
+error[E0599]: no method named `tiff_metadata` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+   --> src\ui\adjustments.rs:111:14
+    |
+109 |           let photoshop_display = face
+    |  _________________________________-
+110 | |             .preview
+111 | |             .tiff_metadata()
+    | |             -^^^^^^^^^^^^^ method not found in `Arc<tiff_io::PreviewFace>`
+    | |_____________|
+    |
+    |
+   ::: src\runtime_preview.rs:76:8
+    |
+ 76 |       fn tiff_metadata(&self) -> Option<&TiffMetadata> {
+    |          ------------- the method is available for `Arc<tiff_io::PreviewFace>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `tiff_metadata` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+
+error[E0599]: no method named `channel_names` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+   --> src\ui\adjustments.rs:639:42
+    |
+639 |         let channel_names = face.preview.channel_names().to_vec();
+    |                                          ^^^^^^^^^^^^^
+    |
+   ::: src\runtime_preview.rs:66:8
+    |
+ 66 |     fn channel_names(&self) -> &[String];
+    |        ------------- the method is available for `Arc<tiff_io::PreviewFace>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `channel_names` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+help: there is a method `channels` with a similar name
+    |
+639 -         let channel_names = face.preview.channel_names().to_vec();
+639 +         let channel_names = face.preview.channels().to_vec();
+    |
+
+error[E0599]: no method named `histograms` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+   --> src\ui\adjustments.rs:648:52
+    |
+648 |         let all_original_histograms = face.preview.histograms().to_vec();
+    |                                                    ^^^^^^^^^^ field, not a method
+    |
+   ::: src\runtime_preview.rs:68:8
+    |
+ 68 |     fn histograms(&self) -> &[[u32; 256]];
+    |        ---------- the method is available for `Arc<tiff_io::PreviewFace>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: remove the arguments
+    |
+648 -         let all_original_histograms = face.preview.histograms().to_vec();
+648 +         let all_original_histograms = face.preview.histograms.to_vec();
+    |
+help: trait `RuntimePreviewSource` which provides `histograms` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+
+error[E0599]: no method named `channel_names` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+  --> src\ui\test_code_panel.rs:24:34
+   |
+24 |         .map(|face| face.preview.channel_names().to_vec())
+   |                                  ^^^^^^^^^^^^^
+   |
+  ::: src\runtime_preview.rs:66:8
+   |
+66 |     fn channel_names(&self) -> &[String];
+   |        ------------- the method is available for `Arc<tiff_io::PreviewFace>` here
+   |
+   = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `channel_names` is implemented but not in scope; perhaps you want to import it
+   |
+ 1 + use crate::runtime_preview::RuntimePreviewSource;
+   |
+help: there is a method `channels` with a similar name
+   |
+24 -         .map(|face| face.preview.channel_names().to_vec())
+24 +         .map(|face| face.preview.channels().to_vec())
+   |
+
+error[E0308]: mismatched types
+    --> src\ui\test_code_panel.rs:84:37
+     |
+  82 | ...                   .selectable_value(
+     |                        ---------------- arguments to this method are incorrect
+  83 | ...                       &mut app.project.test_code.channel,
+  84 | ...                       name.clone(),
+     |                           ^^^^^^^^^^^^ expected `String`, found `&str`
+     |
+note: method defined here
+    --> C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-0.35.0\src\ui.rs:1938:12
+     |
+1938 |     pub fn selectable_value<'a, Value: PartialEq>(
+     |            ^^^^^^^^^^^^^^^^
+help: try using a conversion method
+     |
+  84 -                                     name.clone(),
+  84 +                                     name.to_string(),
+     |
+
+error[E0599]: no method named `channel_names` found for struct `Arc<tiff_io::PreviewFace>` in the current scope
+   --> src\workflow.rs:264:52
+    |
+264 |         .is_some_and(|face| channel < face.preview.channel_names().len())
+    |                                                    ^^^^^^^^^^^^^
+    |
+   ::: src\runtime_preview.rs:66:8
+    |
+ 66 |     fn channel_names(&self) -> &[String];
+    |        ------------- the method is available for `Arc<tiff_io::PreviewFace>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `channel_names` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+help: there is a method `channels` with a similar name
+    |
+264 -         .is_some_and(|face| channel < face.preview.channel_names().len())
+264 +         .is_some_and(|face| channel < face.preview.channels().len())
+    |
+
+error[E0599]: no method named `channel_names` found for struct `tiff_io::PreviewFace` in the current scope
+   --> src\workflow.rs:426:58
+    |
+426 |                 app.project.ensure_channels(item.preview.channel_names());
+    |                                                          ^^^^^^^^^^^^^
+    |
+   ::: src\tiff_io.rs:143:1
+    |
+143 | pub struct PreviewFace {
+    | ---------------------- method `channel_names` not found for this struct
+    |
+   ::: src\runtime_preview.rs:66:8
+    |
+ 66 |     fn channel_names(&self) -> &[String];
+    |        ------------- the method is available for `tiff_io::PreviewFace` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `channel_names` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+help: there is a method `channels` with a similar name
+    |
+426 -                 app.project.ensure_channels(item.preview.channel_names());
+426 +                 app.project.ensure_channels(item.preview.channels());
+    |
+
+error[E0599]: no method named `channel_names` found for struct `tiff_io::PreviewFace` in the current scope
+   --> src\workflow.rs:451:54
+    |
+451 |             app.project.ensure_channels(item.preview.channel_names());
+    |                                                      ^^^^^^^^^^^^^
+    |
+   ::: src\tiff_io.rs:143:1
+    |
+143 | pub struct PreviewFace {
+    | ---------------------- method `channel_names` not found for this struct
+    |
+   ::: src\runtime_preview.rs:66:8
+    |
+ 66 |     fn channel_names(&self) -> &[String];
+    |        ------------- the method is available for `tiff_io::PreviewFace` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `channel_names` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+help: there is a method `channels` with a similar name
+    |
+451 -             app.project.ensure_channels(item.preview.channel_names());
+451 +             app.project.ensure_channels(item.preview.channels());
+    |
+
+error[E0308]: mismatched types
+   --> src\workflow.rs:510:9
+    |
+510 |         preview,
+    |         ^^^^^^^ expected `PreviewFace`, found `RuntimePreview`
+
+error[E0599]: no method named `color_model` found for reference `&RuntimePreview` in the current scope
+   --> src\workflow.rs:568:16
+    |
+568 |     if preview.color_model().title() != expected.color_model {
+    |                ^^^^^^^^^^^ method not found in `&RuntimePreview`
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `color_model` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+
+error[E0599]: no method named `color_model` found for reference `&RuntimePreview` in the current scope
+   --> src\workflow.rs:572:21
+    |
+572 |             preview.color_model().title()
+    |                     ^^^^^^^^^^^ method not found in `&RuntimePreview`
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `color_model` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+
+error[E0599]: no method named `channel_names` found for reference `&RuntimePreview` in the current scope
+   --> src\workflow.rs:586:16
+    |
+586 |     if preview.channel_names() != expected.channel_names.as_slice() {
+    |                ^^^^^^^^^^^^^
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `channel_names` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+help: there is a method `channels` with a similar name
+    |
+586 -     if preview.channel_names() != expected.channel_names.as_slice() {
+586 +     if preview.channels() != expected.channel_names.as_slice() {
+    |
+
+error[E0599]: no method named `channel_names` found for reference `&RuntimePreview` in the current scope
+   --> src\workflow.rs:590:21
+    |
+590 |             preview.channel_names()
+    |                     ^^^^^^^^^^^^^
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `RuntimePreviewSource` which provides `channel_names` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use crate::runtime_preview::RuntimePreviewSource;
+    |
+help: there is a method `channels` with a similar name
+    |
+590 -             preview.channel_names()
+590 +             preview.channels()
+    |
+
+error[E0308]: mismatched types
+   --> src\workflow.rs:616:9
+    |
+616 |         preview,
+    |         ^^^^^^^ expected `PreviewFace`, found `RuntimePreview`
+
+Some errors have detailed explanations: E0308, E0599, E0609, E0615.
+For more information about an error, try `rustc --explain E0308`.
+warning: `windows-shade-editor` (bin "ShadeEditor") generated 2 warnings
+error: could not compile `windows-shade-editor` (bin "ShadeEditor") due to 21 previous errors; 2 warnings emitted
