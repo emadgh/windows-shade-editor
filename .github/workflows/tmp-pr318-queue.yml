@@ -1,7 +1,7 @@
 name: Temporary guarded PR318 queue disposition wiring
 
 on:
-  push:
+  pull_request:
     branches:
       - tmp/pr318-queue-workflow
 
