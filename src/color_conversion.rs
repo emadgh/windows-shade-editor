@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::custom_optimizer_config::CustomOptimizerSolverConfig;
 use crate::model::IccProfileIdentity;
+use crate::source_transparency::SourceTransparencyPolicy;
 
 pub const LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 1;
-pub const CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 2;
+pub const SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 2;
+pub const CONVERSION_RECIPE_SCHEMA_VERSION: u32 = 3;
 
 /// Project role for the source/production derivation workflow.
 ///
@@ -141,6 +143,10 @@ pub struct ConversionRecipe {
     /// Exact source-profile bytes are not embedded here. The stable profile hash
     /// makes a recipe stale if the external/embedded profile changes.
     pub source_profile_identity: IccProfileIdentity,
+    /// Explicit source-alpha handling captured in recipe identity. `None` means no
+    /// flattening was selected and is valid only when source preflight has no unresolved alpha.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_transparency_policy: Option<SourceTransparencyPolicy>,
     pub target: ConversionTargetDefinition,
     pub rendering_intent: ConversionRenderingIntent,
     pub black_point_compensation: bool,
@@ -178,17 +184,28 @@ impl ConversionRecipe {
 
         if !matches!(
             self.schema_version,
-            LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION | CONVERSION_RECIPE_SCHEMA_VERSION
+            LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION
+                | SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION
+                | CONVERSION_RECIPE_SCHEMA_VERSION
         ) {
             errors.push(format!(
-                "Unsupported conversion recipe schema {} (supported: {} and {}).",
+                "Unsupported conversion recipe schema {} (supported: {}, {}, and {}).",
                 self.schema_version,
                 LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION,
+                SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION,
                 CONVERSION_RECIPE_SCHEMA_VERSION
             ));
         }
         if self.source_profile_identity.sha256.trim().is_empty() {
             errors.push("Source ICC identity must include a SHA-256 hash.".to_owned());
+        }
+        if self.source_transparency_policy.is_some()
+            && self.schema_version < CONVERSION_RECIPE_SCHEMA_VERSION
+        {
+            errors.push(
+                "Source transparency policy requires conversion recipe schema 3 or newer."
+                    .to_owned(),
+            );
         }
 
         self.target.validate_into(&mut errors);
@@ -257,7 +274,7 @@ impl ConversionRecipe {
                             errors.extend(config_errors);
                         }
                     }
-                    None if self.schema_version == CONVERSION_RECIPE_SCHEMA_VERSION => {
+                    None if self.schema_version >= SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION => {
                         errors.push(
                             "Custom Optimizer recipe schema 2 requires explicit solver method/configuration."
                                 .to_owned(),
@@ -436,6 +453,7 @@ mod tests {
         strategy.per_ink_bias.insert("Black".to_owned(), 0.8);
 
         let recipe = ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::CustomOptimizer,
             source_profile_identity: profile("Adobe RGB (1998)", "source-hash"),
@@ -464,6 +482,7 @@ mod tests {
             max_coverage: None,
         });
         let recipe = ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::Icc,
             source_profile_identity: profile("sRGB", "source-hash"),
@@ -487,6 +506,7 @@ mod tests {
         let mut target = seven_channel_target();
         target.output_profile_path = None;
         let recipe = ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::Icc,
             source_profile_identity: profile("sRGB", "source-hash"),
@@ -512,6 +532,7 @@ mod tests {
         let mut strategy = SeparationStrategy::default();
         strategy.per_ink_bias.insert("Orange".to_owned(), 0.4);
         let recipe = ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::Icc,
             source_profile_identity: profile("sRGB", "source-hash"),
@@ -531,6 +552,7 @@ mod tests {
         let mut target = seven_channel_target();
         target.characterization_id = None;
         let recipe = ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::CustomOptimizer,
             source_profile_identity: profile("sRGB", "source-hash"),

@@ -131,6 +131,7 @@ mod tests {
                 source_file_sha256: "source-file-hash".to_owned(),
             },
             recipe: ConversionRecipe {
+                source_transparency_policy: None,
                 schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
                 engine_mode: ConversionEngineMode::Icc,
                 source_profile_identity: identity("sRGB", "source-profile-hash"),

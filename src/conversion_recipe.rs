@@ -26,7 +26,7 @@ mod tests {
     use crate::color_conversion::{
         ConversionEngineMode, ConversionRenderingIntent, ConversionTargetDefinition,
         SeparationStrategy, TargetChannelDefinition, CONVERSION_RECIPE_SCHEMA_VERSION,
-        LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION,
+        LEGACY_CONVERSION_RECIPE_SCHEMA_VERSION, SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION,
     };
     use crate::model::IccProfileIdentity;
 
@@ -43,6 +43,7 @@ mod tests {
         bias.insert("Black".to_owned(), 0.8);
 
         ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::CustomOptimizer,
             source_profile_identity: identity("Adobe RGB", "source-hash"),
@@ -151,11 +152,80 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_custom_optimizer_requires_explicit_solver_config() {
+    fn current_schema_custom_optimizer_requires_explicit_solver_config() {
         let mut missing = recipe();
         missing.custom_optimizer_solver = None;
         let errors = missing.validate().expect_err("schema-v2 optimizer needs solver config");
         assert!(errors.iter().any(|error| error.contains("requires explicit solver")));
+    }
+
+    #[test]
+    fn schema_v2_without_policy_round_trips_and_omits_transparency_field() {
+        let mut schema_v2 = recipe();
+        schema_v2.schema_version = SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION;
+        schema_v2.source_transparency_policy = None;
+        schema_v2
+            .validate()
+            .expect("schema-v2 recipe without alpha policy remains valid");
+        let before = recipe_sha256(&schema_v2).unwrap();
+        let json = serde_json::to_string(&schema_v2).unwrap();
+        assert!(!json.contains("source_transparency_policy"));
+        let restored: ConversionRecipe = serde_json::from_str(&json).unwrap();
+        restored
+            .validate()
+            .expect("restored schema-v2 recipe remains valid");
+        assert_eq!(before, recipe_sha256(&restored).unwrap());
+    }
+
+    #[test]
+    fn schema_v2_rejects_a_transparency_policy_it_cannot_define() {
+        let mut schema_v2 = recipe();
+        schema_v2.schema_version = SOLVER_CONVERSION_RECIPE_SCHEMA_VERSION;
+        schema_v2.source_transparency_policy = Some(
+            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+                background_rgb: [u16::MAX; 3],
+            },
+        );
+        let errors = schema_v2
+            .validate()
+            .expect_err("schema-v2 must fail closed when a v3 alpha policy is injected");
+        assert!(errors.iter().any(|error| error.contains("schema 3 or newer")));
+    }
+
+    #[test]
+    fn schema_v3_policy_round_trip_preserves_policy_and_recipe_hash() {
+        let mut with_policy = recipe();
+        let policy = crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+            background_rgb: [65535, 32768, 1234],
+        };
+        with_policy.source_transparency_policy = Some(policy);
+        with_policy.validate().expect("schema-v3 alpha policy is valid");
+        let before = recipe_sha256(&with_policy).unwrap();
+        let json = serde_json::to_string(&with_policy).unwrap();
+        assert!(json.contains("source_transparency_policy"));
+        let restored: ConversionRecipe = serde_json::from_str(&json).unwrap();
+        restored.validate().expect("restored schema-v3 recipe is valid");
+        assert_eq!(restored.source_transparency_policy, Some(policy));
+        assert_eq!(before, recipe_sha256(&restored).unwrap());
+    }
+
+    #[test]
+    fn transparency_background_change_changes_recipe_identity() {
+        let first = recipe();
+        let mut second = first.clone();
+        second.source_transparency_policy = Some(
+            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+                background_rgb: [u16::MAX, u16::MAX, u16::MAX],
+            },
+        );
+        let mut third = second.clone();
+        third.source_transparency_policy = Some(
+            crate::source_transparency::SourceTransparencyPolicy::FlattenSolidRgb16 {
+                background_rgb: [0, 0, 0],
+            },
+        );
+        assert_ne!(recipe_sha256(&first).unwrap(), recipe_sha256(&second).unwrap());
+        assert_ne!(recipe_sha256(&second).unwrap(), recipe_sha256(&third).unwrap());
     }
 
     #[test]

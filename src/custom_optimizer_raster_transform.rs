@@ -453,6 +453,7 @@ mod tests {
 
     fn recipe(bit_depth: u8, source_icc: &[u8]) -> ConversionRecipe {
         ConversionRecipe {
+            source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::CustomOptimizer,
             source_profile_identity: IccProfileIdentity {

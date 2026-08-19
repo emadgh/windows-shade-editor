@@ -1,6 +1,7 @@
 use crate::conversion_workflow::ConversionSaveGate;
 use crate::design_source::{DesignSourceColorModel, DesignSourceDescriptor, SourceLossiness};
 use crate::model::IccProfileIdentity;
+use crate::source_transparency::SourceTransparencyPolicy;
 use crate::tiff_io::ColorModel;
 
 pub use crate::design_source::{SourceImageFormat, TransparencyState};
@@ -109,13 +110,28 @@ pub fn build_conversion_preflight_for_source(
     profile: SourceProfileState,
     save_gate: ConversionSaveGate,
 ) -> ConversionPreflightReport {
+    build_conversion_preflight_for_source_with_policy(source, profile, save_gate, None)
+}
+
+pub fn build_conversion_preflight_for_source_with_policy(
+    source: &DesignSourceDescriptor<'_>,
+    profile: SourceProfileState,
+    save_gate: ConversionSaveGate,
+    transparency_policy: Option<&SourceTransparencyPolicy>,
+) -> ConversionPreflightReport {
     let input = ConversionPreflightInput {
         format: source.format,
         color_model: tiff_color_model(source.color_model),
         bit_depth: source.bit_depth,
         profile,
         save_gate,
-        transparency: source.transparency,
+        transparency: if source.transparency == TransparencyState::PresentUnresolved
+            && transparency_policy.is_some()
+        {
+            TransparencyState::Flattened
+        } else {
+            source.transparency
+        },
     };
     let mut report = build_conversion_preflight(&input);
     if source.format == SourceImageFormat::Jpeg && source.lossiness == SourceLossiness::Lossless {
@@ -319,6 +335,31 @@ mod tests {
         );
         assert!(report.contains(PreflightCode::UnresolvedTransparency));
         assert!(!report.can_convert());
+    }
+
+    #[test]
+    fn explicit_flatten_policy_resolves_only_the_transparency_blocker() {
+        let source = DesignSourceDescriptor::new(
+            SourceImageFormat::Png,
+            DesignSourceColorModel::Rgb,
+            16,
+            3,
+            None,
+            TransparencyState::PresentUnresolved,
+            SourceLossiness::Lossless,
+        );
+        let policy = SourceTransparencyPolicy::FlattenSolidRgb16 {
+            background_rgb: [u16::MAX, u16::MAX, u16::MAX],
+        };
+        let report = build_conversion_preflight_for_source_with_policy(
+            &source,
+            profile(),
+            ConversionSaveGate::Ready,
+            Some(&policy),
+        );
+        assert!(!report.contains(PreflightCode::UnresolvedTransparency));
+        assert!(report.contains(PreflightCode::RgbNotProductionSeparated));
+        assert!(report.can_convert());
     }
 
     #[test]
