@@ -1,8 +1,15 @@
+use std::path::Path;
 use std::sync::Arc;
 
-use crate::tiff_io::{ColorModel as TiffColorModel, PreviewFace, TiffMetadata};
-use windows_shade_editor::design_source::DesignSourceColorModel;
-use windows_shade_editor::design_source_preview::DesignSourcePreview;
+use crate::tiff_io::{self, ColorModel as TiffColorModel, PreviewFace, TiffMetadata};
+use windows_shade_editor::design_source::{
+    DesignSourceColorModel, DesignSourceDescriptor, SourceImageFormat,
+};
+use windows_shade_editor::design_source_preview::{
+    DesignSourcePreview, OwnedDesignSourceDescriptor,
+};
+use windows_shade_editor::jpeg_source::decode_jpeg_source;
+use windows_shade_editor::png_source::decode_png_source;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeColorModel {
@@ -176,6 +183,147 @@ impl RuntimePreviewSource for DesignSourcePreview {
     }
 }
 
+/// Owned preview carrier used by application Faces. The TIFF variant retains the
+/// real TIFF metadata needed for existing Spot/extra-channel behavior. The
+/// Design variant owns normalized PNG/JPEG preview planes and source metadata
+/// without fabricating TIFF state.
+#[derive(Clone, Debug)]
+pub enum RuntimePreview {
+    Tiff(PreviewFace),
+    Design(DesignSourcePreview),
+}
+
+impl RuntimePreview {
+    pub fn load(path: &Path, max_dimension: u32) -> Result<Self, String> {
+        match source_format_from_path(path) {
+            Some(SourceImageFormat::Tiff) => tiff_io::load_preview(path, max_dimension)
+                .map(Self::Tiff)
+                .map_err(|err| format!("Cannot load TIFF source {}: {err}", path.display())),
+            Some(SourceImageFormat::Png) => {
+                let decoded = decode_png_source(path)?;
+                DesignSourcePreview::from_png(&decoded, max_dimension).map(Self::Design)
+            }
+            Some(SourceImageFormat::Jpeg) => {
+                let decoded = decode_jpeg_source(path)?;
+                DesignSourcePreview::from_jpeg(&decoded, max_dimension).map(Self::Design)
+            }
+            None => Err(format!(
+                "Unsupported design source extension for {}. Use TIFF, PNG or JPEG.",
+                path.display()
+            )),
+        }
+    }
+
+    pub fn source_descriptor(&self) -> OwnedDesignSourceDescriptor {
+        match self {
+            Self::Tiff(preview) => OwnedDesignSourceDescriptor::from_borrowed(
+                DesignSourceDescriptor::from_tiff_metadata(&preview.metadata),
+            ),
+            Self::Design(preview) => preview.source.clone(),
+        }
+    }
+
+    pub fn source_dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Tiff(preview) => (preview.metadata.width, preview.metadata.height),
+            Self::Design(preview) => (preview.source_width, preview.source_height),
+        }
+    }
+
+    pub fn as_tiff(&self) -> Option<&PreviewFace> {
+        match self {
+            Self::Tiff(preview) => Some(preview),
+            Self::Design(_) => None,
+        }
+    }
+
+    pub fn is_tiff(&self) -> bool {
+        matches!(self, Self::Tiff(_))
+    }
+}
+
+impl RuntimePreviewSource for RuntimePreview {
+    fn width(&self) -> usize {
+        match self {
+            Self::Tiff(preview) => preview.width(),
+            Self::Design(preview) => preview.width(),
+        }
+    }
+
+    fn height(&self) -> usize {
+        match self {
+            Self::Tiff(preview) => preview.height(),
+            Self::Design(preview) => preview.height(),
+        }
+    }
+
+    fn channel_names(&self) -> &[String] {
+        match self {
+            Self::Tiff(preview) => preview.channel_names(),
+            Self::Design(preview) => preview.channel_names(),
+        }
+    }
+
+    fn channels(&self) -> &[Vec<u16>] {
+        match self {
+            Self::Tiff(preview) => preview.channels(),
+            Self::Design(preview) => preview.channels(),
+        }
+    }
+
+    fn histograms(&self) -> &[[u32; 256]] {
+        match self {
+            Self::Tiff(preview) => preview.histograms(),
+            Self::Design(preview) => preview.histograms(),
+        }
+    }
+
+    fn color_model(&self) -> RuntimeColorModel {
+        match self {
+            Self::Tiff(preview) => preview.color_model(),
+            Self::Design(preview) => preview.color_model(),
+        }
+    }
+
+    fn embedded_icc(&self) -> Option<&[u8]> {
+        match self {
+            Self::Tiff(preview) => preview.embedded_icc(),
+            Self::Design(preview) => preview.embedded_icc(),
+        }
+    }
+
+    fn alpha(&self) -> Option<&[u16]> {
+        match self {
+            Self::Tiff(preview) => preview.alpha(),
+            Self::Design(preview) => preview.alpha(),
+        }
+    }
+
+    fn tiff_metadata(&self) -> Option<&TiffMetadata> {
+        match self {
+            Self::Tiff(preview) => preview.tiff_metadata(),
+            Self::Design(preview) => preview.tiff_metadata(),
+        }
+    }
+}
+
+pub fn source_format_from_path(path: &Path) -> Option<SourceImageFormat> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff") {
+        Some(SourceImageFormat::Tiff)
+    } else if extension.eq_ignore_ascii_case("png") {
+        Some(SourceImageFormat::Png)
+    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        Some(SourceImageFormat::Jpeg)
+    } else {
+        None
+    }
+}
+
+pub fn is_supported_design_source_path(path: &Path) -> bool {
+    source_format_from_path(path).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +378,46 @@ mod tests {
             RuntimePreviewSource::color_model(&preview),
             RuntimeColorModel::Gray
         );
+    }
+
+    #[test]
+    fn path_dispatch_is_case_insensitive_and_rejects_other_formats() {
+        assert_eq!(
+            source_format_from_path(Path::new("Face.TIFF")),
+            Some(SourceImageFormat::Tiff)
+        );
+        assert_eq!(
+            source_format_from_path(Path::new("Face.PnG")),
+            Some(SourceImageFormat::Png)
+        );
+        assert_eq!(
+            source_format_from_path(Path::new("Face.JPEG")),
+            Some(SourceImageFormat::Jpeg)
+        );
+        assert!(source_format_from_path(Path::new("Face.webp")).is_none());
+    }
+
+    #[test]
+    fn runtime_carrier_preserves_png_descriptor_without_tiff_metadata() {
+        let decoded = DecodedPngSource {
+            width: 2,
+            height: 1,
+            bit_depth: 16,
+            model: PngSourceModel::Rgb,
+            samples: vec![1, 2, 3, 4, 5, 6],
+            alpha: Some(vec![7, 8]),
+            icc_profile: Some(vec![9, 10]),
+            declares_srgb: false,
+        };
+        let design = DesignSourcePreview::from_png(&decoded, 512).expect("PNG preview");
+        let preview = RuntimePreview::Design(design);
+        let descriptor = preview.source_descriptor();
+        assert_eq!(descriptor.format, SourceImageFormat::Png);
+        assert_eq!(descriptor.bit_depth, 16);
+        assert_eq!(descriptor.channel_count, 3);
+        assert_eq!(preview.source_dimensions(), (2, 1));
+        assert_eq!(preview.alpha(), Some(&[7, 8][..]));
+        assert!(preview.tiff_metadata().is_none());
+        assert!(!preview.is_tiff());
     }
 }
