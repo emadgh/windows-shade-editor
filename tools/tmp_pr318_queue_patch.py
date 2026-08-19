@@ -1,6 +1,6 @@
 from pathlib import Path
 
-repo = Path(__file__).resolve().parents[1] / "work"
+repo = Path(__file__).resolve().parents[2] / "work"
 path = repo / "src" / "conversion_queue.rs"
 text = path.read_text(encoding="utf-8")
 
