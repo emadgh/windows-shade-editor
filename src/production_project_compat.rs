@@ -57,6 +57,41 @@ pub struct AppendConvertedFaceSpec<'a> {
     pub provenance: ProductionProvenance,
 }
 
+/// Validate the existing Production project itself without requiring an incoming
+/// Face. This is the canonical read-only baseline used by destination discovery
+/// before an operator chooses Append Existing.
+pub fn validate_existing_production_project_baseline(
+    project: &ShadeProject,
+    source_project_path: &Path,
+) -> Result<ProductionCompatibilityKey, String> {
+    let resolved_face_paths = project
+        .faces
+        .iter()
+        .map(|face| PathBuf::from(&face.path))
+        .collect::<Vec<_>>();
+    validate_existing_production_project_baseline_with_resolved_paths(
+        project,
+        &resolved_face_paths,
+        source_project_path,
+    )
+}
+
+/// Path-aware baseline validation for a persisted Production `.shade`. Portable
+/// Face paths are resolved against the exact project path before provenance is
+/// checked.
+pub fn validate_existing_production_project_baseline_at_path(
+    project: &ShadeProject,
+    production_project_path: &Path,
+    source_project_path: &Path,
+) -> Result<ProductionCompatibilityKey, String> {
+    let resolved_face_paths = project.resolve_face_paths(production_project_path);
+    validate_existing_production_project_baseline_with_resolved_paths(
+        project,
+        &resolved_face_paths,
+        source_project_path,
+    )
+}
+
 /// Validate that an incoming converted Face can be appended to an existing
 /// Production project without changing the project's target-side semantics.
 pub fn validate_existing_production_project_for_append(
@@ -95,11 +130,10 @@ pub fn validate_existing_production_project_for_append_at_path(
     )
 }
 
-fn validate_existing_production_project_for_append_with_resolved_paths(
+fn validate_existing_production_project_baseline_with_resolved_paths(
     project: &ShadeProject,
     resolved_face_paths: &[PathBuf],
     source_project_path: &Path,
-    incoming: &ProductionProvenance,
 ) -> Result<ProductionCompatibilityKey, String> {
     if project.project_role != ProjectRole::Production {
         return Err("Append destination is not a Production project.".to_owned());
@@ -135,11 +169,6 @@ fn validate_existing_production_project_for_append_with_resolved_paths(
             source_project_path.display()
         ));
     }
-    if !paths_match(&incoming.source.source_project_path, source_project_path) {
-        return Err(
-            "Incoming conversion provenance references a different Source project.".to_owned(),
-        );
-    }
 
     let canonical = ProductionCompatibilityKey::from_provenance(
         project
@@ -154,6 +183,12 @@ fn validate_existing_production_project_for_append_with_resolved_paths(
         .zip(resolved_face_paths.iter())
         .enumerate()
     {
+        if !paths_match(&provenance.source.source_project_path, source_project_path) {
+            return Err(format!(
+                "Existing Production Face {} provenance references a different Source project.",
+                index + 1
+            ));
+        }
         if !paths_match(&provenance.output_path, resolved_face_path) {
             return Err(format!(
                 "Existing Production Face {} does not match its persisted provenance output path.",
@@ -176,6 +211,26 @@ fn validate_existing_production_project_for_append_with_resolved_paths(
                 "Existing Production project is missing target channel adjustment state for '{channel}'."
             ));
         }
+    }
+
+    Ok(canonical)
+}
+
+fn validate_existing_production_project_for_append_with_resolved_paths(
+    project: &ShadeProject,
+    resolved_face_paths: &[PathBuf],
+    source_project_path: &Path,
+    incoming: &ProductionProvenance,
+) -> Result<ProductionCompatibilityKey, String> {
+    let canonical = validate_existing_production_project_baseline_with_resolved_paths(
+        project,
+        resolved_face_paths,
+        source_project_path,
+    )?;
+    if !paths_match(&incoming.source.source_project_path, source_project_path) {
+        return Err(
+            "Incoming conversion provenance references a different Source project.".to_owned(),
+        );
     }
 
     let incoming_key = ProductionCompatibilityKey::from_provenance(incoming)?;
@@ -308,7 +363,7 @@ mod tests {
     use crate::production_project::{ProductionProjectSpec, build_production_project};
 
     fn hash(character: char) -> String {
-        std::iter::repeat(character).take(64).collect()
+        std::iter::repeat_n(character, 64).collect()
     }
 
     fn identity(description: &str, character: char) -> IccProfileIdentity {
@@ -372,6 +427,18 @@ mod tests {
             provenance: provenance(output, r"C:\Design\Face-1.png", 'a'),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn baseline_validation_returns_canonical_target_without_incoming_face() {
+        let project = production_project();
+        let key = validate_existing_production_project_baseline(
+            &project,
+            Path::new(r"C:\Design\Source.shade"),
+        )
+        .unwrap();
+        assert_eq!(key.channel_names, ["Cyan", "Magenta", "Yellow", "Black"]);
+        assert_eq!(key.bit_depth, 16);
     }
 
     #[test]
@@ -533,6 +600,12 @@ mod tests {
             !Path::new(&loaded.faces[0].path).is_absolute(),
             "saved Production Face should use a portable relative path"
         );
+        validate_existing_production_project_baseline_at_path(
+            &loaded,
+            &project_path,
+            Path::new(r"C:\Design\Source.shade"),
+        )
+        .unwrap();
         let incoming = provenance(&output_two, r"C:\Design\Face-2.jpg", 'b');
         validate_existing_production_project_for_append_at_path(
             &loaded,
@@ -555,5 +628,4 @@ mod tests {
         assert_eq!(loaded.production_provenance.len(), 2);
         let _ = std::fs::remove_file(project_path);
     }
-
 }

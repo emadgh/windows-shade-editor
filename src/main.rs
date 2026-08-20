@@ -210,6 +210,8 @@ enum JobResult {
     InspectTiff(Result<tiff_inspect::TiffInspection, String>),
     ConversionCapture {
         result: Result<windows_shade_editor::conversion_transaction::ConversionJobCapture, String>,
+        production_project_disposition:
+            windows_shade_editor::production_project_disposition::ProductionProjectDisposition,
         default_dpi: f64,
     },
     Export(SnapshotExportBatchResult),
@@ -2245,9 +2247,17 @@ impl ShadeApp {
             }
             JobResult::ConversionCapture {
                 result,
+                production_project_disposition,
                 default_dpi,
             } => match result {
-                Ok(capture) => match self.conversion_queue.enqueue(capture, default_dpi) {
+                Ok(capture) => match self
+                    .conversion_queue
+                    .enqueue_with_production_project_disposition(
+                        capture,
+                        production_project_disposition,
+                        default_dpi,
+                    )
+                {
                     Ok(id) => {
                         self.report_info(format!("Production conversion queued as item #{id}"))
                     }
