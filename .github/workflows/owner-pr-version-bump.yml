@@ -21,7 +21,7 @@ jobs:
       github.event.comment.author_association == 'OWNER'
     runs-on: windows-latest
     steps:
-      - name: Resolve same-repository PR head
+      - name: Resolve owner-authored same-repository PR head
         id: pr
         shell: pwsh
         env:
@@ -39,6 +39,9 @@ jobs:
           if ($pr.head.repo.full_name -ne $env:GITHUB_REPOSITORY) {
             throw "Refusing to write to a fork PR."
           }
+          if ($pr.user.login -ne $env:GITHUB_REPOSITORY_OWNER) {
+            throw "Refusing to execute PR code with a version-bump write workflow unless the PR author is the repository owner."
+          }
           if ($pr.head.ref -eq 'main') { throw "Refusing to bump main directly." }
           "head_ref=$($pr.head.ref)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "head_sha=$($pr.head.sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -47,6 +50,7 @@ jobs:
         with:
           ref: ${{ steps.pr.outputs.head_ref }}
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -111,10 +115,16 @@ jobs:
 
       - name: Commit version bump to PR branch
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock VERSION
           git diff --cached --check
           git commit -m "chore: bump Shade Editor to v${{ steps.version.outputs.next }}"
-          git push origin HEAD:${{ steps.pr.outputs.head_ref }}
+
+          # Inject the write credential only for the final push step. PR-controlled
+          # Cargo/build code never runs with a persisted write credential.
+          $remote = "https://x-access-token:$env:GH_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
+          git push $remote HEAD:${{ steps.pr.outputs.head_ref }}
