@@ -1,0 +1,32 @@
+name: Temporary PR330 compile diagnostic
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr330-compile-diagnostic-workflow
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/color-conversion-stale-provenance
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Print concise cargo-check diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $expected = 'ac6268ac6628cce98752f7d6795e238fc33bb77b'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR330 head moved before diagnostic run' }
+          cargo check --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object cargo-check.log
+          $code = $LASTEXITCODE
+          Write-Host '--- CONCISE RUST DIAGNOSTICS ---'
+          Get-Content cargo-check.log | Select-String -Pattern '^error(\[|:)|^\s*-->\s+src/|^\s*\|\s|^\s*= note:' | Select-Object -Last 160 | ForEach-Object { Write-Host $_.Line }
+          exit $code
