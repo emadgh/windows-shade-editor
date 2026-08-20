@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::color_conversion::ProjectRole;
+use crate::color_conversion::{ConversionRecipe, ProjectRole};
 use crate::icc_conversion_worker::sha256_file;
 use crate::model::ShadeProject;
 use crate::production_project_compat::{
@@ -24,6 +24,10 @@ pub struct ProductionDestinationCandidate {
     pub face_count: Option<usize>,
     pub compatibility: Option<ProductionCompatibilityKey>,
     pub project_sha256: Option<String>,
+    /// Baseline recipe from the first validated Production provenance. The UI
+    /// may use it only as a seed; external ICC/DeviceLink bytes must still be
+    /// reopened and identity-verified before a conversion can be queued.
+    pub baseline_recipe: Option<ConversionRecipe>,
     pub diagnostic: Option<String>,
 }
 
@@ -32,7 +36,50 @@ impl ProductionDestinationCandidate {
         self.availability == ProductionDestinationAvailability::Ready
             && self.compatibility.is_some()
             && self.project_sha256.is_some()
+            && self.baseline_recipe.is_some()
     }
+
+    pub fn matches_recipe(&self, recipe: &ConversionRecipe) -> Result<bool, String> {
+        let Some(expected) = self.compatibility.as_ref() else {
+            return Ok(false);
+        };
+        Ok(expected == &compatibility_for_recipe(recipe)?)
+    }
+}
+
+/// Build the exact target-side compatibility identity directly from a proposed
+/// recipe. This lets the UI fail closed before enqueueing when an operator edits
+/// target controls after selecting an existing Production project.
+pub fn compatibility_for_recipe(
+    recipe: &ConversionRecipe,
+) -> Result<ProductionCompatibilityKey, String> {
+    recipe
+        .validate()
+        .map_err(|errors| format!("Invalid conversion recipe: {}", errors.join(" ")))?;
+    let target = &recipe.target;
+    Ok(ProductionCompatibilityKey {
+        engine_mode: recipe.engine_mode,
+        output_profile_sha256: target
+            .output_profile_identity
+            .as_ref()
+            .map(|identity| identity.sha256.trim().to_ascii_lowercase()),
+        device_link_sha256: target
+            .device_link_identity
+            .as_ref()
+            .map(|identity| identity.sha256.trim().to_ascii_lowercase()),
+        characterization_id: target
+            .characterization_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        channel_names: target
+            .channels
+            .iter()
+            .map(|channel| channel.name.trim().to_owned())
+            .collect(),
+        bit_depth: target.bit_depth,
+    })
 }
 
 pub fn inspect_linked_production_destinations(
@@ -64,6 +111,7 @@ pub fn inspect_candidate(
             face_count: None,
             compatibility: None,
             project_sha256: None,
+            baseline_recipe: None,
             diagnostic: Some("Linked Production project is missing.".to_owned()),
         };
     }
@@ -95,15 +143,22 @@ pub fn inspect_candidate(
         &path,
         source_project_path,
     ) {
-        Ok(compatibility) => ProductionDestinationCandidate {
-            path,
-            availability: ProductionDestinationAvailability::Ready,
-            project_name,
-            face_count,
-            compatibility: Some(compatibility),
-            project_sha256: Some(after),
-            diagnostic: None,
-        },
+        Ok(compatibility) => {
+            let baseline_recipe = project
+                .production_provenance
+                .first()
+                .map(|provenance| provenance.recipe.clone());
+            ProductionDestinationCandidate {
+                path,
+                availability: ProductionDestinationAvailability::Ready,
+                project_name,
+                face_count,
+                compatibility: Some(compatibility),
+                project_sha256: Some(after),
+                baseline_recipe,
+                diagnostic: None,
+            }
+        }
         Err(error) => ProductionDestinationCandidate {
             path,
             availability: ProductionDestinationAvailability::Incompatible,
@@ -111,6 +166,7 @@ pub fn inspect_candidate(
             face_count,
             compatibility: None,
             project_sha256: Some(after),
+            baseline_recipe: None,
             diagnostic: Some(error),
         },
     }
@@ -136,6 +192,7 @@ fn unreadable(path: PathBuf, error: impl Into<String>) -> ProductionDestinationC
         face_count: None,
         compatibility: None,
         project_sha256: None,
+        baseline_recipe: None,
         diagnostic: Some(error.into()),
     }
 }
@@ -146,9 +203,9 @@ mod tests {
 
     use super::*;
     use crate::color_conversion::{
-        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionEngineMode, ConversionRecipe,
-        ConversionRenderingIntent, ConversionSourceRef, ConversionTargetDefinition,
-        LinkedProjectRef, ProductionProvenance, SeparationStrategy, TargetChannelDefinition,
+        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionEngineMode, ConversionRenderingIntent,
+        ConversionSourceRef, ConversionTargetDefinition, LinkedProjectRef, ProductionProvenance,
+        SeparationStrategy, TargetChannelDefinition,
     };
     use crate::model::IccProfileIdentity;
     use crate::production_project::{ProductionProjectSpec, build_production_project};
@@ -169,6 +226,44 @@ mod tests {
         ))
     }
 
+    fn recipe() -> ConversionRecipe {
+        ConversionRecipe {
+            source_transparency_policy: None,
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::Icc,
+            source_profile_identity: IccProfileIdentity {
+                description: "Source".to_owned(),
+                sha256: hash('a'),
+            },
+            target: ConversionTargetDefinition {
+                name: "Press".to_owned(),
+                channels: ["Cyan", "Magenta", "Yellow", "Black"]
+                    .into_iter()
+                    .map(|name| TargetChannelDefinition {
+                        name: name.to_owned(),
+                        display_rgb: None,
+                        solidity: 1.0,
+                        max_coverage: None,
+                    })
+                    .collect(),
+                bit_depth: 16,
+                output_profile_identity: Some(IccProfileIdentity {
+                    description: "Press".to_owned(),
+                    sha256: hash('b'),
+                }),
+                output_profile_path: Some(r"C:\Color\Press.icc".to_owned()),
+                device_link_identity: None,
+                device_link_path: None,
+                characterization_id: None,
+                total_ink_limit: None,
+            },
+            rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
+            black_point_compensation: true,
+            strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
+        }
+    }
+
     fn provenance(source: &Path, output: &Path) -> ProductionProvenance {
         ProductionProvenance {
             source: ConversionSourceRef {
@@ -177,41 +272,7 @@ mod tests {
                 source_snapshot_id: None,
                 source_file_sha256: hash('s'),
             },
-            recipe: ConversionRecipe {
-                source_transparency_policy: None,
-                schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
-                engine_mode: ConversionEngineMode::Icc,
-                source_profile_identity: IccProfileIdentity {
-                    description: "Source".to_owned(),
-                    sha256: hash('a'),
-                },
-                target: ConversionTargetDefinition {
-                    name: "Press".to_owned(),
-                    channels: ["Cyan", "Magenta", "Yellow", "Black"]
-                        .into_iter()
-                        .map(|name| TargetChannelDefinition {
-                            name: name.to_owned(),
-                            display_rgb: None,
-                            solidity: 1.0,
-                            max_coverage: None,
-                        })
-                        .collect(),
-                    bit_depth: 16,
-                    output_profile_identity: Some(IccProfileIdentity {
-                        description: "Press".to_owned(),
-                        sha256: hash('b'),
-                    }),
-                    output_profile_path: Some(r"C:\Color\Press.icc".to_owned()),
-                    device_link_identity: None,
-                    device_link_path: None,
-                    characterization_id: None,
-                    total_ink_limit: None,
-                },
-                rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
-                black_point_compensation: true,
-                strategy: SeparationStrategy::default(),
-                custom_optimizer_solver: None,
-            },
+            recipe: recipe(),
             custom_optimizer: None,
             output_path: output.to_string_lossy().into_owned(),
             output_sha256: hash('o'),
@@ -220,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_link_is_ready_with_sha_and_topology() {
+    fn compatible_link_is_ready_with_sha_topology_and_recipe_seed() {
         let source_path = temp_path("source", "shade");
         let production_path = temp_path("production", "shade");
         let output_path = production_path.with_extension("tif");
@@ -253,8 +314,27 @@ mod tests {
             candidates[0].compatibility.as_ref().unwrap().channel_names,
             ["Cyan", "Magenta", "Yellow", "Black"]
         );
+        assert!(candidates[0].baseline_recipe.is_some());
+        assert!(candidates[0].matches_recipe(&recipe()).unwrap());
         let _ = fs::remove_file(output_path);
         let _ = fs::remove_file(production_path);
+    }
+
+    #[test]
+    fn recipe_target_drift_is_detected_before_append_capture() {
+        let candidate = ProductionDestinationCandidate {
+            path: PathBuf::from(r"C:\Production\Job.shade"),
+            availability: ProductionDestinationAvailability::Ready,
+            project_name: Some("Production".to_owned()),
+            face_count: Some(1),
+            compatibility: Some(compatibility_for_recipe(&recipe()).unwrap()),
+            project_sha256: Some(hash('p')),
+            baseline_recipe: Some(recipe()),
+            diagnostic: None,
+        };
+        let mut changed = recipe();
+        changed.target.bit_depth = 8;
+        assert!(!candidate.matches_recipe(&changed).unwrap());
     }
 
     #[test]
