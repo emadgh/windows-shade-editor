@@ -26,11 +26,11 @@ use windows_shade_editor::design_source::{
     DesignSourceColorModel, SourceImageFormat, SourceLossiness, TransparencyState,
 };
 use windows_shade_editor::model::IccProfileIdentity as ConversionIccProfileIdentity;
-use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 use windows_shade_editor::production_target::{
     ProductionTargetProfileInspection, validate_target_channel_names,
     verify_production_target_profile,
 };
+use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 use windows_shade_editor::tiff_io::ColorModel as ConversionColorModel;
 
 const CONVERSION_WINDOW_ID: &str = "shade-editor-color-conversion-preflight-open";
@@ -158,6 +158,7 @@ enum ConversionQueueUiAction {
     TogglePaused,
     Cancel(u64),
     Retry(u64),
+    RecoverProject(u64),
     ClearFinished,
 }
 
@@ -416,6 +417,49 @@ impl ShadeApp {
                 ConversionQueueUiAction::Retry(id) => {
                     self.conversion_queue.retry(id);
                 }
+                ConversionQueueUiAction::RecoverProject(id) => {
+                    match self.conversion_queue.recover_project(id) {
+                        Ok(Some(completion)) => {
+                            let is_current_source =
+                                self.project_path.as_ref().is_some_and(|path| {
+                                    path.to_string_lossy().eq_ignore_ascii_case(
+                                        &completion.capture.source_project_path.to_string_lossy(),
+                                    )
+                                });
+                            match completion.result {
+                                windows_shade_editor::conversion_queue::ConversionQueueCompletionResult::Completed(completed) => {
+                                    if is_current_source {
+                                        match production_project::link_source_project_to_production(
+                                            &mut self.project,
+                                            &completed.production_project_path,
+                                        ) {
+                                            Ok(()) => {
+                                                self.mark_project_dirty();
+                                                self.log.info(
+                                                    "Recovered Production linkage changed the open Source project; explicit Save is required.",
+                                                );
+                                            }
+                                            Err(error) => self.log.error(&format!(
+                                                "Could not mirror recovered Production link in the open Source project: {error}"
+                                            )),
+                                        }
+                                    }
+                                    self.report_info(format!(
+                                        "Recovered Production project: {}",
+                                        completed.production_project_path.display()
+                                    ));
+                                }
+                                _ => self.report_error(
+                                    "Project-only recovery returned an unexpected conversion result.",
+                                ),
+                            }
+                        }
+                        Ok(None) => self
+                            .report_info("This conversion item has no project-only recovery work."),
+                        Err(error) => self
+                            .report_error(format!("Production project recovery blocked: {error}")),
+                    }
+                }
                 ConversionQueueUiAction::ClearFinished => {
                     self.conversion_queue.clear_finished();
                 }
@@ -446,13 +490,12 @@ impl ShadeApp {
         let (profile, profile_label, production_profile_path, has_assigned_profile) =
             production_source_profile_state(&descriptor, source_model, face_ref);
         let profile_identity = profile.identity().cloned();
-        let transparency_policy = if self.color_conversion.source_key.as_deref()
-            == Some(face.path.as_path())
-        {
-            self.color_conversion.source_transparency_policy.as_ref()
-        } else {
-            None
-        };
+        let transparency_policy =
+            if self.color_conversion.source_key.as_deref() == Some(face.path.as_path()) {
+                self.color_conversion.source_transparency_policy.as_ref()
+            } else {
+                None
+            };
         let report = build_conversion_preflight_for_source_with_policy(
             &descriptor,
             profile,
@@ -480,7 +523,10 @@ impl ShadeApp {
             source_model,
             transparency: descriptor.transparency,
             lossiness: descriptor.lossiness,
-            execution_supported: production_execution_supported(descriptor.format, descriptor.color_model),
+            execution_supported: production_execution_supported(
+                descriptor.format,
+                descriptor.color_model,
+            ),
             color_model_label: source_model.title(),
             bit_depth: descriptor.bit_depth,
             channel_count: descriptor.channel_count,
@@ -1350,11 +1396,20 @@ fn render_conversion_queue(
                         actions.push(ConversionQueueUiAction::Cancel(row.id));
                     }
                 }
-                ConversionQueueStatus::Failed
-                | ConversionQueueStatus::Cancelled
-                | ConversionQueueStatus::NeedsRecovery => {
+                ConversionQueueStatus::Failed | ConversionQueueStatus::Cancelled => {
                     if ui.button("Retry safely").clicked() {
                         actions.push(ConversionQueueUiAction::Retry(row.id));
+                    }
+                }
+                ConversionQueueStatus::NeedsRecovery => {
+                    if ui
+                        .button("Recover Project")
+                        .on_hover_text(
+                            "Complete only the Production .shade save. The committed TIFF is verified and never rendered again.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(ConversionQueueUiAction::RecoverProject(row.id));
                     }
                 }
                 ConversionQueueStatus::Done => {}
