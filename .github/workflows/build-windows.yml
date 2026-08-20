@@ -42,7 +42,7 @@ jobs:
         run: cargo test --locked --target x86_64-pc-windows-msvc --lib
 
   build:
-    name: Full merge gate
+    name: build
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
     runs-on: windows-latest
     steps:
