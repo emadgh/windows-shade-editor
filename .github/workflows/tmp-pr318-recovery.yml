@@ -1,4 +1,4 @@
-name: Temporary guarded PR318 recovery safety
+name: Temporary guarded PR318 v0.21.48 bump
 
 on:
   pull_request:
@@ -9,44 +9,64 @@ permissions:
   contents: write
 
 jobs:
-  patch:
+  bump:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: tmp/pr318-recovery-workflow
-          path: helper
-      - uses: actions/checkout@v6
-        with:
           ref: codex/append-existing-production-transaction
           fetch-depth: 0
-          path: work
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Block unsafe retry of committed recovery work
+      - name: Verify and publish v0.21.48 identity
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Set-Location work
-          $expected = '07a1f6aea70999f50263488ed66c5514afe83111'
-          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR318 head moved before recovery safety patch' }
-          Set-Location ..
-          python helper/tools/tmp_pr318_recovery_patch.py
+          $expected = '8d7750a7bdd443761e357fa4449c4105af84b234'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR318 head moved before v0.21.48 bump' }
+
+          @'
+          from pathlib import Path
+
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text(encoding='utf-8')
+          old = 'version = "0.21.47"'
+          new = 'version = "0.21.48"'
+          if text.count(old) != 1:
+              raise SystemExit(f'Cargo.toml expected exactly one root version occurrence, found {text.count(old)}')
+          cargo.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          lock = Path('Cargo.lock')
+          text = lock.read_text(encoding='utf-8')
+          old = 'name = "windows-shade-editor"\nversion = "0.21.47"'
+          new = 'name = "windows-shade-editor"\nversion = "0.21.48"'
+          if text.count(old) != 1:
+              raise SystemExit(f'Cargo.lock expected exactly one root package occurrence, found {text.count(old)}')
+          lock.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          version = Path('VERSION')
+          if version.read_text(encoding='utf-8').strip() != '0.21.47':
+              raise SystemExit('VERSION is not 0.21.47')
+          version.write_text('0.21.48\n', encoding='utf-8', newline='\n')
+          '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Set-Location work
-          cargo fmt --all -- --check
-          if ($LASTEXITCODE -ne 0) { cargo fmt --all }
+
           $changed = @(git diff --name-only)
-          if ($changed.Count -ne 1 -or $changed[0] -ne 'src/conversion_queue.rs') {
-            throw "Recovery safety changed unexpected files: $($changed -join ', ')"
+          $expectedFiles = @('Cargo.lock', 'Cargo.toml', 'VERSION')
+          if ($changed.Count -ne 3) { throw "Version bump changed $($changed.Count) files: $($changed -join ', ')" }
+          foreach ($file in $expectedFiles) {
+            if ($changed -notcontains $file) { throw "Version bump did not change expected file $file" }
           }
+          foreach ($file in $changed) {
+            if ($expectedFiles -notcontains $file) { throw "Unexpected version-bump file $file" }
+          }
+
           cargo check --locked --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/conversion_queue.rs
-          git commit -m 'fix: preserve NeedsRecovery state instead of rerunning committed conversion (#316)'
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m 'chore: finalize v0.21.48 Production append transaction (#316)'
           git push origin HEAD:codex/append-existing-production-transaction
