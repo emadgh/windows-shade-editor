@@ -10,7 +10,7 @@ struct TestStackUiState {
     selected_snapshot_ids: BTreeSet<u64>,
     layout: TestStackLayout,
     anchor: TestStackAnchor,
-    anchor_initialized: bool,
+    follow_code_corner: bool,
 }
 
 impl Default for TestStackUiState {
@@ -19,7 +19,7 @@ impl Default for TestStackUiState {
             selected_snapshot_ids: BTreeSet::new(),
             layout: TestStackLayout::THREE_ROWS,
             anchor: TestStackAnchor::TopLeft,
-            anchor_initialized: false,
+            follow_code_corner: true,
         }
     }
 }
@@ -184,9 +184,8 @@ fn ui_test_stack(app: &mut ShadeApp, ui: &mut egui::Ui) {
     state
         .selected_snapshot_ids
         .retain(|snapshot_id| available_ids.contains(snapshot_id));
-    if !state.anchor_initialized {
+    if state.follow_code_corner {
         state.anchor = anchor_from_test_code_position(app.project.test_code.position);
-        state.anchor_initialized = true;
     }
 
     let mut build_requested = false;
@@ -209,23 +208,30 @@ fn ui_test_stack(app: &mut ShadeApp, ui: &mut egui::Ui) {
                 }
             });
 
-            ui.horizontal(|ui| {
-                ui.small("Anchor");
-                egui::ComboBox::from_id_salt("test-stack-anchor")
-                    .selected_text(state.anchor.label())
-                    .show_ui(ui, |ui| {
-                        for anchor in [
-                            TestStackAnchor::TopLeft,
-                            TestStackAnchor::TopRight,
-                            TestStackAnchor::BottomLeft,
-                            TestStackAnchor::BottomRight,
-                        ] {
-                            ui.selectable_value(&mut state.anchor, anchor, anchor.label());
-                        }
-                    });
-                if ui.small_button("Use code corner").clicked() {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut state.follow_code_corner, "Follow Test Code corner")
+                    .on_hover_text("Keep Test Stack alignment synchronized with the corner used to print the Snapshot code");
+                if state.follow_code_corner {
                     state.anchor = anchor_from_test_code_position(app.project.test_code.position);
+                    ui.small(format!("· {}", state.anchor.label()));
                 }
+            });
+            ui.add_enabled_ui(!state.follow_code_corner, |ui| {
+                ui.horizontal(|ui| {
+                    ui.small("Custom anchor");
+                    egui::ComboBox::from_id_salt("test-stack-anchor")
+                        .selected_text(state.anchor.label())
+                        .show_ui(ui, |ui| {
+                            for anchor in [
+                                TestStackAnchor::TopLeft,
+                                TestStackAnchor::TopRight,
+                                TestStackAnchor::BottomLeft,
+                                TestStackAnchor::BottomRight,
+                            ] {
+                                ui.selectable_value(&mut state.anchor, anchor, anchor.label());
+                            }
+                        });
+                });
             });
 
             ui.add_space(4.0);
