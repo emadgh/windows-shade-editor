@@ -56,6 +56,8 @@ pub mod palette;
 pub mod png_source;
 pub mod production_acceptance;
 pub mod production_colorimetry;
+pub mod production_destination;
+pub mod production_destination_selection;
 pub mod production_lab_transform;
 pub mod production_project;
 pub mod production_project_compat;
