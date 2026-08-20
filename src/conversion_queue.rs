@@ -7,6 +7,8 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::conversion_recovery::{ConversionRecoveryRecord, ConversionRecoveryStage};
+use crate::conversion_recovery::recover_production_project;
 use crate::conversion_transaction::{
     CommittedConversionOutput, CompletedConversionTransaction, ConversionCancellation,
     ConversionJobCapture, ConversionPhase, ConversionTransactionOutcome,
@@ -45,14 +47,6 @@ impl ConversionQueueStatus {
     fn reserves_destination(self) -> bool {
         matches!(self, Self::Waiting | Self::Processing | Self::NeedsRecovery)
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ConversionRecoveryRecord {
-    pub committed_output: CommittedConversionOutput,
-    pub production_project_path: PathBuf,
-    pub production_project: Option<ShadeProject>,
-    pub error: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -354,11 +348,6 @@ impl ConversionQueue {
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
-        // A NeedsRecovery item has already committed its TIFF. Re-running the
-        // full conversion can collide with MustNotExist output policy and, for
-        // append-existing jobs, can discard the exact project mutation state
-        // needed for optimistic-concurrency recovery. Keep that state intact;
-        // project-only recovery is a separate operation.
         if !matches!(
             item.status,
             ConversionQueueStatus::Failed | ConversionQueueStatus::Cancelled
@@ -374,6 +363,49 @@ impl ConversionQueue {
         item.requires_resume = false;
         self.persist();
         true
+    }
+
+    pub fn recover_project(
+        &mut self,
+        id: u64,
+    ) -> Result<Option<ConversionQueueCompletion>, String> {
+        let Some(index) = self.items.iter().position(|item| item.id == id) else {
+            return Ok(None);
+        };
+        if self.items[index].status != ConversionQueueStatus::NeedsRecovery {
+            return Ok(None);
+        }
+        let recovery = self.items[index]
+            .recovery
+            .clone()
+            .ok_or_else(|| "Conversion queue item is missing its persisted recovery record.".to_owned())?;
+        let capture = self.items[index].spec.capture.clone();
+        let disposition = self.items[index].spec.production_project_disposition.clone();
+
+        match recover_production_project(&capture, &disposition, &recovery) {
+            Ok(completed) => {
+                let result = ConversionQueueCompletionResult::Completed(completed);
+                apply_completion(&mut self.items[index], &result);
+                self.items[index].detail = "Production project recovery completed".to_owned();
+                let completion = ConversionQueueCompletion {
+                    id,
+                    capture,
+                    result,
+                };
+                self.persist();
+                Ok(Some(completion))
+            }
+            Err(error) => {
+                self.items[index].phase = ConversionPhase::ProductionProjectSave.label().to_owned();
+                self.items[index].detail = "Production project recovery remains blocked".to_owned();
+                self.items[index].error = Some(error.clone());
+                if let Some(record) = self.items[index].recovery.as_mut() {
+                    record.error = error.clone();
+                }
+                self.persist();
+                Err(error)
+            }
+        }
     }
 
     pub fn clear_finished(&mut self) -> usize {
@@ -484,23 +516,21 @@ impl ConversionQueue {
                     &cancellation,
                     &mut backend,
                     |progress| {
-                    let _ = worker_tx.send(ConversionQueueEvent::Progress {
-                        id,
-                        phase: progress.phase.label().to_owned(),
-                        fraction: progress.fraction,
-                        detail: progress.detail,
-                    });
-                },
+                        let _ = worker_tx.send(ConversionQueueEvent::Progress {
+                            id,
+                            phase: progress.phase.label().to_owned(),
+                            fraction: progress.fraction,
+                            detail: progress.detail,
+                        });
+                    },
                 )
             }))
-            .unwrap_or_else(|payload| {
-                ConversionTransactionOutcome::FailedBeforeCommit {
-                    phase: ConversionPhase::CaptureValidation,
-                    error: format!(
-                        "Conversion worker panicked: {}",
-                        panic_payload_text(payload.as_ref())
-                    ),
-                }
+            .unwrap_or_else(|payload| ConversionTransactionOutcome::FailedBeforeCommit {
+                phase: ConversionPhase::CaptureValidation,
+                error: format!(
+                    "Conversion worker panicked: {}",
+                    panic_payload_text(payload.as_ref())
+                ),
             });
             let result = completion_result(&capture, outcome);
             let _ = tx.send(ConversionQueueEvent::Finished {
@@ -579,11 +609,6 @@ fn completion_result(
     outcome: ConversionTransactionOutcome,
 ) -> ConversionQueueCompletionResult {
     match outcome {
-        // The TIFF and Production project are the queue-owned transactional
-        // outputs. The Source .shade is explicitly-save-only (#204), so the
-        // worker must never reopen and save it as a reciprocal-link side effect.
-        // The UI mirrors the link into the currently open Source project and
-        // marks it dirty; durable Source persistence remains an explicit Save.
         ConversionTransactionOutcome::Completed(value) => {
             ConversionQueueCompletionResult::Completed(value)
         }
@@ -605,6 +630,7 @@ fn completion_result(
             production_project,
             error,
         } => ConversionQueueCompletionResult::NeedsRecovery(ConversionRecoveryRecord {
+            stage: ConversionRecoveryStage::ProductionProjectSavePending,
             committed_output,
             production_project_path,
             production_project,
@@ -777,6 +803,7 @@ mod tests {
             let item = queue.items.iter_mut().find(|item| item.id == id).unwrap();
             item.status = ConversionQueueStatus::NeedsRecovery;
             item.recovery = Some(ConversionRecoveryRecord {
+                stage: ConversionRecoveryStage::ProductionProjectSavePending,
                 committed_output: CommittedConversionOutput {
                     path: PathBuf::from(r"C:\Production\recover.tif"),
                     sha256: HASH.to_owned(),
@@ -795,6 +822,28 @@ mod tests {
         assert_eq!(
             item.recovery.as_ref().unwrap().error,
             "simulated project-save failure"
+        );
+    }
+
+    #[test]
+    fn legacy_recovery_record_defaults_to_project_save_stage() {
+        let record = ConversionRecoveryRecord {
+            stage: ConversionRecoveryStage::ProductionProjectSavePending,
+            committed_output: CommittedConversionOutput {
+                path: PathBuf::from(r"C:\Production\recover.tif"),
+                sha256: HASH.to_owned(),
+                converted_at_unix_ms: 1,
+            },
+            production_project_path: PathBuf::from(r"C:\Production\recover.shade"),
+            production_project: Some(ShadeProject::default()),
+            error: "legacy".to_owned(),
+        };
+        let mut value = serde_json::to_value(record).unwrap();
+        value.as_object_mut().unwrap().remove("stage");
+        let restored: ConversionRecoveryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.stage,
+            ConversionRecoveryStage::ProductionProjectSavePending
         );
     }
 
