@@ -65,6 +65,7 @@ pub mod production_target;
 pub mod safe_fs;
 pub mod separation_optimizer;
 pub mod source_transparency;
+pub mod test_stack;
 #[path = "tiff_io.rs"]
 pub mod tiff_io;
 
@@ -90,5 +91,7 @@ mod inverse_lut_production_eligibility_tests;
 mod inverse_lut_runtime_tests;
 #[cfg(test)]
 mod inverse_lut_validation_tests;
+#[cfg(test)]
+mod test_stack_tests;
 #[cfg(test)]
 mod tiff_conformance_tests;
