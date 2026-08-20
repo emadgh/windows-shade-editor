@@ -1,0 +1,1 @@
+Trigger guarded v0.21.49 version bump for PR #328 exact head ddf754a79a608d49ed0cbfa9120e4e29e68c72cf.
