@@ -60,11 +60,15 @@ pub mod production_colorimetry;
 pub mod production_destination;
 pub mod production_destination_selection;
 pub mod production_lab_transform;
+pub mod production_lineage;
 pub mod production_project;
 pub mod production_project_compat;
 pub mod production_project_disposition;
+pub mod production_replacement;
+pub mod production_staleness;
 pub mod production_target;
 pub mod project_link_navigation;
+pub mod reconversion_policy;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
 pub mod separation_optimizer;
