@@ -1,1 +1,1 @@
-Trigger guarded PR328 project-only recovery UI patch.
+Retrigger guarded PR328 project-only recovery UI patch after formatter scope fix.
