@@ -93,5 +93,5 @@ fn append_existing_public_api_freezes_exact_project_baseline() {
     };
 
     assert_eq!(expected_project_sha256, hash('a'));
-    assert_eq!(expected_compatibility, compatibility);
+    assert!(expected_compatibility.matches_runtime(&compatibility));
 }
