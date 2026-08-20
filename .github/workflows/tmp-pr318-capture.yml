@@ -1,4 +1,4 @@
-name: Temporary guarded PR318 capture disposition migration
+name: Temporary guarded PR318 capture-owned disposition migration
 
 on:
   push:
@@ -19,24 +19,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Add immutable Production disposition to capture, validate and publish
+      - name: Move Production disposition into immutable capture
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $expected = '5dbe9a9231c6dc936e73c80f14e341fcced3fca8'
-          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR318 head moved before capture migration' }
+          $expected = '07a1f6aea70999f50263488ed66c5514afe83111'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR318 head moved before capture-owned disposition migration' }
 
           @'
           from pathlib import Path
           import re
 
+          disposition_path = 'crate::production_project_disposition::ProductionProjectDisposition::CreateNew'
+
+          # 1) ConversionJobCapture becomes the single immutable owner of Production destination intent.
           tx = Path('src/conversion_transaction.rs')
           text = tx.read_text(encoding='utf-8')
-
           old = 'use crate::production_project::{ProductionProjectSpec, build_production_project};\n'
           new = old + 'use crate::production_project_disposition::ProductionProjectDisposition;\n'
           if text.count(old) != 1:
-              raise SystemExit(f'production_project import marker count={text.count(old)}')
+              raise SystemExit(f'transaction import marker count={text.count(old)}')
           text = text.replace(old, new, 1)
 
           old = '''    #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,14 +55,15 @@ jobs:
               raise SystemExit(f'capture field marker count={text.count(old)}')
           text = text.replace(old, new, 1)
 
-          for old, new in [
+          constructor_pairs = [
               ('            custom_optimizer_evidence: None,\n            output_policy,',
                '            custom_optimizer_evidence: None,\n            production_project_disposition: ProductionProjectDisposition::CreateNew,\n            output_policy,'),
               ('            custom_optimizer_evidence: Some(custom_optimizer_evidence),\n            output_policy,',
                '            custom_optimizer_evidence: Some(custom_optimizer_evidence),\n            production_project_disposition: ProductionProjectDisposition::CreateNew,\n            output_policy,'),
-          ]:
+          ]
+          for old, new in constructor_pairs:
               if text.count(old) != 1:
-                  raise SystemExit(f'constructor marker count={text.count(old)} for {old[:48]!r}')
+                  raise SystemExit(f'constructor marker count={text.count(old)}')
               text = text.replace(old, new, 1)
 
           marker = '    pub fn validate(&self) -> Result<(), String> {\n'
@@ -86,28 +89,35 @@ jobs:
             .map_err(|err| err.to_string())?;
 '''
           if text.count(marker) != 1:
-              raise SystemExit(f'output-validation marker count={text.count(marker)}')
+              raise SystemExit(f'output validation marker count={text.count(marker)}')
           text = text.replace(marker, replacement, 1)
           tx.write_text(text, encoding='utf-8', newline='\n')
 
-          literal_pattern = re.compile(r'^(?P<indent>\s*)ConversionJobCapture \{\s*$', re.MULTILINE)
-          touched = []
+          # Rust struct literals need the new field explicitly; serde defaults only cover persisted JSON.
+          touched_literals = []
+          bare = re.compile(r'^(?P<indent>\s*)ConversionJobCapture \{\s*$', re.MULTILINE)
+          assigned = re.compile(r'^(?P<indent>\s*)let\s+[^=\n]+?=\s*ConversionJobCapture \{\s*$', re.MULTILINE)
           for root in (Path('src'), Path('tests')):
               for path in root.rglob('*.rs'):
                   if path == tx:
                       continue
                   original = path.read_text(encoding='utf-8')
-                  matches = list(literal_pattern.finditer(original))
-                  if not matches:
-                      continue
-                  updated = literal_pattern.sub(
-                      lambda m: m.group(0) + '\n' + m.group('indent') + '    production_project_disposition: crate::production_project_disposition::ProductionProjectDisposition::CreateNew,',
-                      original,
-                  )
-                  path.write_text(updated, encoding='utf-8', newline='\n')
-                  touched.append((path.as_posix(), len(matches)))
-          print('migrated direct capture literals:', touched)
+                  updated = original
+                  count = 0
+                  for pattern in (bare, assigned):
+                      matches = list(pattern.finditer(updated))
+                      if matches:
+                          count += len(matches)
+                          updated = pattern.sub(
+                              lambda m: m.group(0) + '\n' + m.group('indent') + f'    production_project_disposition: {disposition_path},',
+                              updated,
+                          )
+                  if updated != original:
+                      path.write_text(updated, encoding='utf-8', newline='\n')
+                      touched_literals.append((path.as_posix(), count))
+          print('migrated direct capture literals:', touched_literals)
 
+          # Capture compatibility: missing field in legacy JSON must become CreateNew.
           compat = Path('src/conversion_capture_compat_tests.rs')
           text = compat.read_text(encoding='utf-8')
           old = '''    let restored: ConversionJobCapture = serde_json::from_slice(&bytes).unwrap();
@@ -141,32 +151,277 @@ fn legacy_capture_json_without_production_disposition_defaults_to_create_new() {
 }
 '''
           if text.count(old) != 1:
-              raise SystemExit(f'compat test marker count={text.count(old)}')
+              raise SystemExit(f'capture compatibility marker count={text.count(old)}')
           compat.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+
+          # 2) Queue persists only the capture; no duplicate sidecar disposition may drift.
+          queue = Path('src/conversion_queue.rs')
+          text = queue.read_text(encoding='utf-8')
+          old = '''struct QueuedConversionSpec {
+    capture: ConversionJobCapture,
+    #[serde(default)]
+    production_project_disposition: ProductionProjectDisposition,
+    default_dpi: f64,
+}
+'''
+          new = '''struct QueuedConversionSpec {
+    capture: ConversionJobCapture,
+    default_dpi: f64,
+}
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'queue spec marker count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    pub fn enqueue(
+        &mut self,
+        capture: ConversionJobCapture,
+        default_dpi: f64,
+    ) -> Result<u64, String> {
+        self.enqueue_with_production_project_disposition(
+            capture,
+            ProductionProjectDisposition::CreateNew,
+            default_dpi,
+        )
+    }
+
+    pub fn enqueue_with_production_project_disposition(
+        &mut self,
+        capture: ConversionJobCapture,
+        production_project_disposition: ProductionProjectDisposition,
+        default_dpi: f64,
+    ) -> Result<u64, String> {
+        capture.validate()?;
+        production_project_disposition.validate()?;
+        if !default_dpi.is_finite() || default_dpi <= 0.0 {
+            return Err("Conversion fallback DPI must be finite and positive.".to_owned());
+        }
+        for item in self
+            .items
+            .iter()
+            .filter(|item| item.status.reserves_destination())
+        {
+            if paths_match(&item.destination, &capture.output_tiff_path)
+                || paths_match(
+                    &item.production_project_path,
+                    &capture.production_project_path,
+                )
+            {
+                return Err("Conversion output or Production project is already reserved by another queued job.".to_owned());
+            }
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.items.push(item_from_spec(
+            id,
+            QueuedConversionSpec {
+                capture,
+                production_project_disposition,
+                default_dpi,
+            },
+            ConversionQueueStatus::Waiting,
+            false,
+            false,
+            None,
+            None,
+        ));
+        self.persist();
+        Ok(id)
+    }
+'''
+          new = '''    pub fn enqueue(
+        &mut self,
+        capture: ConversionJobCapture,
+        default_dpi: f64,
+    ) -> Result<u64, String> {
+        capture.validate()?;
+        if !default_dpi.is_finite() || default_dpi <= 0.0 {
+            return Err("Conversion fallback DPI must be finite and positive.".to_owned());
+        }
+        for item in self
+            .items
+            .iter()
+            .filter(|item| item.status.reserves_destination())
+        {
+            if paths_match(&item.destination, &capture.output_tiff_path)
+                || paths_match(
+                    &item.production_project_path,
+                    &capture.production_project_path,
+                )
+            {
+                return Err("Conversion output or Production project is already reserved by another queued job.".to_owned());
+            }
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.items.push(item_from_spec(
+            id,
+            QueuedConversionSpec {
+                capture,
+                default_dpi,
+            },
+            ConversionQueueStatus::Waiting,
+            false,
+            false,
+            None,
+            None,
+        ));
+        self.persist();
+        Ok(id)
+    }
+
+    pub fn enqueue_with_production_project_disposition(
+        &mut self,
+        capture: ConversionJobCapture,
+        production_project_disposition: ProductionProjectDisposition,
+        default_dpi: f64,
+    ) -> Result<u64, String> {
+        let capture = capture
+            .with_production_project_disposition(production_project_disposition)?;
+        self.enqueue(capture, default_dpi)
+    }
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'queue enqueue block marker count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '            let production_project_disposition = spec.production_project_disposition;\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'queue worker disposition marker count={text.count(old)}')
+          text = text.replace(old, '', 1)
+          old = '''                    &capture,
+                    &production_project_disposition,
+                    &cancellation,
+'''
+          new = '''                    &capture,
+                    &capture.production_project_disposition,
+                    &cancellation,
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'queue transaction call marker count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    #[test]
+    fn queued_spec_without_project_disposition_defaults_to_create_new() {
+        let spec = QueuedConversionSpec {
+            capture: capture(r"C:\\Production\\legacy.tif"),
+            production_project_disposition: ProductionProjectDisposition::CreateNew,
+            default_dpi: 220.0,
+        };
+        let mut value = serde_json::to_value(&spec).unwrap();
+        value
+            .as_object_mut()
+            .expect("queued spec object")
+            .remove("production_project_disposition");
+        let restored: QueuedConversionSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.production_project_disposition,
+            ProductionProjectDisposition::CreateNew
+        );
+    }
+'''
+          new = '''    #[test]
+    fn queued_legacy_capture_without_project_disposition_defaults_to_create_new() {
+        let spec = QueuedConversionSpec {
+            capture: capture(r"C:\\Production\\legacy.tif"),
+            default_dpi: 220.0,
+        };
+        let mut value = serde_json::to_value(&spec).unwrap();
+        value
+            .get_mut("capture")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("queued capture object")
+            .remove("production_project_disposition");
+        let restored: QueuedConversionSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.capture.production_project_disposition,
+            ProductionProjectDisposition::CreateNew
+        );
+        restored.capture.validate().unwrap();
+    }
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'queue legacy test marker count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          old = '''        assert_eq!(
+            queue.items[0].spec.production_project_disposition,
+            disposition
+        );
+'''
+          new = '''        assert_eq!(
+            queue.items[0].spec.capture.production_project_disposition,
+            disposition
+        );
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'queue append assertion marker count={text.count(old)}')
+          queue.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+
+          # 3) Explicit transaction parameter may not override immutable capture intent.
+          td = Path('src/conversion_transaction_disposition.rs')
+          text = td.read_text(encoding='utf-8')
+          marker = '''    if let Err(error) = disposition.validate() {
+        return ConversionTransactionOutcome::FailedBeforeCommit {
+            phase: ConversionPhase::CaptureValidation,
+            error,
+        };
+    }
+
+'''
+          replacement = marker + '''    if &capture.production_project_disposition != disposition {
+        return ConversionTransactionOutcome::FailedBeforeCommit {
+            phase: ConversionPhase::CaptureValidation,
+            error: "Production project disposition does not match the immutable conversion capture."
+                .to_owned(),
+        };
+    }
+
+'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'transaction disposition validation marker count={text.count(marker)}')
+          text = text.replace(marker, replacement, 1)
+          old = '''            &capture(),
+            &disposition,
+'''
+          count = text.count(old)
+          if count < 4:
+              raise SystemExit(f'append transaction test call count={count}')
+          new = '''            &capture()
+                .with_production_project_disposition(disposition.clone())
+                .unwrap(),
+            &disposition,
+'''
+          text = text.replace(old, new)
+          td.write_text(text, encoding='utf-8', newline='\n')
           '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) {
+            cargo fmt --all
+          }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $allowed = @(
             'src/conversion_transaction.rs',
             'src/conversion_capture_compat_tests.rs',
             'src/conversion_queue.rs',
+            'src/conversion_transaction_disposition.rs',
+            'src/icc_conversion_worker.rs',
             'src/ui/color_conversion.rs',
             'src/main.rs',
-            'src/icc_conversion_worker.rs',
             'tests/non_tiff_production_source.rs'
           )
           $changed = @(git diff --name-only)
           foreach ($file in $changed) {
-            if ($allowed -notcontains $file) { throw "Unexpected capture-migration file $file" }
+            if ($allowed -notcontains $file) { throw "Unexpected capture-owned migration file $file" }
           }
-
-          cargo check --locked --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -- $changed
-          git commit -m 'feat: persist Production project disposition in conversion capture (#316)'
+          git commit -m 'fix: make Production disposition part of immutable conversion capture (#316)'
           git push origin HEAD:codex/append-existing-production-transaction
