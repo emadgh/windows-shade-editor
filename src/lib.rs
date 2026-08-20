@@ -92,4 +92,6 @@ mod inverse_lut_runtime_tests;
 #[cfg(test)]
 mod inverse_lut_validation_tests;
 #[cfg(test)]
+mod test_stack_tests;
+#[cfg(test)]
 mod tiff_conformance_tests;
