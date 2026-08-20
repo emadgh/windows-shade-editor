@@ -35,7 +35,7 @@ jobs:
           python helper/tools/tmp_pr329_destination_ui_patch.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Set-Location work
-          rustfmt --edition 2024 src/ui/color_conversion.rs src/main.rs
+          rustfmt --edition 2024 src/ui/color_conversion.rs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $changed = @(git diff --name-only)
           $expectedFiles = @('src/main.rs', 'src/ui/color_conversion.rs')
