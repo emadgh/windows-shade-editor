@@ -2,6 +2,7 @@
 
 pub mod color_conversion;
 pub mod conversion_analytics;
+pub mod conversion_audit;
 pub mod conversion_capabilities;
 pub mod conversion_output;
 pub mod conversion_preflight;

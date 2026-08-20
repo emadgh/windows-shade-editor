@@ -1,0 +1,455 @@
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::color_conversion::{ConversionEngineMode, ProductionProvenance};
+use crate::conversion_transaction::{CommittedConversionOutput, ConversionJobCapture};
+
+pub const CONVERSION_AUDIT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversionAuditSource {
+    pub project_path: String,
+    pub project_file_sha256: String,
+    pub face_path: String,
+    pub snapshot_id: Option<u64>,
+    pub source_file_sha256: String,
+    pub source_profile_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversionAuditTarget {
+    pub engine_mode: ConversionEngineMode,
+    pub target_name: String,
+    pub channel_names: Vec<String>,
+    pub bit_depth: u8,
+    pub output_profile_sha256: Option<String>,
+    pub device_link_sha256: Option<String>,
+    pub characterization_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversionAuditOutput {
+    pub path: String,
+    pub sha256: String,
+    pub converted_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversionAuditFinding {
+    pub code: String,
+    pub message: String,
+    pub acknowledged: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversionAuditRecord {
+    pub schema_version: u32,
+    pub app_version: String,
+    pub source: ConversionAuditSource,
+    pub target: ConversionAuditTarget,
+    pub recipe_sha256: String,
+    pub output: ConversionAuditOutput,
+    /// Findings must come from the actual preflight/transaction path. The audit
+    /// model never reconstructs warnings from current UI or project state.
+    pub findings: Vec<ConversionAuditFinding>,
+}
+
+impl ConversionAuditRecord {
+    pub fn from_committed_job(
+        capture: &ConversionJobCapture,
+        committed_output: &CommittedConversionOutput,
+        findings: Vec<ConversionAuditFinding>,
+    ) -> Result<Self, String> {
+        capture.validate()?;
+        if !paths_match(
+            committed_output.path.to_string_lossy().as_ref(),
+            capture.output_tiff_path.to_string_lossy().as_ref(),
+        ) {
+            return Err(
+                "Committed conversion output path does not match the captured job destination."
+                    .to_owned(),
+            );
+        }
+        if !has_sha256(&committed_output.sha256) {
+            return Err("Committed conversion output requires a full SHA-256.".to_owned());
+        }
+        if committed_output.converted_at_unix_ms <= 0 {
+            return Err("Committed conversion output requires a valid conversion timestamp.".to_owned());
+        }
+        validate_findings(&findings)?;
+
+        let target = &capture.conversion_recipe.target;
+        let record = Self {
+            schema_version: CONVERSION_AUDIT_SCHEMA_VERSION,
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            source: ConversionAuditSource {
+                project_path: capture.source_project_path.to_string_lossy().into_owned(),
+                project_file_sha256: capture.source_project_file_sha256.clone(),
+                face_path: capture.source_face_path.to_string_lossy().into_owned(),
+                snapshot_id: capture.source_snapshot_id,
+                source_file_sha256: capture.source_file_sha256.clone(),
+                source_profile_sha256: capture
+                    .conversion_recipe
+                    .source_profile_identity
+                    .sha256
+                    .clone(),
+            },
+            target: ConversionAuditTarget {
+                engine_mode: capture.conversion_recipe.engine_mode,
+                target_name: target.name.clone(),
+                channel_names: target
+                    .channels
+                    .iter()
+                    .map(|channel| channel.name.clone())
+                    .collect(),
+                bit_depth: target.bit_depth,
+                output_profile_sha256: target
+                    .output_profile_identity
+                    .as_ref()
+                    .map(|identity| identity.sha256.clone()),
+                device_link_sha256: target
+                    .device_link_identity
+                    .as_ref()
+                    .map(|identity| identity.sha256.clone()),
+                characterization_id: target.characterization_id.clone(),
+            },
+            recipe_sha256: capture.conversion_recipe_sha256.clone(),
+            output: ConversionAuditOutput {
+                path: committed_output.path.to_string_lossy().into_owned(),
+                sha256: committed_output.sha256.clone(),
+                converted_at_unix_ms: committed_output.converted_at_unix_ms,
+            },
+            findings,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Validate the audit object independently of current UI state. This makes
+    /// persisted audit data self-checking before it is displayed or exported.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != CONVERSION_AUDIT_SCHEMA_VERSION {
+            return Err(format!(
+                "Unsupported conversion audit schema {} (expected {}).",
+                self.schema_version, CONVERSION_AUDIT_SCHEMA_VERSION
+            ));
+        }
+        if self.app_version.trim().is_empty() {
+            return Err("Conversion audit requires the producing app version.".to_owned());
+        }
+        for (name, value) in [
+            ("source project SHA-256", self.source.project_file_sha256.as_str()),
+            ("source file SHA-256", self.source.source_file_sha256.as_str()),
+            ("source profile SHA-256", self.source.source_profile_sha256.as_str()),
+            ("recipe SHA-256", self.recipe_sha256.as_str()),
+            ("output SHA-256", self.output.sha256.as_str()),
+        ] {
+            if !has_sha256(value) {
+                return Err(format!("Conversion audit {name} must be a full SHA-256."));
+            }
+        }
+        if self.source.project_path.trim().is_empty() || self.source.face_path.trim().is_empty() {
+            return Err("Conversion audit requires Source project and Face paths.".to_owned());
+        }
+        if self.target.target_name.trim().is_empty() || self.target.channel_names.is_empty() {
+            return Err("Conversion audit requires a named target and channel topology.".to_owned());
+        }
+        if self.target.channel_names.iter().any(|name| name.trim().is_empty()) {
+            return Err("Conversion audit target channels cannot be empty.".to_owned());
+        }
+        if self.output.path.trim().is_empty() || self.output.converted_at_unix_ms <= 0 {
+            return Err("Conversion audit requires committed output identity and timestamp.".to_owned());
+        }
+        validate_findings(&self.findings)
+    }
+
+    /// Prove that this record belongs to one exact persisted Production
+    /// provenance entry before attaching, displaying or exporting it. The
+    /// Source-project file hash is intentionally not reconstructed here because
+    /// ProductionProvenance stores Source artwork identity, not mutable Source
+    /// project bytes.
+    pub fn validate_against_provenance(
+        &self,
+        provenance: &ProductionProvenance,
+    ) -> Result<(), String> {
+        self.validate()?;
+
+        let recipe_sha256 = recipe_sha256(&provenance.recipe)?;
+        let target = &provenance.recipe.target;
+        let channel_names = target
+            .channels
+            .iter()
+            .map(|channel| channel.name.as_str())
+            .collect::<Vec<_>>();
+
+        if !paths_match(&self.source.project_path, &provenance.source.source_project_path)
+            || !paths_match(&self.source.face_path, &provenance.source.source_face_path)
+            || self.source.snapshot_id != provenance.source.source_snapshot_id
+            || !hashes_match(&self.source.source_file_sha256, &provenance.source.source_file_sha256)
+            || !hashes_match(
+                &self.source.source_profile_sha256,
+                &provenance.recipe.source_profile_identity.sha256,
+            )
+        {
+            return Err(
+                "Conversion audit Source identity does not match Production provenance.".to_owned(),
+            );
+        }
+        if !hashes_match(&self.recipe_sha256, &recipe_sha256) {
+            return Err(
+                "Conversion audit recipe SHA-256 does not match Production provenance.".to_owned(),
+            );
+        }
+        if self.target.engine_mode != provenance.recipe.engine_mode
+            || self.target.target_name != target.name
+            || self.target.bit_depth != target.bit_depth
+            || self.target.channel_names.len() != channel_names.len()
+            || !self
+                .target
+                .channel_names
+                .iter()
+                .zip(channel_names.iter())
+                .all(|(left, right)| left == right)
+            || !optional_hashes_match(
+                self.target.output_profile_sha256.as_deref(),
+                target
+                    .output_profile_identity
+                    .as_ref()
+                    .map(|identity| identity.sha256.as_str()),
+            )
+            || !optional_hashes_match(
+                self.target.device_link_sha256.as_deref(),
+                target
+                    .device_link_identity
+                    .as_ref()
+                    .map(|identity| identity.sha256.as_str()),
+            )
+            || self.target.characterization_id != target.characterization_id
+        {
+            return Err(
+                "Conversion audit target identity does not match Production provenance.".to_owned(),
+            );
+        }
+        if !paths_match(&self.output.path, &provenance.output_path)
+            || !hashes_match(&self.output.sha256, &provenance.output_sha256)
+            || self.output.converted_at_unix_ms != provenance.converted_at_unix_ms
+        {
+            return Err(
+                "Conversion audit output identity does not match Production provenance.".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn to_pretty_json(&self) -> Result<String, String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self)
+            .map_err(|error| format!("Cannot serialize conversion audit record: {error}"))
+    }
+}
+
+fn recipe_sha256(recipe: &crate::color_conversion::ConversionRecipe) -> Result<String, String> {
+    let bytes = serde_json::to_vec(recipe)
+        .map_err(|error| format!("Cannot serialize conversion recipe for audit binding: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn validate_findings(findings: &[ConversionAuditFinding]) -> Result<(), String> {
+    for finding in findings {
+        if finding.code.trim().is_empty() || finding.message.trim().is_empty() {
+            return Err("Conversion audit findings require non-empty code and message.".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn has_sha256(value: &str) -> bool {
+    let value = value.trim();
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn hashes_match(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn optional_hashes_match(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => hashes_match(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn paths_match(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::color_conversion::{
+        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionEngineMode, ConversionRecipe,
+        ConversionRenderingIntent, ConversionSourceRef, ConversionTargetDefinition,
+        SeparationStrategy, TargetChannelDefinition,
+    };
+    use crate::conversion_transaction::{CapturedOutputPolicy, CapturedSourceProfile};
+    use crate::model::{IccProfileIdentity, ShadeProject};
+
+    fn hash(character: char) -> String {
+        character.to_string().repeat(64)
+    }
+
+    fn capture() -> ConversionJobCapture {
+        let recipe = ConversionRecipe {
+            source_transparency_policy: None,
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::Icc,
+            source_profile_identity: IccProfileIdentity {
+                description: "Source RGB".to_owned(),
+                sha256: hash('a'),
+            },
+            target: ConversionTargetDefinition {
+                name: "Press CMYK".to_owned(),
+                channels: ["Cyan", "Magenta", "Yellow", "Black"]
+                    .into_iter()
+                    .map(|name| TargetChannelDefinition {
+                        name: name.to_owned(),
+                        display_rgb: None,
+                        solidity: 1.0,
+                        max_coverage: None,
+                    })
+                    .collect(),
+                bit_depth: 16,
+                output_profile_identity: Some(IccProfileIdentity {
+                    description: "Press CMYK".to_owned(),
+                    sha256: hash('b'),
+                }),
+                output_profile_path: Some(r"C:\Color\Press.icc".to_owned()),
+                device_link_identity: None,
+                device_link_path: None,
+                characterization_id: None,
+                total_ink_limit: None,
+            },
+            rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
+            black_point_compensation: true,
+            strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
+        };
+        ConversionJobCapture::capture(
+            &ShadeProject::default(),
+            PathBuf::from(r"C:\Design\Source.shade"),
+            hash('c'),
+            PathBuf::from(r"C:\Design\Face.tif"),
+            Some(7),
+            hash('d'),
+            CapturedSourceProfile::Embedded,
+            recipe,
+            CapturedOutputPolicy::MustNotExist,
+            PathBuf::from(r"C:\Production\Face-CMYK.tif"),
+            PathBuf::from(r"C:\Production\Job.shade"),
+            "Production".to_owned(),
+            "Face CMYK".to_owned(),
+        )
+        .unwrap()
+    }
+
+    fn committed(capture: &ConversionJobCapture) -> CommittedConversionOutput {
+        CommittedConversionOutput {
+            path: capture.output_tiff_path.clone(),
+            sha256: hash('e'),
+            converted_at_unix_ms: 1234,
+        }
+    }
+
+    fn provenance(
+        capture: &ConversionJobCapture,
+        output: &CommittedConversionOutput,
+    ) -> ProductionProvenance {
+        ProductionProvenance {
+            source: ConversionSourceRef {
+                source_project_path: capture.source_project_path.to_string_lossy().into_owned(),
+                source_face_path: capture.source_face_path.to_string_lossy().into_owned(),
+                source_snapshot_id: capture.source_snapshot_id,
+                source_file_sha256: capture.source_file_sha256.clone(),
+            },
+            recipe: capture.conversion_recipe.clone(),
+            custom_optimizer: None,
+            output_path: output.path.to_string_lossy().into_owned(),
+            output_sha256: output.sha256.clone(),
+            converted_at_unix_ms: output.converted_at_unix_ms,
+        }
+    }
+
+    #[test]
+    fn audit_is_derived_from_frozen_job_and_committed_output() {
+        let capture = capture();
+        let output = committed(&capture);
+        let audit = ConversionAuditRecord::from_committed_job(
+            &capture,
+            &output,
+            vec![ConversionAuditFinding {
+                code: "lossy_source".to_owned(),
+                message: "Source artwork is JPEG-derived.".to_owned(),
+                acknowledged: true,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(audit.source.snapshot_id, Some(7));
+        assert_eq!(audit.target.channel_names, ["Cyan", "Magenta", "Yellow", "Black"]);
+        assert_eq!(audit.recipe_sha256, capture.conversion_recipe_sha256);
+        assert_eq!(audit.output.sha256, hash('e'));
+        assert!(audit.findings[0].acknowledged);
+        assert!(audit.to_pretty_json().unwrap().contains("Press CMYK"));
+    }
+
+    #[test]
+    fn audit_binds_to_exact_production_provenance() {
+        let capture = capture();
+        let output = committed(&capture);
+        let audit = ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new()).unwrap();
+        let provenance = provenance(&capture, &output);
+        audit.validate_against_provenance(&provenance).unwrap();
+
+        let mut foreign = provenance.clone();
+        foreign.output_sha256 = hash('f');
+        assert!(
+            audit
+                .validate_against_provenance(&foreign)
+                .unwrap_err()
+                .contains("output identity")
+        );
+    }
+
+    #[test]
+    fn audit_rejects_output_from_a_different_transaction() {
+        let capture = capture();
+        let output = CommittedConversionOutput {
+            path: PathBuf::from(r"C:\Production\Other.tif"),
+            sha256: hash('e'),
+            converted_at_unix_ms: 1234,
+        };
+        let error = ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new())
+            .expect_err("foreign output path must fail closed");
+        assert!(error.contains("does not match"));
+    }
+
+    #[test]
+    fn audit_findings_must_be_actual_named_diagnostics() {
+        let capture = capture();
+        let output = committed(&capture);
+        let error = ConversionAuditRecord::from_committed_job(
+            &capture,
+            &output,
+            vec![ConversionAuditFinding {
+                code: String::new(),
+                message: "warning".to_owned(),
+                acknowledged: false,
+            }],
+        )
+        .expect_err("anonymous findings must be rejected");
+        assert!(error.contains("non-empty code"));
+    }
+}
