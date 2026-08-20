@@ -13,9 +13,7 @@ use crate::conversion_transaction::{
 };
 use crate::conversion_transaction_disposition::run_conversion_transaction_with_disposition;
 use crate::icc_conversion_worker::FilesystemIccConversionBackend;
-use crate::icc_conversion_worker::sha256_file;
 use crate::model::ShadeProject;
-use crate::production_project::link_source_project_to_production;
 use crate::production_project_disposition::ProductionProjectDisposition;
 use crate::safe_fs;
 
@@ -577,22 +575,17 @@ fn item_from_spec(
 }
 
 fn completion_result(
-    capture: &ConversionJobCapture,
+    _capture: &ConversionJobCapture,
     outcome: ConversionTransactionOutcome,
 ) -> ConversionQueueCompletionResult {
     match outcome {
+        // The TIFF and Production project are the queue-owned transactional
+        // outputs. The Source .shade is explicitly-save-only (#204), so the
+        // worker must never reopen and save it as a reciprocal-link side effect.
+        // The UI mirrors the link into the currently open Source project and
+        // marks it dirty; durable Source persistence remains an explicit Save.
         ConversionTransactionOutcome::Completed(value) => {
-            match commit_source_project_link(capture, &value) {
-                Ok(()) => ConversionQueueCompletionResult::Completed(value),
-                Err(error) => {
-                    ConversionQueueCompletionResult::NeedsRecovery(ConversionRecoveryRecord {
-                        committed_output: value.committed_output,
-                        production_project_path: value.production_project_path,
-                        production_project: Some(value.production_project),
-                        error,
-                    })
-                }
-            }
+            ConversionQueueCompletionResult::Completed(value)
         }
         ConversionTransactionOutcome::CancelledBeforeCommit { phase, message } => {
             ConversionQueueCompletionResult::Cancelled {
@@ -618,29 +611,6 @@ fn completion_result(
             error,
         }),
     }
-}
-
-fn commit_source_project_link(
-    capture: &ConversionJobCapture,
-    completed: &CompletedConversionTransaction,
-) -> Result<(), String> {
-    let current_hash = sha256_file(&capture.source_project_path)?;
-    if !current_hash.eq_ignore_ascii_case(capture.source_project_file_sha256.trim()) {
-        return Err(
-            "Production output/project committed, but the Source project changed after capture; reciprocal link was not written."
-                .to_owned(),
-        );
-    }
-    let mut source = ShadeProject::load(&capture.source_project_path)?;
-    let face_paths = source.resolve_face_paths(&capture.source_project_path);
-    link_source_project_to_production(&mut source, &completed.production_project_path)?;
-    source
-        .save(&capture.source_project_path, &face_paths)
-        .map_err(|error| {
-            format!(
-                "Production output/project committed, but the Source project link could not be saved: {error}"
-            )
-        })
 }
 
 fn apply_completion(item: &mut ConversionQueueItem, result: &ConversionQueueCompletionResult) {
@@ -858,33 +828,30 @@ mod tests {
     }
 
     #[test]
-    fn completed_conversion_links_only_the_unchanged_source_project() {
-        let source_path = temp_path("source").with_extension("shade");
-        let production_path = temp_path("production").with_extension("shade");
+    fn completed_conversion_does_not_write_source_project() {
+        let source_path = temp_path("source-explicit-save").with_extension("shade");
+        let production_path = temp_path("production-explicit-save").with_extension("shade");
         let source = ShadeProject::default();
         source.save(&source_path, &[]).unwrap();
-        let source_hash = sha256_file(&source_path).unwrap();
+        let before = fs::read(&source_path).unwrap();
         let mut captured = capture(r"C:\Production\out.tif");
         captured.source_project_path = source_path.clone();
-        captured.source_project_file_sha256 = source_hash;
         let completed = CompletedConversionTransaction {
             committed_output: CommittedConversionOutput {
                 path: PathBuf::from(r"C:\Production\out.tif"),
                 sha256: HASH.to_owned(),
                 converted_at_unix_ms: 1,
             },
-            production_project_path: production_path.clone(),
+            production_project_path: production_path,
             production_project: ShadeProject::default(),
         };
 
-        commit_source_project_link(&captured, &completed).unwrap();
-        let linked = ShadeProject::load(&source_path).unwrap();
-        assert_eq!(linked.linked_projects.len(), 1);
-        assert_eq!(
-            linked.linked_projects[0].path,
-            production_path.display().to_string()
+        let result = completion_result(
+            &captured,
+            ConversionTransactionOutcome::Completed(completed),
         );
-        assert!(commit_source_project_link(&captured, &completed).is_err());
+        assert!(matches!(result, ConversionQueueCompletionResult::Completed(_)));
+        assert_eq!(fs::read(&source_path).unwrap(), before);
         let _ = fs::remove_file(source_path);
     }
 
