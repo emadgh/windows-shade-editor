@@ -358,7 +358,19 @@ fn start_test_stack(
         return;
     }
 
-    let project = app.project.clone();
+    // main.rs and lib.rs intentionally compile their own application model modules.
+    // Bridge the identical persisted schema explicitly at this boundary instead of
+    // coupling the UI binary's ShadeProject type to the library crate's type identity.
+    let project = match serde_json::to_vec(&app.project).and_then(|bytes| {
+        serde_json::from_slice::<windows_shade_editor::model::ShadeProject>(&bytes)
+    }) {
+        Ok(project) => project,
+        Err(err) => {
+            app.report_error(format!("Cannot prepare Test Stack project state: {err}"));
+            return;
+        }
+    };
+
     let default_dpi = app.settings.default_dpi;
     let options = windows_shade_editor::export::ExportOptions {
         force_lzw: app.settings.lzw_compression,
