@@ -1,0 +1,78 @@
+name: Temporary PR329 v0.21.50 guard
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  bump-and-validate:
+    if: github.head_ref == 'tmp/pr329-v02150-guard'
+    runs-on: windows-latest
+    steps:
+      - name: Verify target branch head is unchanged
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: 5726092f3c1d0c97588f9220c36d4293363867c1
+        run: |
+          $actual = (Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" } -Uri "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/codex/color-conversion-production-destination-ui").object.sha
+          if ($actual -ne $env:EXPECTED_SHA) { throw "PR329 head moved: expected $env:EXPECTED_SHA, got $actual" }
+
+      - name: Checkout PR329 exact head
+        uses: actions/checkout@v4
+        with:
+          ref: codex/color-conversion-production-destination-ui
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Set version identity to 0.21.50
+        shell: python
+        run: |
+          from pathlib import Path
+          old = "0.21.49"
+          new = "0.21.50"
+
+          cargo = Path("Cargo.toml")
+          text = cargo.read_text(encoding="utf-8")
+          needle = f'version = "{old}"'
+          assert text.count(needle) == 1, "unexpected Cargo.toml version identity"
+          cargo.write_text(text.replace(needle, f'version = "{new}"', 1), encoding="utf-8")
+
+          lock = Path("Cargo.lock")
+          text = lock.read_text(encoding="utf-8")
+          needle = f'name = "windows-shade-editor"\nversion = "{old}"'
+          assert text.count(needle) == 1, "unexpected Cargo.lock root package identity"
+          lock.write_text(text.replace(needle, f'name = "windows-shade-editor"\nversion = "{new}"', 1), encoding="utf-8")
+
+          version = Path("VERSION")
+          assert version.read_text(encoding="utf-8").strip() == old, "unexpected VERSION identity"
+          version.write_text(new + "\n", encoding="utf-8")
+
+      - name: Guard changed files
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only)
+          $expected = @('Cargo.lock','Cargo.toml','VERSION')
+          $unexpected = @($changed | Where-Object { $_ -notin $expected })
+          $missing = @($expected | Where-Object { $_ -notin $changed })
+          if ($unexpected.Count -gt 0 -or $missing.Count -gt 0) {
+            throw "Version guard failed. Changed=$($changed -join ',') Unexpected=$($unexpected -join ',') Missing=$($missing -join ',')"
+          }
+
+      - name: Locked Windows check
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+
+      - name: Locked Windows tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Push validated version commit to PR329
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock VERSION
+          git commit -m "chore: bump version to 0.21.50"
+          git push origin HEAD:codex/color-conversion-production-destination-ui
