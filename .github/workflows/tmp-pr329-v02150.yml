@@ -16,7 +16,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_SHA: 5726092f3c1d0c97588f9220c36d4293363867c1
+          EXPECTED_SHA: 471957e1b690ed4ef57333806c3dc63d95020c66
         run: |
           $actual = (Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" } -Uri "https://api.github.com/repos/${{ github.repository }}/git/ref/heads/codex/color-conversion-production-destination-ui").object.sha
           if ($actual -ne $env:EXPECTED_SHA) { throw "PR329 head moved: expected $env:EXPECTED_SHA, got $actual" }
