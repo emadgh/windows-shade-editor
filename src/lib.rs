@@ -62,6 +62,7 @@ pub mod production_project_compat;
 pub mod production_project_disposition;
 pub mod production_staleness;
 pub mod production_target;
+pub mod reconversion_policy;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
 pub mod separation_optimizer;
