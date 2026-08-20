@@ -169,7 +169,7 @@ pub(crate) fn ui_test_code(app: &mut ShadeApp, ui: &mut egui::Ui) {
 }
 
 fn ui_test_stack(app: &mut ShadeApp, ui: &mut egui::Ui) {
-    let state_id = egui::Id::new("test-stack-ui-state");
+    let state_id = egui::Id::new(("test-stack-ui-state", app.lifecycle.session_id));
     let mut state = ui
         .ctx()
         .data_mut(|data| data.get_temp::<TestStackUiState>(state_id))
