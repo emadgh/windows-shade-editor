@@ -34,6 +34,8 @@ jobs:
           Set-Location ..
           python helper/tools/tmp_pr329_destination_ui_patch.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python helper/tools/tmp_pr329_destination_ui_boundary_fix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Set-Location work
           rustfmt --edition 2024 src/ui/color_conversion.rs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
