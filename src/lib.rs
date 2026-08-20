@@ -60,6 +60,7 @@ pub mod production_lineage;
 pub mod production_project;
 pub mod production_project_compat;
 pub mod production_project_disposition;
+pub mod production_replacement;
 pub mod production_staleness;
 pub mod production_target;
 pub mod reconversion_policy;
