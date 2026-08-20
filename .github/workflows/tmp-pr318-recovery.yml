@@ -1,0 +1,52 @@
+name: Temporary guarded PR318 recovery safety
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr318-recovery-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: tmp/pr318-recovery-workflow
+          path: helper
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/append-existing-production-transaction
+          fetch-depth: 0
+          path: work
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Block unsafe retry of committed recovery work
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location work
+          $expected = '07a1f6aea70999f50263488ed66c5514afe83111'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR318 head moved before recovery safety patch' }
+          Set-Location ..
+          python helper/tools/tmp_pr318_recovery_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Location work
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { cargo fmt --all }
+          $changed = @(git diff --name-only)
+          if ($changed.Count -ne 1 -or $changed[0] -ne 'src/conversion_queue.rs') {
+            throw "Recovery safety changed unexpected files: $($changed -join ', ')"
+          }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/conversion_queue.rs
+          git commit -m 'fix: preserve NeedsRecovery state instead of rerunning committed conversion (#316)'
+          git push origin HEAD:codex/append-existing-production-transaction
