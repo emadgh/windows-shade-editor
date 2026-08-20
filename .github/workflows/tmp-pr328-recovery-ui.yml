@@ -35,7 +35,8 @@ jobs:
           python helper/tools/tmp_pr328_recovery_ui_patch.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Set-Location work
-          cargo fmt --all
+          rustfmt --edition 2024 src/ui/color_conversion.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $changed = @(git diff --name-only)
           if ($changed.Count -ne 1 -or $changed[0] -ne 'src/ui/color_conversion.rs') {
             throw "Recovery UI patch changed unexpected files: $($changed -join ', ')"
