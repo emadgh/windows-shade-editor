@@ -4,13 +4,14 @@ permissions:
   contents: write
 
 on:
-  push:
+  pull_request:
     branches:
       - feature/test-stack
+    types: [opened, synchronize, reopened]
 
 jobs:
   bump:
-    if: github.actor != 'github-actions[bot]'
+    if: github.head_ref == 'automation/test-stack-version-bump'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -42,7 +43,7 @@ jobs:
       - name: Validate locked build after bump
         run: cargo check --locked --target x86_64-pc-windows-msvc
 
-      - name: Commit version bump
+      - name: Commit version bump to feature branch
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
