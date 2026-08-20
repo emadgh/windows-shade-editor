@@ -64,6 +64,7 @@ pub mod production_project;
 pub mod production_project_compat;
 pub mod production_project_disposition;
 pub mod production_target;
+pub mod project_link_navigation;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
 pub mod separation_optimizer;
