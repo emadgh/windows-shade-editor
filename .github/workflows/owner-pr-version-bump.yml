@@ -57,16 +57,20 @@ jobs:
         shell: pwsh
         run: |
           $current = (Get-Content -Raw VERSION).Trim()
-          if ($current -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
+          $semanticVersion = [regex]::Match($current, '^(\d+)\.(\d+)\.(\d+)$')
+          if (-not $semanticVersion.Success) {
             throw "VERSION is not a strict semantic patch version: '$current'"
           }
-          $next = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+          $major = $semanticVersion.Groups[1].Value
+          $minor = $semanticVersion.Groups[2].Value
+          $patch = [int]$semanticVersion.Groups[3].Value
+          $next = "$major.$minor.$($patch + 1)"
 
           $cargo = Get-Content -Raw Cargo.toml
           $pattern = '(?m)^version = "' + [regex]::Escape($current) + '"$'
-          $matches = [regex]::Matches($cargo, $pattern)
-          if ($matches.Count -ne 1) {
-            throw "Expected exactly one root Cargo.toml package version '$current'; found $($matches.Count)."
+          $packageVersionMatches = [regex]::Matches($cargo, $pattern)
+          if ($packageVersionMatches.Count -ne 1) {
+            throw "Expected exactly one root Cargo.toml package version '$current'; found $($packageVersionMatches.Count)."
           }
           $cargo = [regex]::Replace($cargo, $pattern, "version = `"$next`"", 1)
           [System.IO.File]::WriteAllText((Join-Path $PWD 'Cargo.toml'), $cargo, [System.Text.UTF8Encoding]::new($false))
