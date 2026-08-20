@@ -10,12 +10,11 @@ use serde::{Deserialize, Serialize};
 use crate::conversion_transaction::{
     CommittedConversionOutput, CompletedConversionTransaction, ConversionCancellation,
     ConversionJobCapture, ConversionPhase, ConversionTransactionOutcome,
-    run_conversion_transaction,
 };
+use crate::conversion_transaction_disposition::run_conversion_transaction_with_disposition;
 use crate::icc_conversion_worker::FilesystemIccConversionBackend;
-use crate::icc_conversion_worker::sha256_file;
 use crate::model::ShadeProject;
-use crate::production_project::link_source_project_to_production;
+use crate::production_project_disposition::ProductionProjectDisposition;
 use crate::safe_fs;
 
 const QUEUE_FORMAT_VERSION: u32 = 1;
@@ -59,6 +58,8 @@ pub struct ConversionRecoveryRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct QueuedConversionSpec {
     capture: ConversionJobCapture,
+    #[serde(default)]
+    production_project_disposition: ProductionProjectDisposition,
     default_dpi: f64,
 }
 
@@ -216,7 +217,21 @@ impl ConversionQueue {
         capture: ConversionJobCapture,
         default_dpi: f64,
     ) -> Result<u64, String> {
+        self.enqueue_with_production_project_disposition(
+            capture,
+            ProductionProjectDisposition::CreateNew,
+            default_dpi,
+        )
+    }
+
+    pub fn enqueue_with_production_project_disposition(
+        &mut self,
+        capture: ConversionJobCapture,
+        production_project_disposition: ProductionProjectDisposition,
+        default_dpi: f64,
+    ) -> Result<u64, String> {
         capture.validate()?;
+        production_project_disposition.validate()?;
         if !default_dpi.is_finite() || default_dpi <= 0.0 {
             return Err("Conversion fallback DPI must be finite and positive.".to_owned());
         }
@@ -240,6 +255,7 @@ impl ConversionQueue {
             id,
             QueuedConversionSpec {
                 capture,
+                production_project_disposition,
                 default_dpi,
             },
             ConversionQueueStatus::Waiting,
@@ -338,11 +354,14 @@ impl ConversionQueue {
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
+        // A NeedsRecovery item has already committed its TIFF. Re-running the
+        // full conversion can collide with MustNotExist output policy and, for
+        // append-existing jobs, can discard the exact project mutation state
+        // needed for optimistic-concurrency recovery. Keep that state intact;
+        // project-only recovery is a separate operation.
         if !matches!(
             item.status,
-            ConversionQueueStatus::Failed
-                | ConversionQueueStatus::Cancelled
-                | ConversionQueueStatus::NeedsRecovery
+            ConversionQueueStatus::Failed | ConversionQueueStatus::Cancelled
         ) {
             return false;
         }
@@ -447,6 +466,7 @@ impl ConversionQueue {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let capture = spec.capture;
+            let production_project_disposition = spec.production_project_disposition;
             let worker_tx = tx.clone();
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let mut backend = match FilesystemIccConversionBackend::new(spec.default_dpi) {
@@ -458,14 +478,20 @@ impl ConversionQueue {
                         };
                     }
                 };
-                run_conversion_transaction(&capture, &cancellation, &mut backend, |progress| {
+                run_conversion_transaction_with_disposition(
+                    &capture,
+                    &production_project_disposition,
+                    &cancellation,
+                    &mut backend,
+                    |progress| {
                     let _ = worker_tx.send(ConversionQueueEvent::Progress {
                         id,
                         phase: progress.phase.label().to_owned(),
                         fraction: progress.fraction,
                         detail: progress.detail,
                     });
-                })
+                },
+                )
             }))
             .unwrap_or_else(|payload| {
                 ConversionTransactionOutcome::FailedBeforeCommit {
@@ -549,22 +575,17 @@ fn item_from_spec(
 }
 
 fn completion_result(
-    capture: &ConversionJobCapture,
+    _capture: &ConversionJobCapture,
     outcome: ConversionTransactionOutcome,
 ) -> ConversionQueueCompletionResult {
     match outcome {
+        // The TIFF and Production project are the queue-owned transactional
+        // outputs. The Source .shade is explicitly-save-only (#204), so the
+        // worker must never reopen and save it as a reciprocal-link side effect.
+        // The UI mirrors the link into the currently open Source project and
+        // marks it dirty; durable Source persistence remains an explicit Save.
         ConversionTransactionOutcome::Completed(value) => {
-            match commit_source_project_link(capture, &value) {
-                Ok(()) => ConversionQueueCompletionResult::Completed(value),
-                Err(error) => {
-                    ConversionQueueCompletionResult::NeedsRecovery(ConversionRecoveryRecord {
-                        committed_output: value.committed_output,
-                        production_project_path: value.production_project_path,
-                        production_project: Some(value.production_project),
-                        error,
-                    })
-                }
-            }
+            ConversionQueueCompletionResult::Completed(value)
         }
         ConversionTransactionOutcome::CancelledBeforeCommit { phase, message } => {
             ConversionQueueCompletionResult::Cancelled {
@@ -590,29 +611,6 @@ fn completion_result(
             error,
         }),
     }
-}
-
-fn commit_source_project_link(
-    capture: &ConversionJobCapture,
-    completed: &CompletedConversionTransaction,
-) -> Result<(), String> {
-    let current_hash = sha256_file(&capture.source_project_path)?;
-    if !current_hash.eq_ignore_ascii_case(capture.source_project_file_sha256.trim()) {
-        return Err(
-            "Production output/project committed, but the Source project changed after capture; reciprocal link was not written."
-                .to_owned(),
-        );
-    }
-    let mut source = ShadeProject::load(&capture.source_project_path)?;
-    let face_paths = source.resolve_face_paths(&capture.source_project_path);
-    link_source_project_to_production(&mut source, &completed.production_project_path)?;
-    source
-        .save(&capture.source_project_path, &face_paths)
-        .map_err(|error| {
-            format!(
-                "Production output/project committed, but the Source project link could not be saved: {error}"
-            )
-        })
 }
 
 fn apply_completion(item: &mut ConversionQueueItem, result: &ConversionQueueCompletionResult) {
@@ -770,6 +768,37 @@ mod tests {
     }
 
     #[test]
+    fn needs_recovery_cannot_be_retried_as_full_conversion() {
+        let mut queue = ConversionQueue::new();
+        let id = queue
+            .enqueue(capture(r"C:\Production\recover.tif"), 220.0)
+            .unwrap();
+        {
+            let item = queue.items.iter_mut().find(|item| item.id == id).unwrap();
+            item.status = ConversionQueueStatus::NeedsRecovery;
+            item.recovery = Some(ConversionRecoveryRecord {
+                committed_output: CommittedConversionOutput {
+                    path: PathBuf::from(r"C:\Production\recover.tif"),
+                    sha256: HASH.to_owned(),
+                    converted_at_unix_ms: 1,
+                },
+                production_project_path: PathBuf::from(r"C:\Production\recover.shade"),
+                production_project: Some(ShadeProject::default()),
+                error: "simulated project-save failure".to_owned(),
+            });
+        }
+
+        assert!(!queue.retry(id));
+        let item = queue.items.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(item.status, ConversionQueueStatus::NeedsRecovery);
+        assert!(item.recovery.is_some());
+        assert_eq!(
+            item.recovery.as_ref().unwrap().error,
+            "simulated project-save failure"
+        );
+    }
+
+    #[test]
     fn duplicate_output_reservation_is_rejected() {
         let mut queue = ConversionQueue::new();
         queue
@@ -799,33 +828,30 @@ mod tests {
     }
 
     #[test]
-    fn completed_conversion_links_only_the_unchanged_source_project() {
-        let source_path = temp_path("source").with_extension("shade");
-        let production_path = temp_path("production").with_extension("shade");
+    fn completed_conversion_does_not_write_source_project() {
+        let source_path = temp_path("source-explicit-save").with_extension("shade");
+        let production_path = temp_path("production-explicit-save").with_extension("shade");
         let source = ShadeProject::default();
         source.save(&source_path, &[]).unwrap();
-        let source_hash = sha256_file(&source_path).unwrap();
+        let before = fs::read(&source_path).unwrap();
         let mut captured = capture(r"C:\Production\out.tif");
         captured.source_project_path = source_path.clone();
-        captured.source_project_file_sha256 = source_hash;
         let completed = CompletedConversionTransaction {
             committed_output: CommittedConversionOutput {
                 path: PathBuf::from(r"C:\Production\out.tif"),
                 sha256: HASH.to_owned(),
                 converted_at_unix_ms: 1,
             },
-            production_project_path: production_path.clone(),
+            production_project_path: production_path,
             production_project: ShadeProject::default(),
         };
 
-        commit_source_project_link(&captured, &completed).unwrap();
-        let linked = ShadeProject::load(&source_path).unwrap();
-        assert_eq!(linked.linked_projects.len(), 1);
-        assert_eq!(
-            linked.linked_projects[0].path,
-            production_path.display().to_string()
+        let result = completion_result(
+            &captured,
+            ConversionTransactionOutcome::Completed(completed),
         );
-        assert!(commit_source_project_link(&captured, &completed).is_err());
+        assert!(matches!(result, ConversionQueueCompletionResult::Completed(_)));
+        assert_eq!(fs::read(&source_path).unwrap(), before);
         let _ = fs::remove_file(source_path);
     }
 
@@ -849,4 +875,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn queued_spec_without_project_disposition_defaults_to_create_new() {
+        let spec = QueuedConversionSpec {
+            capture: capture(r"C:\Production\legacy.tif"),
+            production_project_disposition: ProductionProjectDisposition::CreateNew,
+            default_dpi: 220.0,
+        };
+        let mut value = serde_json::to_value(&spec).unwrap();
+        value
+            .as_object_mut()
+            .expect("queued spec object")
+            .remove("production_project_disposition");
+        let restored: QueuedConversionSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.production_project_disposition,
+            ProductionProjectDisposition::CreateNew
+        );
+    }
+
+    #[test]
+    fn enqueue_with_append_disposition_persists_exact_destination_intent() {
+        let mut queue = ConversionQueue::new();
+        let key = crate::production_project_compat::ProductionCompatibilityKey {
+            engine_mode: ConversionEngineMode::Icc,
+            output_profile_sha256: Some(HASH.to_owned()),
+            device_link_sha256: None,
+            characterization_id: None,
+            channel_names: vec![
+                "Cyan".to_owned(),
+                "Magenta".to_owned(),
+                "Yellow".to_owned(),
+                "Black".to_owned(),
+            ],
+            bit_depth: 16,
+        };
+        let disposition = ProductionProjectDisposition::append_existing(HASH.to_owned(), &key)
+            .unwrap();
+        queue
+            .enqueue_with_production_project_disposition(
+                capture(r"C:\Production\append.tif"),
+                disposition.clone(),
+                220.0,
+            )
+            .unwrap();
+        assert_eq!(
+            queue.items[0].spec.production_project_disposition,
+            disposition
+        );
+    }
 }

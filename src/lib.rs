@@ -11,6 +11,7 @@ pub mod conversion_queue;
 pub mod conversion_recipe;
 pub mod conversion_tiff;
 pub mod conversion_transaction;
+pub mod conversion_transaction_disposition;
 pub mod conversion_workflow;
 pub mod custom_optimizer_config;
 pub mod custom_optimizer_evidence;
@@ -57,6 +58,7 @@ pub mod production_colorimetry;
 pub mod production_lab_transform;
 pub mod production_project;
 pub mod production_project_compat;
+pub mod production_project_disposition;
 pub mod production_target;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;

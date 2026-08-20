@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::color_conversion::production_provenance::validate_production_provenance;
 use crate::color_conversion::{ConversionEngineMode, ProductionProvenance, ProjectRole};
@@ -64,6 +64,43 @@ pub fn validate_existing_production_project_for_append(
     source_project_path: &Path,
     incoming: &ProductionProvenance,
 ) -> Result<ProductionCompatibilityKey, String> {
+    let resolved_face_paths = project
+        .faces
+        .iter()
+        .map(|face| PathBuf::from(&face.path))
+        .collect::<Vec<_>>();
+    validate_existing_production_project_for_append_with_resolved_paths(
+        project,
+        &resolved_face_paths,
+        source_project_path,
+        incoming,
+    )
+}
+
+/// Validate a Production project loaded from disk. Face paths stored in `.shade`
+/// are portable and therefore must be resolved relative to the exact project
+/// path before comparing them with immutable provenance output identities.
+pub fn validate_existing_production_project_for_append_at_path(
+    project: &ShadeProject,
+    production_project_path: &Path,
+    source_project_path: &Path,
+    incoming: &ProductionProvenance,
+) -> Result<ProductionCompatibilityKey, String> {
+    let resolved_face_paths = project.resolve_face_paths(production_project_path);
+    validate_existing_production_project_for_append_with_resolved_paths(
+        project,
+        &resolved_face_paths,
+        source_project_path,
+        incoming,
+    )
+}
+
+fn validate_existing_production_project_for_append_with_resolved_paths(
+    project: &ShadeProject,
+    resolved_face_paths: &[PathBuf],
+    source_project_path: &Path,
+    incoming: &ProductionProvenance,
+) -> Result<ProductionCompatibilityKey, String> {
     if project.project_role != ProjectRole::Production {
         return Err("Append destination is not a Production project.".to_owned());
     }
@@ -81,6 +118,13 @@ pub fn validate_existing_production_project_for_append(
             "Existing Production project has {} Faces but {} provenance records; append is blocked until lineage is repaired.",
             project.faces.len(),
             project.production_provenance.len()
+        ));
+    }
+    if resolved_face_paths.len() != project.faces.len() {
+        return Err(format!(
+            "Existing Production project resolved {} Face paths for {} Faces; append is blocked until path state is repaired.",
+            resolved_face_paths.len(),
+            project.faces.len()
         ));
     }
     if !project.linked_projects.iter().any(|link| {
@@ -104,13 +148,13 @@ pub fn validate_existing_production_project_for_append(
             .expect("non-empty provenance checked above"),
     )?;
 
-    for (index, (face, provenance)) in project
-        .faces
+    for (index, (provenance, resolved_face_path)) in project
+        .production_provenance
         .iter()
-        .zip(project.production_provenance.iter())
+        .zip(resolved_face_paths.iter())
         .enumerate()
     {
-        if !paths_match(&provenance.output_path, Path::new(&face.path)) {
+        if !paths_match(&provenance.output_path, resolved_face_path) {
             return Err(format!(
                 "Existing Production Face {} does not match its persisted provenance output path.",
                 index + 1
@@ -142,7 +186,9 @@ pub fn validate_existing_production_project_for_append(
         ));
     }
 
-    if project.faces.iter().any(|face| paths_match(&face.path, Path::new(&incoming.output_path)))
+    if resolved_face_paths
+        .iter()
+        .any(|path| paths_match(&incoming.output_path, path))
         || project
             .production_provenance
             .iter()
@@ -162,28 +208,52 @@ pub fn append_converted_face_to_production_project(
     project: &mut ShadeProject,
     spec: AppendConvertedFaceSpec<'_>,
 ) -> Result<(), String> {
-    let label = spec.output_face_label.trim();
-    if label.is_empty() {
-        return Err("Production Face label cannot be empty.".to_owned());
-    }
-    if spec.provenance.output_path.trim().is_empty() {
-        return Err("Production provenance output path cannot be empty.".to_owned());
-    }
-
+    validate_append_spec(&spec)?;
     validate_existing_production_project_for_append(
         project,
         spec.source_project_path,
         &spec.provenance,
     )?;
+    push_converted_face(project, spec);
+    Ok(())
+}
 
+/// Path-aware append for a Production project loaded from disk. This keeps
+/// portable Face paths valid while preserving exact provenance/output checks.
+pub fn append_converted_face_to_production_project_at_path(
+    project: &mut ShadeProject,
+    production_project_path: &Path,
+    spec: AppendConvertedFaceSpec<'_>,
+) -> Result<(), String> {
+    validate_append_spec(&spec)?;
+    validate_existing_production_project_for_append_at_path(
+        project,
+        production_project_path,
+        spec.source_project_path,
+        &spec.provenance,
+    )?;
+    push_converted_face(project, spec);
+    Ok(())
+}
+
+fn validate_append_spec(spec: &AppendConvertedFaceSpec<'_>) -> Result<(), String> {
+    if spec.output_face_label.trim().is_empty() {
+        return Err("Production Face label cannot be empty.".to_owned());
+    }
+    if spec.provenance.output_path.trim().is_empty() {
+        return Err("Production provenance output path cannot be empty.".to_owned());
+    }
+    Ok(())
+}
+
+fn push_converted_face(project: &mut ShadeProject, spec: AppendConvertedFaceSpec<'_>) {
     project.faces.push(FaceRef {
         path: spec.provenance.output_path.clone(),
-        label: label.to_owned(),
+        label: spec.output_face_label.trim().to_owned(),
         status: FaceStatus::Accepted,
         production_source_profile: None,
     });
     project.production_provenance.push(spec.provenance);
-    Ok(())
 }
 
 fn describe_key_mismatch(
@@ -427,4 +497,63 @@ mod tests {
         .expect_err("different Source project must fail");
         assert!(error.contains("not linked") || error.contains("different Source"));
     }
+
+    #[test]
+    fn saved_and_reloaded_portable_face_path_validates_and_appends() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let project_path = std::env::temp_dir().join(format!(
+            "shade-production-append-portable-{}-{stamp}.shade",
+            std::process::id()
+        ));
+        let output_one = project_path.with_file_name(format!(
+            "shade-production-face-1-{}-{stamp}.tif",
+            std::process::id()
+        ));
+        let output_two = project_path.with_file_name(format!(
+            "shade-production-face-2-{}-{stamp}.tif",
+            std::process::id()
+        ));
+        let project = build_production_project(ProductionProjectSpec {
+            project_name: "Production",
+            source_project_path: Path::new(r"C:\Design\Source.shade"),
+            output_tiff_path: &output_one,
+            output_face_label: "Face 1",
+            provenance: provenance(&output_one, r"C:\Design\Face-1.png", 'a'),
+        })
+        .unwrap();
+        project
+            .save_new(&project_path, std::slice::from_ref(&output_one))
+            .unwrap();
+
+        let mut loaded = ShadeProject::load(&project_path).unwrap();
+        assert!(
+            !Path::new(&loaded.faces[0].path).is_absolute(),
+            "saved Production Face should use a portable relative path"
+        );
+        let incoming = provenance(&output_two, r"C:\Design\Face-2.jpg", 'b');
+        validate_existing_production_project_for_append_at_path(
+            &loaded,
+            &project_path,
+            Path::new(r"C:\Design\Source.shade"),
+            &incoming,
+        )
+        .unwrap();
+        append_converted_face_to_production_project_at_path(
+            &mut loaded,
+            &project_path,
+            AppendConvertedFaceSpec {
+                source_project_path: Path::new(r"C:\Design\Source.shade"),
+                output_face_label: "Face 2",
+                provenance: incoming,
+            },
+        )
+        .unwrap();
+        assert_eq!(loaded.faces.len(), 2);
+        assert_eq!(loaded.production_provenance.len(), 2);
+        let _ = std::fs::remove_file(project_path);
+    }
+
 }

@@ -1,4 +1,5 @@
 const MAIN_SOURCE: &str = include_str!("../src/main.rs");
+const CONVERSION_QUEUE_SOURCE: &str = include_str!("../src/conversion_queue.rs");
 
 #[test]
 fn active_source_has_no_timer_autosave_writer() {
@@ -29,6 +30,22 @@ fn conversion_source_link_never_marks_project_saved() {
     let block = &MAIN_SOURCE[start..end];
     assert!(block.contains("self.mark_project_dirty()"));
     assert!(!block.contains("self.mark_project_saved()"));
+}
+
+#[test]
+fn conversion_queue_never_persists_reciprocal_source_link() {
+    assert!(
+        !CONVERSION_QUEUE_SOURCE.contains("commit_source_project_link"),
+        "conversion queue must not own a hidden Source-project persistence path"
+    );
+    assert!(
+        !CONVERSION_QUEUE_SOURCE.contains("ShadeProject::load(&capture.source_project_path)"),
+        "conversion queue must not reopen the Source project to persist lineage"
+    );
+    assert!(
+        !CONVERSION_QUEUE_SOURCE.contains("source.save(&capture.source_project_path"),
+        "conversion queue must leave Source .shade persistence to explicit Save"
+    );
 }
 
 #[test]
