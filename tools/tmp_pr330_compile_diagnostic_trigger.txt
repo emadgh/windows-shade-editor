@@ -1,0 +1,1 @@
+Trigger concise compile diagnostics for PR #330 exact head ac6268ac6628cce98752f7d6795e238fc33bb77b.
