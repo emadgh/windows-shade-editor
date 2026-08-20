@@ -1,0 +1,53 @@
+name: Temporary Test Stack version bump
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - feature/test-stack
+
+jobs:
+  bump:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feature/test-stack
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bump version sources atomically
+        shell: pwsh
+        run: |
+          $old = '0.21.49'
+          $new = '0.21.50'
+
+          $cargo = Get-Content -Raw Cargo.toml
+          $cargoNeedle = "version = `"$old`""
+          if (($cargo.Split($cargoNeedle).Count - 1) -lt 1) { throw "Cargo.toml package version $old not found" }
+          $cargo = $cargo.Replace($cargoNeedle, "version = `"$new`"")
+          Set-Content -Path Cargo.toml -Value $cargo -NoNewline -Encoding utf8
+
+          $lock = Get-Content -Raw Cargo.lock
+          $lockNeedle = "[[package]]`nname = `"windows-shade-editor`"`nversion = `"$old`""
+          $lockReplacement = "[[package]]`nname = `"windows-shade-editor`"`nversion = `"$new`""
+          if (-not $lock.Contains($lockNeedle)) { throw "Cargo.lock root package version $old not found" }
+          $lock = $lock.Replace($lockNeedle, $lockReplacement)
+          Set-Content -Path Cargo.lock -Value $lock -NoNewline -Encoding utf8
+
+          Set-Content -Path VERSION -Value $new -NoNewline -Encoding ascii
+
+      - name: Validate locked build after bump
+        run: cargo check --locked --target x86_64-pc-windows-msvc
+
+      - name: Commit version bump
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock VERSION
+          git diff --cached --check
+          git commit -m "chore: bump Test Stack build to v0.21.50"
+          git push origin HEAD:feature/test-stack
