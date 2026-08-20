@@ -1,0 +1,54 @@
+name: Temporary guarded PR329 destination UI patch
+
+on:
+  pull_request:
+    branches:
+      - tmp/pr329-destination-ui-workflow
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: tmp/pr329-destination-ui-workflow
+          path: helper
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/color-conversion-production-destination-ui
+          fetch-depth: 0
+          path: work
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Patch Production destination selection and queue intent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location work
+          $expected = 'faf316a8f5afc62fbdb7549c388d8ed89d1331f0'
+          if ((git rev-parse HEAD).Trim() -ne $expected) { throw 'PR329 head moved before guarded UI patch' }
+          Set-Location ..
+          python helper/tools/tmp_pr329_destination_ui_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Location work
+          rustfmt --edition 2024 src/ui/color_conversion.rs src/main.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changed = @(git diff --name-only)
+          $expectedFiles = @('src/main.rs', 'src/ui/color_conversion.rs')
+          if ($changed.Count -ne 2) { throw "Destination UI patch changed unexpected file count: $($changed -join ', ')" }
+          foreach ($file in $changed) {
+            if ($expectedFiles -notcontains $file) { throw "Destination UI patch changed unexpected file: $file" }
+          }
+          cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/ui/color_conversion.rs
+          git commit -m 'feat: wire Append Existing Production destination into Convert Color (#326)'
+          git push origin HEAD:codex/color-conversion-production-destination-ui
