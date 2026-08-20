@@ -356,11 +356,14 @@ impl ConversionQueue {
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
+        // A NeedsRecovery item has already committed its TIFF. Re-running the
+        // full conversion can collide with MustNotExist output policy and, for
+        // append-existing jobs, can discard the exact project mutation state
+        // needed for optimistic-concurrency recovery. Keep that state intact;
+        // project-only recovery is a separate operation.
         if !matches!(
             item.status,
-            ConversionQueueStatus::Failed
-                | ConversionQueueStatus::Cancelled
-                | ConversionQueueStatus::NeedsRecovery
+            ConversionQueueStatus::Failed | ConversionQueueStatus::Cancelled
         ) {
             return false;
         }
@@ -795,6 +798,37 @@ mod tests {
     }
 
     #[test]
+    fn needs_recovery_cannot_be_retried_as_full_conversion() {
+        let mut queue = ConversionQueue::new();
+        let id = queue
+            .enqueue(capture(r"C:\Production\recover.tif"), 220.0)
+            .unwrap();
+        {
+            let item = queue.items.iter_mut().find(|item| item.id == id).unwrap();
+            item.status = ConversionQueueStatus::NeedsRecovery;
+            item.recovery = Some(ConversionRecoveryRecord {
+                committed_output: CommittedConversionOutput {
+                    path: PathBuf::from(r"C:\Production\recover.tif"),
+                    sha256: HASH.to_owned(),
+                    converted_at_unix_ms: 1,
+                },
+                production_project_path: PathBuf::from(r"C:\Production\recover.shade"),
+                production_project: Some(ShadeProject::default()),
+                error: "simulated project-save failure".to_owned(),
+            });
+        }
+
+        assert!(!queue.retry(id));
+        let item = queue.items.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(item.status, ConversionQueueStatus::NeedsRecovery);
+        assert!(item.recovery.is_some());
+        assert_eq!(
+            item.recovery.as_ref().unwrap().error,
+            "simulated project-save failure"
+        );
+    }
+
+    #[test]
     fn duplicate_output_reservation_is_rejected() {
         let mut queue = ConversionQueue::new();
         queue
@@ -874,7 +908,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn queued_spec_without_project_disposition_defaults_to_create_new() {
         let spec = QueuedConversionSpec {
@@ -924,5 +957,4 @@ mod tests {
             disposition
         );
     }
-
 }
