@@ -1,0 +1,45 @@
+name: Temporary PR330 segmented tests
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lib-tests:
+    if: github.head_ref == 'tmp/pr330-segment-test'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Library tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib
+
+  staleness-labels:
+    if: github.head_ref == 'tmp/pr330-segment-test'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Production staleness label integration test
+        run: cargo test --locked --target x86_64-pc-windows-msvc --test production_staleness_status_labels
+
+  non-tiff-production-source:
+    if: github.head_ref == 'tmp/pr330-segment-test'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Non-TIFF Production Source integration test
+        run: cargo test --locked --target x86_64-pc-windows-msvc --test non_tiff_production_source
+
+  persistence-policy:
+    if: github.head_ref == 'tmp/pr330-segment-test'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Persistence policy integration test
+        run: cargo test --locked --target x86_64-pc-windows-msvc --test persistence_policy
