@@ -62,6 +62,7 @@ pub mod production_destination;
 pub mod production_destination_selection;
 pub mod production_lab_transform;
 pub mod production_lineage;
+pub mod production_profile_catalog;
 pub mod production_project;
 pub mod production_project_compat;
 pub mod production_project_disposition;
