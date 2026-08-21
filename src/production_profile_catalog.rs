@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::color_conversion::ConversionEngineMode;
 use crate::icc_profile_registry::{IccProfileRecord, IccProfileRegistry, IccProfileRole};
+use crate::model::IccProfileIdentity;
 use crate::tiff_io::ColorModel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +82,27 @@ pub fn inspect_production_profile_candidate(
     source_model: ColorModel,
 ) -> Result<IccProfileRecord, String> {
     let profile = registry.inspect(path)?;
+    ensure_eligible(profile, mode, source_model)
+}
+
+/// Reuse boundary for a previously selected profile. This must not trust browse-cache facts:
+/// the registry re-reads and re-hashes the bytes first, then production eligibility is checked.
+pub fn verify_production_profile_candidate(
+    registry: IccProfileRegistry,
+    path: &Path,
+    expected_identity: &IccProfileIdentity,
+    mode: ConversionEngineMode,
+    source_model: ColorModel,
+) -> Result<IccProfileRecord, String> {
+    let profile = registry.verify_identity(path, expected_identity)?;
+    ensure_eligible(profile, mode, source_model)
+}
+
+fn ensure_eligible(
+    profile: IccProfileRecord,
+    mode: ConversionEngineMode,
+    source_model: ColorModel,
+) -> Result<IccProfileRecord, String> {
     if let Some(rejection) = production_profile_rejection(&profile, mode, source_model) {
         return Err(format!(
             "Production profile '{}' cannot be used: {}.",
@@ -205,6 +227,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("profile role"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn saved_selection_is_freshly_rehashed_before_reuse() {
+        let path = temp_path("verify");
+        let mut profile = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0).unwrap();
+        profile.save_profile_to_file(&path).unwrap();
+        let selected = inspect_production_profile_candidate(
+            IccProfileRegistry,
+            &path,
+            ConversionEngineMode::DeviceLink,
+            ColorModel::Cmyk,
+        )
+        .unwrap();
+        assert!(
+            verify_production_profile_candidate(
+                IccProfileRegistry,
+                &path,
+                &selected.identity,
+                ConversionEngineMode::DeviceLink,
+                ColorModel::Cmyk,
+            )
+            .is_ok()
+        );
+
+        let mut replacement = Profile::new_srgb();
+        replacement.save_profile_to_file(&path).unwrap();
+        let error = verify_production_profile_candidate(
+            IccProfileRegistry,
+            &path,
+            &selected.identity,
+            ConversionEngineMode::DeviceLink,
+            ColorModel::Cmyk,
+        )
+        .unwrap_err();
+        assert!(error.contains("no longer matches"));
         let _ = fs::remove_file(path);
     }
 
