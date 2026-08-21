@@ -43,6 +43,10 @@ mod tests {
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
     const EXPORT_TESTS: &str = include_str!("export.rs");
     const TIFF_IO_TESTS: &str = include_str!("tiff_io.rs");
+    const CONVERSION_TIFF_TESTS: &str = include_str!("conversion_tiff.rs");
+    const NCHANNEL_ICC_TESTS: &str = include_str!("nchannel_icc.rs");
+    const ICC_CONVERSION_WORKER_TESTS: &str = include_str!("icc_conversion_worker.rs");
+    const DEVICELINK_CONVERSION_TESTS: &str = include_str!("devicelink_conversion.rs");
     const WORKFLOW_SRC: &str = include_str!("workflow.rs");
     const MAIN_SRC: &str = include_str!("main.rs");
 
@@ -82,29 +86,20 @@ mod tests {
             "identity_export_preserves_16bit_cmyk_samples",
             "identity_export_preserves_spot_names_icc_photoshop_resources_and_dpi",
         ] {
-            assert!(
-                CONFORMANCE_TESTS.contains(required),
-                "missing required TIFF conformance test: {required}"
-            );
+            assert!(CONFORMANCE_TESTS.contains(required), "missing required TIFF conformance test: {required}");
         }
         for required in [
             "streaming_identity_export_preserves_six_channels",
             "large_layout_selects_bigtiff_without_allocating_pixels",
             "identity_export_preserves_bigtiff_container",
         ] {
-            assert!(
-                EXPORT_TESTS.contains(required),
-                "missing required export transport test: {required}"
-            );
+            assert!(EXPORT_TESTS.contains(required), "missing required export transport test: {required}");
         }
         for required in [
             "region_stream_compacts_edge_tiles_without_full_decode",
             "region_stream_interleaves_planar_strips_without_full_decode",
         ] {
-            assert!(
-                TIFF_IO_TESTS.contains(required),
-                "missing required tiled/planar streaming coverage: {required}"
-            );
+            assert!(TIFF_IO_TESTS.contains(required), "missing required tiled/planar streaming coverage: {required}");
         }
     }
 
@@ -117,10 +112,7 @@ mod tests {
             ".installed()?",
             "inspect_registry_profile_fresh",
         ] {
-            assert!(
-                COLOR_MANAGEMENT_SRC.contains(required),
-                "Color Management lost shared ICC registry integration: {required}"
-            );
+            assert!(COLOR_MANAGEMENT_SRC.contains(required), "Color Management lost shared ICC registry integration: {required}");
         }
         for forbidden in [
             "EnumColorProfilesW",
@@ -129,10 +121,7 @@ mod tests {
             "registered_profile_names",
             "fn color_directory()",
         ] {
-            assert!(
-                !COLOR_MANAGEMENT_SRC.contains(forbidden),
-                "Color Management reintroduced private ICC registry infrastructure: {forbidden}"
-            );
+            assert!(!COLOR_MANAGEMENT_SRC.contains(forbidden), "Color Management reintroduced private ICC registry infrastructure: {forbidden}");
         }
     }
 
@@ -147,10 +136,7 @@ mod tests {
             "record.compatible_with_source_model",
             "record.pcs_space_channels()",
         ] {
-            assert!(
-                PRODUCTION_TARGET_SRC.contains(required),
-                "Production target lost shared ICC registry integration: {required}"
-            );
+            assert!(PRODUCTION_TARGET_SRC.contains(required), "Production target lost shared ICC registry integration: {required}");
         }
         for forbidden in [
             "Sha256::digest",
@@ -158,11 +144,37 @@ mod tests {
             "fn profile_class_label(",
             "let bytes = fs::read(path)",
         ] {
-            assert!(
-                !PRODUCTION_TARGET_SRC.contains(forbidden),
-                "Production target reintroduced private ICC identity/role inspection: {forbidden}"
-            );
+            assert!(!PRODUCTION_TARGET_SRC.contains(forbidden), "Production target reintroduced private ICC identity/role inspection: {forbidden}");
         }
+    }
+
+    #[test]
+    fn nchannel_conversion_contract_remains_in_the_release_suite() {
+        for required in [
+            "five_channel_u8_round_trips_as_direct_coverage_base_inks",
+            "seven_channel_tiff_round_trips_topology_names_icc_and_samples",
+            "forced_bigtiff_round_trips_ink_names_without_large_allocation",
+            "devicelink_output_round_trips_without_mislabeling_link_as_output_icc",
+            "new_only_commit_never_replaces_a_destination_that_appeared_after_capture",
+        ] {
+            assert!(CONVERSION_TIFF_TESTS.contains(required), "missing required N-channel conversion TIFF contract test: {required}");
+        }
+        for required in [
+            "missing_nchannel_colorant_table_requires_operator_confirmation",
+            "target_channel_names_must_match_count_and_be_unique",
+            "unsupported_output_channel_counts_are_rejected",
+            "real_cmyk_devicelink_declares_direct_input_and_output_topology",
+        ] {
+            assert!(PRODUCTION_TARGET_SRC.contains(required), "missing required production-target topology test: {required}");
+        }
+        for required in [
+            "supported_channel_counts_map_to_distinct_formats",
+            "unsupported_channel_counts_are_rejected_before_profile_transform",
+        ] {
+            assert!(NCHANNEL_ICC_TESTS.contains(required), "missing required N-channel LittleCMS format test: {required}");
+        }
+        assert!(ICC_CONVERSION_WORKER_TESTS.contains("runtime_dispatch_executes_captured_devicelink_without_source_icc_chain"), "missing captured DeviceLink runtime-dispatch regression");
+        assert!(DEVICELINK_CONVERSION_TESTS.contains("real_cmyk_devicelink_fixture_is_deterministic_and_ink_limited"), "missing deterministic real DeviceLink fixture regression");
     }
 
     #[test]
@@ -179,12 +191,7 @@ mod tests {
             "status.is_rejected()",
             "excluded {rejected_count} Rejected Face(s)",
         ] {
-            assert!(
-                WORKFLOW_SRC.contains(required)
-                    || EXPORT_TESTS.contains(required)
-                    || MAIN_SRC.contains(required),
-                "missing required missing-Face/relink guard: {required}"
-            );
+            assert!(WORKFLOW_SRC.contains(required) || EXPORT_TESTS.contains(required) || MAIN_SRC.contains(required), "missing required missing-Face/relink guard: {required}");
         }
     }
 
@@ -198,10 +205,7 @@ mod tests {
             "Validate Shell property schema XML",
             "actions/upload-artifact@v4",
         ] {
-            assert!(
-                BUILD_WORKFLOW.contains(required),
-                "production Windows CI lost required step: {required}"
-            );
+            assert!(BUILD_WORKFLOW.contains(required), "production Windows CI lost required step: {required}");
         }
     }
 }
