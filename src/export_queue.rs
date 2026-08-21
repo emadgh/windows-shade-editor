@@ -2,22 +2,23 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use windows_shade_editor::queue_core::{
+    PersistedQueueEnvelope, QueueLifecycle, QueueRuntime, load_persisted_queue,
+    sanitize_progress, write_persisted_queue,
+};
 
 use crate::export;
 use crate::export_batch::{self, ConflictPolicy, DestinationDecision};
 use crate::export_recipe::ExportRecipe;
 use crate::path_safety;
-use crate::safe_fs;
 use crate::validation;
 use crate::worker_guard;
 
-const QUEUE_FORMAT_VERSION: u32 = 1;
 const FINGERPRINT_SAMPLE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,8 +41,33 @@ impl ExportQueueStatus {
         }
     }
 
+    fn common_lifecycle(self) -> QueueLifecycle {
+        match self {
+            Self::Waiting => QueueLifecycle::Waiting,
+            Self::Processing => QueueLifecycle::Processing,
+            Self::Done => QueueLifecycle::Done,
+            Self::Failed => QueueLifecycle::Failed,
+            Self::Cancelled => QueueLifecycle::Cancelled,
+        }
+    }
+
+    fn from_common_lifecycle(status: QueueLifecycle) -> Self {
+        match status {
+            QueueLifecycle::Waiting => Self::Waiting,
+            QueueLifecycle::Processing => Self::Processing,
+            QueueLifecycle::Done => Self::Done,
+            QueueLifecycle::Failed => Self::Failed,
+            QueueLifecycle::Cancelled => Self::Cancelled,
+        }
+    }
+
+    fn restored(self) -> (Self, bool) {
+        let (status, requires_resume) = self.common_lifecycle().restored();
+        (Self::from_common_lifecycle(status), requires_resume)
+    }
+
     pub fn finished(self) -> bool {
-        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+        self.common_lifecycle().finished()
     }
 }
 
@@ -193,15 +219,6 @@ enum ExportQueueEvent {
 }
 
 #[derive(Serialize, Deserialize)]
-struct PersistedQueue {
-    format_version: u32,
-    next_id: u64,
-    #[serde(default)]
-    paused: bool,
-    items: Vec<PersistedQueueItem>,
-}
-
-#[derive(Serialize, Deserialize)]
 struct PersistedQueueItem {
     id: u64,
     status: ExportQueueStatus,
@@ -211,14 +228,8 @@ struct PersistedQueueItem {
 
 pub struct ExportQueue {
     items: Vec<ExportQueueItem>,
-    next_id: u64,
-    active_id: Option<u64>,
+    runtime: QueueRuntime<ExportQueueEvent>,
     stop_after_current: bool,
-    paused: bool,
-    tx: mpsc::Sender<ExportQueueEvent>,
-    rx: mpsc::Receiver<ExportQueueEvent>,
-    persistence_path: Option<PathBuf>,
-    last_persistence_error: Option<String>,
 }
 
 impl Default for ExportQueue {
@@ -237,51 +248,31 @@ impl ExportQueue {
     }
 
     fn empty(persistence_path: Option<PathBuf>) -> Self {
-        let (tx, rx) = mpsc::channel();
         Self {
             items: Vec::new(),
-            next_id: 1,
-            active_id: None,
+            runtime: QueueRuntime::new(persistence_path),
             stop_after_current: false,
-            paused: false,
-            tx,
-            rx,
-            persistence_path,
-            last_persistence_error: None,
         }
     }
 
     fn load_from_path(path: PathBuf) -> Result<Self, String> {
-        let mut queue = Self::empty(Some(path.clone()));
-        if !path.exists() {
-            return Ok(queue);
-        }
-        let bytes = std::fs::read(&path)
-            .map_err(|err| format!("Cannot read export queue {}: {err}", path.display()))?;
-        let persisted: PersistedQueue = serde_json::from_slice(&bytes)
-            .map_err(|err| format!("Invalid export queue {}: {err}", path.display()))?;
-        if persisted.format_version != QUEUE_FORMAT_VERSION {
-            return Err(format!(
-                "Unsupported export queue format {} (expected {}).",
-                persisted.format_version, QUEUE_FORMAT_VERSION
-            ));
-        }
-        queue.next_id = persisted.next_id.max(1);
-        queue.paused = persisted.paused;
+        let Some(persisted) = load_persisted_queue::<PersistedQueueItem>(&path, "export")? else {
+            return Ok(Self::empty(Some(path)));
+        };
+        let mut queue = Self {
+            items: Vec::new(),
+            runtime: QueueRuntime::restore_runtime(
+                Some(path),
+                persisted.next_id,
+                persisted.paused,
+            ),
+            stop_after_current: false,
+        };
         for saved in persisted.items {
             if saved.status == ExportQueueStatus::Done {
                 continue;
             }
-            let recovered_processing = saved.status == ExportQueueStatus::Processing;
-            let requires_resume = matches!(
-                saved.status,
-                ExportQueueStatus::Waiting | ExportQueueStatus::Processing
-            );
-            let status = if recovered_processing {
-                ExportQueueStatus::Waiting
-            } else {
-                saved.status
-            };
+            let (status, requires_resume) = saved.status.restored();
             let mut spec = saved.spec;
             spec.project_session_id = 0;
             spec.export.mark = None;
@@ -308,11 +299,11 @@ impl ExportQueue {
     }
 
     pub fn take_persistence_error(&mut self) -> Option<String> {
-        self.last_persistence_error.take()
+        self.runtime.take_persistence_error()
     }
 
     fn persist(&mut self) {
-        let Some(path) = self.persistence_path.clone() else {
+        let Some(path) = self.runtime.persistence_path().map(Path::to_path_buf) else {
             return;
         };
         let items = self
@@ -326,23 +317,17 @@ impl ExportQueue {
                 error: item.error.clone(),
             })
             .collect();
-        let persisted = PersistedQueue {
-            format_version: QUEUE_FORMAT_VERSION,
-            next_id: self.next_id,
-            paused: self.paused,
+        let persisted = PersistedQueueEnvelope::new(
+            self.runtime.next_id(),
+            self.runtime.is_paused(),
             items,
-        };
-        let result = serde_json::to_vec_pretty(&persisted)
-            .map_err(|err| format!("Cannot serialize export queue: {err}"))
-            .and_then(|bytes| safe_fs::atomic_write(&path, &bytes, None));
-        if let Err(err) = result {
-            self.last_persistence_error = Some(err);
-        }
+        );
+        let result = write_persisted_queue(&path, "export", &persisted);
+        self.runtime.record_persistence_result(result);
     }
 
     pub fn enqueue(&mut self, spec: ExportQueueSpec) -> u64 {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.runtime.allocate_id();
         self.items.push(ExportQueueItem {
             id,
             label: spec.label.clone(),
@@ -382,8 +367,7 @@ impl ExportQueue {
             ));
         }
         let source_fingerprint = SourceFingerprint::capture(&spec.source)?;
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.runtime.allocate_id();
         self.items.push(ExportQueueItem {
             id,
             label: spec.label.clone(),
@@ -465,18 +449,17 @@ impl ExportQueue {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active_id.is_some()
+        self.runtime.active_id().is_some()
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused
+        self.runtime.is_paused()
     }
 
     pub fn set_paused(&mut self, paused: bool) -> bool {
-        if self.paused == paused {
+        if !self.runtime.set_paused(paused) {
             return false;
         }
-        self.paused = paused;
         self.persist();
         true
     }
@@ -562,7 +545,7 @@ impl ExportQueue {
     }
 
     pub fn active_summary(&self) -> Option<(f32, String)> {
-        let id = self.active_id?;
+        let id = self.runtime.active_id()?;
         let item = self.items.iter().find(|item| item.id == id)?;
         let mut text = if item.detail.trim().is_empty() {
             item.label.clone()
@@ -609,7 +592,7 @@ impl ExportQueue {
     }
 
     pub fn compact_status(&self) -> Option<String> {
-        if let Some(id) = self.active_id {
+        if let Some(id) = self.runtime.active_id() {
             let item = self.items.iter().find(|item| item.id == id)?;
             let index = self.items.iter().position(|row| row.id == id).unwrap_or(0) + 1;
             let total = self.items.len().max(1);
@@ -626,7 +609,7 @@ impl ExportQueue {
             .iter()
             .filter(|item| item.status == ExportQueueStatus::Waiting && !item.requires_resume)
             .count();
-        if self.paused && waiting > 0 {
+        if self.runtime.is_paused() && waiting > 0 {
             Some(format!("Queue paused · {waiting} waiting"))
         } else if waiting > 0 {
             Some(format!("Queue · {waiting} waiting"))
@@ -715,7 +698,7 @@ impl ExportQueue {
     pub fn poll_with_start(&mut self, allow_start: bool) -> Vec<ExportQueueCompletion> {
         let mut completions = Vec::new();
         let mut changed = false;
-        while let Ok(event) = self.rx.try_recv() {
+        while let Ok(event) = self.runtime.try_recv() {
             match event {
                 ExportQueueEvent::Progress {
                     id,
@@ -723,11 +706,7 @@ impl ExportQueue {
                     detail,
                 } => {
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
-                        item.progress = if fraction.is_finite() {
-                            fraction.clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        };
+                        item.progress = sanitize_progress(fraction);
                         item.detail = detail;
                     }
                 }
@@ -738,7 +717,7 @@ impl ExportQueue {
                     mark,
                     provenance,
                 } => {
-                    self.active_id = None;
+                    self.runtime.set_active_id(None);
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
                         item.progress = 1.0;
                         match &result {
@@ -776,7 +755,11 @@ impl ExportQueue {
             }
         }
 
-        if allow_start && self.active_id.is_none() && !self.stop_after_current && !self.paused {
+        if allow_start
+            && self.runtime.active_id().is_none()
+            && !self.stop_after_current
+            && !self.runtime.is_paused()
+        {
             changed |= self.start_next();
         }
         if changed {
@@ -816,8 +799,8 @@ impl ExportQueue {
                 ConflictPolicy::Overwrite => {}
                 ConflictPolicy::Skip => {
                     self.items[index].status = ExportQueueStatus::Processing;
-                    self.active_id = Some(id);
-                    let tx = self.tx.clone();
+                    self.runtime.set_active_id(Some(id));
+                    let tx = self.runtime.sender();
                     thread::spawn(move || {
                         let _ = tx.send(ExportQueueEvent::Finished {
                             id,
@@ -882,10 +865,10 @@ impl ExportQueue {
         self.items[index].started_at = Some(Instant::now());
         self.items[index].detail = "Starting".to_owned();
         self.items[index].error = None;
-        self.active_id = Some(id);
+        self.runtime.set_active_id(Some(id));
 
         let spec = queued.export;
-        let tx = self.tx.clone();
+        let tx = self.runtime.sender();
         thread::spawn(move || {
             let mark = spec.mark.clone();
             let provenance = mark.as_ref().map(|_| SnapshotExportProvenance {
@@ -957,8 +940,8 @@ impl ExportQueue {
     ) -> bool {
         self.items[index].status = ExportQueueStatus::Processing;
         self.items[index].started_at = Some(Instant::now());
-        self.active_id = Some(id);
-        let tx = self.tx.clone();
+        self.runtime.set_active_id(Some(id));
+        let tx = self.runtime.sender();
         thread::spawn(move || {
             let _ = tx.send(ExportQueueEvent::Finished {
                 id,
@@ -973,11 +956,7 @@ impl ExportQueue {
 }
 
 fn finite_progress(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
+    sanitize_progress(value)
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -1149,7 +1128,7 @@ mod tests {
         let mut queue = ExportQueue::new();
         let first = queue.enqueue(spec("first.tif"));
         queue.items[0].status = ExportQueueStatus::Processing;
-        queue.active_id = Some(first);
+        queue.runtime.set_active_id(Some(first));
         let second = queue.enqueue(spec("second.tif"));
 
         for _ in 0..200 {
@@ -1159,7 +1138,7 @@ mod tests {
                 .map(|item| (item.id, item.status, item.progress, item.detail.clone()))
                 .collect::<Vec<_>>();
             assert_eq!(rows.len(), 2);
-            assert_eq!(queue.active_id, Some(first));
+            assert_eq!(queue.runtime.active_id(), Some(first));
             assert_eq!(queue.items()[1].id, second);
             assert_eq!(queue.items()[1].status, ExportQueueStatus::Waiting);
         }
@@ -1182,9 +1161,9 @@ mod tests {
 
         let mut restored = ExportQueue::load_from_path(path).unwrap();
         assert_eq!(restored.pending_count(), 0);
-        assert!(restored.active_id.is_none());
+        assert!(restored.runtime.active_id().is_none());
         assert!(restored.poll().is_empty());
-        assert!(restored.active_id.is_none());
+        assert!(restored.runtime.active_id().is_none());
         assert!(restored.resume(id));
         assert_eq!(restored.pending_count(), 1);
         let _ = std::fs::remove_dir_all(folder);
@@ -1196,11 +1175,11 @@ mod tests {
         queue.enqueue(spec("paused.tif"));
         assert!(queue.set_paused(true));
         assert!(queue.poll().is_empty());
-        assert!(queue.active_id.is_none());
+        assert!(queue.runtime.active_id().is_none());
         assert_eq!(queue.pending_count(), 1);
         assert!(queue.set_paused(false));
         let _ = queue.poll();
-        assert!(queue.active_id.is_some());
+        assert!(queue.runtime.active_id().is_some());
     }
 
     #[test]

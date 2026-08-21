@@ -2,7 +2,6 @@ use std::any::Any;
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::thread;
 
 use serde::{Deserialize, Serialize};
@@ -17,9 +16,10 @@ use crate::conversion_transaction_disposition::run_conversion_transaction_with_d
 use crate::icc_conversion_worker::FilesystemIccConversionBackend;
 use crate::model::ShadeProject;
 use crate::production_project_disposition::ProductionProjectDisposition;
-use crate::safe_fs;
-
-const QUEUE_FORMAT_VERSION: u32 = 1;
+use crate::queue_core::{
+    PersistedQueueEnvelope, QueueLifecycle, QueueRuntime, load_persisted_queue,
+    sanitize_progress, write_persisted_queue,
+};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +46,35 @@ impl ConversionQueueStatus {
 
     fn reserves_destination(self) -> bool {
         matches!(self, Self::Waiting | Self::Processing | Self::NeedsRecovery)
+    }
+
+    fn common_lifecycle(self) -> Option<QueueLifecycle> {
+        match self {
+            Self::Waiting => Some(QueueLifecycle::Waiting),
+            Self::Processing => Some(QueueLifecycle::Processing),
+            Self::Done => Some(QueueLifecycle::Done),
+            Self::Failed => Some(QueueLifecycle::Failed),
+            Self::Cancelled => Some(QueueLifecycle::Cancelled),
+            Self::NeedsRecovery => None,
+        }
+    }
+
+    fn from_common_lifecycle(status: QueueLifecycle) -> Self {
+        match status {
+            QueueLifecycle::Waiting => Self::Waiting,
+            QueueLifecycle::Processing => Self::Processing,
+            QueueLifecycle::Done => Self::Done,
+            QueueLifecycle::Failed => Self::Failed,
+            QueueLifecycle::Cancelled => Self::Cancelled,
+        }
+    }
+
+    fn restored(self) -> (Self, bool) {
+        let Some(common) = self.common_lifecycle() else {
+            return (Self::NeedsRecovery, false);
+        };
+        let (restored, requires_resume) = common.restored();
+        (Self::from_common_lifecycle(restored), requires_resume)
     }
 }
 
@@ -105,14 +134,6 @@ enum ConversionQueueEvent {
 }
 
 #[derive(Serialize, Deserialize)]
-struct PersistedQueue {
-    format_version: u32,
-    next_id: u64,
-    paused: bool,
-    items: Vec<PersistedQueueItem>,
-}
-
-#[derive(Serialize, Deserialize)]
 struct PersistedQueueItem {
     id: u64,
     status: ConversionQueueStatus,
@@ -123,14 +144,8 @@ struct PersistedQueueItem {
 
 pub struct ConversionQueue {
     items: Vec<ConversionQueueItem>,
-    next_id: u64,
-    active_id: Option<u64>,
+    runtime: QueueRuntime<ConversionQueueEvent>,
     active_cancellation: Option<ConversionCancellation>,
-    paused: bool,
-    tx: mpsc::Sender<ConversionQueueEvent>,
-    rx: mpsc::Receiver<ConversionQueueEvent>,
-    persistence_path: Option<PathBuf>,
-    last_persistence_error: Option<String>,
 }
 
 impl Default for ConversionQueue {
@@ -149,56 +164,38 @@ impl ConversionQueue {
     }
 
     fn empty(persistence_path: Option<PathBuf>) -> Self {
-        let (tx, rx) = mpsc::channel();
         Self {
             items: Vec::new(),
-            next_id: 1,
-            active_id: None,
+            runtime: QueueRuntime::new(persistence_path),
             active_cancellation: None,
-            paused: false,
-            tx,
-            rx,
-            persistence_path,
-            last_persistence_error: None,
         }
     }
 
     fn load_from_path(path: PathBuf) -> Result<Self, String> {
-        let mut queue = Self::empty(Some(path.clone()));
-        if !path.exists() {
-            return Ok(queue);
-        }
-        let bytes = fs::read(&path)
-            .map_err(|err| format!("Cannot read conversion queue {}: {err}", path.display()))?;
-        let persisted: PersistedQueue = serde_json::from_slice(&bytes)
-            .map_err(|err| format!("Invalid conversion queue {}: {err}", path.display()))?;
-        if persisted.format_version != QUEUE_FORMAT_VERSION {
-            return Err(format!(
-                "Unsupported conversion queue format {} (expected {}).",
-                persisted.format_version, QUEUE_FORMAT_VERSION
-            ));
-        }
-        queue.next_id = persisted.next_id.max(1);
-        queue.paused = persisted.paused;
+        let Some(persisted) = load_persisted_queue::<PersistedQueueItem>(&path, "conversion")?
+        else {
+            return Ok(Self::empty(Some(path)));
+        };
+        let mut queue = Self {
+            items: Vec::new(),
+            runtime: QueueRuntime::restore_runtime(
+                Some(path),
+                persisted.next_id,
+                persisted.paused,
+            ),
+            active_cancellation: None,
+        };
         for saved in persisted.items {
             if saved.status == ConversionQueueStatus::Done {
                 continue;
             }
-            let recovered_work = matches!(
-                saved.status,
-                ConversionQueueStatus::Waiting | ConversionQueueStatus::Processing
-            );
-            let status = if saved.status == ConversionQueueStatus::Processing {
-                ConversionQueueStatus::Waiting
-            } else {
-                saved.status
-            };
+            let (status, requires_resume) = saved.status.restored();
             queue.items.push(item_from_spec(
                 saved.id,
                 saved.spec,
                 status,
                 true,
-                recovered_work,
+                requires_resume,
                 saved.error,
                 saved.recovery,
             ));
@@ -243,8 +240,7 @@ impl ConversionQueue {
                 return Err("Conversion output or Production project is already reserved by another queued job.".to_owned());
             }
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.runtime.allocate_id();
         self.items.push(item_from_spec(
             id,
             QueuedConversionSpec {
@@ -274,7 +270,7 @@ impl ConversionQueue {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active_id.is_some()
+        self.runtime.active_id().is_some()
     }
 
     pub fn recovered_waiting_count(&self) -> usize {
@@ -285,23 +281,22 @@ impl ConversionQueue {
     }
 
     pub fn active_summary(&self) -> Option<(f32, String)> {
-        let id = self.active_id?;
+        let id = self.runtime.active_id()?;
         let item = self.items.iter().find(|item| item.id == id)?;
         let text = if item.detail.trim().is_empty() {
             format!("Conversion #{} - {}", item.id, item.phase)
         } else {
             format!("Conversion #{} - {} - {}", item.id, item.phase, item.detail)
         };
-        Some((finite_progress(item.progress), text))
+        Some((sanitize_progress(item.progress), text))
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused
+        self.runtime.is_paused()
     }
 
     pub fn set_paused(&mut self, paused: bool) {
-        if self.paused != paused {
-            self.paused = paused;
+        if self.runtime.set_paused(paused) {
             self.persist();
         }
     }
@@ -322,6 +317,7 @@ impl ConversionQueue {
     }
 
     pub fn cancel(&mut self, id: u64) -> bool {
+        let active_id = self.runtime.active_id();
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
@@ -333,7 +329,7 @@ impl ConversionQueue {
                 self.persist();
                 true
             }
-            ConversionQueueStatus::Processing if self.active_id == Some(id) => {
+            ConversionQueueStatus::Processing if active_id == Some(id) => {
                 if let Some(cancellation) = &self.active_cancellation {
                     cancellation.request();
                 }
@@ -426,7 +422,7 @@ impl ConversionQueue {
     }
 
     pub fn take_persistence_error(&mut self) -> Option<String> {
-        self.last_persistence_error.take()
+        self.runtime.take_persistence_error()
     }
 
     pub fn poll(&mut self) -> Vec<ConversionQueueCompletion> {
@@ -436,7 +432,7 @@ impl ConversionQueue {
     pub fn poll_with_start(&mut self, allow_start: bool) -> Vec<ConversionQueueCompletion> {
         let mut completions = Vec::new();
         let mut changed = false;
-        while let Ok(event) = self.rx.try_recv() {
+        while let Ok(event) = self.runtime.try_recv() {
             match event {
                 ConversionQueueEvent::Progress {
                     id,
@@ -446,7 +442,7 @@ impl ConversionQueue {
                 } => {
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
                         item.phase = phase;
-                        item.progress = finite_progress(fraction);
+                        item.progress = sanitize_progress(fraction);
                         item.detail = detail;
                     }
                 }
@@ -455,7 +451,7 @@ impl ConversionQueue {
                     capture,
                     result,
                 } => {
-                    self.active_id = None;
+                    self.runtime.set_active_id(None);
                     self.active_cancellation = None;
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
                         apply_completion(item, &result);
@@ -469,7 +465,7 @@ impl ConversionQueue {
                 }
             }
         }
-        if allow_start && self.active_id.is_none() && !self.paused {
+        if allow_start && self.runtime.active_id().is_none() && !self.runtime.is_paused() {
             changed |= self.start_next();
         }
         if changed {
@@ -492,10 +488,10 @@ impl ConversionQueue {
         self.items[index].phase = ConversionPhase::CaptureValidation.label().to_owned();
         self.items[index].detail = "Starting production conversion".to_owned();
         self.items[index].error = None;
-        self.active_id = Some(id);
+        self.runtime.set_active_id(Some(id));
         self.active_cancellation = Some(cancellation.clone());
 
-        let tx = self.tx.clone();
+        let tx = self.runtime.sender();
         thread::spawn(move || {
             let capture = spec.capture;
             let production_project_disposition = spec.production_project_disposition;
@@ -543,7 +539,7 @@ impl ConversionQueue {
     }
 
     fn persist(&mut self) {
-        let Some(path) = self.persistence_path.clone() else {
+        let Some(path) = self.runtime.persistence_path().map(Path::to_path_buf) else {
             return;
         };
         let items = self
@@ -558,18 +554,13 @@ impl ConversionQueue {
                 recovery: item.recovery.clone(),
             })
             .collect();
-        let persisted = PersistedQueue {
-            format_version: QUEUE_FORMAT_VERSION,
-            next_id: self.next_id,
-            paused: self.paused,
+        let persisted = PersistedQueueEnvelope::new(
+            self.runtime.next_id(),
+            self.runtime.is_paused(),
             items,
-        };
-        let result = serde_json::to_vec_pretty(&persisted)
-            .map_err(|err| format!("Cannot serialize conversion queue: {err}"))
-            .and_then(|bytes| safe_fs::atomic_write(&path, &bytes, None));
-        if let Err(error) = result {
-            self.last_persistence_error = Some(error);
-        }
+        );
+        let result = write_persisted_queue(&path, "conversion", &persisted);
+        self.runtime.record_persistence_result(result);
     }
 }
 
@@ -671,14 +662,6 @@ fn apply_completion(item: &mut ConversionQueueItem, result: &ConversionQueueComp
             item.error = Some(recovery.error.clone());
             item.recovery = Some(recovery.clone());
         }
-    }
-}
-
-fn finite_progress(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(0.0, 1.0)
-    } else {
-        0.0
     }
 }
 
@@ -972,5 +955,35 @@ mod tests {
             queue.items[0].spec.production_project_disposition,
             disposition
         );
+    }
+
+    #[test]
+    fn needs_recovery_restore_is_not_flattened_into_common_waiting_state() {
+        let path = temp_path("needs-recovery");
+        let mut queue = ConversionQueue::empty(Some(path.clone()));
+        let id = queue
+            .enqueue(capture(r"C:\Production\recover-persisted.tif"), 220.0)
+            .unwrap();
+        let item = queue.items.iter_mut().find(|item| item.id == id).unwrap();
+        item.status = ConversionQueueStatus::NeedsRecovery;
+        item.recovery = Some(ConversionRecoveryRecord {
+            stage: ConversionRecoveryStage::ProductionProjectSavePending,
+            committed_output: CommittedConversionOutput {
+                path: PathBuf::from(r"C:\Production\recover-persisted.tif"),
+                sha256: HASH.to_owned(),
+                converted_at_unix_ms: 1,
+            },
+            production_project_path: PathBuf::from(r"C:\Production\recover-persisted.shade"),
+            production_project: Some(ShadeProject::default()),
+            error: "persisted recovery".to_owned(),
+        });
+        queue.persist();
+        drop(queue);
+
+        let restored = ConversionQueue::load_from_path(path.clone()).unwrap();
+        assert_eq!(restored.items[0].status, ConversionQueueStatus::NeedsRecovery);
+        assert!(!restored.items[0].requires_resume);
+        assert!(restored.items[0].recovery.is_some());
+        let _ = fs::remove_file(path);
     }
 }

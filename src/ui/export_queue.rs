@@ -34,7 +34,18 @@ impl ShadeApp {
             .collect::<Vec<_>>();
         let pending = self.export.queue.pending_count();
         let queue_paused = self.export.queue.is_paused();
-        let (_, _, done_count, failed_count, _) = self.export.queue.status_counts();
+        let (_, _, done_count, failed_count, cancelled_count) = self.export.queue.status_counts();
+        let finished_count = done_count + failed_count + cancelled_count;
+        let cancellable_count = rows
+            .iter()
+            .filter(|(_, _, _, status, _, _, _, _, _, _)| {
+                matches!(
+                    status,
+                    export_queue::ExportQueueStatus::Waiting
+                        | export_queue::ExportQueueStatus::Processing
+                )
+            })
+            .count();
         let recovered_waiting = self.export.queue.recovered_waiting_count();
         let mut actions = Vec::new();
 
@@ -53,29 +64,40 @@ impl ShadeApp {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if failed_count > 0 {
-                            if ui
-                                .button(format!("Clear failed ({failed_count})"))
-                                .clicked()
-                            {
-                                actions.push(ExportQueueUiAction::ClearFailed);
-                            }
-                            if ui
+                        if failed_count > 0
+                            && ui
                                 .button(format!("Retry all failed ({failed_count})"))
                                 .clicked()
-                            {
-                                actions.push(ExportQueueUiAction::RetryAllFailed);
-                            }
+                        {
+                            actions.push(ExportQueueUiAction::RetryAllFailed);
                         }
-                        if done_count > 0
+                        if finished_count > 0
                             && ui
-                                .button(format!("Clear completed ({done_count})"))
+                                .button(format!("Clear Jobs ({finished_count})"))
+                                .on_hover_text(
+                                    "Remove completed, failed and cancelled jobs from the queue history.",
+                                )
                                 .clicked()
                         {
-                            actions.push(ExportQueueUiAction::ClearCompleted);
+                            actions.push(ExportQueueUiAction::ClearJobs);
                         }
-                        if ui.button("Cancel waiting").clicked() {
-                            actions.push(ExportQueueUiAction::CancelAllWaiting);
+                        if cancellable_count > 0
+                            && ui
+                                .button(format!("Cancel All ({cancellable_count})"))
+                                .on_hover_text(
+                                    "Cancel every waiting job. If one export is processing, request a safe stop after its current atomic TIFF commit.",
+                                )
+                                .clicked()
+                        {
+                            for (id, _, _, status, _, _, _, _, _, _) in &rows {
+                                if matches!(
+                                    status,
+                                    export_queue::ExportQueueStatus::Waiting
+                                        | export_queue::ExportQueueStatus::Processing
+                                ) {
+                                    actions.push(ExportQueueUiAction::Cancel(*id));
+                                }
+                            }
                         }
                         if ui
                             .button(if queue_paused {
@@ -95,7 +117,7 @@ impl ShadeApp {
                 if recovered_waiting > 0 {
                     ui.small("Recovered exports are never started automatically. Resume individual rows or use Resume recovered when you want them to run.");
                 } else {
-                    ui.small("Waiting items can be cancelled immediately. Processing items use Stop after current so the current atomic TIFF finishes safely.");
+                    ui.small("Cancel is immediate for waiting jobs. Cancelling the active export preserves its atomic TIFF boundary, then stops the remaining queue.");
                 }
                 ui.separator();
 
@@ -188,7 +210,10 @@ impl ShadeApp {
                                                         }
                                                         export_queue::ExportQueueStatus::Processing => {
                                                             if ui
-                                                                .small_button("Stop after current")
+                                                                .small_button("Cancel")
+                                                                .on_hover_text(
+                                                                    "Request cancellation without breaking the current atomic TIFF commit. The queue stops after the active export reaches its safe boundary.",
+                                                                )
                                                                 .clicked()
                                                             {
                                                                 actions.push(

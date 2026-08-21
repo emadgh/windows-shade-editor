@@ -104,6 +104,7 @@ mod tests {
             "self.export.queue.cancel_all_waiting()",
             "self.export.queue.clear_completed()",
             "self.export.queue.clear_failed()",
+            "self.export.queue.clear_finished()",
             "self.export.queue.resume(",
             "self.export.queue.cancel(",
             "self.export.queue.retry(",
@@ -134,6 +135,24 @@ mod tests {
                 "Adjustments presentation bypassed typed actions with {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn export_queue_exposes_clear_jobs_cancel_and_cancel_all_controls() {
+        let export_queue = include_str!("export_queue.rs");
+        let actions = include_str!("actions.rs");
+        for required in ["Clear Jobs", "Cancel All", "small_button(\"Cancel\")"] {
+            assert!(
+                export_queue.contains(required),
+                "Export Queue is missing requested control: {required}"
+            );
+        }
+        assert!(
+            actions.contains("ExportQueueUiAction::ClearJobs"),
+            "Clear Jobs must dispatch through a typed queue action"
+        );
+        assert!(!export_queue.contains("Cancel waiting"));
+        assert!(!export_queue.contains("Stop after current"));
     }
 
     #[test]

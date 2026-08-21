@@ -68,6 +68,7 @@ pub mod production_replacement;
 pub mod production_staleness;
 pub mod production_target;
 pub mod project_link_navigation;
+pub mod queue_core;
 pub mod reconversion_policy;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
