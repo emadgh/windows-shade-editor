@@ -21,6 +21,35 @@ pub struct ConversionBatchProgress {
 }
 
 #[derive(Clone, Debug)]
+pub enum ConversionBatchStepOutcome {
+    AlreadyComplete {
+        checkpoint: ConversionBatchCheckpoint,
+    },
+    CompletedFace {
+        checkpoint: ConversionBatchCheckpoint,
+        completed: CompletedConversionTransaction,
+        source_face_index: usize,
+        ordinal: usize,
+        batch_complete: bool,
+    },
+    Halted {
+        checkpoint: ConversionBatchCheckpoint,
+        source_face_index: usize,
+        outcome: ConversionTransactionOutcome,
+    },
+}
+
+impl ConversionBatchStepOutcome {
+    pub fn checkpoint(&self) -> &ConversionBatchCheckpoint {
+        match self {
+            Self::AlreadyComplete { checkpoint }
+            | Self::CompletedFace { checkpoint, .. }
+            | Self::Halted { checkpoint, .. } => checkpoint,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum ConversionBatchExecutionOutcome {
     Completed {
         checkpoint: ConversionBatchCheckpoint,
@@ -46,15 +75,125 @@ impl ConversionBatchExecutionOutcome {
     }
 }
 
-/// Run pending Faces in deterministic Source-project order.
+/// Execute exactly one pending Face from a deterministic conversion batch.
 ///
-/// Each Face keeps the existing single-Face TIFF transaction. After the first
-/// successful Face, the next append disposition is derived from the exact
-/// Production project bytes just committed by this batch. External edits between
-/// Faces are still caught by the existing optimistic SHA check inside append save.
-pub fn run_conversion_batch<B, F>(
+/// Queue callers intentionally use this one-Face step instead of running the
+/// whole batch in one worker. After `CompletedFace` the updated checkpoint can
+/// be persisted before another Face is allowed to start, making restart/crash
+/// recovery deterministic at every committed TIFF/Production-project boundary.
+pub fn run_next_conversion_batch_face<B, F>(
     batch: &ConversionBatchCapture,
     checkpoint: ConversionBatchCheckpoint,
+    cancellation: &ConversionCancellation,
+    backend: &mut B,
+    mut report: F,
+) -> ConversionBatchStepOutcome
+where
+    B: ConversionTransactionBackend + ExistingProductionProjectStore,
+    F: FnMut(ConversionBatchProgress),
+{
+    if let Err(error) = batch.validate() {
+        return halted_step_before_face(batch, checkpoint, 0, error);
+    }
+    if let Err(error) = checkpoint.validate_for(batch) {
+        return halted_step_before_face(batch, checkpoint, 0, error);
+    }
+
+    let ordinal = checkpoint.completed_count();
+    let Some(face) = batch.faces.get(ordinal) else {
+        return ConversionBatchStepOutcome::AlreadyComplete { checkpoint };
+    };
+
+    if cancellation.is_requested() {
+        return ConversionBatchStepOutcome::Halted {
+            checkpoint,
+            source_face_index: face.source_face_index,
+            outcome: ConversionTransactionOutcome::CancelledBeforeCommit {
+                phase: ConversionPhase::CaptureValidation,
+                message: "Production conversion batch cancelled before the next Face commit."
+                    .to_owned(),
+            },
+        };
+    }
+
+    let disposition = match disposition_for_face(batch, ordinal, backend) {
+        Ok(disposition) => disposition,
+        Err(error) => {
+            return ConversionBatchStepOutcome::Halted {
+                checkpoint,
+                source_face_index: face.source_face_index,
+                outcome: ConversionTransactionOutcome::FailedBeforeCommit {
+                    phase: ConversionPhase::CaptureValidation,
+                    error,
+                },
+            };
+        }
+    };
+
+    let face_count = batch.faces.len();
+    let mut batch_report = |progress: ConversionProgress| {
+        let face_fraction = sanitize_fraction(progress.fraction);
+        report(ConversionBatchProgress {
+            source_face_index: face.source_face_index,
+            ordinal,
+            face_count,
+            phase: progress.phase,
+            face_fraction,
+            overall_fraction: sanitize_fraction(
+                (ordinal as f32 + face_fraction) / face_count as f32,
+            ),
+            detail: progress.detail,
+        });
+    };
+    let outcome = run_conversion_transaction_with_disposition(
+        &face.capture,
+        &disposition,
+        cancellation,
+        backend,
+        &mut batch_report,
+    );
+
+    match outcome {
+        ConversionTransactionOutcome::Completed(completed) => {
+            let mut checkpoint = checkpoint;
+            if let Err(error) = checkpoint.record_committed(batch, &completed.committed_output) {
+                return ConversionBatchStepOutcome::Halted {
+                    checkpoint,
+                    source_face_index: face.source_face_index,
+                    outcome: ConversionTransactionOutcome::OutputCommittedNeedsRecovery {
+                        committed_output: completed.committed_output,
+                        production_project_path: completed.production_project_path,
+                        production_project: Some(completed.production_project),
+                        error: format!(
+                            "Converted Face committed but batch checkpoint could not advance: {error}"
+                        ),
+                    },
+                };
+            }
+            let batch_complete = checkpoint.completed_count() == face_count;
+            ConversionBatchStepOutcome::CompletedFace {
+                checkpoint,
+                completed,
+                source_face_index: face.source_face_index,
+                ordinal,
+                batch_complete,
+            }
+        }
+        outcome => ConversionBatchStepOutcome::Halted {
+            checkpoint,
+            source_face_index: face.source_face_index,
+            outcome,
+        },
+    }
+}
+
+/// Convenience runner for domain tests/callers that do not require a durable
+/// checkpoint between Faces. Persistent queue execution should call
+/// `run_next_conversion_batch_face` and save the returned checkpoint before
+/// starting another Face.
+pub fn run_conversion_batch<B, F>(
+    batch: &ConversionBatchCapture,
+    mut checkpoint: ConversionBatchCheckpoint,
     cancellation: &ConversionCancellation,
     backend: &mut B,
     mut report: F,
@@ -63,104 +202,51 @@ where
     B: ConversionTransactionBackend + ExistingProductionProjectStore,
     F: FnMut(ConversionBatchProgress),
 {
-    if let Err(error) = batch.validate() {
-        return halted_before_face(batch, checkpoint, 0, error);
-    }
-    if let Err(error) = checkpoint.validate_for(batch) {
-        return halted_before_face(batch, checkpoint, 0, error);
-    }
-
-    let mut checkpoint = checkpoint;
     let mut completions = Vec::new();
-    let face_count = batch.faces.len();
-
-    while checkpoint.completed_count() < face_count {
-        let ordinal = checkpoint.completed_count();
-        let face = &batch.faces[ordinal];
-
-        if cancellation.is_requested() {
-            return ConversionBatchExecutionOutcome::Halted {
-                checkpoint,
-                completions,
-                source_face_index: face.source_face_index,
-                outcome: ConversionTransactionOutcome::CancelledBeforeCommit {
-                    phase: ConversionPhase::CaptureValidation,
-                    message: "Production conversion batch cancelled before the next Face commit."
-                        .to_owned(),
-                },
-            };
-        }
-
-        let disposition = match disposition_for_face(batch, ordinal, backend) {
-            Ok(disposition) => disposition,
-            Err(error) => {
-                return ConversionBatchExecutionOutcome::Halted {
-                    checkpoint,
-                    completions,
-                    source_face_index: face.source_face_index,
-                    outcome: ConversionTransactionOutcome::FailedBeforeCommit {
-                        phase: ConversionPhase::CaptureValidation,
-                        error,
-                    },
-                };
-            }
-        };
-
-        let mut batch_report = |progress: ConversionProgress| {
-            let face_fraction = sanitize_fraction(progress.fraction);
-            report(ConversionBatchProgress {
-                source_face_index: face.source_face_index,
-                ordinal,
-                face_count,
-                phase: progress.phase,
-                face_fraction,
-                overall_fraction: sanitize_fraction(
-                    (ordinal as f32 + face_fraction) / face_count as f32,
-                ),
-                detail: progress.detail,
-            });
-        };
-        let outcome = run_conversion_transaction_with_disposition(
-            &face.capture,
-            &disposition,
+    loop {
+        match run_next_conversion_batch_face(
+            batch,
+            checkpoint,
             cancellation,
             backend,
-            &mut batch_report,
-        );
-
-        match outcome {
-            ConversionTransactionOutcome::Completed(completed) => {
-                if let Err(error) = checkpoint.record_committed(batch, &completed.committed_output) {
-                    return ConversionBatchExecutionOutcome::Halted {
+            &mut report,
+        ) {
+            ConversionBatchStepOutcome::AlreadyComplete {
+                checkpoint: completed_checkpoint,
+            } => {
+                return ConversionBatchExecutionOutcome::Completed {
+                    checkpoint: completed_checkpoint,
+                    completions,
+                };
+            }
+            ConversionBatchStepOutcome::CompletedFace {
+                checkpoint: next_checkpoint,
+                completed,
+                batch_complete,
+                ..
+            } => {
+                checkpoint = next_checkpoint;
+                completions.push(completed);
+                if batch_complete {
+                    return ConversionBatchExecutionOutcome::Completed {
                         checkpoint,
                         completions,
-                        source_face_index: face.source_face_index,
-                        outcome: ConversionTransactionOutcome::OutputCommittedNeedsRecovery {
-                            committed_output: completed.committed_output,
-                            production_project_path: completed.production_project_path,
-                            production_project: Some(completed.production_project),
-                            error: format!(
-                                "Converted Face committed but batch checkpoint could not advance: {error}"
-                            ),
-                        },
                     };
                 }
-                completions.push(completed);
             }
-            outcome => {
+            ConversionBatchStepOutcome::Halted {
+                checkpoint: halted_checkpoint,
+                source_face_index,
+                outcome,
+            } => {
                 return ConversionBatchExecutionOutcome::Halted {
-                    checkpoint,
+                    checkpoint: halted_checkpoint,
                     completions,
-                    source_face_index: face.source_face_index,
+                    source_face_index,
                     outcome,
                 };
             }
         }
-    }
-
-    ConversionBatchExecutionOutcome::Completed {
-        checkpoint,
-        completions,
     }
 }
 
@@ -186,20 +272,19 @@ where
     ProductionProjectDisposition::append_existing(loaded.file_sha256, &compatibility)
 }
 
-fn halted_before_face(
+fn halted_step_before_face(
     batch: &ConversionBatchCapture,
     checkpoint: ConversionBatchCheckpoint,
     ordinal: usize,
     error: String,
-) -> ConversionBatchExecutionOutcome {
+) -> ConversionBatchStepOutcome {
     let source_face_index = batch
         .faces
         .get(ordinal)
         .map(|face| face.source_face_index)
         .unwrap_or(0);
-    ConversionBatchExecutionOutcome::Halted {
+    ConversionBatchStepOutcome::Halted {
         checkpoint,
-        completions: Vec::new(),
         source_face_index,
         outcome: ConversionTransactionOutcome::FailedBeforeCommit {
             phase: ConversionPhase::CaptureValidation,
@@ -346,7 +431,7 @@ mod tests {
             if self
                 .fail_source
                 .as_deref()
-                .is_some_and(|path| path == capture.source_face_path)
+                .is_some_and(|path| path == capture.source_face_path.as_path())
             {
                 return Err("mock Face conversion failure".to_owned());
             }
@@ -398,6 +483,32 @@ mod tests {
             self.advance_project_identity();
             Ok(())
         }
+    }
+
+    #[test]
+    fn one_step_commits_exactly_one_face_before_returning_checkpoint() {
+        let batch = batch();
+        let mut backend = MockBackend::new();
+        let step = run_next_conversion_batch_face(
+            &batch,
+            ConversionBatchCheckpoint::default(),
+            &ConversionCancellation::default(),
+            &mut backend,
+            |_| {},
+        );
+        let ConversionBatchStepOutcome::CompletedFace {
+            checkpoint,
+            source_face_index,
+            batch_complete,
+            ..
+        } = step
+        else {
+            panic!("first batch step should commit one Face");
+        };
+        assert_eq!(source_face_index, 0);
+        assert_eq!(checkpoint.completed_count(), 1);
+        assert!(!batch_complete);
+        assert_eq!(backend.project.as_ref().unwrap().faces.len(), 1);
     }
 
     #[test]
