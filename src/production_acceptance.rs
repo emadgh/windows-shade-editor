@@ -38,6 +38,7 @@ mod tests {
     use super::*;
 
     const BUILD_WORKFLOW: &str = include_str!("../.github/workflows/build-windows.yml");
+    const COLOR_MANAGEMENT_SRC: &str = include_str!("color_management.rs");
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
     const EXPORT_TESTS: &str = include_str!("export.rs");
     const TIFF_IO_TESTS: &str = include_str!("tiff_io.rs");
@@ -102,6 +103,34 @@ mod tests {
             assert!(
                 TIFF_IO_TESTS.contains(required),
                 "missing required tiled/planar streaming coverage: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn color_management_uses_shared_icc_registry_as_profile_authority() {
+        for required in [
+            "IccProfileRegistry",
+            "IccProfileRegistry.inspect(path)",
+            "IccProfileRegistry.verify_identity",
+            ".installed()?",
+            "inspect_registry_profile_fresh",
+        ] {
+            assert!(
+                COLOR_MANAGEMENT_SRC.contains(required),
+                "Color Management lost shared ICC registry integration: {required}"
+            );
+        }
+        for forbidden in [
+            "EnumColorProfilesW",
+            "PROFILE_INSPECTION_CACHE",
+            "CachedProfileInspection",
+            "registered_profile_names",
+            "fn color_directory()",
+        ] {
+            assert!(
+                !COLOR_MANAGEMENT_SRC.contains(forbidden),
+                "Color Management reintroduced private ICC registry infrastructure: {forbidden}"
             );
         }
     }
