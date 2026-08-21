@@ -1,14 +1,12 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use lcms2::{
-    ColorSpaceSignature, ColorSpaceSignatureExt, InfoType, Locale, Profile, ProfileClassSignature,
-    Tag, TagSignature,
-};
-use sha2::{Digest, Sha256};
+use lcms2::{ColorSpaceSignature, Profile, Tag, TagSignature};
 
 use crate::color_conversion::ConversionEngineMode;
+use crate::icc_profile_registry::{
+    inspect_profile_fresh, IccProfileRecord, IccProfileRegistry, IccProfileRole,
+};
 use crate::model::IccProfileIdentity;
 use crate::tiff_io::ColorModel;
 
@@ -30,10 +28,8 @@ pub struct ProductionTargetProfileInspection {
 
 /// Inspect either an Output-class target profile or a DeviceLink.
 ///
-/// Normal ICC output profiles define only the destination device space; the
-/// separately selected Source ICC supplies source colorimetry. DeviceLinks
-/// define both input and output device spaces, so their input must match the
-/// active RGB/CMYK source model.
+/// Identity, role and declared input/output topology come from the canonical ICC
+/// registry. Production target inspection adds only channel-name/colorant-table policy.
 pub fn inspect_production_target_profile(
     path: &Path,
     mode: ConversionEngineMode,
@@ -46,40 +42,10 @@ pub fn inspect_production_target_profile(
         );
     }
 
-    let bytes = fs::read(path).map_err(|err| {
-        format!(
-            "Cannot read production target profile {}: {err}",
-            path.display()
-        )
-    })?;
-    let profile = Profile::new_icc(&bytes).map_err(|err| {
-        format!(
-            "Cannot open production target profile {}: {err}",
-            path.display()
-        )
-    })?;
-
-    let facts = profile_facts(&profile, mode, source_model)?;
-    let (channel_names, channel_names_authoritative) = target_channel_names(
-        &profile,
-        mode,
-        facts.output_space,
-        facts.output_channel_count,
-    );
-
-    Ok(ProductionTargetProfileInspection {
-        path: path.to_path_buf(),
-        identity: IccProfileIdentity {
-            description: profile_description(&profile),
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
-        },
-        device_class_label: profile_class_label(profile.device_class()),
-        source_space_label: facts.source_space.map(color_space_label),
-        output_space_label: color_space_label(facts.output_space),
-        output_channel_count: facts.output_channel_count,
-        channel_names,
-        channel_names_authoritative,
-    })
+    // Selection is an identity-bearing persistence boundary: bypass browse cache and
+    // capture facts from a fresh byte read/hash.
+    let record = inspect_profile_fresh(path)?;
+    inspect_target_record(path, record, mode, source_model)
 }
 
 /// Re-inspect an assigned target and reject replacement at the stored path.
@@ -89,82 +55,111 @@ pub fn verify_production_target_profile(
     mode: ConversionEngineMode,
     source_model: ColorModel,
 ) -> Result<ProductionTargetProfileInspection, String> {
-    if expected_identity.sha256.trim().is_empty() {
+    if mode == ConversionEngineMode::CustomOptimizer {
         return Err(
-            "Production target profile has no stored SHA-256 identity. Select it again.".to_owned(),
+            "Custom optimizer targets require characterized target data, not an ICC/DeviceLink file."
+                .to_owned(),
         );
     }
-    let inspected = inspect_production_target_profile(path, mode, source_model)?;
-    if !inspected
-        .identity
-        .sha256
-        .eq_ignore_ascii_case(expected_identity.sha256.trim())
-    {
-        return Err(format!(
-            "Production target profile at {} no longer matches stored profile '{}'. Select or relink the target profile before conversion.",
-            path.display(),
-            expected_identity.description
-        ));
-    }
-    Ok(inspected)
+    let record = IccProfileRegistry.verify_identity(path, expected_identity)?;
+    inspect_target_record(path, record, mode, source_model)
+}
+
+fn inspect_target_record(
+    path: &Path,
+    record: IccProfileRecord,
+    mode: ConversionEngineMode,
+    source_model: ColorModel,
+) -> Result<ProductionTargetProfileInspection, String> {
+    let facts = profile_facts(&record, mode, source_model)?;
+
+    // LittleCMS is reopened only for target ColorantTable/ColorantTableOut tags.
+    // Identity, role and topology have already been frozen by the registry record.
+    let profile = Profile::new_file(path).map_err(|err| {
+        format!(
+            "Cannot open production target profile {} for colorant metadata: {err}",
+            path.display()
+        )
+    })?;
+    let (channel_names, channel_names_authoritative) = target_channel_names(
+        &profile,
+        mode,
+        &facts.output_space_label,
+        facts.output_channel_count,
+    );
+
+    // Fail closed if the external profile changed while LittleCMS was reopened to read
+    // ColorantTable metadata. The returned channel names must belong to the same exact
+    // bytes whose identity/role/topology were frozen above.
+    IccProfileRegistry.verify_identity(path, &record.identity)?;
+
+    Ok(ProductionTargetProfileInspection {
+        path: path.to_path_buf(),
+        identity: record.identity,
+        device_class_label: record.role.label().to_owned(),
+        source_space_label: facts.source_space_label,
+        output_space_label: facts.output_space_label,
+        output_channel_count: facts.output_channel_count,
+        channel_names,
+        channel_names_authoritative,
+    })
 }
 
 #[derive(Debug)]
 struct ProfileFacts {
-    source_space: Option<ColorSpaceSignature>,
-    output_space: ColorSpaceSignature,
+    source_space_label: Option<String>,
+    output_space_label: String,
     output_channel_count: usize,
 }
 
 fn profile_facts(
-    profile: &Profile,
+    record: &IccProfileRecord,
     mode: ConversionEngineMode,
     source_model: ColorModel,
 ) -> Result<ProfileFacts, String> {
     match mode {
         ConversionEngineMode::Icc => {
-            if profile.device_class() != ProfileClassSignature::OutputClass {
+            if record.role != IccProfileRole::Output {
                 return Err(format!(
                     "Standard ICC target must be an Output/printer profile; selected profile is {}.",
-                    profile_class_label(profile.device_class())
+                    record.role.label()
                 ));
             }
-            let output_space = profile.color_space();
-            let output_channel_count = output_space.channels() as usize;
-            validate_output_channels(output_space, output_channel_count)?;
+            let output_space_label = record.color_space_label();
+            let output_channel_count = record.color_space_channels();
+            validate_output_channels(&output_space_label, output_channel_count)?;
             Ok(ProfileFacts {
-                source_space: None,
-                output_space,
+                source_space_label: None,
+                output_space_label,
                 output_channel_count,
             })
         }
         ConversionEngineMode::DeviceLink => {
-            if profile.device_class() != ProfileClassSignature::LinkClass {
+            if record.role != IccProfileRole::DeviceLink {
                 return Err(format!(
                     "DeviceLink mode requires a DeviceLink profile; selected profile is {}.",
-                    profile_class_label(profile.device_class())
+                    record.role.label()
                 ));
             }
-            let source_space = profile.color_space();
-            let expected_source = expected_source_space(source_model).ok_or_else(|| {
-                format!(
+            if !matches!(source_model, ColorModel::Rgb | ColorModel::Cmyk) {
+                return Err(format!(
                     "{} source data cannot be used as a production DeviceLink input.",
                     source_model.title()
-                )
-            })?;
-            if source_space != expected_source {
+                ));
+            }
+            if !record.compatible_with_source_model(source_model) {
                 return Err(format!(
                     "DeviceLink input space {} does not match source {}.",
-                    color_space_label(source_space),
+                    record.color_space_label(),
                     source_model.title()
                 ));
             }
-            let output_space = profile.pcs();
-            let output_channel_count = output_space.channels() as usize;
-            validate_output_channels(output_space, output_channel_count)?;
+            let output_space_label = record.pcs_space_label();
+            let output_channel_count = record.pcs_space_channels();
+            validate_output_channels(&output_space_label, output_channel_count)?;
             Ok(ProfileFacts {
-                source_space: Some(source_space),
-                output_space,
+                source_space_label: Some(record.color_space_label()),
+                output_space_label,
                 output_channel_count,
             })
         }
@@ -173,29 +168,27 @@ fn profile_facts(
 }
 
 fn validate_output_channels(
-    output_space: ColorSpaceSignature,
+    output_space_label: &str,
     output_channel_count: usize,
 ) -> Result<(), String> {
-    if output_channel_count == 4 && output_space == ColorSpaceSignature::CmykData {
+    if output_channel_count == 4 && output_space_label.eq_ignore_ascii_case("CMYK") {
         return Ok(());
     }
     if (5..=12).contains(&output_channel_count) {
         return Ok(());
     }
     Err(format!(
-        "Production target space {} has {} channels; current production transforms support CMYK (4) or N-channel 5..=12 output.",
-        color_space_label(output_space),
-        output_channel_count
+        "Production target space {output_space_label} has {output_channel_count} channels; current production transforms support CMYK (4) or N-channel 5..=12 output."
     ))
 }
 
 fn target_channel_names(
     profile: &Profile,
     mode: ConversionEngineMode,
-    output_space: ColorSpaceSignature,
+    output_space_label: &str,
     channel_count: usize,
 ) -> (Vec<String>, bool) {
-    if output_space == ColorSpaceSignature::CmykData {
+    if output_space_label.eq_ignore_ascii_case("CMYK") && channel_count == 4 {
         return (
             ["Cyan", "Magenta", "Yellow", "Black"]
                 .into_iter()
@@ -258,57 +251,34 @@ fn valid_channel_names(names: &[String], expected_count: usize) -> bool {
     validate_target_channel_names(names, expected_count).is_ok()
 }
 
-fn expected_source_space(model: ColorModel) -> Option<ColorSpaceSignature> {
-    match model {
-        ColorModel::Rgb => Some(ColorSpaceSignature::RgbData),
-        ColorModel::Cmyk => Some(ColorSpaceSignature::CmykData),
-        ColorModel::Gray | ColorModel::Other => None,
-    }
-}
-
-fn profile_description(profile: &Profile) -> String {
-    profile
-        .info(InfoType::Description, Locale::none())
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "ICC profile".to_owned())
-}
-
-fn color_space_label(space: ColorSpaceSignature) -> String {
-    match space {
-        ColorSpaceSignature::RgbData => "RGB".to_owned(),
-        ColorSpaceSignature::CmykData => "CMYK".to_owned(),
-        ColorSpaceSignature::GrayData => "Gray".to_owned(),
-        other => format!("{other:?}"),
-    }
-}
-
-fn profile_class_label(class: ProfileClassSignature) -> String {
-    match class {
-        ProfileClassSignature::InputClass => "Input".to_owned(),
-        ProfileClassSignature::DisplayClass => "Display".to_owned(),
-        ProfileClassSignature::OutputClass => "Output / printer".to_owned(),
-        ProfileClassSignature::LinkClass => "DeviceLink".to_owned(),
-        ProfileClassSignature::AbstractClass => "Abstract".to_owned(),
-        ProfileClassSignature::ColorSpaceClass => "Color space".to_owned(),
-        ProfileClassSignature::NamedColorClass => "Named color".to_owned(),
-        other => format!("{other:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_profile_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shade-production-target-{label}-{}-{}.icc",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn save_profile(profile: &mut Profile, label: &str) -> PathBuf {
+        let path = temp_profile_path(label);
+        profile.save_profile_to_file(&path).unwrap();
+        path
+    }
 
     #[test]
     fn standard_cmyk_topology_is_authoritative() {
         let profile = Profile::new_srgb();
-        let (names, authoritative) = target_channel_names(
-            &profile,
-            ConversionEngineMode::Icc,
-            ColorSpaceSignature::CmykData,
-            4,
-        );
+        let (names, authoritative) =
+            target_channel_names(&profile, ConversionEngineMode::Icc, "CMYK", 4);
         assert!(authoritative);
         assert_eq!(names, ["Cyan", "Magenta", "Yellow", "Black"]);
     }
@@ -316,12 +286,8 @@ mod tests {
     #[test]
     fn missing_nchannel_colorant_table_requires_operator_confirmation() {
         let profile = Profile::new_srgb();
-        let (names, authoritative) = target_channel_names(
-            &profile,
-            ConversionEngineMode::Icc,
-            ColorSpaceSignature::Sig7colorData,
-            7,
-        );
+        let (names, authoritative) =
+            target_channel_names(&profile, ConversionEngineMode::Icc, "Sig7colorData", 7);
         assert!(!authoritative);
         assert_eq!(names.first().map(String::as_str), Some("Ink 1"));
         assert_eq!(names.last().map(String::as_str), Some("Ink 7"));
@@ -345,32 +311,54 @@ mod tests {
 
     #[test]
     fn display_profile_is_rejected_as_production_output_target() {
-        let profile = Profile::new_srgb();
-        let error = profile_facts(&profile, ConversionEngineMode::Icc, ColorModel::Rgb)
+        let path = save_profile(&mut Profile::new_srgb(), "display");
+        let record = inspect_profile_fresh(&path).unwrap();
+        let error = profile_facts(&record, ConversionEngineMode::Icc, ColorModel::Rgb)
             .expect_err("sRGB display profile is not an output target");
         assert!(error.contains("Output/printer"));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn real_cmyk_devicelink_declares_direct_input_and_output_topology() {
-        let profile = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0).unwrap();
+        let mut profile = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0).unwrap();
+        let path = save_profile(&mut profile, "devicelink");
+        let record = inspect_profile_fresh(&path).unwrap();
         let facts =
-            profile_facts(&profile, ConversionEngineMode::DeviceLink, ColorModel::Cmyk).unwrap();
-        assert_eq!(facts.source_space, Some(ColorSpaceSignature::CmykData));
-        assert_eq!(facts.output_space, ColorSpaceSignature::CmykData);
+            profile_facts(&record, ConversionEngineMode::DeviceLink, ColorModel::Cmyk).unwrap();
+        assert_eq!(facts.source_space_label.as_deref(), Some("CMYK"));
+        assert_eq!(facts.output_space_label, "CMYK");
         assert_eq!(facts.output_channel_count, 4);
 
-        let error = profile_facts(&profile, ConversionEngineMode::DeviceLink, ColorModel::Rgb)
+        let error = profile_facts(&record, ConversionEngineMode::DeviceLink, ColorModel::Rgb)
             .expect_err("CMYK DeviceLink must reject RGB source topology");
         assert!(error.contains("does not match"));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn unsupported_output_channel_counts_are_rejected() {
-        assert!(validate_output_channels(ColorSpaceSignature::CmykData, 4).is_ok());
-        assert!(validate_output_channels(ColorSpaceSignature::Sig4colorData, 4).is_err());
-        assert!(validate_output_channels(ColorSpaceSignature::Sig7colorData, 7).is_ok());
-        assert!(validate_output_channels(ColorSpaceSignature::RgbData, 3).is_err());
-        assert!(validate_output_channels(ColorSpaceSignature::Sig13colorData, 13).is_err());
+        assert!(validate_output_channels("CMYK", 4).is_ok());
+        assert!(validate_output_channels("Sig4colorData", 4).is_err());
+        assert!(validate_output_channels("Sig7colorData", 7).is_ok());
+        assert!(validate_output_channels("RGB", 3).is_err());
+        assert!(validate_output_channels("Sig13colorData", 13).is_err());
+    }
+
+    #[test]
+    fn verification_reuses_registry_fresh_identity_boundary() {
+        let path = save_profile(&mut Profile::new_srgb(), "verify");
+        let selected = inspect_profile_fresh(&path).unwrap();
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, vec![0u8; original.len()]).unwrap();
+        let error = verify_production_target_profile(
+            &path,
+            &selected.identity,
+            ConversionEngineMode::Icc,
+            ColorModel::Rgb,
+        )
+        .unwrap_err();
+        assert!(error.contains("no longer matches") || error.contains("Cannot open ICC profile"));
+        let _ = fs::remove_file(path);
     }
 }
