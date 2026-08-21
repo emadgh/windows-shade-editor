@@ -39,6 +39,7 @@ mod tests {
 
     const BUILD_WORKFLOW: &str = include_str!("../.github/workflows/build-windows.yml");
     const COLOR_MANAGEMENT_SRC: &str = include_str!("color_management.rs");
+    const PRODUCTION_TARGET_SRC: &str = include_str!("production_target.rs");
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
     const EXPORT_TESTS: &str = include_str!("export.rs");
     const TIFF_IO_TESTS: &str = include_str!("tiff_io.rs");
@@ -131,6 +132,35 @@ mod tests {
             assert!(
                 !COLOR_MANAGEMENT_SRC.contains(forbidden),
                 "Color Management reintroduced private ICC registry infrastructure: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_target_uses_shared_icc_registry_as_identity_and_role_authority() {
+        for required in [
+            "inspect_profile_fresh(path)?",
+            "IccProfileRegistry.verify_identity",
+            "IccProfileRegistry.verify_identity(path, &record.identity)?",
+            "IccProfileRole::Output",
+            "IccProfileRole::DeviceLink",
+            "record.compatible_with_source_model",
+            "record.pcs_space_channels()",
+        ] {
+            assert!(
+                PRODUCTION_TARGET_SRC.contains(required),
+                "Production target lost shared ICC registry integration: {required}"
+            );
+        }
+        for forbidden in [
+            "Sha256::digest",
+            "fn profile_description(",
+            "fn profile_class_label(",
+            "let bytes = fs::read(path)",
+        ] {
+            assert!(
+                !PRODUCTION_TARGET_SRC.contains(forbidden),
+                "Production target reintroduced private ICC identity/role inspection: {forbidden}"
             );
         }
     }
