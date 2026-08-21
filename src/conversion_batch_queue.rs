@@ -869,6 +869,7 @@ mod tests {
         let project = ShadeProject::default();
         let mut faces = Vec::new();
         for index in 0..2 {
+            let source_profile_hash = if index == 0 { hash('1') } else { hash('2') };
             let capture = ConversionJobCapture::capture(
                 &project,
                 PathBuf::from(r"C:\Design\Source.shade"),
@@ -877,7 +878,7 @@ mod tests {
                 Some(7),
                 hash(if index == 0 { 'b' } else { 'c' }),
                 CapturedSourceProfile::Embedded,
-                recipe(if index == 0 { &hash('1') } else { &hash('2') }),
+                recipe(&source_profile_hash),
                 CapturedOutputPolicy::MustNotExist,
                 PathBuf::from(format!(r"C:\Production\{project_suffix}-Face-{index}.tif")),
                 PathBuf::from(format!(r"C:\Production\{project_suffix}.shade")),
