@@ -25,11 +25,16 @@ use windows_shade_editor::conversion_workflow::{
 use windows_shade_editor::design_source::{
     DesignSourceColorModel, SourceImageFormat, SourceLossiness, TransparencyState,
 };
+use windows_shade_editor::icc_profile_registry::IccProfileRegistry;
 use windows_shade_editor::model::IccProfileIdentity as ConversionIccProfileIdentity;
 use windows_shade_editor::production_destination::{
     ProductionDestinationCandidate, inspect_linked_production_destinations,
 };
 use windows_shade_editor::production_destination_selection::FrozenProductionDestination;
+use windows_shade_editor::production_profile_catalog::{
+    ProductionProfileCandidate, inspect_production_profile_candidate,
+    installed_production_profiles, verify_production_profile_candidate,
+};
 use windows_shade_editor::production_project_disposition::ProductionProjectDisposition;
 use windows_shade_editor::production_target::{
     ProductionTargetProfileInspection, validate_target_channel_names,
@@ -59,6 +64,11 @@ pub(crate) struct ColorConversionUiState {
     stage: ConversionStage,
     engine_mode: ConversionEngineMode,
     target_profile: Option<ProductionTargetProfileInspection>,
+    installed_target_profiles: Vec<ProductionProfileCandidate>,
+    installed_profiles_loaded: bool,
+    installed_profiles_error: Option<String>,
+    target_profile_query: String,
+    show_incompatible_profiles: bool,
     target_name: String,
     channel_names: Vec<String>,
     channel_names_confirmed: bool,
@@ -80,6 +90,11 @@ impl Default for ColorConversionUiState {
             stage: ConversionStage::SourcePreflight,
             engine_mode: ConversionEngineMode::Icc,
             target_profile: None,
+            installed_target_profiles: Vec::new(),
+            installed_profiles_loaded: false,
+            installed_profiles_error: None,
+            target_profile_query: String::new(),
+            show_incompatible_profiles: false,
             target_name: String::new(),
             channel_names: Vec::new(),
             channel_names_confirmed: false,
@@ -115,6 +130,13 @@ impl ColorConversionUiState {
         self.output_path = None;
     }
 
+    fn clear_installed_profile_catalog(&mut self) {
+        self.installed_target_profiles.clear();
+        self.installed_profiles_loaded = false;
+        self.installed_profiles_error = None;
+        self.target_profile_query.clear();
+    }
+
     fn accept_target_profile(
         &mut self,
         profile: ProductionTargetProfileInspection,
@@ -127,6 +149,7 @@ impl ColorConversionUiState {
             recommended_output_path(source_path, &self.target_name, profile.output_channel_count)
                 .ok();
         self.target_profile = Some(profile);
+        self.installed_profiles_error = None;
     }
 }
 
@@ -400,20 +423,10 @@ impl ShadeApp {
                 })
                 .pick_file()
             {
-                match windows_shade_editor::production_target::inspect_production_target_profile(
-                    &path,
-                    self.color_conversion.engine_mode,
-                    conversion_color_model(source.source_model),
-                ) {
-                    Ok(profile) => {
-                        let description = profile.identity.description.clone();
-                        let channels = profile.output_channel_count;
-                        self.color_conversion
-                            .accept_target_profile(profile, &source.source_path);
-                        self.report_info(format!(
-                            "Selected production target '{description}' ({channels} channels)."
-                        ));
-                    }
+                match accept_target_profile_path(&mut self.color_conversion, &source, &path) {
+                    Ok((description, channels)) => self.report_info(format!(
+                        "Selected production target '{description}' ({channels} channels)."
+                    )),
                     Err(err) => self.report_error(err),
                 }
             }
@@ -587,11 +600,13 @@ impl ShadeApp {
             .map(|face| face.label.clone())
             .unwrap_or_else(|| format!("Face {}", self.current_face + 1));
 
-        match color_management::inspect_profile(&path) {
-            Ok(profile) if profile.compatible_with_runtime(source_model) => {
+        match IccProfileRegistry.inspect(&path) {
+            Ok(profile)
+                if profile.compatible_with_source_model(conversion_color_model(source_model)) =>
+            {
                 let assignment = model::ProductionSourceProfileAssignment {
                     path: path.to_string_lossy().into_owned(),
-                    identity: profile.identity().clone(),
+                    identity: local_profile_identity(&profile.identity),
                 };
                 let Some(face) = self.project.faces.get_mut(self.current_face) else {
                     self.report_error(
@@ -945,6 +960,51 @@ fn render_source_preflight(
     }
 }
 
+fn refresh_installed_target_profiles(
+    state: &mut ColorConversionUiState,
+    source: &CurrentConversionSource,
+) {
+    state.installed_profiles_loaded = true;
+    match installed_production_profiles(
+        IccProfileRegistry,
+        state.engine_mode,
+        conversion_color_model(source.source_model),
+        "",
+        true,
+    ) {
+        Ok(rows) => {
+            state.installed_target_profiles = rows;
+            state.installed_profiles_error = None;
+        }
+        Err(error) => {
+            state.installed_target_profiles.clear();
+            state.installed_profiles_error = Some(error);
+        }
+    }
+}
+
+fn accept_target_profile_path(
+    state: &mut ColorConversionUiState,
+    source: &CurrentConversionSource,
+    path: &Path,
+) -> Result<(String, usize), String> {
+    inspect_production_profile_candidate(
+        IccProfileRegistry,
+        path,
+        state.engine_mode,
+        conversion_color_model(source.source_model),
+    )?;
+    let profile = windows_shade_editor::production_target::inspect_production_target_profile(
+        path,
+        state.engine_mode,
+        conversion_color_model(source.source_model),
+    )?;
+    let description = profile.identity.description.clone();
+    let channels = profile.output_channel_count;
+    state.accept_target_profile(profile, &source.source_path);
+    Ok((description, channels))
+}
+
 fn render_target_setup(
     ui: &mut egui::Ui,
     state: &mut ColorConversionUiState,
@@ -984,23 +1044,124 @@ fn render_target_setup(
         });
     if previous_mode != state.engine_mode {
         state.clear_target_profile();
+        state.clear_installed_profile_catalog();
         state.black_point_compensation = state.engine_mode == ConversionEngineMode::Icc;
     }
 
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .button(match state.engine_mode {
-                ConversionEngineMode::Icc => "Select Output ICC...",
-                ConversionEngineMode::DeviceLink => "Select DeviceLink...",
-                ConversionEngineMode::CustomOptimizer => "Select characterization...",
-            })
-            .clicked()
-        {
-            *select_target_profile = true;
+    ui.group(|ui| {
+        ui.strong("Production target profile");
+        ui.horizontal_wrapped(|ui| {
+            let installed_label = if state.installed_profiles_loaded {
+                "Refresh installed profiles"
+            } else {
+                "Browse installed profiles"
+            };
+            if ui
+                .add_enabled(
+                    state.engine_mode != ConversionEngineMode::CustomOptimizer,
+                    egui::Button::new(installed_label),
+                )
+                .clicked()
+            {
+                refresh_installed_target_profiles(state, source);
+            }
+            if ui
+                .button(match state.engine_mode {
+                    ConversionEngineMode::Icc => "Browse Output ICC file...",
+                    ConversionEngineMode::DeviceLink => "Browse DeviceLink file...",
+                    ConversionEngineMode::CustomOptimizer => "Select characterization...",
+                })
+                .clicked()
+            {
+                *select_target_profile = true;
+            }
+        });
+
+        if state.installed_profiles_loaded {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Filter");
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.target_profile_query)
+                        .desired_width(260.0)
+                        .hint_text("description, filename, role, color space"),
+                );
+                ui.checkbox(
+                    &mut state.show_incompatible_profiles,
+                    "Show incompatible",
+                );
+            });
+
+            let mut selected_installed: Option<PathBuf> = None;
+            let mut visible_count = 0usize;
+            egui::ScrollArea::vertical()
+                .id_salt("conversion-installed-production-profiles")
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    for candidate in &state.installed_target_profiles {
+                        if !candidate.profile.matches_query(&state.target_profile_query) {
+                            continue;
+                        }
+                        if !state.show_incompatible_profiles && !candidate.selectable() {
+                            continue;
+                        }
+                        visible_count += 1;
+                        let topology = if candidate.profile.is_device_link() {
+                            format!(
+                                "{} → {} · {}ch",
+                                candidate.profile.color_space_label(),
+                                candidate.profile.pcs_space_label(),
+                                candidate.profile.pcs_space_channels(),
+                            )
+                        } else {
+                            format!(
+                                "{} · {}ch",
+                                candidate.profile.color_space_label(),
+                                candidate.profile.color_space_channels(),
+                            )
+                        };
+                        let label = format!(
+                            "{} · {} · {}",
+                            candidate.profile.description,
+                            candidate.profile.role.label(),
+                            topology,
+                        );
+                        let selected = state.target_profile.as_ref().is_some_and(|current| {
+                            current.path == candidate.profile.path
+                                && current
+                                    .identity
+                                    .sha256
+                                    .eq_ignore_ascii_case(&candidate.profile.identity.sha256)
+                        });
+                        let response = ui.add_enabled(
+                            candidate.selectable(),
+                            egui::Button::selectable(selected, label),
+                        );
+                        let response = if let Some(rejection) = candidate.rejection {
+                            response.on_hover_text(rejection.label())
+                        } else {
+                            response.on_hover_text(candidate.profile.path.display().to_string())
+                        };
+                        if response.clicked() {
+                            selected_installed = Some(candidate.profile.path.clone());
+                        }
+                    }
+                });
+            ui.small(format!("{visible_count} installed profile(s) shown"));
+
+            if let Some(path) = selected_installed {
+                if let Err(error) = accept_target_profile_path(state, source, &path) {
+                    state.installed_profiles_error = Some(error);
+                }
+            }
         }
+
+        if let Some(error) = state.installed_profiles_error.as_deref() {
+            ui.label(egui::RichText::new(error).color(egui::Color32::LIGHT_RED));
+        }
+
         if let Some(profile) = state.target_profile.as_ref() {
             ui.label(
-                egui::RichText::new(&profile.identity.description)
+                egui::RichText::new(format!("Selected: {}", profile.identity.description))
                     .color(egui::Color32::LIGHT_GREEN),
             );
         } else {
@@ -1332,6 +1493,13 @@ fn seed_state_from_existing_destination(
     let profile_identity = profile_identity.ok_or_else(|| {
         "Selected Production recipe does not contain its target profile identity.".to_owned()
     })?;
+    verify_production_profile_candidate(
+        IccProfileRegistry,
+        Path::new(profile_path),
+        profile_identity,
+        recipe.engine_mode,
+        conversion_color_model(source.source_model),
+    )?;
     let verified = verify_production_target_profile(
         Path::new(profile_path),
         profile_identity,
@@ -1368,6 +1536,15 @@ fn build_target_setup_review(
         ]);
     };
 
+    if let Err(err) = verify_production_profile_candidate(
+        IccProfileRegistry,
+        &stored_profile.path,
+        &stored_profile.identity,
+        state.engine_mode,
+        conversion_color_model(source.source_model),
+    ) {
+        errors.push(err);
+    }
     let inspected = match verify_production_target_profile(
         &stored_profile.path,
         &stored_profile.identity,
@@ -1661,14 +1838,29 @@ fn production_source_profile_state(
 ) -> (SourceProfileState, String, Option<String>, bool) {
     if let Some(assignment) = face.and_then(|face| face.production_source_profile.as_ref()) {
         let path = PathBuf::from(&assignment.path);
-        return match color_management::inspect_production_source_profile_runtime(
-            &path,
-            &assignment.identity,
-            source_model,
-        ) {
+        let expected = conversion_profile_identity(&assignment.identity);
+        return match IccProfileRegistry.verify_identity(&path, &expected) {
+            Ok(profile)
+                if profile.compatible_with_source_model(conversion_color_model(source_model)) =>
+            {
+                (
+                    SourceProfileState::Assigned(profile.identity.clone()),
+                    format!("Assigned: {}", profile.description),
+                    Some(assignment.path.clone()),
+                    true,
+                )
+            }
             Ok(profile) => (
-                SourceProfileState::Assigned(conversion_profile_identity(profile.identity())),
-                format!("Assigned: {}", profile.description),
+                SourceProfileState::Invalid(format!(
+                    "Assigned production Source ICC '{}' declares {} but the source Face is {}.",
+                    profile.description,
+                    profile.color_space_label(),
+                    source_model.title(),
+                )),
+                format!(
+                    "Assigned profile invalid: {}",
+                    assignment.identity.description
+                ),
                 Some(assignment.path.clone()),
                 true,
             ),
@@ -1713,6 +1905,15 @@ fn conversion_profile_identity(
     identity: &model::IccProfileIdentity,
 ) -> ConversionIccProfileIdentity {
     ConversionIccProfileIdentity {
+        description: identity.description.clone(),
+        sha256: identity.sha256.clone(),
+    }
+}
+
+fn local_profile_identity(
+    identity: &ConversionIccProfileIdentity,
+) -> model::IccProfileIdentity {
+    model::IccProfileIdentity {
         description: identity.description.clone(),
         sha256: identity.sha256.clone(),
     }
