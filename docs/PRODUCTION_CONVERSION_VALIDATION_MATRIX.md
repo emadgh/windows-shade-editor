@@ -26,6 +26,20 @@ This matrix separates automated internal conformance from external application/R
 | Production printer workflow | Confirm RIP output maps each generated separation to the intended physical ink and preserves configured limits | Pending production approval |
 | Measurement / fired result | Record target, ink set, profile/DeviceLink identity, print/firing conditions and measured/fired acceptance result | Pending calibrated production dataset |
 
+## External evidence record
+
+Every row moved out of `Pending` must be backed by a reproducible evidence record containing at least:
+
+- source fixture name and SHA-256;
+- generated output TIFF SHA-256;
+- exact target ICC/DeviceLink description and SHA-256;
+- Shade Editor version and immutable conversion-recipe identity;
+- consumer name/version (Photoshop, RIP, printer workflow, or measurement system);
+- dimensions, bit depth, channel count, channel order and exact channel names observed by that consumer;
+- pass/fail result plus notes or attached screenshots/reports where appropriate.
+
+Production/fired approval additionally records printer/RIP configuration, physical ink set, substrate/body, firing conditions and the measurement/fired-result reference. Approval evidence must identify the exact fixture and profile bytes; filename-only or visually similar replacements are not equivalent evidence.
+
 ## Approval rule
 
 External rows must stay `Pending` until evidence from the named consumer is attached to the corresponding validation work. Internal unit/integration tests must never be used as a substitute for external Photoshop/RIP/production approval.
