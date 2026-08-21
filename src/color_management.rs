@@ -12,6 +12,7 @@ use windows_shade_editor::icc_profile_registry::{
     inspect_profile_fresh as inspect_registry_profile_fresh,
     is_profile_path as registry_is_profile_path, IccProfileRecord, IccProfileRegistry,
 };
+use windows_shade_editor::model::IccProfileIdentity as RegistryIccProfileIdentity;
 
 use crate::model::{IccProfileIdentity, PreviewRenderingIntent, ShadeProject};
 use crate::runtime_preview::{RuntimeColorModel, RuntimePreviewSource};
@@ -633,6 +634,20 @@ pub fn file_profile_preferred_intent(path: &Path) -> Result<PreviewRenderingInte
     })
 }
 
+fn local_identity(identity: RegistryIccProfileIdentity) -> IccProfileIdentity {
+    IccProfileIdentity {
+        description: identity.description,
+        sha256: identity.sha256,
+    }
+}
+
+fn registry_identity(identity: &IccProfileIdentity) -> RegistryIccProfileIdentity {
+    RegistryIccProfileIdentity {
+        description: identity.description.clone(),
+        sha256: identity.sha256.clone(),
+    }
+}
+
 fn installed_profile_from_registry(record: IccProfileRecord) -> Result<InstalledIccProfile, String> {
     // Color Management still needs the raw LCMS signatures to construct preview transforms.
     // Discovery, caching and identity are owned by the canonical registry; this reopen only
@@ -644,7 +659,7 @@ fn installed_profile_from_registry(record: IccProfileRecord) -> Result<Installed
         description: record.description,
         color_space: profile.color_space(),
         device_class: profile.device_class(),
-        identity: record.identity,
+        identity: local_identity(record.identity),
     })
 }
 
@@ -653,7 +668,7 @@ pub fn inspect_profile(path: &Path) -> Result<InstalledIccProfile, String> {
 }
 
 pub fn profile_identity(path: &Path) -> Result<IccProfileIdentity, String> {
-    inspect_registry_profile_fresh(path).map(|profile| profile.identity)
+    inspect_registry_profile_fresh(path).map(|profile| local_identity(profile.identity))
 }
 
 pub fn production_embedded_profile_identity_for_runtime(
@@ -692,9 +707,8 @@ pub fn inspect_production_source_profile_runtime(
     expected_identity: &IccProfileIdentity,
     source_model: RuntimeColorModel,
 ) -> Result<InstalledIccProfile, String> {
-    let profile = installed_profile_from_registry(
-        IccProfileRegistry.verify_identity(path, expected_identity)?,
-    )?;
+    let expected = registry_identity(expected_identity);
+    let profile = installed_profile_from_registry(IccProfileRegistry.verify_identity(path, &expected)?)?;
     if !profile.compatible_with_runtime(source_model) {
         return Err(format!(
             "Assigned production Source ICC '{}' declares {} but the source Face is {}.",
@@ -750,9 +764,8 @@ pub fn inspect_production_source_profile(
     expected_identity: &IccProfileIdentity,
     source_model: ColorModel,
 ) -> Result<InstalledIccProfile, String> {
-    let profile = installed_profile_from_registry(
-        IccProfileRegistry.verify_identity(path, expected_identity)?,
-    )?;
+    let expected = registry_identity(expected_identity);
+    let profile = installed_profile_from_registry(IccProfileRegistry.verify_identity(path, &expected)?)?;
     if !profile.compatible_with(source_model) {
         return Err(format!(
             "Assigned production Source ICC '{}' declares {} but the source Face is {}.",
@@ -772,8 +785,9 @@ fn verify_profile_identity(
     let Some(expected) = expected.filter(|identity| !identity.sha256.trim().is_empty()) else {
         return Ok(());
     };
+    let expected_registry = registry_identity(expected);
     IccProfileRegistry
-        .verify_identity(path, expected)
+        .verify_identity(path, &expected_registry)
         .map(|_| ())
         .map_err(|_| {
             format!(
@@ -793,7 +807,10 @@ pub fn resolve_external_profile_path(
         if path.is_file()
             && (identity.is_none()
                 || identity.is_some_and(|expected| {
-                    IccProfileRegistry.verify_identity(&path, expected).is_ok()
+                    let expected_registry = registry_identity(expected);
+                    IccProfileRegistry
+                        .verify_identity(&path, &expected_registry)
+                        .is_ok()
                 }))
         {
             return Some(path);
@@ -1265,7 +1282,12 @@ mod tests {
         let expected = profile_identity(&path).unwrap();
         let original = fs::read(&path).unwrap();
         fs::write(&path, vec![0u8; original.len()]).unwrap();
-        assert!(IccProfileRegistry.verify_identity(&path, &expected).is_err());
+        let expected_registry = registry_identity(&expected);
+        assert!(
+            IccProfileRegistry
+                .verify_identity(&path, &expected_registry)
+                .is_err()
+        );
         let _ = fs::remove_file(path);
     }
 }
