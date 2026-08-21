@@ -1,0 +1,33 @@
+# Production Conversion Validation Matrix
+
+This matrix separates automated internal conformance from external application/RIP approval. A green CI run proves the internal contracts below; it does **not** by itself claim Photoshop, RIP, printer, ink, or fired-tile approval.
+
+## Automated internal release contract
+
+| Area | Required coverage | Current status |
+| --- | --- | --- |
+| 5-channel TIFF | Direct-coverage N-channel samples round-trip with production ink semantics | Automated in Windows CI |
+| 7-channel TIFF | Channel topology, names, embedded target ICC and pixel samples round-trip | Automated in Windows CI |
+| BigTIFF | N-channel writer selects/round-trips BigTIFF without requiring multi-GiB fixture allocation | Automated in Windows CI |
+| Output commit safety | A destination created after capture is never overwritten by a new-only conversion commit | Automated in Windows CI |
+| N-channel target topology | Supported channel counts, unique channel names and missing authoritative colorant metadata are fail-closed/explicit | Automated in Windows CI |
+| LittleCMS N-channel formats | Supported channel counts map to explicit formats; unsupported counts fail before transform construction | Automated in Windows CI |
+| DeviceLink topology | DeviceLink input/output topology is authoritative and the captured runtime path bypasses a source-ICC chain | Automated in Windows CI |
+| DeviceLink fixture | Real CMYK DeviceLink conversion remains deterministic and ink-limited | Automated in Windows CI |
+
+`src/production_acceptance.rs` pins the exact regression-test names that implement this release contract. Removing or renaming one of those tests therefore breaks the acceptance suite instead of silently reducing coverage.
+
+## External acceptance matrix
+
+| Consumer / validation | Required evidence | Status |
+| --- | --- | --- |
+| Adobe Photoshop | Open generated 5C/7C TIFF; verify dimensions, bit depth, channel count/order/names, spot/base-ink interpretation, embedded target ICC behavior and visible sample parity | Pending manual fixture approval |
+| Ceramic RIP | Import the same approved fixtures; verify channel mapping/order/names, bit depth, raster dimensions, ink polarity/coverage and no implicit channel remap | Pending manual fixture approval |
+| Production printer workflow | Confirm RIP output maps each generated separation to the intended physical ink and preserves configured limits | Pending production approval |
+| Measurement / fired result | Record target, ink set, profile/DeviceLink identity, print/firing conditions and measured/fired acceptance result | Pending calibrated production dataset |
+
+## Approval rule
+
+External rows must stay `Pending` until evidence from the named consumer is attached to the corresponding validation work. Internal unit/integration tests must never be used as a substitute for external Photoshop/RIP/production approval.
+
+Related milestone work: #91 and #96.
