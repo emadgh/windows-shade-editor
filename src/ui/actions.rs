@@ -57,6 +57,7 @@ pub(crate) enum ExportQueueUiAction {
     CancelAllWaiting,
     ClearCompleted,
     ClearFailed,
+    ClearJobs,
     Resume(u64),
     Cancel(u64),
     Retry(u64),
@@ -258,6 +259,9 @@ impl ShadeApp {
             ExportQueueUiAction::ClearFailed => {
                 self.export.queue.clear_failed();
             }
+            ExportQueueUiAction::ClearJobs => {
+                self.export.queue.clear_finished();
+            }
             ExportQueueUiAction::Resume(id) => {
                 self.export.queue.resume(id);
             }
@@ -360,6 +364,7 @@ mod tests {
             ExportQueueUiAction::Retry(42),
             ExportQueueUiAction::Retry(42)
         );
+        assert_eq!(ExportQueueUiAction::ClearJobs, ExportQueueUiAction::ClearJobs);
         let folder = PathBuf::from(r"C:\exports\batch-42");
         assert_eq!(
             ExportQueueUiAction::RevealFolder(folder.clone()),
