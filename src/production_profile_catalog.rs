@@ -47,8 +47,26 @@ pub fn installed_production_profiles(
     query: &str,
     include_incompatible: bool,
 ) -> Result<Vec<ProductionProfileCandidate>, String> {
-    let mut rows = registry
-        .installed()?
+    Ok(production_profile_candidates(
+        registry.installed()?,
+        mode,
+        source_model,
+        query,
+        include_incompatible,
+    ))
+}
+
+/// Pure catalog projection used by installed browsing and deterministic tests.
+/// Windows profile enumeration remains an I/O concern of `IccProfileRegistry`; role,
+/// source compatibility, query filtering and stable ordering are domain policy here.
+pub fn production_profile_candidates(
+    profiles: impl IntoIterator<Item = IccProfileRecord>,
+    mode: ConversionEngineMode,
+    source_model: ColorModel,
+    query: &str,
+    include_incompatible: bool,
+) -> Vec<ProductionProfileCandidate> {
+    let mut rows = profiles
         .into_iter()
         .filter(|profile| profile.matches_query(query))
         .map(|profile| {
@@ -70,7 +88,7 @@ pub fn installed_production_profiles(
                     .cmp(&right.profile.filename().to_lowercase())
             })
     });
-    Ok(rows)
+    rows
 }
 
 /// Explicit file-picker path for Converter. The file is inspected by the same registry as
@@ -175,12 +193,16 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn display_profile_is_rejected_for_standard_output_mode() {
-        let path = temp_path("display");
-        let mut profile = Profile::new_srgb();
+    fn inspect_temp(profile: &mut Profile, label: &str) -> (PathBuf, IccProfileRecord) {
+        let path = temp_path(label);
         profile.save_profile_to_file(&path).unwrap();
         let record = IccProfileRegistry.inspect(&path).unwrap();
+        (path, record)
+    }
+
+    #[test]
+    fn display_profile_is_rejected_for_standard_output_mode() {
+        let (path, record) = inspect_temp(&mut Profile::new_srgb(), "display");
         assert_eq!(
             production_profile_rejection(&record, ConversionEngineMode::Icc, ColorModel::Rgb),
             Some(ProductionProfileRejection::WrongRole)
@@ -189,11 +211,43 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_catalog_filter_hides_or_exposes_incompatible_rows() {
+        let (display_path, display) = inspect_temp(&mut Profile::new_srgb(), "filter-display");
+        let mut link_profile = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0).unwrap();
+        let (link_path, link) = inspect_temp(&mut link_profile, "filter-link");
+
+        let compatible_only = production_profile_candidates(
+            vec![display.clone(), link.clone()],
+            ConversionEngineMode::DeviceLink,
+            ColorModel::Cmyk,
+            "",
+            false,
+        );
+        assert_eq!(compatible_only.len(), 1);
+        assert_eq!(compatible_only[0].profile.identity, link.identity);
+        assert!(compatible_only[0].selectable());
+
+        let with_incompatible = production_profile_candidates(
+            vec![display, link],
+            ConversionEngineMode::DeviceLink,
+            ColorModel::Cmyk,
+            "display",
+            true,
+        );
+        assert_eq!(with_incompatible.len(), 1);
+        assert_eq!(
+            with_incompatible[0].rejection,
+            Some(ProductionProfileRejection::WrongRole)
+        );
+
+        let _ = fs::remove_file(display_path);
+        let _ = fs::remove_file(link_path);
+    }
+
+    #[test]
     fn cmyk_devicelink_is_selectable_only_for_matching_cmyk_source() {
-        let path = temp_path("devicelink");
         let mut profile = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0).unwrap();
-        profile.save_profile_to_file(&path).unwrap();
-        let record = IccProfileRegistry.inspect(&path).unwrap();
+        let (path, record) = inspect_temp(&mut profile, "devicelink");
         assert_eq!(record.role, IccProfileRole::DeviceLink);
         assert_eq!(
             production_profile_rejection(
