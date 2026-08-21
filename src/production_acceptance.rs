@@ -141,6 +141,7 @@ mod tests {
         for required in [
             "inspect_profile_fresh(path)?",
             "IccProfileRegistry.verify_identity",
+            "IccProfileRegistry.verify_identity(path, &record.identity)?",
             "IccProfileRole::Output",
             "IccProfileRole::DeviceLink",
             "record.compatible_with_source_model",
