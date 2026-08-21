@@ -1,17 +1,17 @@
-use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
+
+#[cfg(test)]
+use std::{fs, time::UNIX_EPOCH};
 
 use lcms2::{
     ColorSpaceSignature, Flags, InfoType, Intent, Locale, PixelFormat, Profile,
     ProfileClassSignature, Transform,
 };
 use sha2::{Digest, Sha256};
-
-#[cfg(windows)]
-use windows_sys::Win32::UI::ColorSystem::{ENUM_TYPE_VERSION, ENUMTYPEW, EnumColorProfilesW};
+use windows_shade_editor::icc_profile_registry::{
+    inspect_profile_fresh as inspect_registry_profile_fresh,
+    is_profile_path as registry_is_profile_path, IccProfileRecord, IccProfileRegistry,
+};
 
 use crate::model::{IccProfileIdentity, PreviewRenderingIntent, ShadeProject};
 use crate::runtime_preview::{RuntimeColorModel, RuntimePreviewSource};
@@ -633,69 +633,27 @@ pub fn file_profile_preferred_intent(path: &Path) -> Result<PreviewRenderingInte
     })
 }
 
-#[derive(Clone)]
-struct CachedProfileInspection {
-    size: u64,
-    modified_ns: Option<u128>,
-    profile: InstalledIccProfile,
-}
-
-static PROFILE_INSPECTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedProfileInspection>>> =
-    OnceLock::new();
-
-fn profile_cache() -> &'static Mutex<HashMap<PathBuf, CachedProfileInspection>> {
-    PROFILE_INSPECTION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn installed_profile_from_registry(record: IccProfileRecord) -> Result<InstalledIccProfile, String> {
+    // Color Management still needs the raw LCMS signatures to construct preview transforms.
+    // Discovery, caching and identity are owned by the canonical registry; this reopen only
+    // adapts the record to the existing preview-facing type and does not re-hash the file.
+    let profile = Profile::new_file(&record.path)
+        .map_err(|err| format!("Cannot open ICC profile {}: {err}", record.path.display()))?;
+    Ok(InstalledIccProfile {
+        path: record.path,
+        description: record.description,
+        color_space: profile.color_space(),
+        device_class: profile.device_class(),
+        identity: record.identity,
+    })
 }
 
 pub fn inspect_profile(path: &Path) -> Result<InstalledIccProfile, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|err| format!("Cannot inspect ICC profile {}: {err}", path.display()))?;
-    let size = metadata.len();
-    let modified_ns = metadata.modified().ok().and_then(|time| {
-        time.duration_since(UNIX_EPOCH)
-            .ok()
-            .map(|duration| duration.as_nanos())
-    });
-    let cache_key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if let Ok(cache) = profile_cache().lock() {
-        if let Some(cached) = cache.get(&cache_key) {
-            if cached.size == size && cached.modified_ns == modified_ns {
-                return Ok(cached.profile.clone());
-            }
-        }
-    }
-
-    let profile = Profile::new_file(path)
-        .map_err(|err| format!("Cannot open ICC profile {}: {err}", path.display()))?;
-    let description = profile_description(&profile);
-    let bytes = fs::read(path)
-        .map_err(|err| format!("Cannot hash ICC profile {}: {err}", path.display()))?;
-    let identity = IccProfileIdentity {
-        description: description.clone(),
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
-    };
-    let inspected = InstalledIccProfile {
-        path: path.to_path_buf(),
-        description,
-        color_space: profile.color_space(),
-        device_class: profile.device_class(),
-        identity,
-    };
-    if let Ok(mut cache) = profile_cache().lock() {
-        cache.insert(
-            cache_key,
-            CachedProfileInspection {
-                size,
-                modified_ns,
-                profile: inspected.clone(),
-            },
-        );
-    }
-    Ok(inspected)
+    installed_profile_from_registry(IccProfileRegistry.inspect(path)?)
 }
 
 pub fn profile_identity(path: &Path) -> Result<IccProfileIdentity, String> {
-    inspect_profile(path).map(|profile| profile.identity)
+    inspect_registry_profile_fresh(path).map(|profile| profile.identity)
 }
 
 pub fn production_embedded_profile_identity_for_runtime(
@@ -734,26 +692,15 @@ pub fn inspect_production_source_profile_runtime(
     expected_identity: &IccProfileIdentity,
     source_model: RuntimeColorModel,
 ) -> Result<InstalledIccProfile, String> {
-    let profile = inspect_profile(path)?;
+    let profile = installed_profile_from_registry(
+        IccProfileRegistry.verify_identity(path, expected_identity)?,
+    )?;
     if !profile.compatible_with_runtime(source_model) {
         return Err(format!(
             "Assigned production Source ICC '{}' declares {} but the source Face is {}.",
             profile.description,
             profile.color_space_label(),
             source_model.title()
-        ));
-    }
-    if expected_identity.sha256.trim().is_empty() {
-        return Err(
-            "Assigned production Source ICC has no stored SHA-256 identity. Reassign the profile."
-                .to_owned(),
-        );
-    }
-    if !profile.matches_identity(expected_identity) {
-        return Err(format!(
-            "Assigned production Source ICC at {} no longer matches stored profile '{}'. Reassign or relink the profile before conversion.",
-            path.display(),
-            expected_identity.description
         ));
     }
     Ok(profile)
@@ -803,26 +750,15 @@ pub fn inspect_production_source_profile(
     expected_identity: &IccProfileIdentity,
     source_model: ColorModel,
 ) -> Result<InstalledIccProfile, String> {
-    let profile = inspect_profile(path)?;
+    let profile = installed_profile_from_registry(
+        IccProfileRegistry.verify_identity(path, expected_identity)?,
+    )?;
     if !profile.compatible_with(source_model) {
         return Err(format!(
             "Assigned production Source ICC '{}' declares {} but the source Face is {}.",
             profile.description,
             profile.color_space_label(),
             source_model.title()
-        ));
-    }
-    if expected_identity.sha256.trim().is_empty() {
-        return Err(
-            "Assigned production Source ICC has no stored SHA-256 identity. Reassign the profile."
-                .to_owned(),
-        );
-    }
-    if !profile.matches_identity(expected_identity) {
-        return Err(format!(
-            "Assigned production Source ICC at {} no longer matches stored profile '{}'. Reassign or relink the profile before conversion.",
-            path.display(),
-            expected_identity.description
         ));
     }
     Ok(profile)
@@ -836,15 +772,16 @@ fn verify_profile_identity(
     let Some(expected) = expected.filter(|identity| !identity.sha256.trim().is_empty()) else {
         return Ok(());
     };
-    let actual = profile_identity(path)?;
-    if !actual.sha256.eq_ignore_ascii_case(&expected.sha256) {
-        return Err(format!(
-            "{role} ICC at {} no longer matches the profile stored with this configuration (expected '{}'). Relink the profile before previewing.",
-            path.display(),
-            expected.description
-        ));
-    }
-    Ok(())
+    IccProfileRegistry
+        .verify_identity(path, expected)
+        .map(|_| ())
+        .map_err(|_| {
+            format!(
+                "{role} ICC at {} no longer matches the profile stored with this configuration (expected '{}'). Relink the profile before previewing.",
+                path.display(),
+                expected.description
+            )
+        })
 }
 
 pub fn resolve_external_profile_path(
@@ -853,15 +790,13 @@ pub fn resolve_external_profile_path(
     profiles: &[InstalledIccProfile],
 ) -> Option<PathBuf> {
     if let Some(path) = stored_path.map(PathBuf::from) {
-        if path.is_file() {
-            if identity.is_none()
-                || inspect_profile(&path)
-                    .ok()
-                    .zip(identity)
-                    .is_some_and(|(profile, expected)| profile.matches_identity(expected))
-            {
-                return Some(path);
-            }
+        if path.is_file()
+            && (identity.is_none()
+                || identity.is_some_and(|expected| {
+                    IccProfileRegistry.verify_identity(&path, expected).is_ok()
+                }))
+        {
+            return Some(path);
         }
     }
     let identity = identity?;
@@ -929,136 +864,15 @@ fn relink_path(
 }
 
 pub fn installed_profiles() -> Result<Vec<InstalledIccProfile>, String> {
-    let directory = color_directory();
-    let mut paths = Vec::new();
-
-    #[cfg(windows)]
-    {
-        if let Ok(names) = registered_profile_names() {
-            for name in names {
-                let path = PathBuf::from(name);
-                paths.push(if path.is_absolute() {
-                    path
-                } else {
-                    directory.join(path)
-                });
-            }
-        }
-    }
-
-    // Filesystem scan remains a fallback/supplement because vendor installers
-    // sometimes place usable ICCs in the color directory without a device association.
-    if let Ok(entries) = fs::read_dir(&directory) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && is_profile_path(&path) {
-                paths.push(path);
-            }
-        }
-    } else if paths.is_empty() {
-        return Err(format!(
-            "Cannot enumerate Windows color profiles from {}",
-            directory.display()
-        ));
-    }
-
-    paths.sort_by_key(|path| path.to_string_lossy().to_lowercase());
-    paths.dedup_by(|left, right| {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    });
-
-    let mut profiles = paths
+    Ok(IccProfileRegistry
+        .installed()?
         .into_iter()
-        .filter_map(|path| inspect_profile(&path).ok())
-        .collect::<Vec<_>>();
-    profiles.sort_by(|left, right| {
-        left.description
-            .to_lowercase()
-            .cmp(&right.description.to_lowercase())
-            .then_with(|| {
-                left.filename()
-                    .to_lowercase()
-                    .cmp(&right.filename().to_lowercase())
-            })
-    });
-    profiles.dedup_by(|left, right| left.identity.sha256 == right.identity.sha256);
-    Ok(profiles)
-}
-
-fn color_directory() -> PathBuf {
-    let windows = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    windows
-        .join("System32")
-        .join("spool")
-        .join("drivers")
-        .join("color")
-}
-
-#[cfg(windows)]
-fn registered_profile_names() -> Result<Vec<String>, String> {
-    let mut record = ENUMTYPEW::default();
-    record.dwSize = std::mem::size_of::<ENUMTYPEW>() as u32;
-    record.dwVersion = ENUM_TYPE_VERSION;
-    record.dwFields = 0;
-
-    let mut bytes_needed = 0u32;
-    let mut profile_count = 0u32;
-    unsafe {
-        let _ = EnumColorProfilesW(
-            std::ptr::null(),
-            &record,
-            std::ptr::null_mut(),
-            &mut bytes_needed,
-            &mut profile_count,
-        );
-    }
-    if bytes_needed == 0 {
-        return Err("Windows profile enumeration returned an empty buffer size.".to_owned());
-    }
-
-    let mut buffer = vec![0u8; bytes_needed as usize];
-    let ok = unsafe {
-        EnumColorProfilesW(
-            std::ptr::null(),
-            &record,
-            buffer.as_mut_ptr(),
-            &mut bytes_needed,
-            &mut profile_count,
-        )
-    };
-    if ok == 0 {
-        return Err(format!(
-            "EnumColorProfilesW failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let units = buffer
-        .chunks_exact(2)
-        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
-        .collect::<Vec<_>>();
-    let mut names = Vec::with_capacity(profile_count as usize);
-    let mut start = 0usize;
-    for index in 0..units.len() {
-        if units[index] != 0 {
-            continue;
-        }
-        if index == start {
-            break;
-        }
-        names.push(String::from_utf16_lossy(&units[start..index]));
-        start = index + 1;
-    }
-    Ok(names)
+        .filter_map(|record| installed_profile_from_registry(record).ok())
+        .collect())
 }
 
 pub fn is_profile_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("icc") || ext.eq_ignore_ascii_case("icm"))
+    registry_is_profile_path(path)
 }
 
 fn profile_description(profile: &Profile) -> String {
@@ -1443,5 +1257,15 @@ mod tests {
             transform.status(),
             PreviewColorStatus::Applied { .. }
         ));
+    }
+
+    #[test]
+    fn color_management_profile_identity_uses_fresh_registry_bytes() {
+        let path = temp_profile("fresh-registry");
+        let expected = profile_identity(&path).unwrap();
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, vec![0u8; original.len()]).unwrap();
+        assert!(IccProfileRegistry.verify_identity(&path, &expected).is_err());
+        let _ = fs::remove_file(path);
     }
 }
