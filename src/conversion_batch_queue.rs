@@ -9,12 +9,15 @@ use crate::conversion_batch::{ConversionBatchCapture, ConversionBatchCheckpoint}
 use crate::conversion_batch_execution::{
     ConversionBatchStepOutcome, run_next_conversion_batch_face,
 };
-use crate::conversion_recovery::{ConversionRecoveryRecord, ConversionRecoveryStage};
+use crate::conversion_recovery::{
+    ConversionRecoveryRecord, ConversionRecoveryStage, recover_production_project,
+};
 use crate::conversion_transaction::{
-    CompletedConversionTransaction, ConversionCancellation, ConversionPhase,
+    CompletedConversionTransaction, ConversionCancellation, ConversionJobCapture, ConversionPhase,
     ConversionTransactionOutcome,
 };
 use crate::icc_conversion_worker::FilesystemIccConversionBackend;
+use crate::production_project_disposition::ProductionProjectDisposition;
 use crate::queue_core::{
     PersistedQueueEnvelope, QueueLifecycle, QueueRuntime, load_persisted_queue,
     sanitize_progress, write_persisted_queue,
@@ -84,6 +87,8 @@ struct QueuedConversionBatchSpec {
 pub struct ConversionBatchRecoveryRecord {
     pub source_face_index: usize,
     pub ordinal: usize,
+    #[serde(default)]
+    pub disposition: Option<ProductionProjectDisposition>,
     pub recovery: ConversionRecoveryRecord,
 }
 
@@ -394,6 +399,130 @@ impl ConversionBatchQueue {
         true
     }
 
+    /// Recover a Face whose TIFF is already committed by replaying only the
+    /// Production-project save with the exact disposition captured before the
+    /// failed save. The TIFF conversion is never re-rendered here.
+    pub fn recover(&mut self, id: u64) -> Result<ConversionBatchQueueCompletion, String> {
+        self.recover_with(id, recover_production_project)
+    }
+
+    fn recover_with<R>(
+        &mut self,
+        id: u64,
+        mut recover: R,
+    ) -> Result<ConversionBatchQueueCompletion, String>
+    where
+        R: FnMut(
+            &ConversionJobCapture,
+            &ProductionProjectDisposition,
+            &ConversionRecoveryRecord,
+        ) -> Result<CompletedConversionTransaction, String>,
+    {
+        if self.runtime.active_id() == Some(id) {
+            return Err("Active conversion batch cannot enter project-only recovery.".to_owned());
+        }
+        let Some(index) = self.items.iter().position(|item| item.id == id) else {
+            return Err("Conversion batch recovery item no longer exists.".to_owned());
+        };
+        if self.items[index].status != ConversionBatchQueueStatus::NeedsRecovery {
+            return Err("Conversion batch does not require project recovery.".to_owned());
+        }
+        let recovery_record = self.items[index]
+            .recovery
+            .clone()
+            .ok_or_else(|| "Conversion batch recovery state is missing.".to_owned())?;
+        let Some(disposition) = recovery_record.disposition.clone() else {
+            let error = "Batch recovery record predates exact Production disposition capture; automatic recovery is blocked. Re-run must remain manual and non-destructive.".to_owned();
+            self.items[index].detail = "Exact Production recovery disposition is unavailable".to_owned();
+            self.items[index].error = Some(error.clone());
+            self.persist();
+            return Err(error);
+        };
+
+        let ordinal = recovery_record.ordinal;
+        if ordinal != self.items[index].checkpoint.completed_count() {
+            return Err(
+                "Batch recovery ordinal does not match the first uncommitted Face.".to_owned(),
+            );
+        }
+        let face = self.items[index]
+            .spec
+            .batch
+            .faces
+            .get(ordinal)
+            .cloned()
+            .ok_or_else(|| "Batch recovery Face is outside the immutable capture.".to_owned())?;
+        if face.source_face_index != recovery_record.source_face_index {
+            return Err("Batch recovery Source Face identity changed.".to_owned());
+        }
+
+        let completed = match recover(&face.capture, &disposition, &recovery_record.recovery) {
+            Ok(completed) => completed,
+            Err(error) => {
+                self.items[index].detail = format!(
+                    "Face {} project-only recovery is still blocked",
+                    face.source_face_index + 1
+                );
+                self.items[index].error = Some(error.clone());
+                self.persist();
+                return Err(error);
+            }
+        };
+
+        let batch_complete;
+        {
+            let item = &mut self.items[index];
+            if let Err(error) = item
+                .checkpoint
+                .record_committed(&item.spec.batch, &completed.committed_output)
+            {
+                let error = format!(
+                    "Production project recovered, but batch checkpoint could not advance: {error}"
+                );
+                item.detail = "Recovered project is safe, but batch checkpoint remains blocked".to_owned();
+                item.error = Some(error.clone());
+                self.persist();
+                return Err(error);
+            }
+            batch_complete = item.checkpoint.completed_count() == item.spec.batch.face_count();
+            item.status = if batch_complete {
+                ConversionBatchQueueStatus::Done
+            } else {
+                ConversionBatchQueueStatus::Waiting
+            };
+            item.progress =
+                item.checkpoint.completed_count() as f32 / item.spec.batch.face_count() as f32;
+            item.phase = if batch_complete {
+                ConversionPhase::Complete.label().to_owned()
+            } else {
+                "Face recovery checkpoint committed".to_owned()
+            };
+            item.detail = if batch_complete {
+                format!("All {} batch Faces committed", item.spec.batch.face_count())
+            } else {
+                format!(
+                    "Face {} Production project recovered; checkpoint durable before next Face",
+                    face.source_face_index + 1
+                )
+            };
+            item.error = None;
+            item.recovery = None;
+            item.requires_resume = false;
+            refresh_item_cursor(item);
+        }
+        self.persist();
+
+        Ok(ConversionBatchQueueCompletion {
+            id,
+            source_face_index: face.source_face_index,
+            result: ConversionBatchQueueCompletionResult::CompletedFace {
+                completed,
+                ordinal,
+                batch_complete,
+            },
+        })
+    }
+
     pub fn clear_finished(&mut self) -> usize {
         let before = self.items.len();
         self.items.retain(|item| {
@@ -509,6 +638,7 @@ impl ConversionBatchQueue {
                         return ConversionBatchStepOutcome::Halted {
                             checkpoint,
                             source_face_index: pending_index,
+                            disposition: None,
                             outcome: ConversionTransactionOutcome::FailedBeforeCommit {
                                 phase: ConversionPhase::CaptureValidation,
                                 error,
@@ -539,6 +669,7 @@ impl ConversionBatchQueue {
             .unwrap_or_else(|payload| ConversionBatchStepOutcome::Halted {
                 checkpoint: fallback_checkpoint,
                 source_face_index: pending_index,
+                disposition: None,
                 outcome: ConversionTransactionOutcome::FailedBeforeCommit {
                     phase: ConversionPhase::CaptureValidation,
                     error: format!(
@@ -694,6 +825,7 @@ fn apply_step_outcome(
         ConversionBatchStepOutcome::Halted {
             checkpoint,
             source_face_index,
+            disposition,
             outcome,
         } => {
             item.checkpoint = checkpoint;
@@ -739,6 +871,7 @@ fn apply_step_outcome(
                     let recovery = ConversionBatchRecoveryRecord {
                         source_face_index,
                         ordinal,
+                        disposition,
                         recovery: ConversionRecoveryRecord {
                             stage: ConversionRecoveryStage::ProductionProjectSavePending,
                             committed_output,
@@ -749,10 +882,17 @@ fn apply_step_outcome(
                     };
                     item.status = ConversionBatchQueueStatus::NeedsRecovery;
                     item.phase = ConversionPhase::ProductionProjectSave.label().to_owned();
-                    item.detail = format!(
-                        "Face {} TIFF committed; Production project recovery required before batch can continue",
-                        source_face_index + 1
-                    );
+                    item.detail = if recovery.disposition.is_some() {
+                        format!(
+                            "Face {} TIFF committed; Production project recovery required before batch can continue",
+                            source_face_index + 1
+                        )
+                    } else {
+                        format!(
+                            "Face {} TIFF committed; exact Production disposition is unavailable, so automatic recovery is blocked",
+                            source_face_index + 1
+                        )
+                    };
                     item.error = Some(error);
                     item.recovery = Some(recovery.clone());
                     ConversionBatchQueueCompletionResult::NeedsRecovery(recovery)
@@ -911,6 +1051,37 @@ mod tests {
         ))
     }
 
+    fn inject_recovery(
+        queue: &mut ConversionBatchQueue,
+        id: u64,
+        disposition: Option<ProductionProjectDisposition>,
+    ) -> CommittedConversionOutput {
+        let item = queue.items.iter_mut().find(|item| item.id == id).unwrap();
+        let output = CommittedConversionOutput {
+            path: item.spec.batch.faces[0].capture.output_tiff_path.clone(),
+            sha256: hash('e'),
+            converted_at_unix_ms: 1234,
+        };
+        item.status = ConversionBatchQueueStatus::NeedsRecovery;
+        item.recovery = Some(ConversionBatchRecoveryRecord {
+            source_face_index: item.spec.batch.faces[0].source_face_index,
+            ordinal: 0,
+            disposition,
+            recovery: ConversionRecoveryRecord {
+                stage: ConversionRecoveryStage::ProductionProjectSavePending,
+                committed_output: output.clone(),
+                production_project_path: item.spec.batch.faces[0]
+                    .capture
+                    .production_project_path
+                    .clone(),
+                production_project: Some(ShadeProject::default()),
+                error: "mock project save failure".to_owned(),
+            },
+        });
+        refresh_item_cursor(item);
+        output
+    }
+
     #[test]
     fn restored_batch_requires_resume_and_preserves_intent() {
         let path = temp_path("restore");
@@ -975,6 +1146,86 @@ mod tests {
         assert_eq!(item.completed_face_count, 1);
         assert_eq!(item.status, ConversionBatchQueueStatus::Waiting);
         assert!(item.current_source.as_ref().unwrap().to_string_lossy().contains("Face-1"));
+    }
+
+    #[test]
+    fn project_only_recovery_advances_checkpoint_without_rerendering_face() {
+        let mut queue = ConversionBatchQueue::new();
+        let id = queue.enqueue(batch("Recover"), 220.0).unwrap();
+        let output = inject_recovery(
+            &mut queue,
+            id,
+            Some(ProductionProjectDisposition::CreateNew),
+        );
+        let mut recovery_calls = 0;
+
+        let completion = queue
+            .recover_with(id, |capture, disposition, recovery| {
+                recovery_calls += 1;
+                assert!(matches!(disposition, ProductionProjectDisposition::CreateNew));
+                assert_eq!(capture.output_tiff_path, output.path);
+                Ok(CompletedConversionTransaction {
+                    committed_output: recovery.committed_output.clone(),
+                    production_project_path: recovery.production_project_path.clone(),
+                    production_project: recovery.production_project.clone().unwrap(),
+                })
+            })
+            .unwrap();
+
+        assert_eq!(recovery_calls, 1);
+        let ConversionBatchQueueCompletionResult::CompletedFace {
+            ordinal,
+            batch_complete,
+            ..
+        } = completion.result
+        else {
+            panic!("recovery should complete exactly one Face");
+        };
+        assert_eq!(ordinal, 0);
+        assert!(!batch_complete);
+        let item = queue.items.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(item.completed_face_count, 1);
+        assert_eq!(item.status, ConversionBatchQueueStatus::Waiting);
+        assert!(item.recovery.is_none());
+        assert!(item.current_source.as_ref().unwrap().to_string_lossy().contains("Face-1"));
+    }
+
+    #[test]
+    fn legacy_recovery_without_exact_disposition_is_blocked() {
+        let mut queue = ConversionBatchQueue::new();
+        let id = queue.enqueue(batch("LegacyRecovery"), 220.0).unwrap();
+        inject_recovery(&mut queue, id, None);
+
+        let error = queue
+            .recover_with(id, |_, _, _| panic!("legacy recovery must fail before replay"))
+            .expect_err("missing exact disposition must block recovery");
+        assert!(error.contains("predates exact Production disposition"));
+        let item = queue.items.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(item.status, ConversionBatchQueueStatus::NeedsRecovery);
+        assert_eq!(item.completed_face_count, 0);
+    }
+
+    #[test]
+    fn recovery_disposition_survives_restart() {
+        let path = temp_path("recovery-disposition");
+        let mut queue = ConversionBatchQueue::empty(Some(path.clone()));
+        let id = queue.enqueue(batch("RecoveryPersistence"), 220.0).unwrap();
+        inject_recovery(
+            &mut queue,
+            id,
+            Some(ProductionProjectDisposition::CreateNew),
+        );
+        queue.persist();
+        drop(queue);
+
+        let restored = ConversionBatchQueue::load_from_path(path.clone()).unwrap();
+        let recovery = restored.items[0].recovery.as_ref().unwrap();
+        assert!(matches!(
+            recovery.disposition,
+            Some(ProductionProjectDisposition::CreateNew)
+        ));
+        assert_eq!(restored.items[0].status, ConversionBatchQueueStatus::NeedsRecovery);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
