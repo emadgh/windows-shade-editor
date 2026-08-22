@@ -35,6 +35,7 @@ pub enum ConversionBatchStepOutcome {
     Halted {
         checkpoint: ConversionBatchCheckpoint,
         source_face_index: usize,
+        disposition: Option<ProductionProjectDisposition>,
         outcome: ConversionTransactionOutcome,
     },
 }
@@ -59,6 +60,7 @@ pub enum ConversionBatchExecutionOutcome {
         checkpoint: ConversionBatchCheckpoint,
         completions: Vec<CompletedConversionTransaction>,
         source_face_index: usize,
+        disposition: Option<ProductionProjectDisposition>,
         outcome: ConversionTransactionOutcome,
     },
 }
@@ -108,6 +110,7 @@ where
         return ConversionBatchStepOutcome::Halted {
             checkpoint,
             source_face_index: face.source_face_index,
+            disposition: None,
             outcome: ConversionTransactionOutcome::CancelledBeforeCommit {
                 phase: ConversionPhase::CaptureValidation,
                 message: "Production conversion batch cancelled before the next Face commit."
@@ -122,6 +125,7 @@ where
             return ConversionBatchStepOutcome::Halted {
                 checkpoint,
                 source_face_index: face.source_face_index,
+                disposition: None,
                 outcome: ConversionTransactionOutcome::FailedBeforeCommit {
                     phase: ConversionPhase::CaptureValidation,
                     error,
@@ -160,6 +164,7 @@ where
                 return ConversionBatchStepOutcome::Halted {
                     checkpoint,
                     source_face_index: face.source_face_index,
+                    disposition: Some(disposition),
                     outcome: ConversionTransactionOutcome::OutputCommittedNeedsRecovery {
                         committed_output: completed.committed_output,
                         production_project_path: completed.production_project_path,
@@ -182,6 +187,7 @@ where
         outcome => ConversionBatchStepOutcome::Halted {
             checkpoint,
             source_face_index: face.source_face_index,
+            disposition: Some(disposition),
             outcome,
         },
     }
@@ -237,12 +243,14 @@ where
             ConversionBatchStepOutcome::Halted {
                 checkpoint: halted_checkpoint,
                 source_face_index,
+                disposition,
                 outcome,
             } => {
                 return ConversionBatchExecutionOutcome::Halted {
                     checkpoint: halted_checkpoint,
                     completions,
                     source_face_index,
+                    disposition,
                     outcome,
                 };
             }
@@ -286,6 +294,7 @@ fn halted_step_before_face(
     ConversionBatchStepOutcome::Halted {
         checkpoint,
         source_face_index,
+        disposition: None,
         outcome: ConversionTransactionOutcome::FailedBeforeCommit {
             phase: ConversionPhase::CaptureValidation,
             error,
@@ -398,6 +407,7 @@ mod tests {
         project_sha256: Option<String>,
         generation: u32,
         fail_source: Option<PathBuf>,
+        fail_project_save: bool,
     }
 
     impl MockBackend {
@@ -407,6 +417,7 @@ mod tests {
                 project_sha256: None,
                 generation: 0,
                 fail_source: None,
+                fail_project_save: false,
             }
         }
 
@@ -447,6 +458,9 @@ mod tests {
             _path: &Path,
             project: &ShadeProject,
         ) -> Result<(), String> {
+            if self.fail_project_save {
+                return Err("mock Production project save failure".to_owned());
+            }
             self.project = Some(project.clone());
             self.advance_project_identity();
             Ok(())
@@ -478,6 +492,9 @@ mod tests {
         ) -> Result<(), String> {
             if self.project_sha256.as_deref() != Some(expected_sha256) {
                 return Err("mock optimistic Production SHA mismatch".to_owned());
+            }
+            if self.fail_project_save {
+                return Err("mock Production project save failure".to_owned());
             }
             self.project = Some(project.clone());
             self.advance_project_identity();
@@ -573,6 +590,46 @@ mod tests {
         assert!(resumed.is_complete());
         assert_eq!(resumed.checkpoint().completed_count(), 2);
         assert_eq!(backend.project.as_ref().unwrap().faces.len(), 2);
+    }
+
+    #[test]
+    fn committed_second_face_halt_carries_exact_append_disposition() {
+        let batch = batch();
+        let mut backend = MockBackend::new();
+        let first = run_next_conversion_batch_face(
+            &batch,
+            ConversionBatchCheckpoint::default(),
+            &ConversionCancellation::default(),
+            &mut backend,
+            |_| {},
+        );
+        let ConversionBatchStepOutcome::CompletedFace { checkpoint, .. } = first else {
+            panic!("first Face should commit");
+        };
+        let expected_sha256 = backend.project_sha256.clone().unwrap();
+        backend.fail_project_save = true;
+
+        let second = run_next_conversion_batch_face(
+            &batch,
+            checkpoint,
+            &ConversionCancellation::default(),
+            &mut backend,
+            |_| {},
+        );
+        let ConversionBatchStepOutcome::Halted {
+            source_face_index,
+            disposition: Some(ProductionProjectDisposition::AppendExisting {
+                expected_project_sha256,
+                ..
+            }),
+            outcome: ConversionTransactionOutcome::OutputCommittedNeedsRecovery { .. },
+            ..
+        } = second
+        else {
+            panic!("second Face project-save failure should preserve exact append disposition");
+        };
+        assert_eq!(source_face_index, 1);
+        assert_eq!(expected_project_sha256, expected_sha256);
     }
 
     #[test]
