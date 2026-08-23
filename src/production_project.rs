@@ -71,8 +71,11 @@ pub fn build_production_project(spec: ProductionProjectSpec<'_>) -> Result<Shade
     Ok(project)
 }
 
-/// Mark a saved design project as a Source and upsert its Production-project
-/// link. This is intentionally separate from `build_production_project`: the
+/// Mark a saved design project as a Source and retain a link to the exact Production project.
+///
+/// One Source can legitimately feed multiple Production projects/targets. Re-linking the same
+/// Production path is idempotent, while a different path is appended instead of replacing the
+/// previous relationship. This is intentionally separate from `build_production_project`: the
 /// caller saves it only after the Production TIFF/project transaction succeeds.
 pub fn link_source_project_to_production(
     source: &mut ShadeProject,
@@ -87,7 +90,10 @@ pub fn link_source_project_to_production(
     if let Some(link) = source
         .linked_projects
         .iter_mut()
-        .find(|link| link.role == ProjectRole::Production)
+        .find(|link| {
+            link.role == ProjectRole::Production
+                && link.path.trim().eq_ignore_ascii_case(new_path.as_str())
+        })
     {
         link.path = new_path;
     } else {
@@ -190,20 +196,22 @@ mod tests {
     }
 
     #[test]
-    fn source_link_is_upserted_without_touching_adjustments() {
+    fn source_retains_multiple_production_links_without_touching_adjustments() {
         let mut source = ShadeProject::default();
         source
             .adjustments
             .insert("Red".to_owned(), ChannelAdjustment::default());
 
-        link_source_project_to_production(&mut source, Path::new(r"C:\Production\Job.shade"))
-            .unwrap();
-        link_source_project_to_production(&mut source, Path::new(r"C:\Production\Job-v2.shade"))
-            .unwrap();
+        let first = Path::new(r"C:\Production\Job.shade");
+        let second = Path::new(r"C:\Production\Job-v2.shade");
+        link_source_project_to_production(&mut source, first).unwrap();
+        link_source_project_to_production(&mut source, second).unwrap();
+        link_source_project_to_production(&mut source, first).unwrap();
 
         assert_eq!(source.project_role, ProjectRole::Source);
-        assert_eq!(source.linked_projects.len(), 1);
-        assert!(source.linked_projects[0].path.ends_with("Job-v2.shade"));
+        assert_eq!(source.linked_projects.len(), 2);
+        assert!(source.linked_projects.iter().any(|link| link.path.ends_with("Job.shade")));
+        assert!(source.linked_projects.iter().any(|link| link.path.ends_with("Job-v2.shade")));
         assert!(source.adjustments.contains_key("Red"));
     }
 
