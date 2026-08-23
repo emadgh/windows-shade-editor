@@ -42,6 +42,10 @@ impl ConversionBatchCapture {
         production_project_disposition: ProductionProjectDisposition,
         mut faces: Vec<ConversionBatchFaceCapture>,
     ) -> Result<Self, String> {
+        for face in &mut faces {
+            face.capture.output_tiff_path =
+                crate::tiff_output::canonical_destination(&face.capture.output_tiff_path);
+        }
         faces.sort_by_key(|face| face.source_face_index);
         let first = faces
             .first()

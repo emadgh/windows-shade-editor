@@ -1,5 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
+use crate::tiff_output;
+
 #[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
@@ -139,11 +141,7 @@ const MAX_WIN32_PATH_UTF16_WITHOUT_NUL: usize = 259;
 const MAX_VERBATIM_PATH_UTF16_WITHOUT_NUL: usize = 32_766;
 #[cfg(windows)]
 const MAX_WINDOWS_COMPONENT_UTF16: usize = 255;
-/// `conversion_tiff::staged_path` appends this suffix to the destination file
-/// name before validation/atomic commit. Reserve it here so preflight never
-/// accepts a normal Win32 destination whose staged sibling would be too long.
-#[cfg(windows)]
-const CONVERSION_STAGING_SUFFIX_UTF16_RESERVE: usize = 15; // ".conversion.tmp"
+const CONVERSION_STAGING_SUFFIX: &str = ".conversion.tmp";
 
 #[cfg(windows)]
 fn validate_windows_destination_path(destination: &Path) -> Result<(), OutputPathError> {
@@ -180,15 +178,16 @@ fn validate_windows_destination_path(destination: &Path) -> Result<(), OutputPat
     let file_name = destination
         .file_name()
         .ok_or(OutputPathError::MissingFileName)?;
+    let staging_reserve = tiff_output::staging_suffix_utf16_reserve(CONVERSION_STAGING_SUFFIX);
     let staged_file_units = windows_utf16_len(file_name)
-        .checked_add(CONVERSION_STAGING_SUFFIX_UTF16_RESERVE)
+        .checked_add(staging_reserve)
         .ok_or(OutputPathError::MissingFileName)?;
     if staged_file_units > MAX_WINDOWS_COMPONENT_UTF16 {
         return Err(OutputPathError::MissingFileName);
     }
 
     let staged_path_units = windows_utf16_len(destination.as_os_str())
-        .checked_add(CONVERSION_STAGING_SUFFIX_UTF16_RESERVE)
+        .checked_add(staging_reserve)
         .ok_or(OutputPathError::MissingFileName)?;
     let max_path_units = if verbatim {
         MAX_VERBATIM_PATH_UTF16_WITHOUT_NUL

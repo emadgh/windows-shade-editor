@@ -8,6 +8,7 @@ use tiff::tags::{ExtraSamples, Tag};
 use crate::export;
 use crate::model::ShadeProject;
 use crate::tiff_io::{self, ColorModel};
+use crate::{conversion_tiff, dpi, tiff_output};
 
 fn temp_paths(label: &str) -> (PathBuf, PathBuf) {
     let unique = format!(
@@ -55,6 +56,109 @@ fn export_identity_with_options(
         |_, _| {},
     )
     .unwrap();
+}
+
+#[test]
+fn export_and_converter_share_equivalent_cmyk_transport_metadata() {
+    let (source, exported) = temp_paths("export-converter-equivalence");
+    let converted = exported.with_file_name(format!(
+        "{}-converted.tif",
+        exported.file_stem().unwrap().to_string_lossy()
+    ));
+    let pixels = vec![1u8, 2, 3, 4, 32, 64, 96, 128];
+    let profile = lcms2::Profile::new_srgb().icc().unwrap();
+    {
+        let file = File::create(&source).unwrap();
+        let mut encoder = TiffEncoder::new(BufWriter::new(file))
+            .unwrap()
+            .with_compression(Compression::Lzw);
+        let mut image = encoder.new_image::<colortype::CMYK8>(2, 1).unwrap();
+        image.rows_per_strip(1).unwrap();
+        image.x_resolution(dpi::rational(300.0));
+        image.y_resolution(dpi::rational(300.0));
+        image
+            .encoder()
+            .write_tag(Tag::ResolutionUnit, 2u16)
+            .unwrap();
+        image.encoder().write_tag(Tag::Orientation, 1u16).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::IccProfile, profile.as_slice())
+            .unwrap();
+        image.write_data(&pixels).unwrap();
+    }
+
+    export_identity(&source, &exported);
+    let names = ["Cyan", "Magenta", "Yellow", "Black"].map(str::to_owned);
+    let spec = conversion_tiff::ConversionTiffSpec {
+        width: 2,
+        height: 1,
+        channel_names: &names,
+        target_icc: Some(&profile),
+        dpi_x: 300.0,
+        dpi_y: 300.0,
+        orientation: Some(1),
+        rows_per_strip: 1,
+        force_bigtiff: false,
+        replace_existing: true,
+    };
+    conversion_tiff::write_conversion_tiff_u8_atomic(&converted, &spec, |_, _, samples| {
+        samples.copy_from_slice(&pixels);
+        Ok(())
+    })
+    .unwrap();
+
+    let export_decoded = tiff_io::decode_full(&exported).unwrap();
+    let conversion_decoded = tiff_io::decode_full(&converted).unwrap();
+    assert_eq!(export_decoded.samples, conversion_decoded.samples);
+    assert_eq!(export_decoded.metadata.width, conversion_decoded.metadata.width);
+    assert_eq!(export_decoded.metadata.height, conversion_decoded.metadata.height);
+    assert_eq!(export_decoded.metadata.bit_depth, conversion_decoded.metadata.bit_depth);
+    assert_eq!(
+        export_decoded.metadata.samples_per_pixel,
+        conversion_decoded.metadata.samples_per_pixel
+    );
+    assert_eq!(
+        export_decoded.metadata.base_channel_count,
+        conversion_decoded.metadata.base_channel_count
+    );
+    assert_eq!(
+        export_decoded.metadata.color_model,
+        conversion_decoded.metadata.color_model
+    );
+    assert_eq!(
+        export_decoded.metadata.compression,
+        conversion_decoded.metadata.compression
+    );
+    assert_eq!(
+        export_decoded.metadata.predictor,
+        conversion_decoded.metadata.predictor
+    );
+    assert_eq!(
+        export_decoded.metadata.orientation,
+        conversion_decoded.metadata.orientation
+    );
+    assert_eq!(
+        export_decoded.metadata.icc_profile,
+        conversion_decoded.metadata.icc_profile
+    );
+
+    let export_stream = tiff_io::stream_info(&exported).unwrap();
+    let conversion_stream = tiff_io::stream_info(&converted).unwrap();
+    assert_eq!(export_stream.rows_per_strip, conversion_stream.rows_per_strip);
+    assert_eq!(
+        tiff_output::source_is_bigtiff(&exported).unwrap(),
+        tiff_output::source_is_bigtiff(&converted).unwrap()
+    );
+    let export_dpi = dpi::read_dpi(&exported, 220.0);
+    let conversion_dpi = dpi::read_dpi(&converted, 220.0);
+    assert_eq!(export_dpi.unit, conversion_dpi.unit);
+    assert_eq!(export_dpi.raw_x, conversion_dpi.raw_x);
+    assert_eq!(export_dpi.raw_y, conversion_dpi.raw_y);
+
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&exported);
+    let _ = fs::remove_file(&converted);
 }
 
 fn write_rgb8_source(path: &std::path::Path, compression: Compression, predictor: bool) -> Vec<u8> {

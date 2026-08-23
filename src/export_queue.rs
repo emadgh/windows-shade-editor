@@ -147,6 +147,31 @@ fn sampled_sha256(path: &Path, size: u64) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum TestStackAnchor {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ExportQueueOperation {
+    Standard,
+    TestStack {
+        snapshots: Vec<ExportRecipe>,
+        rows: usize,
+        columns: usize,
+        anchor: TestStackAnchor,
+    },
+}
+
+impl Default for ExportQueueOperation {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportQueueSpec {
     pub label: String,
@@ -158,6 +183,8 @@ pub struct ExportQueueSpec {
     pub validate_after_export: bool,
     pub conflict_policy: ConflictPolicy,
     pub mark: Option<ExportQueueMark>,
+    #[serde(default)]
+    pub operation: ExportQueueOperation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -274,6 +301,7 @@ impl ExportQueue {
             }
             let (status, requires_resume) = saved.status.restored();
             let mut spec = saved.spec;
+            spec.export.destination = export_batch::normalize_tiff_destination(&spec.export.destination);
             spec.project_session_id = 0;
             spec.export.mark = None;
             queue.items.push(ExportQueueItem {
@@ -327,6 +355,8 @@ impl ExportQueue {
     }
 
     pub fn enqueue(&mut self, spec: ExportQueueSpec) -> u64 {
+        let mut spec = spec;
+        spec.destination = export_batch::normalize_tiff_destination(&spec.destination);
         let id = self.runtime.allocate_id();
         self.items.push(ExportQueueItem {
             id,
@@ -353,10 +383,11 @@ impl ExportQueue {
 
     pub fn enqueue_for_project(
         &mut self,
-        spec: ExportQueueSpec,
+        mut spec: ExportQueueSpec,
         protected_sources: Vec<PathBuf>,
         project_session_id: u64,
     ) -> Result<u64, String> {
+        spec.destination = export_batch::normalize_tiff_destination(&spec.destination);
         validate_tiff_export_source(&spec.source)?;
         validate_destination(&spec.destination, &protected_sources)?;
         let key = path_safety::path_key(&spec.destination);
@@ -876,30 +907,100 @@ impl ExportQueue {
                 adjustment_sha256: spec.recipe.adjustment_sha256(),
                 destination: spec.destination.clone(),
             });
+            let operation = spec.operation.clone();
             let result = worker_guard::catch_result("Export worker", || {
                 let validate_after_export = spec.validate_after_export;
                 let progress_tx = tx.clone();
-                let project = spec.recipe.materialize_project();
-                export::export_face_with_progress_options(
-                    &spec.source,
-                    &spec.destination,
-                    &project,
-                    spec.default_dpi,
-                    export::ExportOptions {
-                        force_lzw: spec.force_lzw,
-                    },
-                    move |fraction, detail| {
-                        let _ = progress_tx.send(ExportQueueEvent::Progress {
-                            id,
-                            fraction: if validate_after_export {
-                                fraction * 0.90
-                            } else {
-                                fraction
+                let export_result = match operation {
+                    ExportQueueOperation::Standard => {
+                        let project = spec.recipe.materialize_project();
+                        export::export_face_with_progress_options(
+                            &spec.source,
+                            &spec.destination,
+                            &project,
+                            spec.default_dpi,
+                            export::ExportOptions {
+                                force_lzw: spec.force_lzw,
                             },
-                            detail: detail.to_owned(),
-                        });
-                    },
-                )
+                            move |fraction, detail| {
+                                let _ = progress_tx.send(ExportQueueEvent::Progress {
+                                    id,
+                                    fraction: if validate_after_export {
+                                        fraction * 0.90
+                                    } else {
+                                        fraction
+                                    },
+                                    detail: detail.to_owned(),
+                                });
+                            },
+                        )
+                    }
+                    ExportQueueOperation::TestStack {
+                        snapshots,
+                        rows,
+                        columns,
+                        anchor,
+                    } => {
+                        let local_projects = snapshots
+                            .iter()
+                            .map(ExportRecipe::materialize_project)
+                            .collect::<Vec<_>>();
+                        let projects = local_projects
+                            .into_iter()
+                            .map(|project| {
+                                serde_json::to_vec(&project)
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<
+                                            windows_shade_editor::model::ShadeProject,
+                                        >(&bytes)
+                                    })
+                                    .map_err(|err| {
+                                        format!("Cannot prepare Test Stack project state: {err}")
+                                    })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let layout = windows_shade_editor::test_stack::TestStackLayout::new(
+                            rows, columns,
+                        )?;
+                        let anchor = match anchor {
+                            TestStackAnchor::TopLeft => {
+                                windows_shade_editor::test_stack::TestStackAnchor::TopLeft
+                            }
+                            TestStackAnchor::TopRight => {
+                                windows_shade_editor::test_stack::TestStackAnchor::TopRight
+                            }
+                            TestStackAnchor::BottomLeft => {
+                                windows_shade_editor::test_stack::TestStackAnchor::BottomLeft
+                            }
+                            TestStackAnchor::BottomRight => {
+                                windows_shade_editor::test_stack::TestStackAnchor::BottomRight
+                            }
+                        };
+                        windows_shade_editor::test_stack::export_captured_test_stack_with_progress(
+                            &spec.source,
+                            &spec.destination,
+                            &projects,
+                            layout,
+                            anchor,
+                            spec.default_dpi,
+                            windows_shade_editor::export::ExportOptions {
+                                force_lzw: spec.force_lzw,
+                            },
+                            move |fraction, detail| {
+                                let _ = progress_tx.send(ExportQueueEvent::Progress {
+                                    id,
+                                    fraction: if validate_after_export {
+                                        fraction * 0.90
+                                    } else {
+                                        fraction
+                                    },
+                                    detail: detail.to_owned(),
+                                });
+                            },
+                        )
+                    }
+                };
+                export_result
                 .and_then(|_| {
                     if spec.validate_after_export {
                         let _ = tx.send(ExportQueueEvent::Progress {
@@ -1006,6 +1107,8 @@ fn validate_destination(destination: &Path, sources: &[PathBuf]) -> Result<(), S
 mod tests {
     use super::*;
     use crate::model::ShadeProject;
+    use std::fs::File;
+    use tiff::encoder::{TiffEncoder, colortype};
 
     fn spec(destination: &str) -> ExportQueueSpec {
         ExportQueueSpec {
@@ -1018,6 +1121,7 @@ mod tests {
             validate_after_export: false,
             conflict_policy: ConflictPolicy::AutoNumber,
             mark: None,
+            operation: ExportQueueOperation::Standard,
         }
     }
 
@@ -1040,6 +1144,104 @@ mod tests {
         assert_eq!(queue.items()[0].status, ExportQueueStatus::Cancelled);
         assert!(queue.retry(id));
         assert_eq!(queue.items()[0].status, ExportQueueStatus::Waiting);
+    }
+
+    #[test]
+    fn queued_destination_is_normalized_before_reservation() {
+        let mut queue = ExportQueue::new();
+        let id = queue.enqueue(spec("out.TIFF"));
+        assert_eq!(queue.items()[0].id, id);
+        assert_eq!(queue.items()[0].destination, PathBuf::from("out.tif"));
+        assert_eq!(
+            queue.items()[0].spec.export.destination,
+            PathBuf::from("out.tif")
+        );
+    }
+
+    #[test]
+    fn face_snapshot_test_stack_face_jobs_keep_fifo_insertion_order() {
+        let mut queue = ExportQueue::new();
+        for (label, operation) in [
+            ("Face", ExportQueueOperation::Standard),
+            ("Snapshot", ExportQueueOperation::Standard),
+            (
+                "Test Stack",
+                ExportQueueOperation::TestStack {
+                    snapshots: vec![ExportRecipe::from_project(&ShadeProject::default())],
+                    rows: 1,
+                    columns: 1,
+                    anchor: TestStackAnchor::TopLeft,
+                },
+            ),
+            ("Face 2", ExportQueueOperation::Standard),
+        ] {
+            let mut queued = spec(&format!("{label}.tif"));
+            queued.label = label.to_owned();
+            queued.operation = operation;
+            queue.enqueue(queued);
+        }
+
+        assert_eq!(
+            queue
+                .items()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Face", "Snapshot", "Test Stack", "Face 2"]
+        );
+    }
+
+    #[test]
+    fn legacy_queue_spec_defaults_to_standard_operation() {
+        let mut value = serde_json::to_value(spec("out.tif")).unwrap();
+        value.as_object_mut().unwrap().remove("operation");
+        let restored: ExportQueueSpec = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            restored.operation,
+            ExportQueueOperation::Standard
+        ));
+    }
+
+    #[test]
+    fn queued_test_stack_executes_through_export_worker() {
+        let folder = temp_folder("test-stack-worker");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = folder.join("source.tif");
+        let destination = folder.join("stack.TIFF");
+        let file = File::create(&source).unwrap();
+        let mut encoder = TiffEncoder::new(file).unwrap();
+        let image = encoder.new_image::<colortype::Gray8>(2, 2).unwrap();
+        image.write_data(&[0, 1, 2, 3]).unwrap();
+
+        let snapshot_recipe = ExportRecipe::from_project(&ShadeProject::default());
+        let mut stack = spec(destination.to_str().unwrap());
+        stack.source = source.clone();
+        stack.operation = ExportQueueOperation::TestStack {
+            snapshots: vec![snapshot_recipe],
+            rows: 1,
+            columns: 1,
+            anchor: TestStackAnchor::TopLeft,
+        };
+
+        let mut queue = ExportQueue::new();
+        queue
+            .enqueue_for_project(stack, vec![source.clone()], 42)
+            .unwrap();
+        for _ in 0..200 {
+            queue.poll();
+            if queue.items()[0].status.finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(queue.items()[0].status, ExportQueueStatus::Done);
+        assert_eq!(queue.items()[0].destination, folder.join("stack.tif"));
+        let decoded = windows_shade_editor::tiff_io::decode_full(&folder.join("stack.tif"))
+            .unwrap();
+        assert_eq!(decoded.metadata.width, 2);
+        assert_eq!(decoded.metadata.height, 2);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]

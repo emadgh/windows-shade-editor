@@ -9,9 +9,8 @@ use memmap2::{Mmap, MmapMut, MmapOptions};
 use tiff::encoder::{Compression, TiffEncoder, TiffValue, colortype};
 use tiff::tags::{PhotometricInterpretation, SampleFormat, Tag, Type};
 
-use crate::{dpi, safe_fs, tiff_io};
+use crate::{dpi, tiff_io, tiff_output};
 
-const CLASSIC_TIFF_SAFE_RAW_BYTES: u64 = 4_000_000_000;
 static CONVERSION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct ConversionSpool {
@@ -191,28 +190,17 @@ fn write_atomic<F>(
 where
     F: FnOnce(&Path) -> Result<(), String>,
 {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("Cannot create conversion output folder: {err}"))?;
-    let staged = staged_path(destination)?;
-    if staged.exists() {
-        fs::remove_file(&staged)
-            .map_err(|err| format!("Cannot remove stale conversion temp file: {err}"))?;
-    }
-
-    let result = (|| {
-        write_staged(&staged)?;
-        verify_staged(&staged, spec, bit_depth)?;
+    tiff_output::write_atomic(
+        destination,
+        ".conversion.tmp",
         if spec.replace_existing {
-            safe_fs::commit_staged_file(&staged, destination)
+            tiff_output::DestinationPolicy::ReplaceExisting
         } else {
-            safe_fs::commit_staged_file_if_absent(&staged, destination)
-        }
-    })();
-    if result.is_err() && staged.exists() {
-        let _ = fs::remove_file(&staged);
-    }
-    result
+            tiff_output::DestinationPolicy::RequireAbsent
+        },
+        write_staged,
+        |staged| verify_staged(staged, spec, bit_depth),
+    )
 }
 
 fn write_u8<F>(staged: &Path, spec: &ConversionTiffSpec<'_>, render_strip: F) -> Result<(), String>
@@ -801,11 +789,12 @@ fn read_u64(bytes: [u8; 8], little_endian: bool) -> u64 {
 
 fn should_write_bigtiff(spec: &ConversionTiffSpec<'_>, bit_depth: u8) -> bool {
     spec.force_bigtiff
-        || u64::from(spec.width)
-            .checked_mul(u64::from(spec.height))
-            .and_then(|value| value.checked_mul(spec.channel_names.len() as u64))
-            .and_then(|value| value.checked_mul(u64::from(bit_depth / 8)))
-            .is_none_or(|bytes| bytes >= CLASSIC_TIFF_SAFE_RAW_BYTES)
+        || tiff_output::layout_requires_bigtiff(tiff_output::TiffLayout {
+            width: spec.width,
+            height: spec.height,
+            channels: spec.channel_names.len(),
+            bit_depth,
+        })
 }
 
 fn local_conversion_spool_root() -> PathBuf {
@@ -839,12 +828,10 @@ fn spool_label(destination: &Path) -> String {
 }
 
 fn staged_path(destination: &Path) -> Result<PathBuf, String> {
-    let file_name = destination
-        .file_name()
-        .ok_or_else(|| "Conversion destination must include a file name.".to_owned())?;
-    let mut staged_name = file_name.to_os_string();
-    staged_name.push(".conversion.tmp");
-    Ok(destination.with_file_name(staged_name))
+    if destination.file_name().is_none() {
+        return Err("Conversion destination must include a file name.".to_owned());
+    }
+    Ok(tiff_output::staged_path(destination, ".conversion.tmp"))
 }
 
 #[cfg(test)]

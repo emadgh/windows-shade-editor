@@ -76,6 +76,10 @@ pub fn render_export_filename(template: &str, context: &ExportNameContext<'_>) -
     format!("{stem}.tif")
 }
 
+pub fn normalize_tiff_destination(destination: &Path) -> PathBuf {
+    crate::tiff_output::canonical_destination(destination)
+}
+
 pub fn render_export_folder(
     base_folder: &Path,
     template: &str,
@@ -255,6 +259,18 @@ mod tests {
     #[test]
     fn windows_reserved_filename_characters_are_sanitized() {
         assert_eq!(sanitize_filename_stem("A*B:C?D"), "A-B-C-D");
+    }
+
+    #[test]
+    fn normalize_tiff_destination_uses_one_canonical_extension() {
+        assert_eq!(
+            normalize_tiff_destination(Path::new("face.TIFF")),
+            PathBuf::from("face.tif")
+        );
+        assert_eq!(
+            normalize_tiff_destination(Path::new("face")),
+            PathBuf::from("face.tif")
+        );
     }
 
     #[cfg(windows)]

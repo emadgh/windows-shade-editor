@@ -1,18 +1,13 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{BufWriter, Read};
+use std::fs;
 use std::path::{Path, PathBuf};
-
-use tiff::encoder::{Compression, Predictor, TiffEncoder, colortype};
-use tiff::tags::{ExtraSamples, Tag};
 
 use crate::dpi::{self, DpiInfo};
 use crate::export::{self, ExportOptions};
 use crate::model::ShadeProject;
-use crate::safe_fs;
+use crate::source_tiff_writer;
+use crate::tiff_output::{self, DestinationPolicy};
 use crate::tiff_io::{self, ColorModel, TiffMetadata};
-
-const CLASSIC_TIFF_SAFE_RAW_BYTES: u64 = 4_000_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TestStackAnchor {
@@ -249,16 +244,44 @@ pub fn export_test_stack_with_progress<F>(
     anchor: TestStackAnchor,
     default_dpi: f64,
     options: ExportOptions,
-    mut progress: F,
+    progress: F,
 ) -> Result<(), String>
 where
     F: FnMut(f32, &str),
 {
     layout.validate_snapshot_count(snapshot_ids.len())?;
+    let projects = materialize_snapshot_projects(base_project, snapshot_ids)?;
+    export_captured_test_stack_with_progress(
+        source,
+        destination,
+        &projects,
+        layout,
+        anchor,
+        default_dpi,
+        options,
+        progress,
+    )
+}
+
+/// Queue-facing Test Stack entry point. The caller provides immutable captured
+/// Snapshot projects so a queued job does not depend on later project edits.
+pub fn export_captured_test_stack_with_progress<F>(
+    source: &Path,
+    destination: &Path,
+    projects: &[ShadeProject],
+    layout: TestStackLayout,
+    anchor: TestStackAnchor,
+    default_dpi: f64,
+    options: ExportOptions,
+    mut progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(f32, &str),
+{
+    layout.validate_snapshot_count(projects.len())?;
     if source == destination {
         return Err("Test Stack destination must not overwrite the source TIFF.".to_owned());
     }
-    let projects = materialize_snapshot_projects(base_project, snapshot_ids)?;
     let source_info = tiff_io::stream_info(source)?;
     validate_supported_metadata(&source_info.metadata)?;
 
@@ -447,15 +470,6 @@ fn rendered_snapshot_temp_path(index: usize) -> Result<PathBuf, String> {
     )))
 }
 
-fn staged_output_path(destination: &Path) -> PathBuf {
-    let mut name = destination
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_else(|| "test-stack.tif".into());
-    name.push(".test-stack.tmp");
-    destination.with_file_name(name)
-}
-
 fn write_test_stack_tiff(
     source: &Path,
     destination: &Path,
@@ -477,237 +491,48 @@ fn write_test_stack_tiff(
         ));
     }
 
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("Cannot create Test Stack output folder {}: {err}", parent.display()))?;
-    let staged = staged_output_path(destination);
-    if staged.exists() {
-        fs::remove_file(&staged).map_err(|err| {
-            format!("Cannot remove stale Test Stack output {}: {err}", staged.display())
-        })?;
-    }
-
-    let result = (|| -> Result<(), String> {
-        match metadata.bit_depth {
-            8 => {
-                let bytes = samples
-                    .iter()
-                    .map(|value| (value >> 8) as u8)
-                    .collect::<Vec<_>>();
-                write_tiff_pixels(source, &staged, metadata, dpi_info, options, Pixels::U8(&bytes))?;
+    tiff_output::write_atomic(
+        destination,
+        ".test-stack.tmp",
+        DestinationPolicy::ReplaceExisting,
+        |staged| {
+            match metadata.bit_depth {
+                8 => {
+                    let bytes = samples
+                        .iter()
+                        .map(|value| (value >> 8) as u8)
+                        .collect::<Vec<_>>();
+                    source_tiff_writer::write_tiff_pixels(
+                        source,
+                        staged,
+                        metadata,
+                        dpi_info,
+                        options.force_lzw,
+                        None,
+                        source_tiff_writer::OutputPixels::U8(&bytes),
+                    )?;
+                }
+                16 => {
+                    source_tiff_writer::write_tiff_pixels(
+                        source,
+                        staged,
+                        metadata,
+                        dpi_info,
+                        options.force_lzw,
+                        None,
+                        source_tiff_writer::OutputPixels::U16(samples),
+                    )?;
+                }
+                _ => unreachable!(),
             }
-            16 => {
-                write_tiff_pixels(source, &staged, metadata, dpi_info, options, Pixels::U16(samples))?;
-            }
-            _ => unreachable!(),
-        }
-        safe_fs::commit_staged_file(&staged, destination)
-    })();
-    if result.is_err() && staged.exists() {
-        let _ = fs::remove_file(&staged);
-    }
-    result
-}
-
-#[derive(Clone, Copy)]
-enum Pixels<'a> {
-    U8(&'a [u8]),
-    U16(&'a [u16]),
-}
-
-fn write_tiff_pixels(
-    source: &Path,
-    destination: &Path,
-    metadata: &TiffMetadata,
-    dpi_info: DpiInfo,
-    options: ExportOptions,
-    pixels: Pixels<'_>,
-) -> Result<(), String> {
-    let file = File::create(destination)
-        .map_err(|err| format!("Cannot create Test Stack TIFF: {err}"))?;
-    let writer = BufWriter::new(file);
-    if should_write_bigtiff(source, metadata)? {
-        let encoder = TiffEncoder::new_big(writer)
-            .map_err(|err| format!("Cannot initialize Test Stack BigTIFF encoder: {err}"))?;
-        let mut encoder = configure_encoder(encoder, metadata, options);
-        write_with_encoder(&mut encoder, metadata, dpi_info, pixels)
-    } else {
-        let encoder = TiffEncoder::new(writer)
-            .map_err(|err| format!("Cannot initialize Test Stack TIFF encoder: {err}"))?;
-        let mut encoder = configure_encoder(encoder, metadata, options);
-        write_with_encoder(&mut encoder, metadata, dpi_info, pixels)
-    }
-}
-
-fn configure_encoder<W, K>(
-    mut encoder: TiffEncoder<W, K>,
-    metadata: &TiffMetadata,
-    options: ExportOptions,
-) -> TiffEncoder<W, K>
-where
-    W: std::io::Write + std::io::Seek,
-    K: tiff::encoder::TiffKind,
-{
-    let compression = if options.force_lzw {
-        Compression::Lzw
-    } else {
-        match metadata.compression {
-            Some(1) => Compression::Uncompressed,
-            Some(5) => Compression::Lzw,
-            Some(8 | 32946) => Compression::Deflate(tiff::encoder::DeflateLevel::Balanced),
-            Some(32773) => Compression::Packbits,
-            _ => Compression::Lzw,
-        }
-    };
-    encoder = encoder.with_compression(compression);
-    if metadata.predictor == Some(2) && metadata.samples_per_pixel == metadata.base_channel_count {
-        encoder = encoder.with_predictor(Predictor::Horizontal);
-    }
-    encoder
-}
-
-fn write_with_encoder<W, K>(
-    encoder: &mut TiffEncoder<W, K>,
-    metadata: &TiffMetadata,
-    dpi_info: DpiInfo,
-    pixels: Pixels<'_>,
-) -> Result<(), String>
-where
-    W: std::io::Write + std::io::Seek,
-    K: tiff::encoder::TiffKind,
-{
-    let channels = metadata.samples_per_pixel;
-    match (metadata.color_model, metadata.bit_depth, pixels) {
-        (ColorModel::Rgb, 8, Pixels::U8(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::RGB8>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create RGB8 Test Stack TIFF: {err}"))?;
-            configure_metadata(&mut image, channels, 3, metadata, dpi_info)?;
-            image.write_data(data).map_err(|err| format!("Cannot write Test Stack pixels: {err}"))?;
-        }
-        (ColorModel::Rgb, 16, Pixels::U16(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::RGB16>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create RGB16 Test Stack TIFF: {err}"))?;
-            configure_metadata(&mut image, channels, 3, metadata, dpi_info)?;
-            image.write_data(data).map_err(|err| format!("Cannot write Test Stack pixels: {err}"))?;
-        }
-        (ColorModel::Cmyk, 8, Pixels::U8(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::CMYK8>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create CMYK8 Test Stack TIFF: {err}"))?;
-            configure_metadata(&mut image, channels, 4, metadata, dpi_info)?;
-            image.write_data(data).map_err(|err| format!("Cannot write Test Stack pixels: {err}"))?;
-        }
-        (ColorModel::Cmyk, 16, Pixels::U16(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::CMYK16>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create CMYK16 Test Stack TIFF: {err}"))?;
-            configure_metadata(&mut image, channels, 4, metadata, dpi_info)?;
-            image.write_data(data).map_err(|err| format!("Cannot write Test Stack pixels: {err}"))?;
-        }
-        (ColorModel::Gray, 8, Pixels::U8(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::Gray8>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create Gray8 Test Stack TIFF: {err}"))?;
-            configure_metadata(&mut image, channels, 1, metadata, dpi_info)?;
-            image.write_data(data).map_err(|err| format!("Cannot write Test Stack pixels: {err}"))?;
-        }
-        (ColorModel::Gray, 16, Pixels::U16(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::Gray16>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create Gray16 Test Stack TIFF: {err}"))?;
-            configure_metadata(&mut image, channels, 1, metadata, dpi_info)?;
-            image.write_data(data).map_err(|err| format!("Cannot write Test Stack pixels: {err}"))?;
-        }
-        (_, depth, _) => {
-            return Err(format!("Unsupported Test Stack TIFF format: {depth}-bit."));
-        }
-    }
-    Ok(())
-}
-
-fn configure_metadata<W, C, K>(
-    image: &mut tiff::encoder::ImageEncoder<'_, W, C, K>,
-    channels: usize,
-    base_channels: usize,
-    metadata: &TiffMetadata,
-    dpi_info: DpiInfo,
-) -> Result<(), String>
-where
-    W: std::io::Write + std::io::Seek,
-    C: tiff::encoder::colortype::ColorType,
-    K: tiff::encoder::TiffKind,
-{
-    let extra_count = channels.saturating_sub(base_channels);
-    if extra_count > 0 {
-        let extras = (0..extra_count)
-            .map(|_| ExtraSamples::Unspecified)
-            .collect::<Vec<_>>();
-        image
-            .extra_samples(&extras)
-            .map_err(|err| format!("Cannot configure Test Stack extra channels: {err}"))?;
-    }
-
-    let (resolution_x, resolution_y, resolution_unit) = dpi_info.effective_tiff_resolution();
-    image.x_resolution(dpi::rational(resolution_x));
-    image.y_resolution(dpi::rational(resolution_y));
-    image
-        .encoder()
-        .write_tag(Tag::ResolutionUnit, resolution_unit)
-        .map_err(|err| format!("Cannot write Test Stack resolution unit: {err}"))?;
-    if let Some(orientation) = metadata.orientation {
-        image
-            .encoder()
-            .write_tag(Tag::Orientation, orientation)
-            .map_err(|err| format!("Cannot preserve Test Stack orientation: {err}"))?;
-    }
-    if let Some(profile) = &metadata.icc_profile {
-        image
-            .encoder()
-            .write_tag(Tag::IccProfile, profile.as_slice())
-            .map_err(|err| format!("Cannot preserve Test Stack ICC profile: {err}"))?;
-    }
-    if let Some(resources) = &metadata.photoshop_resources {
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34377), resources.as_slice())
-            .map_err(|err| format!("Cannot preserve Test Stack Photoshop resources: {err}"))?;
-    }
-    if let Some(source_data) = &metadata.photoshop_image_source_data {
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(37724), source_data.as_slice())
-            .map_err(|err| format!("Cannot preserve Test Stack ImageSourceData: {err}"))?;
-    }
-    image
-        .encoder()
-        .write_tag(Tag::Software, "Shade Editor Test Stack")
-        .map_err(|err| format!("Cannot write Test Stack software tag: {err}"))?;
-    Ok(())
-}
-
-fn should_write_bigtiff(source: &Path, metadata: &TiffMetadata) -> Result<bool, String> {
-    let bytes_per_sample = u64::from(metadata.bit_depth / 8);
-    let raw_bytes = u64::from(metadata.width)
-        .checked_mul(u64::from(metadata.height))
-        .and_then(|value| value.checked_mul(metadata.samples_per_pixel as u64))
-        .and_then(|value| value.checked_mul(bytes_per_sample))
-        .ok_or_else(|| "Test Stack TIFF size overflow.".to_owned())?;
-    Ok(source_is_bigtiff(source)? || raw_bytes >= CLASSIC_TIFF_SAFE_RAW_BYTES)
-}
-
-fn source_is_bigtiff(source: &Path) -> Result<bool, String> {
-    let mut file = File::open(source)
-        .map_err(|err| format!("Cannot inspect Test Stack source TIFF header: {err}"))?;
-    let mut header = [0u8; 4];
-    file.read_exact(&mut header)
-        .map_err(|err| format!("Cannot read Test Stack source TIFF header: {err}"))?;
-    match header {
-        [b'I', b'I', 43, 0] | [b'M', b'M', 0, 43] => Ok(true),
-        [b'I', b'I', 42, 0] | [b'M', b'M', 0, 42] => Ok(false),
-        _ => Err("Source does not have a valid TIFF/BigTIFF header.".to_owned()),
-    }
+            Ok(())
+        },
+        |staged| {
+            tiff_io::stream_info(staged)
+                .map(|_| ())
+                .map_err(|err| format!("Staged Test Stack TIFF verification failed: {err}"))
+        },
+    )
 }
 
 fn partition_bounds(total: usize, parts: usize, index: usize) -> (usize, usize) {

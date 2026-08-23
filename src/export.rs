@@ -1,16 +1,10 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
-use std::os::windows::ffi::OsStrExt;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fontdue::{Font, FontSettings};
 use memmap2::MmapOptions;
-use tiff::encoder::{Compression, Predictor, TiffEncoder, colortype};
-use tiff::tags::{ExtraSamples, Tag};
-use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-};
 
 use crate::dpi::{self, DpiInfo};
 use crate::model::{
@@ -23,6 +17,8 @@ use crate::tiff_io::{
     ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_region,
     for_each_decoded_strip, stream_info, tiff_sample_from_working, working_sample_from_tiff,
 };
+use crate::tiff_output::{self, DestinationPolicy};
+use crate::source_tiff_writer;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExportOptions {
@@ -75,25 +71,33 @@ pub fn export_face_with_progress_options<F>(
 where
     F: FnMut(f32, &str),
 {
-    let temporary = temporary_export_path(destination)?;
-    remove_stale_temp(&temporary, "temporary export TIFF")?;
-    let result = export_face_direct_with_progress(
-        source,
-        &temporary,
-        project,
-        default_dpi,
-        options,
-        |fraction, detail| progress((fraction * 0.98).clamp(0.0, 0.98), detail),
+    if source == destination {
+        return Err("Refusing export: destination resolves to the source TIFF.".to_owned());
+    }
+    let result = tiff_output::write_atomic(
+        destination,
+        ".export.tmp",
+        DestinationPolicy::ReplaceExisting,
+        |temporary| {
+            export_face_direct_with_progress(
+                source,
+                temporary,
+                project,
+                default_dpi,
+                options,
+                |fraction, detail| progress((fraction * 0.98).clamp(0.0, 0.98), detail),
+            )
+        },
+        |staged| {
+            stream_info(staged)
+                .map(|_| ())
+                .map_err(|err| format!("Staged export TIFF verification failed: {err}"))
+        },
     );
     if let Err(err) = result {
-        let _ = fs::remove_file(&temporary);
         return Err(err);
     }
-    progress(0.99, "Committing TIFF atomically");
-    if let Err(err) = atomic_replace(&temporary, destination) {
-        let _ = fs::remove_file(&temporary);
-        return Err(err);
-    }
+    progress(0.99, "TIFF committed atomically");
     progress(1.0, "Export complete");
     Ok(())
 }
@@ -225,25 +229,25 @@ where
                 .into_iter()
                 .map(|value| (value >> 8) as u8)
                 .collect::<Vec<_>>();
-            write_tiff_pixels(
+            source_tiff_writer::write_tiff_pixels(
                 source,
                 destination,
                 &decoded.metadata,
                 dpi_info,
-                options,
+                options.force_lzw,
                 None,
-                OutputPixels::U8(&data),
+                source_tiff_writer::OutputPixels::U8(&data),
             )?;
         }
         16 => {
-            write_tiff_pixels(
+            source_tiff_writer::write_tiff_pixels(
                 source,
                 destination,
                 &decoded.metadata,
                 dpi_info,
-                options,
+                options.force_lzw,
                 None,
-                OutputPixels::U16(&output),
+                source_tiff_writer::OutputPixels::U16(&output),
             )?;
         }
         depth => {
@@ -377,26 +381,26 @@ where
 
         match metadata.bit_depth {
             8 => {
-                write_tiff_pixels(
+                source_tiff_writer::write_tiff_pixels(
                     source,
                     destination,
                     metadata,
                     dpi_info,
-                    options,
+                    options.force_lzw,
                     Some(stream.rows_per_strip),
-                    OutputPixels::U8(&mmap[..]),
+                    source_tiff_writer::OutputPixels::U8(&mmap[..]),
                 )?;
             }
             16 => {
                 let data = mmap_as_u16(&mmap)?;
-                write_tiff_pixels(
+                source_tiff_writer::write_tiff_pixels(
                     source,
                     destination,
                     metadata,
                     dpi_info,
-                    options,
+                    options.force_lzw,
                     Some(stream.rows_per_strip),
-                    OutputPixels::U16(data),
+                    source_tiff_writer::OutputPixels::U16(data),
                 )?;
             }
             depth => {
@@ -718,274 +722,6 @@ fn mmap_as_u16(mmap: &memmap2::Mmap) -> Result<&[u16], String> {
     })
 }
 
-fn configure_extras_and_metadata<W, C, K>(
-    image: &mut tiff::encoder::ImageEncoder<'_, W, C, K>,
-    channels: usize,
-    base_channels: usize,
-    metadata: &TiffMetadata,
-    dpi_info: DpiInfo,
-) -> Result<(), String>
-where
-    W: std::io::Write + std::io::Seek,
-    C: tiff::encoder::colortype::ColorType,
-    K: tiff::encoder::TiffKind,
-{
-    let extra_count = channels.saturating_sub(base_channels);
-    if extra_count > 0 {
-        let extras = (0..extra_count)
-            .map(|_| ExtraSamples::Unspecified)
-            .collect::<Vec<_>>();
-        image
-            .extra_samples(&extras)
-            .map_err(|err| format!("Cannot configure extra/spot channels: {err}"))?;
-    }
-
-    let (resolution_x, resolution_y, resolution_unit) = dpi_info.effective_tiff_resolution();
-    image.x_resolution(dpi::rational(resolution_x));
-    image.y_resolution(dpi::rational(resolution_y));
-    image
-        .encoder()
-        .write_tag(Tag::ResolutionUnit, resolution_unit)
-        .map_err(|err| format!("Cannot preserve/write TIFF resolution unit: {err}"))?;
-
-    if let Some(orientation) = metadata.orientation {
-        image
-            .encoder()
-            .write_tag(Tag::Orientation, orientation)
-            .map_err(|err| format!("Cannot preserve TIFF orientation: {err}"))?;
-    }
-
-    if let Some(profile) = &metadata.icc_profile {
-        image
-            .encoder()
-            .write_tag(Tag::IccProfile, profile.as_slice())
-            .map_err(|err| format!("Cannot preserve ICC profile: {err}"))?;
-    }
-    if let Some(resources) = &metadata.photoshop_resources {
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(34377), resources.as_slice())
-            .map_err(|err| format!("Cannot preserve Photoshop Image Resources: {err}"))?;
-    }
-    if let Some(source_data) = &metadata.photoshop_image_source_data {
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(37724), source_data.as_slice())
-            .map_err(|err| format!("Cannot preserve Photoshop ImageSourceData: {err}"))?;
-    }
-    image
-        .encoder()
-        .write_tag(Tag::Software, "Shade Editor")
-        .map_err(|err| format!("Cannot write TIFF software tag: {err}"))?;
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum OutputPixels<'a> {
-    U8(&'a [u8]),
-    U16(&'a [u16]),
-}
-
-// Classic TIFF uses 32-bit offsets. Keep a conservative margin below the
-// absolute 4 GiB address limit so strip tables, metadata, ICC/Photoshop
-// resources and encoder overhead cannot push a nominally-safe image over it.
-const CLASSIC_TIFF_SAFE_RAW_BYTES: u64 = 4_000_000_000;
-
-fn source_is_bigtiff(source: &Path) -> Result<bool, String> {
-    let mut file =
-        File::open(source).map_err(|err| format!("Cannot inspect source TIFF header: {err}"))?;
-    let mut header = [0u8; 4];
-    file.read_exact(&mut header)
-        .map_err(|err| format!("Cannot read source TIFF header: {err}"))?;
-    match header {
-        [b'I', b'I', 43, 0] | [b'M', b'M', 0, 43] => Ok(true),
-        [b'I', b'I', 42, 0] | [b'M', b'M', 0, 42] => Ok(false),
-        _ => Err("Source does not have a valid TIFF/BigTIFF header.".to_owned()),
-    }
-}
-
-fn raw_image_bytes(width: u32, height: u32, channels: usize, bit_depth: u8) -> Option<u64> {
-    let bytes_per_sample = u64::from(bit_depth / 8);
-    u64::from(width)
-        .checked_mul(u64::from(height))?
-        .checked_mul(channels as u64)?
-        .checked_mul(bytes_per_sample)
-}
-
-fn layout_requires_bigtiff_values(width: u32, height: u32, channels: usize, bit_depth: u8) -> bool {
-    raw_image_bytes(width, height, channels, bit_depth)
-        .map(|bytes| bytes >= CLASSIC_TIFF_SAFE_RAW_BYTES)
-        .unwrap_or(true)
-}
-
-fn should_write_bigtiff(source: &Path, metadata: &TiffMetadata) -> Result<bool, String> {
-    Ok(source_is_bigtiff(source)?
-        || layout_requires_bigtiff_values(
-            metadata.width,
-            metadata.height,
-            metadata.samples_per_pixel,
-            metadata.bit_depth,
-        ))
-}
-
-fn configure_tiff_encoder<W, K>(
-    mut encoder: TiffEncoder<W, K>,
-    metadata: &TiffMetadata,
-    options: ExportOptions,
-) -> TiffEncoder<W, K>
-where
-    W: std::io::Write + std::io::Seek,
-    K: tiff::encoder::TiffKind,
-{
-    let compression = if options.force_lzw {
-        Compression::Lzw
-    } else {
-        match metadata.compression {
-            Some(1) => Compression::Uncompressed,
-            Some(5) => Compression::Lzw,
-            Some(8 | 32946) => Compression::Deflate(tiff::encoder::DeflateLevel::Balanced),
-            Some(32773) => Compression::Packbits,
-            _ => Compression::Lzw,
-        }
-    };
-    encoder = encoder.with_compression(compression);
-    if metadata.predictor == Some(2) && metadata.samples_per_pixel == metadata.base_channel_count {
-        encoder = encoder.with_predictor(Predictor::Horizontal);
-    }
-    encoder
-}
-
-fn write_tiff_pixels(
-    source: &Path,
-    destination: &Path,
-    metadata: &TiffMetadata,
-    dpi_info: DpiInfo,
-    options: ExportOptions,
-    rows_per_strip: Option<u32>,
-    pixels: OutputPixels<'_>,
-) -> Result<(), String> {
-    let file =
-        File::create(destination).map_err(|err| format!("Cannot create export TIFF: {err}"))?;
-    let writer = BufWriter::new(file);
-    if should_write_bigtiff(source, metadata)? {
-        let encoder = TiffEncoder::new_big(writer)
-            .map_err(|err| format!("Cannot initialize BigTIFF encoder: {err}"))?;
-        let mut encoder = configure_tiff_encoder(encoder, metadata, options);
-        write_tiff_with_encoder(&mut encoder, metadata, dpi_info, rows_per_strip, pixels)
-    } else {
-        let encoder = TiffEncoder::new(writer)
-            .map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?;
-        let mut encoder = configure_tiff_encoder(encoder, metadata, options);
-        write_tiff_with_encoder(&mut encoder, metadata, dpi_info, rows_per_strip, pixels)
-    }
-}
-
-fn write_tiff_with_encoder<W, K>(
-    encoder: &mut TiffEncoder<W, K>,
-    metadata: &TiffMetadata,
-    dpi_info: DpiInfo,
-    rows_per_strip: Option<u32>,
-    pixels: OutputPixels<'_>,
-) -> Result<(), String>
-where
-    W: std::io::Write + std::io::Seek,
-    K: tiff::encoder::TiffKind,
-{
-    let channels = metadata.samples_per_pixel;
-    match (metadata.color_model, metadata.bit_depth, pixels) {
-        (ColorModel::Rgb, 8, OutputPixels::U8(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::RGB8>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create RGB 8-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 3, metadata, dpi_info)?;
-            if let Some(rows) = rows_per_strip {
-                image
-                    .rows_per_strip(rows)
-                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            }
-            image
-                .write_data(data)
-                .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
-        }
-        (ColorModel::Rgb, 16, OutputPixels::U16(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::RGB16>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create RGB 16-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 3, metadata, dpi_info)?;
-            if let Some(rows) = rows_per_strip {
-                image
-                    .rows_per_strip(rows)
-                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            }
-            image
-                .write_data(data)
-                .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
-        }
-        (ColorModel::Cmyk, 8, OutputPixels::U8(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::CMYK8>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create CMYK 8-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 4, metadata, dpi_info)?;
-            if let Some(rows) = rows_per_strip {
-                image
-                    .rows_per_strip(rows)
-                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            }
-            image
-                .write_data(data)
-                .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
-        }
-        (ColorModel::Cmyk, 16, OutputPixels::U16(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::CMYK16>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create CMYK 16-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 4, metadata, dpi_info)?;
-            if let Some(rows) = rows_per_strip {
-                image
-                    .rows_per_strip(rows)
-                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            }
-            image
-                .write_data(data)
-                .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
-        }
-        (ColorModel::Gray, 8, OutputPixels::U8(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::Gray8>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create Gray 8-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 1, metadata, dpi_info)?;
-            if let Some(rows) = rows_per_strip {
-                image
-                    .rows_per_strip(rows)
-                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            }
-            image
-                .write_data(data)
-                .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
-        }
-        (ColorModel::Gray, 16, OutputPixels::U16(data)) => {
-            let mut image = encoder
-                .new_image::<colortype::Gray16>(metadata.width, metadata.height)
-                .map_err(|err| format!("Cannot create Gray 16-bit TIFF image: {err}"))?;
-            configure_extras_and_metadata(&mut image, channels, 1, metadata, dpi_info)?;
-            if let Some(rows) = rows_per_strip {
-                image
-                    .rows_per_strip(rows)
-                    .map_err(|err| format!("Cannot configure output strip size: {err}"))?;
-            }
-            image
-                .write_data(data)
-                .map_err(|err| format!("Cannot write TIFF pixels: {err}"))?;
-        }
-        (_, depth, _) => {
-            return Err(format!(
-                "Unsupported export bit depth/color model: {depth}-bit."
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn local_export_spool_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -1009,44 +745,12 @@ fn temporary_spool_path(_destination: &Path) -> Result<PathBuf, String> {
     )))
 }
 
-fn temporary_export_path(destination: &Path) -> Result<PathBuf, String> {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "export.tif".to_owned());
-    Ok(parent.join(format!("{file_name}.tmp")))
-}
-
 fn remove_stale_temp(path: &Path, label: &str) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
     fs::remove_file(path)
         .map_err(|err| format!("Cannot remove stale {label} {}: {err}", path.display()))
-}
-
-fn atomic_replace(source: &Path, destination: &Path) -> Result<(), String> {
-    let source_wide = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination_wide = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-    let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
-    if moved == 0 {
-        return Err(format!(
-            "Cannot atomically replace {}: {}",
-            destination.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
 }
 
 fn find_windows_font(family: &str) -> Result<PathBuf, String> {
@@ -1329,12 +1033,12 @@ mod streaming_tests {
     fn temporary_export_name_stays_short_and_spool_is_local() {
         let destination =
             Path::new(r"\\192.168.100.154\DurstPrinter\TEST\Fabia_Gray_S8-E6_2026-08-15.tif");
-        let temporary = temporary_export_path(destination).unwrap();
+        let temporary = tiff_output::staged_path(destination, ".export.tmp");
         assert_eq!(
             temporary.file_name().unwrap().to_string_lossy(),
-            "Fabia_Gray_S8-E6_2026-08-15.tif.tmp"
+            "Fabia_Gray_S8-E6_2026-08-15.tif.export.tmp"
         );
-        let spool = temporary_spool_path(&temporary).unwrap();
+        let spool = temporary_spool_path(destination).unwrap();
         assert_eq!(spool.parent().unwrap(), local_export_spool_root());
         assert_ne!(spool.parent(), temporary.parent());
         assert!(
@@ -1348,7 +1052,7 @@ mod streaming_tests {
 
     use super::*;
     use tiff::encoder::{Compression, TiffEncoder, colortype};
-    use tiff::tags::ExtraSamples;
+    use tiff::tags::{ExtraSamples, Tag};
 
     fn test_metadata(
         names: &[String],
@@ -1620,12 +1324,12 @@ mod streaming_tests {
             let mut image = tiff.new_image::<colortype::CMYK8>(2, 2).unwrap();
             image.write_data(&pixels).unwrap();
         }
-        assert!(source_is_bigtiff(&source).unwrap());
+        assert!(tiff_output::source_is_bigtiff(&source).unwrap());
         let decoded_source = decode_full(&source).unwrap();
         let mut project = ShadeProject::default();
         project.ensure_channels(&decoded_source.metadata.channel_names);
         export_face_with_progress(&source, &destination, &project, 220.0, |_, _| {}).unwrap();
-        assert!(source_is_bigtiff(&destination).unwrap());
+        assert!(tiff_output::source_is_bigtiff(&destination).unwrap());
         let decoded_output = decode_full(&destination).unwrap();
         assert_eq!(decoded_output.samples, decoded_source.samples);
         assert_eq!(decoded_output.metadata.color_model, ColorModel::Cmyk);
@@ -1635,9 +1339,29 @@ mod streaming_tests {
 
     #[test]
     fn large_layout_selects_bigtiff_without_allocating_pixels() {
-        assert!(!layout_requires_bigtiff_values(720, 1280, 6, 8));
-        assert!(!layout_requires_bigtiff_values(20_000, 20_000, 4, 8));
-        assert!(layout_requires_bigtiff_values(40_000, 40_000, 4, 8));
-        assert!(layout_requires_bigtiff_values(30_000, 30_000, 4, 16));
+        assert!(!tiff_output::layout_requires_bigtiff(tiff_output::TiffLayout {
+            width: 720,
+            height: 1280,
+            channels: 6,
+            bit_depth: 8,
+        }));
+        assert!(!tiff_output::layout_requires_bigtiff(tiff_output::TiffLayout {
+            width: 20_000,
+            height: 20_000,
+            channels: 4,
+            bit_depth: 8,
+        }));
+        assert!(tiff_output::layout_requires_bigtiff(tiff_output::TiffLayout {
+            width: 40_000,
+            height: 40_000,
+            channels: 4,
+            bit_depth: 8,
+        }));
+        assert!(tiff_output::layout_requires_bigtiff(tiff_output::TiffLayout {
+            width: 30_000,
+            height: 30_000,
+            channels: 4,
+            bit_depth: 16,
+        }));
     }
 }

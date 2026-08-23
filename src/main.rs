@@ -38,8 +38,10 @@ mod runtime_preview;
 mod safe_fs;
 mod settings;
 mod snapshot_preview_cache;
+mod source_tiff_writer;
 mod source_transparency;
 mod thumbnail;
+mod tiff_output;
 mod tiff_inspect;
 mod tiff_io;
 mod ui;
@@ -905,6 +907,8 @@ impl ShadeApp {
     }
 
     fn enqueue_export(&mut self, spec: export_queue::ExportQueueSpec) -> bool {
+        let mut spec = spec;
+        spec.destination = export_batch::normalize_tiff_destination(&spec.destination);
         if self.conversion_queue.has_pending() {
             self.report_error(
                 "Finish or cancel the active Production Conversion before queueing exports.",
@@ -1013,6 +1017,7 @@ impl ShadeApp {
             validate_after_export: self.settings.validate_after_export,
             conflict_policy: export_batch::ConflictPolicy::Overwrite,
             mark: None,
+            operation: export_queue::ExportQueueOperation::Standard,
         }) {
             return;
         }
@@ -1547,6 +1552,7 @@ impl ShadeApp {
                 validate_after_export: self.settings.validate_after_export,
                 conflict_policy,
                 mark: None,
+                operation: export_queue::ExportQueueOperation::Standard,
             }) {
                 return;
             }
@@ -1854,6 +1860,7 @@ impl ShadeApp {
                 face_key,
                 folder,
             }),
+            operation: export_queue::ExportQueueOperation::Standard,
         }) {
             return;
         }
@@ -1979,6 +1986,7 @@ impl ShadeApp {
                     face_key: face_key.clone(),
                     folder,
                 }),
+                operation: export_queue::ExportQueueOperation::Standard,
             }) {
                 return;
             }

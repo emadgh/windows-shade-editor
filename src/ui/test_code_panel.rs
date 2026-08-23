@@ -317,7 +317,6 @@ fn start_test_stack(
     anchor: TestStackAnchor,
 ) {
     if app.job.is_some()
-        || app.export.queue.has_pending()
         || app.conversion_queue.has_pending()
         || !workflow::active_face_available(app)
         || !app.active_face_is_tiff_export_source()
@@ -358,49 +357,49 @@ fn start_test_stack(
         return;
     }
 
-    // main.rs and lib.rs intentionally compile their own application model modules.
-    // Bridge the identical persisted schema explicitly at this boundary instead of
-    // coupling the UI binary's ShadeProject type to the library crate's type identity.
-    let project = match serde_json::to_vec(&app.project).and_then(|bytes| {
-        serde_json::from_slice::<windows_shade_editor::model::ShadeProject>(&bytes)
-    }) {
-        Ok(project) => project,
-        Err(err) => {
-            app.report_error(format!("Cannot prepare Test Stack project state: {err}"));
-            return;
-        }
+    let operation_anchor = match anchor {
+        TestStackAnchor::TopLeft => export_queue::TestStackAnchor::TopLeft,
+        TestStackAnchor::TopRight => export_queue::TestStackAnchor::TopRight,
+        TestStackAnchor::BottomLeft => export_queue::TestStackAnchor::BottomLeft,
+        TestStackAnchor::BottomRight => export_queue::TestStackAnchor::BottomRight,
     };
-
-    let default_dpi = app.settings.default_dpi;
-    let options = windows_shade_editor::export::ExportOptions {
-        force_lzw: app.settings.lzw_compression,
-    };
-    let result_destination = destination.clone();
-    app.launch_job("Building Test Stack", move |job_progress| {
-        let result = windows_shade_editor::test_stack::export_test_stack_with_progress(
-            &source,
-            &destination,
-            &project,
-            &snapshot_ids,
-            layout,
-            anchor,
-            default_dpi,
-            options,
-            |fraction, detail| {
-                ShadeApp::set_progress(
-                    &job_progress,
-                    Some(fraction),
-                    "Building Test Stack",
-                    detail,
-                );
-            },
-        )
-        .map(|_| format!("Test Stack saved: {}", result_destination.display()));
-        JobResult::Export(SnapshotExportBatchResult {
-            result,
-            marks: Vec::new(),
+    let snapshots = snapshot_ids
+        .iter()
+        .filter_map(|snapshot_id| {
+            app.project.snapshots.iter().find(|snapshot| snapshot.id == *snapshot_id)
         })
-    });
+        .map(|snapshot| {
+            let mut project = app.project.clone();
+            project.adjustments = snapshot.adjustments.clone();
+            project.active_snapshot_id = Some(snapshot.id);
+            export_recipe::ExportRecipe::from_snapshot_project(&project)
+        })
+        .collect::<Vec<_>>();
+    if snapshots.len() != layout.capacity() {
+        app.report_error("Selected Snapshots changed before Test Stack was queued.");
+        return;
+    }
+    if !app.enqueue_export(export_queue::ExportQueueSpec {
+        label: format!("Test Stack / {}", layout.label()),
+        source,
+        destination,
+        recipe: export_recipe::ExportRecipe::from_project(&app.project),
+        default_dpi: app.settings.default_dpi,
+        force_lzw: app.settings.lzw_compression,
+        validate_after_export: app.settings.validate_after_export,
+        conflict_policy: export_batch::ConflictPolicy::Overwrite,
+        mark: None,
+        operation: export_queue::ExportQueueOperation::TestStack {
+            snapshots,
+            rows: layout.rows,
+            columns: layout.columns,
+            anchor: operation_anchor,
+        },
+    }) {
+        return;
+    }
+    app.export.show_queue = true;
+    app.report_info("Test Stack added to Export Queue");
 }
 
 fn anchor_from_test_code_position(position: TestCodePosition) -> TestStackAnchor {
