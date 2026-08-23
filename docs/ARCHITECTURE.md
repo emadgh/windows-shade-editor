@@ -20,9 +20,11 @@ Legacy version-suffixed implementations were removed. Active modules have canoni
 - `model.rs` — schema-v9 `.shade` model, Snapshots, adjustments, Test Code and project preview-color settings.
 - `color_management.rs` — embedded/assigned ICC preview transforms and installed Windows profile discovery.
 - `tiff_io.rs` — TIFF decode, channel discovery, Photoshop resources, Spot polarity and metadata.
+- `tiff_output.rs` — canonical `.tif` destination normalization, BigTIFF size policy and unique sibling staging/atomic commit.
 - `render.rs` — preview adjustment pipeline, clipping estimates and RGB/Spot composition.
 - `snapshot_preview_cache.rs` — bounded in-memory LRU for per-Snapshot/Face/display-mode preview textures and compact histogram/clipping state.
 - `export.rs` — full-resolution production TIFF renderer/writer.
+- `source_tiff_writer.rs` — shared RGB/CMYK/Gray 8/16-bit TIFF encoder, metadata preservation and source BigTIFF/compression policy for Export and Test Stack.
 - `validation.rs` — production round-trip comparison.
 - `settings.rs` — application-only preferences such as layout, diagnostics, palettes and export defaults.
 - `previous_shades.rs` — Project View cache/search/inspection.
@@ -107,7 +109,9 @@ Photoshop Spot samples are normalized internally to ink-coverage polarity and co
 
 ## Production export boundary
 
-`export.rs` applies full-resolution adjustments and Test Code, preserves approved metadata, uses bounded streaming/spooling paths, selects/preserves BigTIFF when required and commits output atomically. Preview ICC settings are forbidden inputs to this module.
+`export.rs` applies full-resolution adjustments and Test Code, preserves approved metadata and uses bounded streaming/spooling paths. The RGB/CMYK/Gray 8/16-bit source-topology writer is shared by normal Export and Test Stack, while `tiff_output.rs` owns `.tif` normalization, BigTIFF selection and unique same-directory staging. Every final adjusted-source TIFF is validated before `safe_fs` publishes it atomically. Preview ICC settings are forbidden inputs to this module.
+
+All adjusted-source user actions—current Face, Export All, single/group Snapshot export and Test Stack—are captured as immutable recipes in `ExportQueue` and execute in insertion order. Test Stack is one queue row; its intermediate Snapshot renders are local implementation details and never become queue rows. Conversion remains in `ConversionQueue` because its completion and recovery contract includes the Production `.shade` transaction after TIFF commit, but its TIFF writer uses the same output transaction and BigTIFF policy.
 
 ## Remaining production validation
 

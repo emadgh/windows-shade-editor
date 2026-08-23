@@ -33,6 +33,9 @@ Export keeps:
 - export metrics;
 - `stop_after_current` cancellation behavior;
 - snapshot export marks/provenance.
+- operation payloads for standard Face exports and compact captured Test Stack recipes;
+- `.tif` destination normalization before reservation, persistence and worker execution;
+- one FIFO queue row for a Test Stack, including its pause, retry, cancellation and restore behavior.
 
 Conversion keeps:
 
@@ -76,3 +79,8 @@ A future incompatible persisted-shape change must increment the relevant queue f
 - Conversion cancellation must continue respecting transactional commit boundaries.
 - A committed TIFF that still needs Production-project recovery must remain recoverable and must not be re-run as a fresh conversion.
 - Persistence remains atomic through `safe_fs::atomic_write`.
+- Export Queue operation payloads are backward-compatible: old rows without the operation field
+  deserialize as standard exports. Test Stack payloads store only immutable `ExportRecipe` values,
+  grid dimensions and anchor—not a full project, thumbnail cache or snapshot history.
+- Final export files are unique same-directory staged TIFFs committed through `safe_fs`; local
+  render spools remain under application data and are never used as final-output staging.

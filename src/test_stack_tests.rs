@@ -12,7 +12,8 @@ use crate::model::{
 use crate::test_stack::{
     TestStackAnchor, TestStackLayout, export_test_stack_with_progress,
 };
-use crate::tiff_io::decode_full;
+use crate::tiff_io::{self, decode_full};
+use crate::tiff_output::source_is_bigtiff;
 
 fn temp_folder(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -84,8 +85,19 @@ fn two_by_two_pipeline_renders_each_saved_snapshot_state_and_writes_same_size_ti
     .unwrap();
 
     let decoded = decode_full(&output).unwrap();
+    let source_info = tiff_io::stream_info(&source).unwrap();
+    let output_info = tiff_io::stream_info(&output).unwrap();
     assert_eq!(decoded.metadata.width, 4);
     assert_eq!(decoded.metadata.height, 4);
+    assert_eq!(output_info.metadata.width, source_info.metadata.width);
+    assert_eq!(output_info.metadata.height, source_info.metadata.height);
+    assert_eq!(output_info.metadata.bit_depth, source_info.metadata.bit_depth);
+    assert_eq!(
+        output_info.metadata.samples_per_pixel,
+        source_info.metadata.samples_per_pixel
+    );
+    assert_eq!(output_info.metadata.color_model, source_info.metadata.color_model);
+    assert_eq!(output_info.metadata.channel_names, source_info.metadata.channel_names);
     let bytes = decoded
         .samples
         .iter()
@@ -106,5 +118,37 @@ fn two_by_two_pipeline_renders_each_saved_snapshot_state_and_writes_same_size_ti
     assert!(output.is_file());
     assert!(!output.with_file_name("stack.tif.test-stack.tmp").exists());
 
+    let _ = std::fs::remove_dir_all(folder);
+}
+
+#[test]
+fn test_stack_preserves_bigtiff_container_choice() {
+    let folder = temp_folder("bigtiff");
+    std::fs::create_dir_all(&folder).unwrap();
+    let source = folder.join("source.tif");
+    let output = folder.join("stack.tif");
+
+    let file = File::create(&source).unwrap();
+    let mut encoder = TiffEncoder::new_big(file).unwrap();
+    let image = encoder.new_image::<colortype::Gray8>(2, 2).unwrap();
+    image.write_data(&[0, 1, 2, 3]).unwrap();
+
+    let mut project = ShadeProject::default();
+    project.snapshots = vec![snapshot(1, "Test 1", 0.0)];
+    export_test_stack_with_progress(
+        &source,
+        &output,
+        &project,
+        &[1],
+        TestStackLayout::new(1, 1).unwrap(),
+        TestStackAnchor::TopLeft,
+        220.0,
+        ExportOptions { force_lzw: false },
+        |_, _| {},
+    )
+    .unwrap();
+
+    assert!(source_is_bigtiff(&source).unwrap());
+    assert!(source_is_bigtiff(&output).unwrap());
     let _ = std::fs::remove_dir_all(folder);
 }

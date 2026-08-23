@@ -344,6 +344,7 @@ fn queue_snapshot_export(
             face_key,
             folder,
         }),
+        operation: export_queue::ExportQueueOperation::Standard,
     }) {
         return;
     }
@@ -484,6 +485,7 @@ fn export_snapshot_group_dialog(app: &mut ShadeApp, snapshot_ids: Vec<u64>, labe
                 face_key: face_key.clone(),
                 folder,
             }),
+            operation: export_queue::ExportQueueOperation::Standard,
         }) {
             return;
         }
