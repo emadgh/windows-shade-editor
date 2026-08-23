@@ -88,8 +88,8 @@ pub fn installed_profiles() -> Result<Vec<IccProfileRecord>, String> {
                     refreshed.push(current);
                 }
                 Err(_) => {
-                    // The registry enumeration can race an external delete/replace. Drop the
-                    // stale browse row; a later Windows event/rescan will allow it to reappear.
+                    // Enumeration can race an external delete/replace. Drop the stale row;
+                    // a subsequent registry refresh can add a valid profile again.
                 }
             }
         } else if observed.is_available() {
@@ -148,7 +148,7 @@ mod tests {
             "shade-observed-icc-{label}-{}-{stamp}.icc",
             std::process::id()
         ));
-        let profile = Profile::new_srgb();
+        let mut profile = Profile::new_srgb();
         profile.save_profile_to_file(&path).unwrap();
         path
     }
