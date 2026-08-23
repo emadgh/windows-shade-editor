@@ -85,6 +85,16 @@ When a printer/RIP output ICC is selected and Soft Proof is enabled, Shade Edito
 
 The production-oriented path targets 8-bit and 16-bit RGB/CMYK TIFF with optional additional samples/Spot Channels. ICC tag 34675, Photoshop Image Resources 34377 and ImageSourceData 37724 are retained where supported. Photoshop/RIP interoperability must still be validated with representative production TIFFs; see `docs/PRODUCTION_VALIDATION.md`.
 
+## Atomic staging and durability
+
+Transient file suffixes are defined centrally in `src/staging.rs`. New storage/export code must reuse those constants rather than inventing another `.tmp` naming convention. Final TIFF stages are siblings of their destination so the publish operation stays on one volume; large processing spools may live under Shade Editor's local spool directories because they are never directly renamed into the final destination.
+
+`tiff_output::write_atomic` owns unique final-stage naming, validation, cleanup and the call into `safe_fs`. Normal stage names preserve the destination filename plus the canonical role suffix. If that would exceed the normal Windows 255 UTF-16 filename-component limit, the writer switches to a short `shade-stage-<pid>-<sequence>...` sibling name; it does not move the final commit to another volume.
+
+`safe_fs::commit_staged_file` and `commit_staged_file_if_absent` are the durability boundary. The staged file is `sync_all`'d before publication. On Windows, the final same-volume rename uses `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`; replacement adds `MOVEFILE_REPLACE_EXISTING`, while new-only publication deliberately omits it so a destination that appeared after reservation causes failure rather than overwrite. Non-Windows implementations additionally fsync the parent directory after publication.
+
+UNC/network shares are supported by the Windows APIs, but crash durability beyond the client is limited by the SMB server, remote filesystem and storage hardware honoring write-through semantics. A successful local call cannot guarantee a remote controller has ignored its own volatile cache. `safe_fs` also does not silently rewrite the final destination into a verbatim/long-path form; callers must supply a valid destination path, while `tiff_output` handles only the transient sibling-name overflow described above.
+
 ## Build and test
 
 Requirements:
@@ -115,6 +125,9 @@ src/
 ├─ model.rs             .shade schema and adjustment/project model
 ├─ color_management.rs  ICC preview transform and Windows ICC catalog
 ├─ tiff_io.rs           TIFF decode/channel/Photoshop metadata discovery
+├─ staging.rs           Canonical staging/temp suffix registry
+├─ safe_fs.rs           Durable same-volume atomic publication boundary
+├─ tiff_output.rs       TIFF staging, long-name fallback, validation and commit orchestration
 ├─ conversion_tiff.rs   Atomic CMYK/N-channel conversion TIFF writer
 ├─ conversion_transaction.rs  Immutable job/commit/recovery contract
 ├─ conversion_queue.rs  Persistent conversion scheduling/cancel/recovery state

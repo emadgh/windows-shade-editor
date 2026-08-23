@@ -84,6 +84,7 @@ pub mod safe_fs;
 pub mod separation_optimizer;
 pub mod source_tiff_writer;
 pub mod source_transparency;
+pub mod staging;
 pub mod test_stack;
 pub mod tiff_output;
 #[path = "tiff_io.rs"]

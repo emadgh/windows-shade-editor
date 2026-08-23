@@ -10,12 +10,15 @@ use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 
+#[path = "staging.rs"]
+pub mod staging;
+
 pub fn backup_path(path: &Path) -> PathBuf {
-    append_suffix(path, ".bak")
+    append_suffix(path, staging::BACKUP_SUFFIX)
 }
 
 pub fn temp_path(path: &Path) -> PathBuf {
-    append_suffix(path, ".tmp")
+    append_suffix(path, staging::SAFE_FS_TEMP_SUFFIX)
 }
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -135,65 +138,114 @@ pub fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
     })
 }
 
-/// Atomically commit a fully written and validated staged file. The staged file
-/// must be beside the destination so the final rename cannot cross volumes.
+/// Atomically publish a fully written and validated staged file, replacing the destination.
+///
+/// # Durability contract
+///
+/// Callers must finish writing and validating `staged` before entering this boundary. This
+/// function then:
+///
+/// 1. requires `staged` to be a sibling of `destination`, so the commit cannot cross volumes;
+/// 2. calls `sync_all` on the staged file so its file contents/metadata reach the OS durability
+///    boundary before the name is published; and
+/// 3. atomically replaces the destination and requests durable directory/name metadata.
+///
+/// On Windows the final operation is `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING |
+/// MOVEFILE_WRITE_THROUGH)`. `MOVEFILE_WRITE_THROUGH` is the Win32 equivalent used here for the
+/// final rename/name-metadata durability barrier. On non-Windows builds the rename is followed by
+/// an explicit parent-directory `sync_all`.
+///
+/// A successful return means Shade Editor has completed the strongest local-filesystem durability
+/// sequence available through these platform APIs. It does **not** override storage-controller,
+/// remote-server or network-share caching policy. In particular, UNC/SMB durability ultimately
+/// depends on the server/filesystem honoring the write-through request; transport loss or a remote
+/// server crash can therefore have semantics outside the application's control.
+///
+/// This function does not add a Windows verbatim (`\\?\\`) prefix or shorten an invalid final file
+/// name. Callers creating large TIFF staging names should use `tiff_output`, whose compact sibling
+/// fallback avoids exceeding the normal 255 UTF-16 component limit while keeping the same volume.
 pub fn commit_staged_file(staged: &Path, destination: &Path) -> Result<(), String> {
-    if staged.parent() != destination.parent() {
-        return Err("Atomic commit requires the staged file beside its destination.".to_owned());
-    }
-    if !staged.is_file() {
-        return Err(format!("Staged file is missing: {}", staged.display()));
-    }
-    OpenOptions::new()
-        .write(true)
-        .open(staged)
-        .and_then(|file| file.sync_all())
-        .map_err(|err| format!("Cannot sync staged file {}: {err}", staged.display()))?;
+    validate_staged_sibling(staged, destination)?;
+    sync_staged_file(staged)?;
     replace_path(staged, destination)
 }
 
-/// Atomically publish a staged file only when the destination is still absent.
-/// A same-volume hard link provides a no-replace create boundary; removing the
-/// staging name afterwards leaves the committed bytes owned by the destination.
+/// Atomically publish a fully written staged file only if the destination is still absent.
+///
+/// The durability contract is the same as [`commit_staged_file`], but this variant preserves the
+/// queue/new-only invariant: if another process creates `destination` after reservation, commit
+/// fails rather than replacing it. On Windows this uses `MoveFileExW` with
+/// `MOVEFILE_WRITE_THROUGH` and **without** `MOVEFILE_REPLACE_EXISTING`, so the no-replace check and
+/// final rename happen in one filesystem operation. The non-Windows fallback uses a same-volume
+/// hard-link create boundary, removes the staging name, and fsyncs the parent directory.
 pub fn commit_staged_file_if_absent(staged: &Path, destination: &Path) -> Result<(), String> {
+    validate_staged_sibling(staged, destination)?;
+    sync_staged_file(staged)?;
+    move_path_if_absent(staged, destination)
+}
+
+fn validate_staged_sibling(staged: &Path, destination: &Path) -> Result<(), String> {
     if staged.parent() != destination.parent() {
         return Err("Atomic commit requires the staged file beside its destination.".to_owned());
     }
     if !staged.is_file() {
         return Err(format!("Staged file is missing: {}", staged.display()));
     }
+    Ok(())
+}
+
+fn sync_staged_file(staged: &Path) -> Result<(), String> {
     OpenOptions::new()
         .write(true)
         .open(staged)
         .and_then(|file| file.sync_all())
-        .map_err(|err| format!("Cannot sync staged file {}: {err}", staged.display()))?;
-    fs::hard_link(staged, destination).map_err(|err| {
-        format!(
-            "Cannot commit new destination {} because it exists or cannot be created: {err}",
-            destination.display()
-        )
-    })?;
-    // Once the hard link succeeds, the destination is durably committed. A
-    // staging-name cleanup failure must not be reported as pre-commit failure;
-    // the caller's best-effort cleanup can remove the extra name later.
-    let _ = fs::remove_file(staged);
-    Ok(())
+        .map_err(|err| format!("Cannot sync staged file {}: {err}", staged.display()))
 }
 
 #[cfg(windows)]
 fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
+    move_path_windows(
+        source,
+        destination,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        "atomically replace",
+    )
+}
+
+#[cfg(windows)]
+fn move_path_if_absent(source: &Path, destination: &Path) -> Result<(), String> {
     let source_wide = wide_path(source);
     let destination_wide = wide_path(destination);
     let result = unsafe {
         MoveFileExW(
             source_wide.as_ptr(),
             destination_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            MOVEFILE_WRITE_THROUGH,
         )
     };
     if result == 0 {
         return Err(format!(
-            "Cannot atomically replace {} with {}: {}",
+            "Cannot commit new destination {} because it exists or cannot be created: {}",
+            destination.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn move_path_windows(
+    source: &Path,
+    destination: &Path,
+    flags: u32,
+    operation: &str,
+) -> Result<(), String> {
+    let source_wide = wide_path(source);
+    let destination_wide = wide_path(destination);
+    let result = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
+    if result == 0 {
+        return Err(format!(
+            "Cannot {operation} {} with {}: {}",
             destination.display(),
             source.display(),
             std::io::Error::last_os_error()
@@ -210,7 +262,34 @@ fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
             destination.display(),
             source.display()
         )
-    })
+    })?;
+    sync_parent_directory(destination)
+}
+
+#[cfg(not(windows))]
+fn move_path_if_absent(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::hard_link(source, destination).map_err(|err| {
+        format!(
+            "Cannot commit new destination {} because it exists or cannot be created: {err}",
+            destination.display()
+        )
+    })?;
+    if let Err(err) = fs::remove_file(source) {
+        let _ = fs::remove_file(destination);
+        return Err(format!(
+            "Cannot remove staging name {} after new-only commit: {err}",
+            source.display()
+        ));
+    }
+    sync_parent_directory(destination)
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| format!("Cannot sync parent directory {}: {err}", parent.display()))
 }
 
 #[cfg(windows)]
@@ -282,7 +361,7 @@ mod tests {
         let folder = temp_folder("staged-commit");
         fs::create_dir_all(&folder).unwrap();
         let destination = folder.join("output.tif");
-        let staged = folder.join("output.tif.conversion.tmp");
+        let staged = folder.join(format!("output.tif{}", staging::CONVERSION_STAGED_SUFFIX));
         fs::write(&destination, b"old").unwrap();
         fs::write(&staged, b"new").unwrap();
 
@@ -298,13 +377,28 @@ mod tests {
         let folder = temp_folder("staged-new-only");
         fs::create_dir_all(&folder).unwrap();
         let destination = folder.join("output.tif");
-        let staged = folder.join("output.tif.conversion.tmp");
+        let staged = folder.join(format!("output.tif{}", staging::CONVERSION_STAGED_SUFFIX));
         fs::write(&destination, b"existing").unwrap();
         fs::write(&staged, b"new").unwrap();
 
         assert!(commit_staged_file_if_absent(&staged, &destination).is_err());
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
         assert_eq!(fs::read(&staged).unwrap(), b"new");
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn new_only_staged_commit_moves_stage_when_destination_is_absent() {
+        let folder = temp_folder("staged-new-only-success");
+        fs::create_dir_all(&folder).unwrap();
+        let destination = folder.join("output.tif");
+        let staged = folder.join(format!("output.tif{}", staging::CONVERSION_STAGED_SUFFIX));
+        fs::write(&staged, b"new").unwrap();
+
+        commit_staged_file_if_absent(&staged, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(!staged.exists());
         let _ = fs::remove_dir_all(folder);
     }
 }
