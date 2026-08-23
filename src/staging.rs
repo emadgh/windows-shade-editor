@@ -58,18 +58,15 @@ mod tests {
 
     #[test]
     fn legacy_tiff_suffix_values_resolve_to_canonical_constants() {
-        assert!(std::ptr::eq(
+        assert_eq!(
             canonical_tiff_suffix(".conversion.tmp"),
             CONVERSION_STAGED_SUFFIX
-        ));
-        assert!(std::ptr::eq(
+        );
+        assert_eq!(
             canonical_tiff_suffix(".test-stack.tmp"),
             TEST_STACK_STAGED_SUFFIX
-        ));
-        assert!(std::ptr::eq(
-            canonical_tiff_suffix(".export.tmp"),
-            EXPORT_TEMP_SUFFIX
-        ));
+        );
+        assert_eq!(canonical_tiff_suffix(".export.tmp"), EXPORT_TEMP_SUFFIX);
         assert_eq!(canonical_tiff_suffix(".custom.tmp"), ".custom.tmp");
     }
 }
