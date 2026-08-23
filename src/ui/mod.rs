@@ -7,9 +7,12 @@ pub(crate) mod faces;
 pub(crate) mod history_panel;
 pub(crate) mod input_router;
 pub(crate) mod levels_mixer;
+pub(crate) mod linked_projects;
 pub(crate) mod match_color;
 pub(crate) mod preview_status;
 pub(crate) mod project_navigation;
+#[path = "../project_link_navigation.rs"]
+pub(crate) mod project_link_navigation_core;
 pub(crate) mod project_view_state;
 pub(crate) mod reference_panel;
 pub(crate) mod settings_panel;
@@ -94,6 +97,12 @@ mod tests {
                 "Project navigation bypassed typed actions with {forbidden}"
             );
         }
+
+        let linked_projects = include_str!("linked_projects.rs");
+        assert!(linked_projects.contains("NavigationUiAction::OpenLinkedProject"));
+        assert!(linked_projects.contains("NavigationUiAction::RelinkLinkedProject"));
+        assert!(!linked_projects.contains("request_project_transition("));
+        assert!(!linked_projects.contains("mark_project_dirty("));
 
         let export_queue = include_str!("export_queue.rs");
         for forbidden in [

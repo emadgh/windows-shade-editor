@@ -23,6 +23,8 @@ pub(crate) enum NavigationUiAction {
     NewProject,
     OpenProjectDialog,
     OpenRecent(PathBuf),
+    OpenLinkedProject(PathBuf),
+    RelinkLinkedProject(PathBuf),
     ShowProjectView,
     QuickSave,
     Save,
@@ -142,8 +144,38 @@ impl ShadeApp {
         match action {
             NavigationUiAction::NewProject => self.new_project(),
             NavigationUiAction::OpenProjectDialog => self.open_project_dialog(),
-            NavigationUiAction::OpenRecent(path) => {
+            NavigationUiAction::OpenRecent(path)
+            | NavigationUiAction::OpenLinkedProject(path) => {
                 self.request_project_transition(ProjectTransition::Open(path), Some(ctx));
+            }
+            NavigationUiAction::RelinkLinkedProject(previous_path) => {
+                let Some(current_project_path) = self.project_path.clone() else {
+                    self.report_error("Save the current project before repairing linked-project paths.");
+                    return;
+                };
+                let Some(replacement_path) = rfd::FileDialog::new()
+                    .add_filter("Shade projects", &["shade"])
+                    .pick_file()
+                else {
+                    return;
+                };
+
+                match super::project_link_navigation_core::relink_navigation_target(
+                    &mut self.project,
+                    &current_project_path,
+                    &previous_path,
+                    &replacement_path,
+                ) {
+                    Ok(target) => {
+                        self.mark_project_dirty();
+                        let name = target.project_name.as_deref().unwrap_or("linked project");
+                        self.report_info(format!(
+                            "Relinked {name} to {}. Save the current project to persist the repaired link.",
+                            replacement_path.display()
+                        ));
+                    }
+                    Err(err) => self.report_error(err),
+                }
             }
             NavigationUiAction::ShowProjectView => self.project_view.open = true,
             NavigationUiAction::QuickSave => {
@@ -338,11 +370,19 @@ mod tests {
     }
 
     #[test]
-    fn navigation_open_recent_preserves_path() {
+    fn navigation_project_paths_are_payload_preserving() {
         let path = PathBuf::from(r"C:\work\sample.shade");
         assert_eq!(
             NavigationUiAction::OpenRecent(path.clone()),
-            NavigationUiAction::OpenRecent(path)
+            NavigationUiAction::OpenRecent(path.clone())
+        );
+        assert_eq!(
+            NavigationUiAction::OpenLinkedProject(path.clone()),
+            NavigationUiAction::OpenLinkedProject(path.clone())
+        );
+        assert_eq!(
+            NavigationUiAction::RelinkLinkedProject(path.clone()),
+            NavigationUiAction::RelinkLinkedProject(path)
         );
     }
 
