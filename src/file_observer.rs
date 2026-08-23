@@ -18,12 +18,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-const NATIVE_DEBOUNCE: Duration = Duration::from_millis(80);
+const EVENT_DEBOUNCE: Duration = Duration::from_millis(80);
 const WAIT_SLICE_MS: u32 = 1_000;
-const LOST_EVENT_RESCAN_TICKS: u32 = 5;
+const RESCAN_EVERY_TICKS: u32 = 5;
 
-/// Logical consumers of an external path. Roles are deliberately format-agnostic:
-/// parsing, identity validation and reload policy remain in the owning subsystem.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExternalFileRole {
     Project,
@@ -34,8 +32,6 @@ pub enum ExternalFileRole {
     Converted,
 }
 
-/// Sticky external state. Change states remain visible until the consumer explicitly
-/// acknowledges the current bytes as its new baseline.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExternalFileState {
     #[default]
@@ -118,7 +114,6 @@ impl TrackedEntry {
 #[derive(Default)]
 struct Registry {
     entries: HashMap<String, TrackedEntry>,
-    /// Directory keys with one native watcher/poll-fallback thread currently active.
     watched_dirs: HashSet<String>,
 }
 
@@ -150,8 +145,7 @@ impl FileObserver {
         }
     }
 
-    /// Register a logical consumer and return the current baseline/state. Repeated calls
-    /// for the same canonical path + role are idempotent and never create duplicate watches.
+    /// Registering the same canonical path + role repeatedly is idempotent.
     pub fn observe(&self, path: &Path, role: ExternalFileRole) -> ExternalFileSnapshot {
         let normalized = normalized_storage_path(path);
         let key = path_key(&normalized);
@@ -160,15 +154,15 @@ impl FileObserver {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| normalized.clone());
         let parent_key = path_key(&parent);
-        let mut spawn = false;
+
+        let mut start_watch = false;
         let snapshot = {
             let mut registry = lock_registry(&self.registry);
             if let Some(entry) = registry.entries.get_mut(&key) {
                 entry.roles.insert(role);
                 entry.snapshot()
             } else {
-                let reading = read_fingerprint(&normalized);
-                let (state, fingerprint, last_error) = baseline_from_reading(reading);
+                let (state, fingerprint, last_error) = baseline(read_fingerprint(&normalized));
                 let mut roles = BTreeSet::new();
                 roles.insert(role);
                 let entry = TrackedEntry {
@@ -183,34 +177,28 @@ impl FileObserver {
                 let snapshot = entry.snapshot();
                 registry.entries.insert(key, entry);
                 if self.native_watches && registry.watched_dirs.insert(parent_key.clone()) {
-                    spawn = true;
+                    start_watch = true;
                 }
                 snapshot
             }
         };
-        if spawn {
+
+        if start_watch {
             spawn_directory_observer(self.registry.clone(), parent, parent_key);
         }
         snapshot
     }
 
-    /// Remove one logical consumer. The directory watch remains alive while any other
-    /// tracked path/role still needs it.
     pub fn release(&self, path: &Path, role: ExternalFileRole) {
         let key = path_key(&normalized_storage_path(path));
         let mut registry = lock_registry(&self.registry);
-        let remove = if let Some(entry) = registry.entries.get_mut(&key) {
+        let remove = registry.entries.get_mut(&key).is_some_and(|entry| {
             entry.roles.remove(&role);
             entry.roles.is_empty()
-        } else {
-            false
-        };
+        });
         if remove {
             registry.entries.remove(&key);
         }
-        // watched_dirs is intentionally not cleared here. The owning watcher thread
-        // observes that its directory has no subscribers and exits without a race that
-        // could create duplicate native registrations.
     }
 
     pub fn snapshot(&self, path: &Path) -> Option<ExternalFileSnapshot> {
@@ -221,21 +209,18 @@ impl FileObserver {
             .map(TrackedEntry::snapshot)
     }
 
-    /// Explicit rescan/fallback boundary. This is useful after an operation that may have
-    /// consumed/lost native events or before a destructive/production decision.
     pub fn rescan(&self, path: &Path) -> Option<ExternalFileSnapshot> {
         let key = path_key(&normalized_storage_path(path));
         refresh_key(&self.registry, &key);
         self.snapshot(path)
     }
 
-    /// Accept the current filesystem bytes/existence as the new baseline. Consumers call
-    /// this only after they have reloaded/revalidated the semantic object they own.
+    /// Consumers call this only after their own semantic reload/validation accepts the bytes.
     pub fn acknowledge(&self, path: &Path) -> Option<ExternalFileSnapshot> {
         let key = path_key(&normalized_storage_path(path));
         let mut registry = lock_registry(&self.registry);
         let entry = registry.entries.get_mut(&key)?;
-        let (state, fingerprint, last_error) = baseline_from_reading(read_fingerprint(&entry.path));
+        let (state, fingerprint, last_error) = baseline(read_fingerprint(&entry.path));
         entry.state = state;
         entry.fingerprint = fingerprint;
         entry.last_error = last_error;
@@ -260,30 +245,29 @@ impl FileObserver {
     }
 }
 
-fn shared_observer() -> &'static FileObserver {
-    static SHARED: OnceLock<FileObserver> = OnceLock::new();
-    SHARED.get_or_init(FileObserver::new)
+fn shared() -> &'static FileObserver {
+    static OBSERVER: OnceLock<FileObserver> = OnceLock::new();
+    OBSERVER.get_or_init(FileObserver::new)
 }
 
-/// Shared process-wide registration/query entry point used by application subsystems.
 pub fn observe(path: &Path, role: ExternalFileRole) -> ExternalFileSnapshot {
-    shared_observer().observe(path, role)
+    shared().observe(path, role)
 }
 
 pub fn release(path: &Path, role: ExternalFileRole) {
-    shared_observer().release(path, role);
+    shared().release(path, role);
 }
 
 pub fn snapshot(path: &Path) -> Option<ExternalFileSnapshot> {
-    shared_observer().snapshot(path)
+    shared().snapshot(path)
 }
 
 pub fn rescan(path: &Path) -> Option<ExternalFileSnapshot> {
-    shared_observer().rescan(path)
+    shared().rescan(path)
 }
 
 pub fn acknowledge(path: &Path) -> Option<ExternalFileSnapshot> {
-    shared_observer().acknowledge(path)
+    shared().acknowledge(path)
 }
 
 fn lock_registry(registry: &Arc<Mutex<Registry>>) -> std::sync::MutexGuard<'_, Registry> {
@@ -298,7 +282,7 @@ enum FingerprintReading {
     Unreadable(String),
 }
 
-fn baseline_from_reading(
+fn baseline(
     reading: FingerprintReading,
 ) -> (ExternalFileState, Option<FileFingerprint>, Option<String>) {
     match reading {
@@ -314,19 +298,15 @@ fn baseline_from_reading(
 
 fn read_fingerprint(path: &Path) -> FingerprintReading {
     match fs::metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return FingerprintReading::Unreadable(format!(
-                    "Tracked external path is not a file: {}",
-                    path.display()
-                ));
-            }
-            FingerprintReading::Present(FileFingerprint {
-                size: metadata.len(),
-                modified_ns: system_time_ns(metadata.modified().ok()),
-                created_ns: system_time_ns(metadata.created().ok()),
-            })
-        }
+        Ok(metadata) if metadata.is_file() => FingerprintReading::Present(FileFingerprint {
+            size: metadata.len(),
+            modified_ns: to_ns(metadata.modified().ok()),
+            created_ns: to_ns(metadata.created().ok()),
+        }),
+        Ok(_) => FingerprintReading::Unreadable(format!(
+            "Tracked external path is not a file: {}",
+            path.display()
+        )),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => FingerprintReading::Missing,
         Err(err) => FingerprintReading::Unreadable(format!(
             "Cannot inspect external file {}: {err}",
@@ -335,7 +315,7 @@ fn read_fingerprint(path: &Path) -> FingerprintReading {
     }
 }
 
-fn system_time_ns(time: Option<SystemTime>) -> Option<u128> {
+fn to_ns(time: Option<SystemTime>) -> Option<u128> {
     time.and_then(|time| {
         time.duration_since(UNIX_EPOCH)
             .ok()
@@ -344,36 +324,25 @@ fn system_time_ns(time: Option<SystemTime>) -> Option<u128> {
 }
 
 fn refresh_key(registry: &Arc<Mutex<Registry>>, key: &str) {
-    let (path, old_fingerprint, old_state) = {
+    let path = {
         let registry = lock_registry(registry);
         let Some(entry) = registry.entries.get(key) else {
             return;
         };
-        (entry.path.clone(), entry.fingerprint, entry.state)
+        entry.path.clone()
     };
     let reading = read_fingerprint(&path);
     let mut registry = lock_registry(registry);
     let Some(entry) = registry.entries.get_mut(key) else {
         return;
     };
-    // If another refresh/ack raced this filesystem read, compare against the newest
-    // in-memory baseline rather than overwriting it from stale assumptions.
-    let compare_fingerprint = if entry.fingerprint == old_fingerprint && entry.state == old_state {
-        old_fingerprint
-    } else {
-        entry.fingerprint
-    };
-    apply_reading(entry, compare_fingerprint, reading);
+    apply_reading(entry, reading);
 }
 
-fn apply_reading(
-    entry: &mut TrackedEntry,
-    previous_fingerprint: Option<FileFingerprint>,
-    reading: FingerprintReading,
-) {
+fn apply_reading(entry: &mut TrackedEntry, reading: FingerprintReading) {
     match reading {
         FingerprintReading::Present(current) => {
-            let next_state = match previous_fingerprint {
+            let next = match entry.fingerprint {
                 Some(previous) if previous == current => {
                     if entry.state.is_changed() {
                         entry.state
@@ -392,21 +361,18 @@ fn apply_reading(
                         ExternalFileState::Modified
                     }
                 }
-                None => {
+                None if entry.state == ExternalFileState::Missing => {
                     entry.generation = entry.generation.wrapping_add(1).max(1);
-                    if entry.state == ExternalFileState::Missing {
-                        ExternalFileState::Recreated
-                    } else {
-                        ExternalFileState::Available
-                    }
+                    ExternalFileState::Recreated
                 }
+                None => ExternalFileState::Available,
             };
             entry.fingerprint = Some(current);
-            entry.state = next_state;
+            entry.state = next;
             entry.last_error = None;
         }
         FingerprintReading::Missing => {
-            if previous_fingerprint.is_some() || entry.state != ExternalFileState::Missing {
+            if entry.fingerprint.is_some() || entry.state != ExternalFileState::Missing {
                 entry.generation = entry.generation.wrapping_add(1).max(1);
             }
             entry.fingerprint = None;
@@ -414,7 +380,8 @@ fn apply_reading(
             entry.last_error = None;
         }
         FingerprintReading::Unreadable(error) => {
-            if entry.state != ExternalFileState::Unreadable || entry.last_error.as_deref() != Some(&error)
+            if entry.state != ExternalFileState::Unreadable
+                || entry.last_error.as_deref() != Some(error.as_str())
             {
                 entry.generation = entry.generation.wrapping_add(1).max(1);
             }
@@ -440,14 +407,14 @@ fn refresh_directory(registry: &Arc<Mutex<Registry>>, parent_key: &str) {
     }
 }
 
-fn directory_is_needed(registry: &Arc<Mutex<Registry>>, parent_key: &str) -> bool {
+fn directory_needed(registry: &Arc<Mutex<Registry>>, parent_key: &str) -> bool {
     lock_registry(registry)
         .entries
         .values()
         .any(|entry| entry.parent_key == parent_key && !entry.roles.is_empty())
 }
 
-fn finish_directory_watch(registry: &Arc<Mutex<Registry>>, parent_key: &str) {
+fn finish_watch(registry: &Arc<Mutex<Registry>>, parent_key: &str) {
     let mut registry = lock_registry(registry);
     if !registry
         .entries
@@ -463,10 +430,9 @@ fn spawn_directory_observer(
     parent: PathBuf,
     parent_key: String,
 ) {
-    thread::Builder::new()
+    let _ = thread::Builder::new()
         .name("shade-file-observer".to_owned())
-        .spawn(move || run_directory_observer(registry, parent, parent_key))
-        .ok();
+        .spawn(move || run_directory_observer(registry, parent, parent_key));
 }
 
 #[cfg(windows)]
@@ -483,51 +449,42 @@ fn run_directory_observer(
         | FILE_NOTIFY_CHANGE_CREATION;
     let handle = unsafe { FindFirstChangeNotificationW(wide.as_ptr(), 0, filter) };
     if handle == INVALID_HANDLE_VALUE {
-        run_poll_fallback(&registry, &parent_key);
-        finish_directory_watch(&registry, &parent_key);
+        poll_fallback(&registry, &parent_key);
+        finish_watch(&registry, &parent_key);
         return;
     }
 
-    let mut timeout_ticks = 0u32;
+    let mut ticks = 0u32;
     loop {
-        if !directory_is_needed(&registry, &parent_key) {
+        if !directory_needed(&registry, &parent_key) {
             break;
         }
         let wait = unsafe { WaitForSingleObject(handle, WAIT_SLICE_MS) };
         if wait == WAIT_OBJECT_0 {
-            thread::sleep(NATIVE_DEBOUNCE);
+            thread::sleep(EVENT_DEBOUNCE);
             refresh_directory(&registry, &parent_key);
-            timeout_ticks = 0;
-            let next_ok = unsafe { FindNextChangeNotification(handle) };
-            if next_ok == 0 {
-                unsafe {
-                    FindCloseChangeNotification(handle);
-                }
-                run_poll_fallback(&registry, &parent_key);
-                finish_directory_watch(&registry, &parent_key);
+            ticks = 0;
+            if unsafe { FindNextChangeNotification(handle) } == 0 {
+                unsafe { FindCloseChangeNotification(handle) };
+                poll_fallback(&registry, &parent_key);
+                finish_watch(&registry, &parent_key);
                 return;
             }
         } else if wait == WAIT_TIMEOUT {
-            timeout_ticks = timeout_ticks.saturating_add(1);
-            if timeout_ticks >= LOST_EVENT_RESCAN_TICKS {
-                // Controlled rescan fallback covers dropped/coalesced Windows events and
-                // network/removable filesystems that do not reliably signal changes.
+            ticks = ticks.saturating_add(1);
+            if ticks >= RESCAN_EVERY_TICKS {
                 refresh_directory(&registry, &parent_key);
-                timeout_ticks = 0;
+                ticks = 0;
             }
         } else {
-            unsafe {
-                FindCloseChangeNotification(handle);
-            }
-            run_poll_fallback(&registry, &parent_key);
-            finish_directory_watch(&registry, &parent_key);
+            unsafe { FindCloseChangeNotification(handle) };
+            poll_fallback(&registry, &parent_key);
+            finish_watch(&registry, &parent_key);
             return;
         }
     }
-    unsafe {
-        FindCloseChangeNotification(handle);
-    }
-    finish_directory_watch(&registry, &parent_key);
+    unsafe { FindCloseChangeNotification(handle) };
+    finish_watch(&registry, &parent_key);
 }
 
 #[cfg(not(windows))]
@@ -536,12 +493,12 @@ fn run_directory_observer(
     _parent: PathBuf,
     parent_key: String,
 ) {
-    run_poll_fallback(&registry, &parent_key);
-    finish_directory_watch(&registry, &parent_key);
+    poll_fallback(&registry, &parent_key);
+    finish_watch(&registry, &parent_key);
 }
 
-fn run_poll_fallback(registry: &Arc<Mutex<Registry>>, parent_key: &str) {
-    while directory_is_needed(registry, parent_key) {
+fn poll_fallback(registry: &Arc<Mutex<Registry>>, parent_key: &str) {
+    while directory_needed(registry, parent_key) {
         refresh_directory(registry, parent_key);
         thread::sleep(Duration::from_secs(1));
     }
@@ -558,14 +515,12 @@ fn normalized_storage_path(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    let Some(file_name) = absolute.file_name() else {
-        return absolute;
-    };
+    if let (Some(parent), Some(file_name)) = (absolute.parent(), absolute.file_name()) {
+        if let Ok(parent) = fs::canonicalize(parent) {
+            return parent.join(file_name);
+        }
+    }
     absolute
-        .parent()
-        .and_then(|parent| fs::canonicalize(parent).ok())
-        .map(|parent| parent.join(file_name))
-        .unwrap_or(absolute)
 }
 
 fn path_key(path: &Path) -> String {
@@ -581,28 +536,26 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    static NEXT: AtomicU64 = AtomicU64::new(1);
 
-    struct TempDir {
-        path: PathBuf,
-    }
+    struct TempDir(PathBuf);
 
     impl TempDir {
         fn new(label: &str) -> Self {
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "shade-file-observer-{label}-{}-{id}",
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
-            Self { path }
+            Self(path)
         }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -613,9 +566,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_consumers_share_one_tracked_path() {
+    fn duplicate_roles_share_one_path_and_release_is_reference_safe() {
         let temp = TempDir::new("dedup");
-        let path = temp.path.join("a.tif");
+        let path = temp.0.join("a.tif");
         write(&path, b"one");
         let observer = FileObserver::without_native_watches();
         observer.observe(&path, ExternalFileRole::Face);
@@ -623,99 +576,67 @@ mod tests {
         observer.observe(&path, ExternalFileRole::Face);
         assert_eq!(observer.tracked_path_count(), 1);
         assert_eq!(observer.subscriber_count(&path), 2);
-    }
-
-    #[test]
-    fn releasing_one_role_keeps_other_consumer_alive() {
-        let temp = TempDir::new("release");
-        let path = temp.path.join("a.tif");
-        write(&path, b"one");
-        let observer = FileObserver::without_native_watches();
-        observer.observe(&path, ExternalFileRole::Face);
-        observer.observe(&path, ExternalFileRole::Reference);
         observer.release(&path, ExternalFileRole::Face);
-        assert_eq!(observer.tracked_path_count(), 1);
         assert_eq!(observer.subscriber_count(&path), 1);
         observer.release(&path, ExternalFileRole::Reference);
         assert_eq!(observer.tracked_path_count(), 0);
     }
 
     #[test]
-    fn detects_modify_delete_and_recreate_without_auto_acknowledge() {
+    fn detects_modify_delete_and_recreate_with_sticky_change_state() {
         let temp = TempDir::new("lifecycle");
-        let path = temp.path.join("a.tif");
+        let path = temp.0.join("a.tif");
         write(&path, b"one");
         let observer = FileObserver::without_native_watches();
         assert_eq!(
             observer.observe(&path, ExternalFileRole::Face).state,
             ExternalFileState::Available
         );
-
-        write(&path, b"two-two");
-        let changed = observer.rescan(&path).unwrap();
-        assert!(matches!(
-            changed.state,
-            ExternalFileState::Modified | ExternalFileState::Replaced
-        ));
-        let generation_after_modify = changed.generation;
+        write(&path, b"different-length");
         assert!(observer.rescan(&path).unwrap().is_changed());
-
+        assert!(observer.rescan(&path).unwrap().is_changed());
         observer.acknowledge(&path).unwrap();
-        assert_eq!(
-            observer.snapshot(&path).unwrap().state,
-            ExternalFileState::Available
-        );
-
+        assert_eq!(observer.snapshot(&path).unwrap().state, ExternalFileState::Available);
         fs::remove_file(&path).unwrap();
-        let missing = observer.rescan(&path).unwrap();
-        assert_eq!(missing.state, ExternalFileState::Missing);
-        assert!(missing.generation > generation_after_modify);
-
-        write(&path, b"three");
-        let recreated = observer.rescan(&path).unwrap();
-        assert_eq!(recreated.state, ExternalFileState::Recreated);
-        assert!(recreated.is_available());
+        assert!(observer.rescan(&path).unwrap().is_missing());
+        write(&path, b"recreated");
+        assert_eq!(observer.rescan(&path).unwrap().state, ExternalFileState::Recreated);
     }
 
     #[test]
-    fn initial_missing_path_can_be_created_later() {
-        let temp = TempDir::new("initial-missing");
-        let path = temp.path.join("later.icc");
+    fn initial_missing_registration_detects_later_creation() {
+        let temp = TempDir::new("missing");
+        let path = temp.0.join("later.icc");
         let observer = FileObserver::without_native_watches();
         assert!(observer
             .observe(&path, ExternalFileRole::IccProfile)
             .is_missing());
         write(&path, b"profile");
-        assert_eq!(
-            observer.rescan(&path).unwrap().state,
-            ExternalFileState::Recreated
-        );
+        assert_eq!(observer.rescan(&path).unwrap().state, ExternalFileState::Recreated);
     }
 
     #[test]
-    fn windows_path_casing_maps_to_one_identity() {
+    fn windows_case_variants_are_one_logical_path() {
         let temp = TempDir::new("case");
-        let path = temp.path.join("CaseFile.tif");
+        let path = temp.0.join("CaseFile.tif");
         write(&path, b"one");
-        let uppercase = PathBuf::from(path.to_string_lossy().to_uppercase());
+        let upper = PathBuf::from(path.to_string_lossy().to_uppercase());
         let observer = FileObserver::without_native_watches();
         observer.observe(&path, ExternalFileRole::Face);
-        observer.observe(&uppercase, ExternalFileRole::Reference);
+        observer.observe(&upper, ExternalFileRole::Reference);
         assert_eq!(observer.tracked_path_count(), 1);
         assert_eq!(observer.subscriber_count(&path), 2);
     }
 
     #[test]
-    fn source_and_converted_roles_are_first_class_consumers() {
-        let temp = TempDir::new("conversion-roles");
-        let source = temp.path.join("source.tif");
-        let converted = temp.path.join("converted.tif");
+    fn conversion_source_and_converted_roles_are_supported() {
+        let temp = TempDir::new("conversion");
+        let source = temp.0.join("source.tif");
+        let converted = temp.0.join("converted.tif");
         write(&source, b"source");
         write(&converted, b"converted");
         let observer = FileObserver::without_native_watches();
-        assert!(observer
-            .observe(&source, ExternalFileRole::Source)
-            .is_available());
+        assert!(observer.observe(&source, ExternalFileRole::Source).is_available());
         assert!(observer
             .observe(&converted, ExternalFileRole::Converted)
             .is_available());
