@@ -1,6 +1,7 @@
 use super::actions::{NavigationUiAction, ProjectViewUiAction};
 use crate::*;
 use eframe::egui;
+use windows_shade_editor::file_observer::{self, ExternalFileRole};
 
 impl ShadeApp {
     pub(crate) fn ui_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -12,7 +13,17 @@ impl ShadeApp {
             .previous_shades
             .recent(8)
             .into_iter()
-            .map(|entry| (entry.display_name(), entry.path.clone(), entry.is_missing()))
+            .map(|entry| {
+                let observed = file_observer::observe(
+                    Path::new(&entry.path),
+                    ExternalFileRole::Project,
+                );
+                (
+                    entry.display_name(),
+                    entry.path.clone(),
+                    !observed.is_available(),
+                )
+            })
             .collect::<Vec<_>>();
         let mut recent_requested: Option<PathBuf> = None;
         ui.horizontal(|ui| {
@@ -241,7 +252,10 @@ impl ShadeApp {
                     requested_open = requested_select
                         .clone()
                         .or_else(|| self.project_view.selected.clone())
-                        .filter(|path| Path::new(path).is_file());
+                        .filter(|path| {
+                            file_observer::observe(Path::new(path), ExternalFileRole::Project)
+                                .is_available()
+                        });
                 }
 
                 ui.separator();
@@ -249,6 +263,18 @@ impl ShadeApp {
                 let selected_path = requested_select
                     .clone()
                     .or_else(|| self.project_view.selected.clone());
+                let selected_project_state = selected_path.as_deref().map(|path| {
+                    file_observer::observe(Path::new(path), ExternalFileRole::Project)
+                });
+                if selected_project_state
+                    .as_ref()
+                    .is_some_and(|state| state.is_changed())
+                {
+                    // Force the selected project's inspection through the normal typed Select
+                    // action. ProjectViewState acknowledges the fingerprint exactly when it
+                    // authorizes this controlled reload.
+                    requested_select = selected_path.clone();
+                }
                 let cached_selected = selected_path.as_deref().and_then(|path| {
                     self.previous_shades
                         .entries()
@@ -273,7 +299,10 @@ impl ShadeApp {
                             return;
                         };
 
-                        let exists = Path::new(path).is_file();
+                        let observed = selected_project_state.clone().unwrap_or_else(|| {
+                            file_observer::observe(Path::new(path), ExternalFileRole::Project)
+                        });
+                        let exists = observed.is_available();
                         preview_ui.horizontal_wrapped(|ui| {
                             if ui.add_enabled(exists, egui::Button::new("Open")).clicked() {
                                 requested_open = Some(path.to_owned());
@@ -289,6 +318,15 @@ impl ShadeApp {
                             }
                         });
                         preview_ui.separator();
+
+                        if observed.is_changed() {
+                            preview_ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "Project file changed externally. Cached inspection is stale and is being refreshed from the current .shade file.",
+                            );
+                            preview_ui.small(path);
+                            return;
+                        }
 
                         if let Some(error) = self.project_view.preview_error.as_ref() {
                             preview_ui.colored_label(egui::Color32::YELLOW, error);
@@ -483,8 +521,16 @@ impl ShadeApp {
                                 let entry = self.previous_shades.entries()[indices[row]].clone();
                                 self.ensure_previous_shade_list_texture(ctx, &entry);
                                 let display_name = entry.display_name();
-                                let label = if entry.is_missing() {
+                                let observed = file_observer::observe(
+                                    Path::new(&entry.path),
+                                    ExternalFileRole::Project,
+                                );
+                                let label = if observed.is_missing() {
                                     format!("[missing] {display_name}")
+                                } else if observed.is_changed() {
+                                    format!("[changed] {display_name}")
+                                } else if !observed.is_available() {
+                                    format!("[unreadable] {display_name}")
                                 } else {
                                     display_name
                                 };
@@ -538,7 +584,7 @@ impl ShadeApp {
                                 if response.clicked() {
                                     requested_select = Some(entry.path.clone());
                                 }
-                                if response.double_clicked() && !entry.is_missing() {
+                                if response.double_clicked() && observed.is_available() {
                                     requested_open = Some(entry.path.clone());
                                 }
                             }
@@ -557,6 +603,7 @@ impl ShadeApp {
             actions.push(ProjectViewUiAction::Relink(path));
         }
         if let Some(path) = requested_remove {
+            file_observer::release(Path::new(&path), ExternalFileRole::Project);
             actions.push(ProjectViewUiAction::Remove(path));
         }
         if let Some(path) = requested_open {

@@ -1,6 +1,7 @@
 use crate::*;
 use eframe::egui;
 use std::collections::{BTreeMap, VecDeque};
+use windows_shade_editor::file_observer::{self, ExternalFileRole};
 
 pub(crate) struct ProjectViewState {
     pub(crate) open: bool,
@@ -32,6 +33,14 @@ impl Default for ProjectViewState {
 
 impl ProjectViewState {
     pub(crate) fn needs_preview_load(&self, path: &str) -> bool {
+        let observed = file_observer::observe(Path::new(path), ExternalFileRole::Project);
+        if observed.is_changed() {
+            // The caller immediately reloads inspection data when this returns true. Accept the
+            // current filesystem fingerprint as that inspection attempt's baseline so a sticky
+            // change event cannot cause an endless reload loop.
+            file_observer::acknowledge(Path::new(path));
+            return true;
+        }
         self.selected.as_deref() != Some(path)
     }
 
@@ -70,12 +79,14 @@ mod tests {
     }
 
     #[test]
-    fn preview_load_is_only_needed_when_selection_changes() {
+    fn preview_load_is_only_needed_when_selection_changes_without_external_change() {
         let mut state = ProjectViewState::default();
         assert!(state.needs_preview_load("a.shade"));
         state.selected = Some("a.shade".to_owned());
         assert!(!state.needs_preview_load("a.shade"));
         assert!(state.needs_preview_load("b.shade"));
+        file_observer::release(Path::new("a.shade"), ExternalFileRole::Project);
+        file_observer::release(Path::new("b.shade"), ExternalFileRole::Project);
     }
 
     #[test]

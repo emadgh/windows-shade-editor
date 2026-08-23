@@ -1,6 +1,7 @@
 use super::actions::FaceUiAction;
 use crate::*;
 use eframe::egui;
+use windows_shade_editor::file_observer::{self, ExternalFileRole};
 
 fn face_identity_key(path: &Path) -> String {
     path.to_string_lossy()
@@ -18,6 +19,16 @@ fn duplicate_face_counts(faces: &[RuntimeFace]) -> BTreeMap<String, usize> {
 
 pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
     let mut actions = Vec::new();
+
+    // Availability is synchronized from the shared observer. Recreated/modified files are
+    // intentionally not auto-reloaded: the current RuntimePreview remains authoritative until
+    // the existing relink/verification flow accepts new source bytes.
+    for face in &mut app.faces {
+        let observed = file_observer::observe(&face.path, ExternalFileRole::Face);
+        if !observed.is_available() {
+            face.available = false;
+        }
+    }
 
     egui::CollapsingHeader::new("Faces")
         .id_salt("workspace-faces-panel")
@@ -89,6 +100,8 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                 let mut requested_delete = None;
                 for index in display_indices {
                     let face = &app.faces[index];
+                    let observed = file_observer::observe(&face.path, ExternalFileRole::Face);
+                    let externally_changed = observed.is_changed();
                     let project_face = app.project.faces.get(index);
                     let status = project_face.map(|item| item.status).unwrap_or_default();
                     let label = project_face
@@ -109,13 +122,15 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                     }
                     if !face.available {
                         display_label.push_str("  [missing]");
+                    } else if externally_changed {
+                        display_label.push_str("  [changed externally]");
                     }
                     if duplicate_count > 1 {
                         display_label.push_str(&format!("  [duplicate x{duplicate_count}]"));
                     }
                     let accent = if status.is_rejected() || !face.available {
                         Some(egui::Color32::from_rgb(235, 95, 95))
-                    } else if duplicate_count > 1 {
+                    } else if externally_changed || duplicate_count > 1 {
                         Some(egui::Color32::from_rgb(235, 155, 70))
                     } else {
                         None
@@ -130,7 +145,12 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                         )
                     } else if !face.available {
                         format!(
-                            "Source TIFF is missing: {}. Use Locate file or Locate folder.",
+                            "Source TIFF is missing or unreadable: {}. Use Locate file or Locate folder.",
+                            face.path.display()
+                        )
+                    } else if externally_changed {
+                        format!(
+                            "Source TIFF changed outside Shade Editor: {}. Cached preview is retained; verify/relink before treating the new bytes as authoritative.",
                             face.path.display()
                         )
                     } else if duplicate_count > 1 {
@@ -173,6 +193,9 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                     actions.push(FaceUiAction::SetStatus { index, status });
                 }
                 if let Some(index) = requested_delete {
+                    if let Some(face) = app.faces.get(index) {
+                        file_observer::release(&face.path, ExternalFileRole::Face);
+                    }
                     actions.push(FaceUiAction::Delete(index));
                 } else if let Some(index) = requested_face {
                     actions.push(FaceUiAction::Select(index));
