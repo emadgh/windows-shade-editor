@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::safe_fs;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
+use crate::{safe_fs, staging};
 
 /// Conservative ceiling for classic TIFF pixel payloads. The remaining space
 /// is reserved for strip tables, metadata, ICC/Photoshop resources and encoder
@@ -15,6 +18,7 @@ static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_PROCESS_ID_DIGITS: usize = 10;
 #[allow(dead_code)]
 const MAX_STAGE_SEQUENCE_DIGITS: usize = 20;
+const MAX_WINDOWS_COMPONENT_UTF16: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DestinationPolicy {
@@ -35,6 +39,7 @@ pub fn canonical_destination(path: &Path) -> PathBuf {
 }
 
 pub fn staged_path(destination: &Path, suffix: &str) -> PathBuf {
+    let suffix = staging::canonical_tiff_suffix(suffix);
     let file_name = destination
         .file_name()
         .map(|value| value.to_os_string())
@@ -44,10 +49,16 @@ pub fn staged_path(destination: &Path, suffix: &str) -> PathBuf {
     destination.with_file_name(staged_name)
 }
 
-/// Maximum UTF-16 code units appended to a destination file name by the
+/// Maximum UTF-16 code units appended to a destination file name by the normal
 /// unique staging convention: `{suffix}.{process_id}-{sequence}`.
+///
+/// Production path validation can conservatively reserve this amount. The
+/// runtime writer additionally has a compact sibling-name fallback, so a valid
+/// destination component near the Windows 255-code-unit limit does not fail
+/// merely because the normal descriptive staging name would be too long.
 #[allow(dead_code)]
 pub fn staging_suffix_utf16_reserve(suffix: &str) -> usize {
+    let suffix = staging::canonical_tiff_suffix(suffix);
     suffix.encode_utf16().count() + 1 + MAX_PROCESS_ID_DIGITS + 1 + MAX_STAGE_SEQUENCE_DIGITS
 }
 
@@ -93,6 +104,12 @@ pub fn preserve_source_or_layout_requires_bigtiff(
 /// Stage, validate and atomically publish one TIFF. The staged file is always
 /// a unique sibling of the final destination, while large render spools stay
 /// under their caller-owned local spool directory.
+///
+/// Known production suffix strings are normalized through [`crate::staging`].
+/// If appending the descriptive suffix/process/sequence would exceed the normal
+/// Windows 255 UTF-16 component limit, the writer automatically uses a compact
+/// process/sequence sibling name instead. The fallback remains beside the final
+/// destination, preserving the same-volume atomic-commit invariant.
 pub fn write_atomic<F, V>(
     destination: &Path,
     staging_suffix: &str,
@@ -111,7 +128,8 @@ where
             parent.display()
         )
     })?;
-    let staged = StagedOutput::new(unique_staged_path(destination, staging_suffix));
+    let canonical_suffix = staging::canonical_tiff_suffix(staging_suffix);
+    let staged = StagedOutput::new(unique_staged_path(destination, canonical_suffix));
 
     (|| {
         write_staged(staged.path())?;
@@ -150,29 +168,63 @@ impl Drop for StagedOutput {
 }
 
 fn unique_staged_path(destination: &Path, suffix: &str) -> PathBuf {
+    let suffix = staging::canonical_tiff_suffix(suffix);
     let file_name = destination
         .file_name()
         .map(|value| value.to_os_string())
         .unwrap_or_else(|| "output.tif".into());
     let process = std::process::id();
+
     for _ in 0..64 {
         let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut staged_name = file_name.clone();
-        staged_name.push(format!("{suffix}.{process}-{sequence}"));
-        let candidate = destination.with_file_name(staged_name);
-        if !candidate.exists() {
-            return candidate;
+
+        let mut descriptive_name = file_name.clone();
+        descriptive_name.push(format!("{suffix}.{process}-{sequence}"));
+        let descriptive = destination.with_file_name(descriptive_name);
+        if component_fits_windows_limit(&descriptive) && !descriptive.exists() {
+            return descriptive;
+        }
+
+        // A destination component can itself be valid while leaving no room
+        // for a descriptive suffix. Keep the stage on the same volume but use
+        // a compact unique filename independent of the destination stem.
+        let compact = destination.with_file_name(compact_stage_name(process, sequence, suffix));
+        if component_fits_windows_limit(&compact) && !compact.exists() {
+            return compact;
         }
     }
-    // The sequence space is process-local and the loop above is defensive;
-    // retaining a deterministic fallback keeps the error at file creation
-    // rather than panicking on an exhausted name search.
-    let mut staged_name = file_name;
-    staged_name.push(format!(
-        "{suffix}.{}",
-        STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    destination.with_file_name(staged_name)
+
+    // The process-local sequence makes exhaustion effectively impossible. Keep
+    // a compact deterministic fallback so pathological collision storms fail at
+    // file creation rather than panicking or constructing an oversized name.
+    let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    destination.with_file_name(compact_stage_name(process, sequence, suffix))
+}
+
+fn compact_stage_name(process: u32, sequence: u64, suffix: &str) -> String {
+    let preferred = format!("shade-stage-{process}-{sequence}{suffix}");
+    if preferred.encode_utf16().count() <= MAX_WINDOWS_COMPONENT_UTF16 {
+        preferred
+    } else {
+        format!("shade-stage-{process}-{sequence}{}", staging::SAFE_FS_TEMP_SUFFIX)
+    }
+}
+
+fn component_fits_windows_limit(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    component_utf16_len(name) <= MAX_WINDOWS_COMPONENT_UTF16
+}
+
+#[cfg(windows)]
+fn component_utf16_len(value: &std::ffi::OsStr) -> usize {
+    value.encode_wide().count()
+}
+
+#[cfg(not(windows))]
+fn component_utf16_len(value: &std::ffi::OsStr) -> usize {
+    value.to_string_lossy().encode_utf16().count()
 }
 
 #[cfg(test)]
@@ -204,12 +256,34 @@ mod tests {
 
     #[test]
     fn staging_reserve_covers_the_longest_unique_suffix() {
-        let suffix = ".conversion.tmp";
+        let suffix = staging::CONVERSION_STAGED_SUFFIX;
         let staged_suffix = format!("{suffix}.{}-{}", u32::MAX, u64::MAX);
         assert_eq!(
             staging_suffix_utf16_reserve(suffix),
             staged_suffix.encode_utf16().count()
         );
+    }
+
+    #[test]
+    fn long_destination_component_uses_compact_sibling_stage() {
+        let destination = PathBuf::from(r"C:\Output")
+            .join(format!("{}.tif", "x".repeat(245)));
+        assert!(component_utf16_len(destination.file_name().unwrap()) <= MAX_WINDOWS_COMPONENT_UTF16);
+
+        let staged = unique_staged_path(&destination, staging::CONVERSION_STAGED_SUFFIX);
+
+        assert_eq!(staged.parent(), destination.parent());
+        assert!(component_utf16_len(staged.file_name().unwrap()) <= MAX_WINDOWS_COMPONENT_UTF16);
+        assert!(staged
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("shade-stage-"));
+        assert!(!staged
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&"x".repeat(32)));
     }
 
     #[test]
@@ -237,7 +311,7 @@ mod tests {
 
         let error = write_atomic(
             &destination,
-            ".stage.tmp",
+            staging::EXPORT_TEMP_SUFFIX,
             DestinationPolicy::ReplaceExisting,
             |staged| fs::write(staged, b"partial").map_err(|err| err.to_string()),
             |_| Err("verification failed".to_owned()),
@@ -259,7 +333,7 @@ mod tests {
 
         let error = write_atomic(
             &destination,
-            ".stage.tmp",
+            staging::TEST_STACK_STAGED_SUFFIX,
             DestinationPolicy::ReplaceExisting,
             |staged| {
                 fs::write(staged, b"partial").unwrap();
@@ -285,7 +359,7 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             let _ = write_atomic(
                 &destination,
-                ".stage.tmp",
+                staging::EXPORT_TEMP_SUFFIX,
                 DestinationPolicy::ReplaceExisting,
                 |staged| {
                     fs::write(staged, b"partial").unwrap();
@@ -310,7 +384,7 @@ mod tests {
 
         write_atomic(
             &destination,
-            ".stage.tmp",
+            staging::EXPORT_TEMP_SUFFIX,
             DestinationPolicy::ReplaceExisting,
             |staged| fs::write(staged, b"complete").map_err(|err| err.to_string()),
             |staged| {
@@ -335,14 +409,14 @@ mod tests {
 
         let error = write_atomic(
             &destination,
-            ".stage.tmp",
+            staging::CONVERSION_STAGED_SUFFIX,
             DestinationPolicy::RequireAbsent,
             |staged| fs::write(staged, b"new").map_err(|err| err.to_string()),
             |_| Ok(()),
         )
         .unwrap_err();
 
-        assert!(error.contains("exists") || error.contains("created"));
+        assert!(error.contains("commit new destination") || error.contains("exists") || error.contains("created"));
         assert_eq!(fs::read(&destination).unwrap(), b"previous");
         assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
         let _ = fs::remove_dir_all(folder);
