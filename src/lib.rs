@@ -36,6 +36,9 @@ pub mod gradient_continuity;
 pub mod gradient_validation;
 pub mod icc_conversion;
 pub mod icc_conversion_worker;
+#[path = "icc_profile_registry.rs"]
+mod icc_profile_registry_raw;
+#[path = "icc_profile_registry_observed.rs"]
 pub mod icc_profile_registry;
 pub mod inverse_lut_artifact;
 pub mod inverse_lut_calibration_analysis;
