@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
-use crate::{safe_fs, staging};
+use crate::safe_fs::{self, staging};
 
 /// Conservative ceiling for classic TIFF pixel payloads. The remaining space
 /// is reserved for strip tables, metadata, ICC/Photoshop resources and encoder
@@ -105,11 +105,11 @@ pub fn preserve_source_or_layout_requires_bigtiff(
 /// a unique sibling of the final destination, while large render spools stay
 /// under their caller-owned local spool directory.
 ///
-/// Known production suffix strings are normalized through [`crate::staging`].
-/// If appending the descriptive suffix/process/sequence would exceed the normal
-/// Windows 255 UTF-16 component limit, the writer automatically uses a compact
-/// process/sequence sibling name instead. The fallback remains beside the final
-/// destination, preserving the same-volume atomic-commit invariant.
+/// Known production suffix strings are normalized through the shared staging
+/// registry. If appending the descriptive suffix/process/sequence would exceed
+/// the normal Windows 255 UTF-16 component limit, the writer automatically uses
+/// a compact process/sequence sibling name instead. The fallback remains beside
+/// the final destination, preserving the same-volume atomic-commit invariant.
 pub fn write_atomic<F, V>(
     destination: &Path,
     staging_suffix: &str,
