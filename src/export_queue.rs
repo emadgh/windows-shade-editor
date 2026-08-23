@@ -1159,6 +1159,39 @@ mod tests {
     }
 
     #[test]
+    fn face_snapshot_test_stack_face_jobs_keep_fifo_insertion_order() {
+        let mut queue = ExportQueue::new();
+        for (label, operation) in [
+            ("Face", ExportQueueOperation::Standard),
+            ("Snapshot", ExportQueueOperation::Standard),
+            (
+                "Test Stack",
+                ExportQueueOperation::TestStack {
+                    snapshots: vec![ExportRecipe::from_project(&ShadeProject::default())],
+                    rows: 1,
+                    columns: 1,
+                    anchor: TestStackAnchor::TopLeft,
+                },
+            ),
+            ("Face 2", ExportQueueOperation::Standard),
+        ] {
+            let mut queued = spec(&format!("{label}.tif"));
+            queued.label = label.to_owned();
+            queued.operation = operation;
+            queue.enqueue(queued);
+        }
+
+        assert_eq!(
+            queue
+                .items()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Face", "Snapshot", "Test Stack", "Face 2"]
+        );
+    }
+
+    #[test]
     fn legacy_queue_spec_defaults_to_standard_operation() {
         let mut value = serde_json::to_value(spec("out.tif")).unwrap();
         value.as_object_mut().unwrap().remove("operation");

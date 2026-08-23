@@ -233,6 +233,11 @@ impl ConversionBatchQueue {
         batch: ConversionBatchCapture,
         default_dpi: f64,
     ) -> Result<u64, String> {
+        let mut batch = batch;
+        for face in &mut batch.faces {
+            face.capture.output_tiff_path =
+                crate::tiff_output::canonical_destination(&face.capture.output_tiff_path);
+        }
         batch.validate()?;
         if !default_dpi.is_finite() || default_dpi <= 0.0 {
             return Err("Conversion batch fallback DPI must be finite and positive.".to_owned());
@@ -1095,6 +1100,29 @@ mod tests {
         assert!(restored.items[0].requires_resume);
         assert_eq!(restored.items[0].face_count, 2);
         assert_eq!(restored.items[0].completed_face_count, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn queued_batch_destinations_are_canonical_before_reservation_and_persistence() {
+        let path = temp_path("canonical-destinations");
+        let mut captured = batch("Canonical");
+        captured.faces[0].capture.output_tiff_path =
+            PathBuf::from(r"C:\Production\Canonical-Face-0.TIFF");
+        let mut queue = ConversionBatchQueue::empty(Some(path.clone()));
+
+        queue.enqueue(captured, 220.0).unwrap();
+        assert_eq!(
+            queue.items[0].spec.batch.faces[0].capture.output_tiff_path,
+            PathBuf::from(r"C:\Production\Canonical-Face-0.tif")
+        );
+        drop(queue);
+
+        let restored = ConversionBatchQueue::load_from_path(path.clone()).unwrap();
+        assert_eq!(
+            restored.items[0].spec.batch.faces[0].capture.output_tiff_path,
+            PathBuf::from(r"C:\Production\Canonical-Face-0.tif")
+        );
         let _ = std::fs::remove_file(path);
     }
 

@@ -221,6 +221,9 @@ impl ConversionQueue {
         production_project_disposition: ProductionProjectDisposition,
         default_dpi: f64,
     ) -> Result<u64, String> {
+        let mut capture = capture;
+        capture.output_tiff_path =
+            crate::tiff_output::canonical_destination(&capture.output_tiff_path);
         capture.validate()?;
         production_project_disposition.validate()?;
         if !default_dpi.is_finite() || default_dpi <= 0.0 {
@@ -774,6 +777,28 @@ mod tests {
         assert_eq!(queue.items()[0].status, ConversionQueueStatus::Cancelled);
         assert!(queue.retry(id));
         assert_eq!(queue.items()[0].status, ConversionQueueStatus::Waiting);
+    }
+
+    #[test]
+    fn queued_conversion_destination_is_canonical_before_reservation_and_persistence() {
+        let path = temp_path("canonical-destination");
+        let mut queue = ConversionQueue::empty(Some(path.clone()));
+        let mut captured = capture(r"C:\Production\canonical.tif");
+        captured.output_tiff_path = PathBuf::from(r"C:\Production\canonical.TIFF");
+
+        queue.enqueue(captured, 220.0).unwrap();
+        assert_eq!(
+            queue.items()[0].destination,
+            PathBuf::from(r"C:\Production\canonical.tif")
+        );
+        drop(queue);
+
+        let restored = ConversionQueue::load_from_path(path.clone()).unwrap();
+        assert_eq!(
+            restored.items()[0].destination,
+            PathBuf::from(r"C:\Production\canonical.tif")
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

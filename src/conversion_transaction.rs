@@ -13,6 +13,7 @@ use crate::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;
 use crate::export_recipe::ExportRecipe;
 use crate::model::ShadeProject;
 use crate::production_project::{ProductionProjectSpec, build_production_project};
+use crate::tiff_output;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversionPhase {
@@ -119,6 +120,7 @@ impl ConversionJobCapture {
         output_face_label: String,
     ) -> Result<Self, String> {
         let conversion_recipe_sha256 = recipe_sha256(&conversion_recipe)?;
+        let output_tiff_path = tiff_output::canonical_destination(&output_tiff_path);
         let capture = Self {
             source_project_path,
             source_project_file_sha256,
@@ -158,6 +160,7 @@ impl ConversionJobCapture {
         output_face_label: String,
     ) -> Result<Self, String> {
         let conversion_recipe_sha256 = recipe_sha256(&conversion_recipe)?;
+        let output_tiff_path = tiff_output::canonical_destination(&output_tiff_path);
         let capture = Self {
             source_project_path,
             source_project_file_sha256,

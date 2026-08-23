@@ -11,6 +11,11 @@ pub const CLASSIC_TIFF_SAFE_RAW_BYTES: u64 = 4_000_000_000;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[allow(dead_code)]
+const MAX_PROCESS_ID_DIGITS: usize = 10;
+#[allow(dead_code)]
+const MAX_STAGE_SEQUENCE_DIGITS: usize = 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DestinationPolicy {
     ReplaceExisting,
@@ -37,6 +42,13 @@ pub fn staged_path(destination: &Path, suffix: &str) -> PathBuf {
     let mut staged_name = file_name;
     staged_name.push(suffix);
     destination.with_file_name(staged_name)
+}
+
+/// Maximum UTF-16 code units appended to a destination file name by the
+/// unique staging convention: `{suffix}.{process_id}-{sequence}`.
+#[allow(dead_code)]
+pub fn staging_suffix_utf16_reserve(suffix: &str) -> usize {
+    suffix.encode_utf16().count() + 1 + MAX_PROCESS_ID_DIGITS + 1 + MAX_STAGE_SEQUENCE_DIGITS
 }
 
 pub fn layout_requires_bigtiff(layout: TiffLayout) -> bool {
@@ -99,22 +111,42 @@ where
             parent.display()
         )
     })?;
-    let staged = unique_staged_path(destination, staging_suffix);
+    let staged = StagedOutput::new(unique_staged_path(destination, staging_suffix));
 
-    let result = (|| {
-        write_staged(&staged)?;
-        verify_staged(&staged)?;
+    (|| {
+        write_staged(staged.path())?;
+        verify_staged(staged.path())?;
         match policy {
-            DestinationPolicy::ReplaceExisting => safe_fs::commit_staged_file(&staged, destination),
+            DestinationPolicy::ReplaceExisting => {
+                safe_fs::commit_staged_file(staged.path(), destination)
+            }
             DestinationPolicy::RequireAbsent => {
-                safe_fs::commit_staged_file_if_absent(&staged, destination)
+                safe_fs::commit_staged_file_if_absent(staged.path(), destination)
             }
         }
-    })();
-    if result.is_err() && staged.exists() {
-        let _ = fs::remove_file(&staged);
+    })()
+}
+
+struct StagedOutput {
+    path: PathBuf,
+}
+
+impl StagedOutput {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
     }
-    result
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedOutput {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn unique_staged_path(destination: &Path, suffix: &str) -> PathBuf {
@@ -171,6 +203,16 @@ mod tests {
     }
 
     #[test]
+    fn staging_reserve_covers_the_longest_unique_suffix() {
+        let suffix = ".conversion.tmp";
+        let staged_suffix = format!("{suffix}.{}-{}", u32::MAX, u64::MAX);
+        assert_eq!(
+            staging_suffix_utf16_reserve(suffix),
+            staged_suffix.encode_utf16().count()
+        );
+    }
+
+    #[test]
     fn bigtiff_policy_is_conservative_on_overflow() {
         assert!(!layout_requires_bigtiff(TiffLayout {
             width: 1,
@@ -203,6 +245,57 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("verification failed"));
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn failed_write_preserves_destination_and_cleans_stage() {
+        let folder = temp_folder("write-failure");
+        fs::create_dir_all(&folder).unwrap();
+        let destination = folder.join("output.tif");
+        fs::write(&destination, b"previous").unwrap();
+
+        let error = write_atomic(
+            &destination,
+            ".stage.tmp",
+            DestinationPolicy::ReplaceExisting,
+            |staged| {
+                fs::write(staged, b"partial").unwrap();
+                Err("writer cancelled".to_owned())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cancelled"));
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn writer_panic_preserves_destination_and_cleans_stage() {
+        let folder = temp_folder("writer-panic");
+        fs::create_dir_all(&folder).unwrap();
+        let destination = folder.join("output.tif");
+        fs::write(&destination, b"previous").unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = write_atomic(
+                &destination,
+                ".stage.tmp",
+                DestinationPolicy::ReplaceExisting,
+                |staged| {
+                    fs::write(staged, b"partial").unwrap();
+                    panic!("simulated writer panic");
+                },
+                |_| Ok(()),
+            );
+        });
+
+        assert!(result.is_err());
         assert_eq!(fs::read(&destination).unwrap(), b"previous");
         assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
         let _ = fs::remove_dir_all(folder);

@@ -1584,18 +1584,19 @@ fn build_target_setup_review(
         errors.push("Select a production TIFF destination.".to_owned());
         return Err(errors);
     };
-    if let Err(err) = validate_conversion_output_path(&source.source_path, preferred_output) {
+    let preferred_output = crate::tiff_output::canonical_destination(preferred_output);
+    if let Err(err) = validate_conversion_output_path(&source.source_path, &preferred_output) {
         errors.push(output_path_error(err));
     }
     let effective_output_path = match state.collision_policy {
-        OutputCollisionPolicy::Versioned => match next_versioned_output_path(preferred_output) {
+        OutputCollisionPolicy::Versioned => match next_versioned_output_path(&preferred_output) {
             Ok(path) => path,
             Err(err) => {
                 errors.push(output_path_error(err));
-                preferred_output.to_path_buf()
+                preferred_output.clone()
             }
         },
-        OutputCollisionPolicy::TransactionalReplace => preferred_output.to_path_buf(),
+        OutputCollisionPolicy::TransactionalReplace => preferred_output,
     };
     let create_new_project_path = effective_output_path.with_extension("shade");
     if state.destination_mode == ProductionDestinationMode::CreateNew
