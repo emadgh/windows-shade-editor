@@ -1,6 +1,7 @@
 use super::match_color;
 use crate::*;
 use eframe::egui;
+use windows_shade_editor::file_observer::{self, ExternalFileRole};
 
 pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
     let ctrl_right_click = ui.ctx().input(|input| {
@@ -14,6 +15,9 @@ pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
     }
 
     let target = match_color::target_snapshot();
+    let reference_state = target
+        .as_ref()
+        .map(|target| file_observer::observe(&target.path, ExternalFileRole::Reference));
     ui.horizontal(|ui| {
         ui.strong("Reference File");
         let field_width = (ui.available_width() - 92.0).clamp(90.0, 190.0);
@@ -30,9 +34,22 @@ pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
                 "{}\nCtrl + Right Click: quick in-app preview",
                 target.path.display()
             ));
-            if !target.is_available() {
+            if reference_state.as_ref().is_some_and(|state| state.is_missing()) {
                 ui.colored_label(egui::Color32::YELLOW, "missing")
                     .on_hover_text("The Reference file has been moved or deleted.");
+            } else if reference_state
+                .as_ref()
+                .is_some_and(|state| state.is_changed())
+            {
+                ui.colored_label(egui::Color32::YELLOW, "changed")
+                    .on_hover_text(
+                        "The Reference file changed externally. Reselect it before using the cached preview/histograms.",
+                    );
+            } else if reference_state
+                .as_ref()
+                .is_some_and(|state| !state.is_available())
+            {
+                ui.colored_label(egui::Color32::YELLOW, "unreadable");
             }
         }
 
@@ -41,8 +58,16 @@ pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
             .on_hover_text("Select or replace Reference image")
             .clicked()
         {
+            let previous_path = target.as_ref().map(|target| target.path.clone());
             match match_color::choose_target(app.settings.max_preview_dimension) {
                 Ok(Some(target)) => {
+                    if let Some(previous_path) = previous_path {
+                        if previous_path != target.path {
+                            file_observer::release(&previous_path, ExternalFileRole::Reference);
+                        }
+                    }
+                    file_observer::observe(&target.path, ExternalFileRole::Reference);
+                    file_observer::acknowledge(&target.path);
                     app.report_info(format!("Reference image: {}", target.display_name()));
                 }
                 Ok(None) => {}
@@ -50,7 +75,12 @@ pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
             }
         }
         if ui
-            .add_enabled(target.as_ref().is_some_and(|item| item.is_available()), egui::Button::new("↗").small())
+            .add_enabled(
+                reference_state
+                    .as_ref()
+                    .is_some_and(|state| state.is_available()),
+                egui::Button::new("↗").small(),
+            )
             .on_hover_text("Reveal Reference file in Explorer")
             .clicked()
         {
@@ -65,6 +95,9 @@ pub(crate) fn ui_reference_file(app: &mut ShadeApp, ui: &mut egui::Ui) {
             .on_hover_text("Clear Reference image and histogram; applied Match Color Levels remain")
             .clicked()
         {
+            if let Some(target) = target.as_ref() {
+                file_observer::release(&target.path, ExternalFileRole::Reference);
+            }
             match_color::clear_target();
             app.report_info("Reference image cleared; applied adjustments were kept.");
         }
@@ -87,10 +120,19 @@ fn ui_reference_preview(ctx: &egui::Context) {
         .resizable(true)
         .default_size([720.0, 620.0])
         .show(ctx, |ui| {
-            if !target.is_available() {
+            let state = file_observer::observe(&target.path, ExternalFileRole::Reference);
+            if !state.is_available() {
                 ui.colored_label(
                     egui::Color32::YELLOW,
                     "Reference file is unavailable. Reselect it to refresh preview and histogram data.",
+                );
+                ui.small(target.path.display().to_string());
+                return;
+            }
+            if state.is_changed() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Reference file changed externally. Cached preview/histograms are intentionally blocked; reselect the file to verify and reload it.",
                 );
                 ui.small(target.path.display().to_string());
                 return;
