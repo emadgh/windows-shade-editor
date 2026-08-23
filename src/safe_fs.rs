@@ -10,7 +10,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 
-use crate::staging;
+#[path = "staging.rs"]
+pub mod staging;
 
 pub fn backup_path(path: &Path) -> PathBuf {
     append_suffix(path, staging::BACKUP_SUFFIX)
