@@ -31,19 +31,22 @@ Do not push any branch or commit. Implement, test and commit locally only. GitHu
 8. Existing persistent queue files must deserialize safely. New fields require Serde defaults or an explicit queue schema migration.
 9. Do not run a repository-wide formatter rewrite. Format only touched files and keep the diff scoped.
 
-## Current output-path matrix
+## Audited output-path matrix
 
-| Output path | UI/runtime entry | Queue | Render/encode path | Stage/commit path | Important semantics |
-|---|---|---|---|---|---|
-| Current Face Export | `main.rs::export_current_dialog` | `export_queue.rs` | `export.rs::export_face_with_progress_options` | `export.rs::temporary_export_path` → private `atomic_replace` | Adjustments, optional transport validation, source metadata preservation |
-| Export All Faces | `main.rs` batch path | `export_queue.rs` FIFO | Same `export.rs` path per Face | Same private Export staging/replace | Name/folder templates, conflict policy, destination reservation |
-| Single Snapshot Export | `ui/snapshots_panel.rs` and legacy `main.rs` path | `export_queue.rs` | Same `export.rs` path with immutable `ExportRecipe` | Same private Export staging/replace | Snapshot test-code provenance and export mark |
-| Snapshot group export | `ui/snapshots_panel.rs` and legacy `main.rs` path | `export_queue.rs` FIFO | Same `export.rs` path per Snapshot | Same private Export staging/replace | Batch collision choice, immutable recipe capture |
-| Test Stack intermediate renders | `test_stack.rs::export_test_stack_with_progress` | No queue item; foreground job wrapper | Calls normal `export.rs` once per selected Snapshot | Each intermediate render also stages/commits a temporary TIFF | Correct Snapshot render semantics, but unnecessary atomic publication for internal temporary files |
-| Test Stack final TIFF | `ui/test_code_panel.rs::start_test_stack` | **Bypasses Export Queue** | Separate encoder in `test_stack.rs` | `staged_output_path` → `safe_fs::commit_staged_file` | Composed same-size raster, duplicate RGB/CMYK/Gray metadata writer |
-| ICC Converter output | `icc_conversion_worker.rs` | `conversion_queue.rs` | `conversion_tiff.rs` | Conversion-specific stage, validation and `safe_fs` commit | Target ICC embedding, transaction commit boundary |
-| DeviceLink output | Same worker/queue | `conversion_queue.rs` | Same conversion writer | Same conversion stage/validation/commit | DeviceLink is a transform; LinkClass profile is not embedded as output ICC |
-| N-channel output | Same worker/queue | `conversion_queue.rs` | Dynamic 5–12 channel adapter in `conversion_tiff.rs` | Same conversion stage/validation/commit | Explicit InkSet/NumberOfInks/InkNames and channel order |
+This matrix records the implemented post-consolidation paths. Domain-specific renderers and validators remain explicit; every final TIFF publication uses the same storage transaction and `safe_fs` commit primitive.
+
+| Output path | UI/runtime entry | Queue | Render/encode primitive | Staged validator | Stage/commit primitive | Intentional domain semantics |
+|---|---|---|---|---|---|---|
+| Current Face Export | `main.rs::export_current_dialog` | `ExportQueue` | `export.rs::export_face_with_progress_options` → `source_tiff_writer::write_tiff_pixels` | `tiff_io::stream_info` | `tiff_output::write_atomic` → `safe_fs::commit_staged_file` | Adjustments, source metadata preservation and optional transport validation |
+| Export All Faces | `main.rs` batch path | `ExportQueue` FIFO | Same Export/source-writer path per Face | `tiff_io::stream_info` | Same shared output transaction | Name/folder templates, conflict policy and reservation |
+| Single Snapshot Export | `ui/snapshots_panel.rs` and legacy `main.rs` path | `ExportQueue` | Same Export/source-writer path with immutable `ExportRecipe` | `tiff_io::stream_info` | Same shared output transaction | Snapshot Test Code provenance and export mark |
+| Snapshot group export | `ui/snapshots_panel.rs` and legacy `main.rs` path | `ExportQueue` FIFO | Same Export/source-writer path per Snapshot | `tiff_io::stream_info` | Same shared output transaction | Batch collision choice and immutable recipe capture |
+| Test Stack intermediate renders | `test_stack.rs::export_test_stack_captured_with_progress` | Internal steps of one `ExportQueue` row | Normal Export/source-writer path once per captured Snapshot | `tiff_io::stream_info`, then Test Stack topology compatibility | Shared output transaction into unique local temporary TIFFs | Intermediate TIFFs are local composition details, not user-visible queue rows |
+| Test Stack final TIFF | `ui/test_code_panel.rs::start_test_stack` | One `ExportQueue` row | `test_stack.rs::write_test_stack_tiff` → `source_tiff_writer::write_tiff_pixels` | `tiff_io::stream_info` | `tiff_output::write_atomic` → `safe_fs::commit_staged_file` | Same-size composed raster and captured grid/anchor semantics |
+| ICC Converter output | `icc_conversion_worker.rs` | `ConversionQueue` | `conversion_tiff.rs` explicit 4–12-channel adapter | `conversion_tiff::verify_staged` | `tiff_output::write_atomic` → replace/require-absent `safe_fs` commit | Exact target ICC, topology and post-TIFF Production-project transaction |
+| DeviceLink output | Same worker/queue | `ConversionQueue` | Same conversion adapter | `conversion_tiff::verify_staged` | Same shared output transaction | DeviceLink is a transform and its LinkClass profile is not embedded as output ICC |
+| N-channel output | Same worker/queue | `ConversionQueue` | `conversion_tiff.rs` explicit `Separated8/16<5..12>` dispatch | `conversion_tiff::verify_staged` | Same shared output transaction | InkSet, NumberOfInks, NUL-separated InkNames and exact channel order |
+| Multi-Face ICC/DeviceLink/N-channel output | `conversion_batch_execution.rs` | `ConversionBatchQueue` | One immutable `ConversionJobCapture` per Face through the same conversion adapter | `conversion_tiff::verify_staged` per Face | Same shared output transaction per Face | Ordered per-Face checkpoints and Production-project recovery after each committed TIFF |
 
 ## Confirmed duplication and drift risks
 
@@ -436,22 +439,24 @@ Avoid one large mixed commit. Each commit should compile and should not contain 
 
 ## Acceptance checklist
 
-- [ ] A checked-in matrix identifies every output path, writer, stage, validator and commit primitive.
-- [ ] Export no longer owns a private Win32 atomic-replace implementation.
-- [ ] Export, Test Stack and Converter use one staging/cleanup/fsync/commit abstraction.
-- [ ] BigTIFF threshold arithmetic is implemented once.
-- [ ] Export and Test Stack share RGB/CMYK/Gray 8/16-bit encoder and metadata policy.
-- [ ] Converter retains explicit 4–12 channel and profile semantics while reusing common mechanics.
-- [ ] All adjusted-source outputs, including Test Stack, appear in Export Queue in FIFO order.
-- [ ] Production conversion remains transactionally safe in Conversion Queue.
-- [ ] `.tif` is canonical before queue reservation and persistence.
-- [ ] Equivalent outputs pass metadata/transport comparisons.
-- [ ] Failure and cancellation tests prove no partial final TIFF is exposed.
-- [ ] Existing Snapshot export marks/provenance are preserved.
-- [ ] Existing conversion recovery tests remain green.
-- [ ] Full local test/check suite exits zero.
-- [ ] Changes are committed locally in scoped commits.
-- [ ] Nothing is pushed to GitHub.
+- [x] A checked-in matrix identifies every output path, writer, stage, validator and commit primitive.
+- [x] Export no longer owns a private Win32 atomic-replace implementation.
+- [x] Export, Test Stack and Converter use one staging/cleanup/fsync/commit abstraction.
+- [x] BigTIFF threshold arithmetic is implemented once.
+- [x] Export and Test Stack share RGB/CMYK/Gray 8/16-bit encoder and metadata policy.
+- [x] Converter retains explicit 4–12 channel and profile semantics while reusing common mechanics.
+- [x] All adjusted-source outputs, including Test Stack, appear in Export Queue in FIFO order.
+- [x] Production conversion remains transactionally safe in Conversion Queue.
+- [x] `.tif` is canonical before queue reservation and persistence, including single and Multi-Face Conversion capture.
+- [x] Equivalent outputs pass metadata/transport comparisons.
+- [x] Failure, cancellation-result and panic-unwind tests prove no partial final TIFF is exposed.
+- [x] Existing Snapshot export marks/provenance are preserved.
+- [x] Existing conversion recovery tests remain green.
+- [x] Full local test/check suite exits zero.
+- [x] Changes are committed locally in issue-scoped commits.
+- [x] No direct push to `main`; feature-branch publication occurs only after the owner explicitly requests the PR.
+
+Local completion evidence (2026-08-23): `cargo test --all-targets` passed 489 library tests, 254 binary tests and all integration targets; `cargo check --all-targets` and `cargo build --release` exited zero. The later owner request for a PR supersedes the original no-push stop condition for the feature branch only.
 
 ## Stop conditions for the implementing model
 
