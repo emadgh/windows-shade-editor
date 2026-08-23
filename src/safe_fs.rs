@@ -214,12 +214,23 @@ fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn move_path_if_absent(source: &Path, destination: &Path) -> Result<(), String> {
-    move_path_windows(
-        source,
-        destination,
-        MOVEFILE_WRITE_THROUGH,
-        "commit new destination",
-    )
+    let source_wide = wide_path(source);
+    let destination_wide = wide_path(destination);
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(format!(
+            "Cannot commit new destination {} because it exists or cannot be created: {}",
+            destination.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
