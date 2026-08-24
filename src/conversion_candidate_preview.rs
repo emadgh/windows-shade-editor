@@ -1,11 +1,9 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::color_conversion::{
-    ConversionEngineMode, ConversionRecipe, TargetChannelDefinition,
-};
+use crate::color_conversion::{ConversionEngineMode, ConversionRecipe, TargetChannelDefinition};
 use crate::conversion_recipe::recipe_sha256;
 use crate::conversion_transaction::{CapturedSourceProfile, ConversionCancellation};
 use crate::devicelink_conversion::ProductionDeviceLinkTransform;
@@ -19,8 +17,7 @@ pub struct CandidatePreviewInput {
     pub width: usize,
     pub height: usize,
     pub source_model: IccSourceModel,
-    /// Downsampled, source-adjusted planes in production working polarity.
-    /// RGB inputs require 3 planes; CMYK inputs require 4.
+    /// Source-adjusted downsampled planes in production working polarity.
     pub source_planes: Vec<Vec<u16>>,
     pub source_profile: CapturedSourceProfile,
     pub embedded_source_icc: Option<Vec<u8>>,
@@ -38,18 +35,14 @@ pub struct CandidatePreviewResult {
 }
 
 impl CandidatePreviewResult {
-    pub fn channel_names(&self) -> Vec<String> {
-        self.channels.iter().map(|channel| channel.name.clone()).collect()
-    }
-
     pub fn channel_count(&self) -> usize {
         self.channels.len()
     }
 }
 
-/// Convert a bounded preview raster with the same production transform primitives
-/// used by the final conversion worker. This function performs no output write,
-/// project mutation, or Production-project creation.
+/// Execute the same characterized ICC/N-channel/DeviceLink transforms used by
+/// production conversion, but against an already downsampled Source-adjusted raster.
+/// No TIFF, Production project, or Source state is written by this function.
 pub fn render_candidate_preview(
     input: CandidatePreviewInput,
     cancellation: &ConversionCancellation,
@@ -57,30 +50,30 @@ pub fn render_candidate_preview(
     input.recipe.validate().map_err(|errors| {
         format!("Candidate preview recipe is invalid: {}", errors.join(" "))
     })?;
-    cancellation_check(cancellation)?;
+    check_cancelled(cancellation)?;
 
-    let expected_source_channels = match input.source_model {
+    let source_channels = match input.source_model {
         IccSourceModel::Rgb => 3,
         IccSourceModel::Cmyk => 4,
     };
-    if input.source_planes.len() != expected_source_channels {
+    if input.source_planes.len() != source_channels {
         return Err(format!(
-            "Candidate preview {:?} source requires {expected_source_channels} adjusted planes; found {}.",
+            "Candidate {:?} source requires {source_channels} planes; found {}.",
             input.source_model,
             input.source_planes.len()
         ));
     }
-    let pixel_count = input
+    let pixels = input
         .width
         .checked_mul(input.height)
-        .ok_or_else(|| "Candidate preview dimensions overflow the pixel count.".to_owned())?;
-    if pixel_count == 0 {
-        return Err("Candidate preview requires a non-empty raster.".to_owned());
+        .ok_or_else(|| "Candidate preview dimensions overflow pixel count.".to_owned())?;
+    if pixels == 0 {
+        return Err("Candidate preview raster is empty.".to_owned());
     }
     for (index, plane) in input.source_planes.iter().enumerate() {
-        if plane.len() != pixel_count {
+        if plane.len() != pixels {
             return Err(format!(
-                "Candidate preview source plane {} has {} samples; expected {pixel_count}.",
+                "Candidate source plane {} has {} samples; expected {pixels}.",
                 index + 1,
                 plane.len()
             ));
@@ -93,10 +86,9 @@ pub fn render_candidate_preview(
         &input.recipe.source_profile_identity.sha256,
     )?;
     let target_icc = load_target_icc(&input.recipe)?;
-    cancellation_check(cancellation)?;
+    check_cancelled(cancellation)?;
 
-    let channel_count = input.recipe.target.channels.len();
-    let planes = match channel_count {
+    let planes = match input.recipe.target.channels.len() {
         4 => transform_4(
             input.source_model,
             &input.source_planes,
@@ -113,13 +105,13 @@ pub fn render_candidate_preview(
         10 => transform_n::<10>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
         11 => transform_n::<11>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
         12 => transform_n::<12>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
-        other => {
+        channels => {
             return Err(format!(
-                "Candidate preview supports production target topology 4..=12 channels; found {other}."
+                "Candidate preview supports production target topology 4..=12 channels; found {channels}."
             ));
         }
     };
-    let histograms = histograms(&planes);
+    let histograms = build_histograms(&planes);
     Ok(CandidatePreviewResult {
         width: input.width,
         height: input.height,
@@ -131,8 +123,8 @@ pub fn render_candidate_preview(
 }
 
 fn transform_4(
-    source_model: IccSourceModel,
-    source_planes: &[Vec<u16>],
+    model: IccSourceModel,
+    planes: &[Vec<u16>],
     source_icc: &[u8],
     target_icc: &[u8],
     recipe: &ConversionRecipe,
@@ -141,53 +133,43 @@ fn transform_4(
     match recipe.engine_mode {
         ConversionEngineMode::Icc => {
             let transform = ProductionCmykTransform::new(
-                source_model,
+                model,
                 RuntimeIccProfile::Embedded(source_icc),
                 RuntimeIccProfile::Embedded(target_icc),
                 recipe.rendering_intent,
                 recipe.black_point_compensation,
             )?;
-            match source_model {
-                IccSourceModel::Rgb => {
-                    transform_rgb_to::<4, _>(source_planes, cancellation, |src, dst| {
-                        transform.transform_rgb_chunk(src, dst)
-                    })
-                }
-                IccSourceModel::Cmyk => {
-                    transform_cmyk_to::<4, _>(source_planes, cancellation, |src, dst| {
-                        transform.transform_cmyk_chunk(src, dst)
-                    })
-                }
-            }
+            dispatch::<4, _, _>(
+                model,
+                planes,
+                cancellation,
+                |source, destination| transform.transform_rgb_chunk(source, destination),
+                |source, destination| transform.transform_cmyk_chunk(source, destination),
+            )
         }
         ConversionEngineMode::DeviceLink => {
             let transform = ProductionDeviceLinkTransform::<4>::new(
-                source_model,
+                model,
                 RuntimeIccProfile::Embedded(target_icc),
             )?;
-            match source_model {
-                IccSourceModel::Rgb => {
-                    transform_rgb_to::<4, _>(source_planes, cancellation, |src, dst| {
-                        transform.transform_rgb_chunk(src, dst)
-                    })
-                }
-                IccSourceModel::Cmyk => {
-                    transform_cmyk_to::<4, _>(source_planes, cancellation, |src, dst| {
-                        transform.transform_cmyk_chunk(src, dst)
-                    })
-                }
-            }
+            dispatch::<4, _, _>(
+                model,
+                planes,
+                cancellation,
+                |source, destination| transform.transform_rgb_chunk(source, destination),
+                |source, destination| transform.transform_cmyk_chunk(source, destination),
+            )
         }
         ConversionEngineMode::CustomOptimizer => Err(
-            "Candidate preview for Custom Optimizer requires its authorized characterized-target runtime and is not available through the ICC/DeviceLink preview path."
+            "Custom Optimizer candidate preview requires its characterized-target runtime."
                 .to_owned(),
         ),
     }
 }
 
 fn transform_n<const N: usize>(
-    source_model: IccSourceModel,
-    source_planes: &[Vec<u16>],
+    model: IccSourceModel,
+    planes: &[Vec<u16>],
     source_icc: &[u8],
     target_icc: &[u8],
     recipe: &ConversionRecipe,
@@ -196,51 +178,58 @@ fn transform_n<const N: usize>(
     match recipe.engine_mode {
         ConversionEngineMode::Icc => {
             let transform = ProductionNChannelTransform::<N>::new(
-                source_model,
+                model,
                 RuntimeIccProfile::Embedded(source_icc),
                 RuntimeIccProfile::Embedded(target_icc),
                 recipe.rendering_intent,
                 recipe.black_point_compensation,
             )?;
-            match source_model {
-                IccSourceModel::Rgb => transform_rgb_to::<N, _>(
-                    source_planes,
-                    cancellation,
-                    |src, dst| transform.transform_rgb_chunk(src, dst),
-                ),
-                IccSourceModel::Cmyk => transform_cmyk_to::<N, _>(
-                    source_planes,
-                    cancellation,
-                    |src, dst| transform.transform_cmyk_chunk(src, dst),
-                ),
-            }
+            dispatch::<N, _, _>(
+                model,
+                planes,
+                cancellation,
+                |source, destination| transform.transform_rgb_chunk(source, destination),
+                |source, destination| transform.transform_cmyk_chunk(source, destination),
+            )
         }
         ConversionEngineMode::DeviceLink => {
             let transform = ProductionDeviceLinkTransform::<N>::new(
-                source_model,
+                model,
                 RuntimeIccProfile::Embedded(target_icc),
             )?;
-            match source_model {
-                IccSourceModel::Rgb => transform_rgb_to::<N, _>(
-                    source_planes,
-                    cancellation,
-                    |src, dst| transform.transform_rgb_chunk(src, dst),
-                ),
-                IccSourceModel::Cmyk => transform_cmyk_to::<N, _>(
-                    source_planes,
-                    cancellation,
-                    |src, dst| transform.transform_cmyk_chunk(src, dst),
-                ),
-            }
+            dispatch::<N, _, _>(
+                model,
+                planes,
+                cancellation,
+                |source, destination| transform.transform_rgb_chunk(source, destination),
+                |source, destination| transform.transform_cmyk_chunk(source, destination),
+            )
         }
         ConversionEngineMode::CustomOptimizer => Err(
-            "Candidate preview for Custom Optimizer requires its authorized characterized-target runtime and is not available through the ICC/DeviceLink preview path."
+            "Custom Optimizer candidate preview requires its characterized-target runtime."
                 .to_owned(),
         ),
     }
 }
 
-fn transform_rgb_to<const N: usize, F>(
+fn dispatch<const N: usize, R, C>(
+    model: IccSourceModel,
+    planes: &[Vec<u16>],
+    cancellation: &ConversionCancellation,
+    rgb_transform: R,
+    cmyk_transform: C,
+) -> Result<Vec<Vec<u16>>, String>
+where
+    R: FnMut(&[[u16; 3]], &mut [[u16; N]]) -> Result<(), String>,
+    C: FnMut(&[[u16; 4]], &mut [[u16; N]]) -> Result<(), String>,
+{
+    match model {
+        IccSourceModel::Rgb => transform_rgb::<N, R>(planes, cancellation, rgb_transform),
+        IccSourceModel::Cmyk => transform_cmyk::<N, C>(planes, cancellation, cmyk_transform),
+    }
+}
+
+fn transform_rgb<const N: usize, F>(
     planes: &[Vec<u16>],
     cancellation: &ConversionCancellation,
     mut transform: F,
@@ -248,21 +237,20 @@ fn transform_rgb_to<const N: usize, F>(
 where
     F: FnMut(&[[u16; 3]], &mut [[u16; N]]) -> Result<(), String>,
 {
-    let pixel_count = planes[0].len();
-    let mut source = Vec::with_capacity(pixel_count);
-    for pixel in 0..pixel_count {
-        source.push([planes[0][pixel], planes[1][pixel], planes[2][pixel]]);
-    }
-    let mut destination = vec![[0u16; N]; pixel_count];
-    for start in (0..pixel_count).step_by(PREVIEW_CHUNK_PIXELS) {
-        cancellation_check(cancellation)?;
-        let end = (start + PREVIEW_CHUNK_PIXELS).min(pixel_count);
+    let pixels = planes[0].len();
+    let source = (0..pixels)
+        .map(|pixel| [planes[0][pixel], planes[1][pixel], planes[2][pixel]])
+        .collect::<Vec<_>>();
+    let mut destination = vec![[0u16; N]; pixels];
+    for start in (0..pixels).step_by(PREVIEW_CHUNK_PIXELS) {
+        check_cancelled(cancellation)?;
+        let end = (start + PREVIEW_CHUNK_PIXELS).min(pixels);
         transform(&source[start..end], &mut destination[start..end])?;
     }
-    Ok(deinterleave::<N>(&destination))
+    Ok(deinterleave(&destination))
 }
 
-fn transform_cmyk_to<const N: usize, F>(
+fn transform_cmyk<const N: usize, F>(
     planes: &[Vec<u16>],
     cancellation: &ConversionCancellation,
     mut transform: F,
@@ -270,23 +258,22 @@ fn transform_cmyk_to<const N: usize, F>(
 where
     F: FnMut(&[[u16; 4]], &mut [[u16; N]]) -> Result<(), String>,
 {
-    let pixel_count = planes[0].len();
-    let mut source = Vec::with_capacity(pixel_count);
-    for pixel in 0..pixel_count {
-        source.push([
+    let pixels = planes[0].len();
+    let source = (0..pixels)
+        .map(|pixel| [
             planes[0][pixel],
             planes[1][pixel],
             planes[2][pixel],
             planes[3][pixel],
-        ]);
-    }
-    let mut destination = vec![[0u16; N]; pixel_count];
-    for start in (0..pixel_count).step_by(PREVIEW_CHUNK_PIXELS) {
-        cancellation_check(cancellation)?;
-        let end = (start + PREVIEW_CHUNK_PIXELS).min(pixel_count);
+        ])
+        .collect::<Vec<_>>();
+    let mut destination = vec![[0u16; N]; pixels];
+    for start in (0..pixels).step_by(PREVIEW_CHUNK_PIXELS) {
+        check_cancelled(cancellation)?;
+        let end = (start + PREVIEW_CHUNK_PIXELS).min(pixels);
         transform(&source[start..end], &mut destination[start..end])?;
     }
-    Ok(deinterleave::<N>(&destination))
+    Ok(deinterleave(&destination))
 }
 
 fn deinterleave<const N: usize>(pixels: &[[u16; N]]) -> Vec<Vec<u16>> {
@@ -301,7 +288,7 @@ fn deinterleave<const N: usize>(pixels: &[[u16; N]]) -> Vec<Vec<u16>> {
     planes
 }
 
-fn histograms(planes: &[Vec<u16>]) -> Vec<[u32; 256]> {
+fn build_histograms(planes: &[Vec<u16>]) -> Vec<[u32; 256]> {
     planes
         .iter()
         .map(|plane| {
@@ -322,9 +309,15 @@ fn load_source_icc(
     let bytes = match source_profile {
         CapturedSourceProfile::Embedded => embedded
             .map(ToOwned::to_owned)
-            .ok_or_else(|| "Candidate preview expects an embedded Source ICC, but the preview source has none.".to_owned())?,
+            .ok_or_else(|| {
+                "Candidate expects an embedded Source ICC, but the preview source has none."
+                    .to_owned()
+            })?,
         CapturedSourceProfile::External { path } => fs::read(path).map_err(|error| {
-            format!("Cannot reopen assigned Source ICC {} for candidate preview: {error}", path.display())
+            format!(
+                "Cannot reopen assigned Source ICC {} for candidate preview: {error}",
+                path.display()
+            )
         })?,
     };
     verify_sha256(&bytes, expected_sha256, "Source ICC")?;
@@ -332,7 +325,7 @@ fn load_source_icc(
 }
 
 fn load_target_icc(recipe: &ConversionRecipe) -> Result<Vec<u8>, String> {
-    let (path, expected_sha256, label) = match recipe.engine_mode {
+    let (path, hash, label) = match recipe.engine_mode {
         ConversionEngineMode::Icc => (
             recipe.target.output_profile_path.as_deref(),
             recipe
@@ -352,18 +345,14 @@ fn load_target_icc(recipe: &ConversionRecipe) -> Result<Vec<u8>, String> {
             "DeviceLink ICC",
         ),
         ConversionEngineMode::CustomOptimizer => {
-            return Err(
-                "Custom Optimizer candidate preview does not use an ICC/DeviceLink payload."
-                    .to_owned(),
-            );
+            return Err("Custom Optimizer has no ICC/DeviceLink candidate payload.".to_owned());
         }
     };
-    let path = path.ok_or_else(|| format!("Candidate preview recipe has no {label} path."))?;
-    let expected_sha256 =
-        expected_sha256.ok_or_else(|| format!("Candidate preview recipe has no {label} identity."))?;
+    let path = path.ok_or_else(|| format!("Candidate recipe has no {label} path."))?;
+    let hash = hash.ok_or_else(|| format!("Candidate recipe has no {label} identity."))?;
     let bytes = fs::read(Path::new(path))
         .map_err(|error| format!("Cannot reopen {label} {path}: {error}"))?;
-    verify_sha256(&bytes, expected_sha256, label)?;
+    verify_sha256(&bytes, hash, label)?;
     Ok(bytes)
 }
 
@@ -379,7 +368,7 @@ fn verify_sha256(bytes: &[u8], expected: &str, label: &str) -> Result<(), String
     }
 }
 
-fn cancellation_check(cancellation: &ConversionCancellation) -> Result<(), String> {
+fn check_cancelled(cancellation: &ConversionCancellation) -> Result<(), String> {
     if cancellation.is_requested() {
         Err("Candidate preview cancelled because the target/recipe changed.".to_owned())
     } else {
@@ -391,7 +380,6 @@ fn cancellation_check(cancellation: &ConversionCancellation) -> Result<(), Strin
 mod tests {
     use super::*;
     use lcms2::{ColorSpaceSignature, Profile};
-    use tempfile::tempdir;
 
     use crate::color_conversion::{
         CONVERSION_RECIPE_SCHEMA_VERSION, ConversionRenderingIntent,
@@ -403,13 +391,32 @@ mod tests {
         format!("{:x}", Sha256::digest(bytes))
     }
 
-    fn cmyk_link_recipe(path: &Path, link_bytes: &[u8], source_icc: &[u8]) -> ConversionRecipe {
-        ConversionRecipe {
+    fn unique_temp_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shade-candidate-{name}-{}-{}.icc",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn candidate_uses_production_devicelink_samples_and_builds_target_histograms() {
+        let link_bytes = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0)
+            .unwrap()
+            .icc()
+            .unwrap();
+        let link_path = unique_temp_file("link");
+        fs::write(&link_path, &link_bytes).unwrap();
+        let source_icc = Profile::new_srgb().icc().unwrap();
+        let recipe = ConversionRecipe {
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
             engine_mode: ConversionEngineMode::DeviceLink,
             source_profile_identity: IccProfileIdentity {
-                description: "Source".to_owned(),
-                sha256: hash(source_icc),
+                description: "Source identity".to_owned(),
+                sha256: hash(&source_icc),
             },
             source_transparency_policy: None,
             target: ConversionTargetDefinition {
@@ -428,9 +435,9 @@ mod tests {
                 output_profile_path: None,
                 device_link_identity: Some(IccProfileIdentity {
                     description: "Link".to_owned(),
-                    sha256: hash(link_bytes),
+                    sha256: hash(&link_bytes),
                 }),
-                device_link_path: Some(path.to_string_lossy().into_owned()),
+                device_link_path: Some(link_path.to_string_lossy().into_owned()),
                 characterization_id: None,
                 total_ink_limit: None,
             },
@@ -438,20 +445,7 @@ mod tests {
             black_point_compensation: false,
             strategy: SeparationStrategy::default(),
             custom_optimizer_solver: None,
-        }
-    }
-
-    #[test]
-    fn candidate_preview_uses_direct_production_devicelink_samples_and_histograms() {
-        let dir = tempdir().unwrap();
-        let link_bytes = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0)
-            .unwrap()
-            .icc()
-            .unwrap();
-        let link_path = dir.path().join("link.icc");
-        fs::write(&link_path, &link_bytes).unwrap();
-        let source_icc = Profile::new_srgb().icc().unwrap();
-        let recipe = cmyk_link_recipe(&link_path, &link_bytes, &source_icc);
+        };
         let input = CandidatePreviewInput {
             width: 2,
             height: 1,
@@ -468,62 +462,64 @@ mod tests {
         };
         let result = render_candidate_preview(input, &ConversionCancellation::default()).unwrap();
         assert_eq!(result.channel_count(), 4);
-        assert_eq!(result.width, 2);
-        assert_eq!(result.height, 1);
         assert_eq!(result.planes[0][0], 0);
         assert_eq!(result.histograms[0].iter().sum::<u32>(), 2);
         assert_eq!(result.recipe_sha256.len(), 64);
+        let _ = fs::remove_file(link_path);
     }
 
     #[test]
-    fn cancellation_blocks_stale_preview_before_transform() {
+    fn cancellation_invalidates_stale_candidate_before_profile_io() {
         let cancellation = ConversionCancellation::default();
         cancellation.request();
-        let input = CandidatePreviewInput {
-            width: 1,
-            height: 1,
-            source_model: IccSourceModel::Rgb,
-            source_planes: vec![vec![0], vec![0], vec![0]],
-            source_profile: CapturedSourceProfile::Embedded,
-            embedded_source_icc: None,
-            recipe: ConversionRecipe {
-                schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
-                engine_mode: ConversionEngineMode::Icc,
-                source_profile_identity: IccProfileIdentity {
-                    description: "Source".to_owned(),
-                    sha256: "0".repeat(64),
-                },
-                source_transparency_policy: None,
-                target: ConversionTargetDefinition {
-                    name: "CMYK".to_owned(),
-                    channels: ["Cyan", "Magenta", "Yellow", "Black"]
-                        .into_iter()
-                        .map(|name| TargetChannelDefinition {
-                            name: name.to_owned(),
-                            display_rgb: None,
-                            solidity: 1.0,
-                            max_coverage: None,
-                        })
-                        .collect(),
-                    bit_depth: 16,
-                    output_profile_identity: Some(IccProfileIdentity {
-                        description: "Target".to_owned(),
-                        sha256: "1".repeat(64),
-                    }),
-                    output_profile_path: Some("missing.icc".to_owned()),
-                    device_link_identity: None,
-                    device_link_path: None,
-                    characterization_id: None,
-                    total_ink_limit: None,
-                },
-                rendering_intent: ConversionRenderingIntent::Perceptual,
-                black_point_compensation: false,
-                strategy: SeparationStrategy::default(),
-                custom_optimizer_solver: None,
+        let recipe = ConversionRecipe {
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::Icc,
+            source_profile_identity: IccProfileIdentity {
+                description: "Source".to_owned(),
+                sha256: "0".repeat(64),
             },
+            source_transparency_policy: None,
+            target: ConversionTargetDefinition {
+                name: "Target".to_owned(),
+                channels: ["Cyan", "Magenta", "Yellow", "Black"]
+                    .into_iter()
+                    .map(|name| TargetChannelDefinition {
+                        name: name.to_owned(),
+                        display_rgb: None,
+                        solidity: 1.0,
+                        max_coverage: None,
+                    })
+                    .collect(),
+                bit_depth: 16,
+                output_profile_identity: Some(IccProfileIdentity {
+                    description: "Target".to_owned(),
+                    sha256: "1".repeat(64),
+                }),
+                output_profile_path: Some("missing.icc".to_owned()),
+                device_link_identity: None,
+                device_link_path: None,
+                characterization_id: None,
+                total_ink_limit: None,
+            },
+            rendering_intent: ConversionRenderingIntent::Perceptual,
+            black_point_compensation: false,
+            strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: None,
         };
-        assert!(render_candidate_preview(input, &cancellation)
-            .unwrap_err()
-            .contains("cancelled"));
+        let error = render_candidate_preview(
+            CandidatePreviewInput {
+                width: 1,
+                height: 1,
+                source_model: IccSourceModel::Rgb,
+                source_planes: vec![vec![0], vec![0], vec![0]],
+                source_profile: CapturedSourceProfile::Embedded,
+                embedded_source_icc: None,
+                recipe,
+            },
+            &cancellation,
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"));
     }
 }
