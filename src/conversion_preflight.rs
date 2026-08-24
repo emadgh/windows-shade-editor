@@ -1,6 +1,7 @@
 use crate::conversion_workflow::ConversionSaveGate;
 use crate::design_source::{DesignSourceColorModel, DesignSourceDescriptor, SourceLossiness};
 use crate::model::IccProfileIdentity;
+use crate::source_profile_fallback::is_srgb_fallback_identity;
 use crate::source_transparency::SourceTransparencyPolicy;
 use crate::tiff_io::ColorModel;
 
@@ -195,11 +196,18 @@ pub fn build_conversion_preflight(input: &ConversionPreflightInput) -> Conversio
     }
 
     match &input.profile {
+        SourceProfileState::Missing if input.color_model == ColorModel::Rgb => findings.push(PreflightFinding {
+            code: PreflightCode::MissingSourceProfile,
+            severity: PreflightSeverity::Warning,
+            title: "No Source ICC — sRGB fallback will be used",
+            detail: "This RGB artwork has no assigned or embedded Source ICC. Conversion is allowed and will interpret its RGB samples as sRGB. Assign a Source ICC if the artwork uses another RGB encoding.".to_owned(),
+            action: Some("Assign Source Profile..."),
+        }),
         SourceProfileState::Missing => findings.push(PreflightFinding {
             code: PreflightCode::MissingSourceProfile,
             severity: PreflightSeverity::Blocking,
             title: "Source ICC profile required",
-            detail: "Assign or confirm the source profile before conversion. Shade Editor must not silently guess production source colorimetry.".to_owned(),
+            detail: "This source color model has no safe default production interpretation. Assign or confirm its Source ICC before conversion.".to_owned(),
             action: Some("Assign Source Profile..."),
         }),
         SourceProfileState::Invalid(reason) => findings.push(PreflightFinding {
@@ -207,6 +215,13 @@ pub fn build_conversion_preflight(input: &ConversionPreflightInput) -> Conversio
             severity: PreflightSeverity::Blocking,
             title: "Invalid source ICC profile",
             detail: reason.clone(),
+            action: Some("Assign Source Profile..."),
+        }),
+        SourceProfileState::Embedded(identity) if is_srgb_fallback_identity(identity) => findings.push(PreflightFinding {
+            code: PreflightCode::MissingSourceProfile,
+            severity: PreflightSeverity::Warning,
+            title: "No Source ICC — using reproducible sRGB fallback",
+            detail: "This RGB artwork is untagged. Shade Editor will interpret it as sRGB for this conversion and records the exact fallback ICC identity in the recipe. Assign a Source ICC if another RGB encoding is intended.".to_owned(),
             action: Some("Assign Source Profile..."),
         }),
         SourceProfileState::Embedded(identity) | SourceProfileState::Assigned(identity)
@@ -292,12 +307,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_profile_blocks_production_conversion() {
+    fn missing_rgb_profile_warns_but_does_not_block_conversion() {
         let mut input = ready_rgb();
         input.profile = SourceProfileState::Missing;
         let report = build_conversion_preflight(&input);
         assert!(report.contains(PreflightCode::MissingSourceProfile));
+        assert!(report.can_convert());
+        assert_eq!(report.highest_severity(), Some(PreflightSeverity::Warning));
+    }
+
+    #[test]
+    fn missing_cmyk_profile_remains_blocking() {
+        let mut input = ready_rgb();
+        input.color_model = ColorModel::Cmyk;
+        input.profile = SourceProfileState::Missing;
+        let report = build_conversion_preflight(&input);
+        assert!(report.contains(PreflightCode::MissingSourceProfile));
         assert!(!report.can_convert());
+    }
+
+    #[test]
+    fn explicit_rgb_fallback_identity_is_reported_as_warning() {
+        let mut input = ready_rgb();
+        input.profile = SourceProfileState::Embedded(
+            crate::source_profile_fallback::srgb_fallback_identity().unwrap(),
+        );
+        let report = build_conversion_preflight(&input);
+        assert!(report.contains(PreflightCode::MissingSourceProfile));
+        assert!(report.can_convert());
     }
 
     #[test]

@@ -104,7 +104,6 @@ struct CandidateSource {
     embedded_source_icc: Option<Vec<u8>>,
     width: usize,
     height: usize,
-    adjusted_planes: Vec<Vec<u16>>,
 }
 
 impl ShadeApp {
@@ -208,6 +207,14 @@ impl ShadeApp {
                             ui.label(
                                 egui::RichText::new("Saved Source state ready")
                                     .color(egui::Color32::LIGHT_GREEN),
+                            );
+                        }
+                        if windows_shade_editor::source_profile_fallback::is_srgb_fallback_identity(&source.profile_identity) {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Warning: this RGB Face has no Source ICC. Candidate and final conversion use the reproducible sRGB fallback.",
+                                )
+                                .color(egui::Color32::YELLOW),
                             );
                         }
                     }
@@ -515,7 +522,7 @@ impl ShadeApp {
                     None,
                 )
             } else {
-                let identity = color_management::production_embedded_profile_identity_for_runtime(
+                let identity = color_management::production_source_profile_identity_or_rgb_fallback_for_runtime(
                     face.preview.color_model(),
                     face.preview.embedded_icc(),
                 )?
@@ -529,7 +536,6 @@ impl ShadeApp {
                     face.preview.embedded_icc().map(ToOwned::to_owned),
                 )
             };
-        let adjusted_planes = render::adjusted_planes(face.preview.as_ref(), &self.project);
         let face_label = face_ref
             .map(|face| face.label.clone())
             .filter(|label| !label.trim().is_empty())
@@ -550,7 +556,6 @@ impl ShadeApp {
             embedded_source_icc,
             width: face.preview.width(),
             height: face.preview.height(),
-            adjusted_planes,
         })
     }
 
@@ -563,6 +568,7 @@ impl ShadeApp {
     ) {
         let mut removed_stale_active = false;
         let mut start = false;
+        let mut keep_polling = false;
         CANDIDATE.with(|cell| {
             let mut state = cell.borrow_mut();
             let changed = state.desired_key.as_deref() != Some(key.as_str());
@@ -590,13 +596,14 @@ impl ShadeApp {
                 state.debounce_started = None;
                 start = true;
             }
+            keep_polling = state.pending.is_some() || state.debounce_started.is_some();
         });
         if removed_stale_active {
             self.force_source_preview_refresh();
         }
         if start {
             self.start_candidate_preview(key, recipe, ctx);
-        } else {
+        } else if keep_polling {
             ctx.request_repaint_after(Duration::from_millis(40));
         }
     }
@@ -614,13 +621,22 @@ impl ShadeApp {
                 return;
             }
         };
+        let adjusted_planes = match self.faces.get(source.face_index) {
+            Some(face) => render::adjusted_planes(face.preview.as_ref(), &self.project),
+            None => {
+                CANDIDATE.with(|cell| {
+                    cell.borrow_mut().error = Some("Candidate Source Face disappeared before rendering.".to_owned())
+                });
+                return;
+            }
+        };
         let cancellation = ConversionCancellation::default();
         let worker_cancel = cancellation.clone();
         let input = CandidatePreviewInput {
             width: source.width,
             height: source.height,
             source_model: source.source_model,
-            source_planes: source.adjusted_planes,
+            source_planes: adjusted_planes,
             source_profile: source.captured_profile,
             embedded_source_icc: source.embedded_source_icc,
             recipe,
@@ -1177,6 +1193,24 @@ fn intent_label(intent: ConversionRenderingIntent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_raster_is_built_only_when_a_new_worker_starts() {
+        let source = include_str!("conversion_candidate_preview.rs");
+        let candidate_source = source
+            .split("    fn candidate_source(&self)")
+            .nth(1)
+            .and_then(|section| section.split("    fn observe_candidate(").next())
+            .unwrap();
+        assert!(!candidate_source.contains("render::adjusted_planes"));
+        let starter = source
+            .split("    fn start_candidate_preview(")
+            .nth(1)
+            .and_then(|section| section.split("    fn poll_candidate_preview(").next())
+            .unwrap();
+        assert!(starter.contains("render::adjusted_planes"));
+        assert!(source.contains("else if keep_polling"));
+    }
 
     #[test]
     fn solo_candidate_uses_direct_ink_coverage_polarity() {

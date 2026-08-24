@@ -84,6 +84,7 @@ pub mod reconversion_policy;
 pub mod safe_fs;
 pub mod separation_optimizer;
 pub mod source_tiff_writer;
+pub mod source_profile_fallback;
 pub mod source_transparency;
 pub mod staging;
 pub mod test_stack;

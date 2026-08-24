@@ -9,6 +9,7 @@ use crate::conversion_transaction::{CapturedSourceProfile, ConversionCancellatio
 use crate::devicelink_conversion::ProductionDeviceLinkTransform;
 use crate::icc_conversion::{IccSourceModel, ProductionCmykTransform, RuntimeIccProfile};
 use crate::nchannel_icc::ProductionNChannelTransform;
+use crate::source_profile_fallback::srgb_fallback_icc;
 
 const PREVIEW_CHUNK_PIXELS: usize = 16 * 1024;
 
@@ -307,12 +308,10 @@ fn load_source_icc(
     expected_sha256: &str,
 ) -> Result<Vec<u8>, String> {
     let bytes = match source_profile {
-        CapturedSourceProfile::Embedded => embedded
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                "Candidate expects an embedded Source ICC, but the preview source has none."
-                    .to_owned()
-            })?,
+        CapturedSourceProfile::Embedded => match embedded {
+            Some(bytes) => bytes.to_vec(),
+            None => srgb_fallback_icc()?,
+        },
         CapturedSourceProfile::External { path } => fs::read(path).map_err(|error| {
             format!(
                 "Cannot reopen assigned Source ICC {} for candidate preview: {error}",

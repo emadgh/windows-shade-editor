@@ -1907,16 +1907,24 @@ fn production_source_profile_state(
         };
     }
 
-    match color_management::production_embedded_profile_identity_for_runtime(
+    match color_management::production_source_profile_identity_or_rgb_fallback_for_runtime(
         source_model,
         descriptor.embedded_icc,
     ) {
-        Ok(Some(identity)) => (
-            SourceProfileState::Embedded(conversion_profile_identity(&identity)),
-            format!("Embedded: {}", identity.description),
-            None,
-            false,
-        ),
+        Ok(Some(identity)) => {
+            let converted = conversion_profile_identity(&identity);
+            let label = if windows_shade_editor::source_profile_fallback::is_srgb_fallback_identity(&converted) {
+                format!("No Source ICC · fallback: {}", identity.description)
+            } else {
+                format!("Embedded: {}", identity.description)
+            };
+            (
+                SourceProfileState::Embedded(converted),
+                label,
+                None,
+                false,
+            )
+        },
         Ok(None) => (
             SourceProfileState::Missing,
             "Missing production Source ICC".to_owned(),
