@@ -302,13 +302,19 @@ impl ShadeApp {
         let mut queue_actions = Vec::new();
 
         let state = &mut self.color_conversion;
+        let scroll_height = (ctx.available_rect().height() - 120.0).clamp(360.0, 720.0);
         egui::Window::new("Production Color Conversion")
             .id(egui::Id::new("production-color-conversion-window"))
             .open(&mut open)
             .resizable(true)
-            .default_size([820.0, 720.0])
+            .default_size([900.0, 680.0])
             .min_width(640.0)
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("production-color-conversion-scroll")
+                    .auto_shrink([false, false])
+                    .max_height(scroll_height)
+                    .show(ui, |ui| {
                 ui.heading("Production Color Conversion");
                 ui.label(
                     "Saved RGB/CMYK Source → characterized CMYK/Multichannel Production output.",
@@ -318,27 +324,37 @@ impl ShadeApp {
                 );
                 ui.add_space(8.0);
 
-                render_source_summary(ui, &source);
-
                 match state.stage {
                     ConversionStage::SourcePreflight => {
-                        render_source_profile_actions(
-                            ui,
-                            &source,
-                            &mut assign_production_profile,
-                            &mut clear_production_profile,
-                        );
-                        render_transparency_policy(ui, state, &source);
-                        render_source_preflight(
-                            ui,
-                            &source,
-                            &mut navigation_action,
-                            &mut assign_production_profile,
-                            &mut open_preview_color_management,
-                        );
+                        egui::CollapsingHeader::new("Source information")
+                            .id_salt("conversion-source-information-preflight")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                render_source_summary(ui, &source);
+                                ui.add_space(4.0);
+                                render_source_profile_actions(
+                                    ui,
+                                    &source,
+                                    &mut assign_production_profile,
+                                    &mut clear_production_profile,
+                                );
+                                render_transparency_policy(ui, state, &source);
+                            });
 
-                        ui.add_space(8.0);
-                        ui.separator();
+                        egui::CollapsingHeader::new("Source preflight")
+                            .id_salt("conversion-source-preflight-foldout")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                render_source_preflight(
+                                    ui,
+                                    &source,
+                                    &mut navigation_action,
+                                    &mut assign_production_profile,
+                                    &mut open_preview_color_management,
+                                );
+                            });
+
+                        ui.add_space(6.0);
                         let ready = source.report.can_convert();
                         ui.horizontal_wrapped(|ui| {
                             if ui
@@ -365,7 +381,11 @@ impl ShadeApp {
                                     .color(egui::Color32::LIGHT_GREEN),
                             );
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
+                        egui::CollapsingHeader::new("Source information")
+                            .id_salt("conversion-source-information-target")
+                            .default_open(false)
+                            .show(ui, |ui| render_source_summary(ui, &source));
                         render_target_setup(
                             ui,
                             state,
@@ -378,18 +398,23 @@ impl ShadeApp {
                     }
                 }
 
-                ui.add_space(8.0);
-                ui.separator();
+                ui.add_space(6.0);
                 ui.small(
                     "Target Setup does not write pixels. The original Source file remains byte-identical; production conversion starts only through the transactional worker.",
                 );
-                render_conversion_queue(
-                    ui,
-                    &queue_rows,
-                    queue_paused,
-                    recovered_waiting,
-                    &mut queue_actions,
-                );
+                egui::CollapsingHeader::new(format!("Conversion queue ({})", queue_rows.len()))
+                    .id_salt("conversion-queue-foldout")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        render_conversion_queue(
+                            ui,
+                            &queue_rows,
+                            queue_paused,
+                            recovered_waiting,
+                            &mut queue_actions,
+                        );
+                    });
+                    });
             });
 
         if !open {
@@ -766,35 +791,36 @@ impl ShadeApp {
 }
 
 fn render_source_summary(ui: &mut egui::Ui, source: &CurrentConversionSource) {
+    let snapshot = source
+        .snapshot_id
+        .map(|id| format!("#{id}"))
+        .unwrap_or_else(|| "Current saved project state".to_owned());
+    let rows = [
+        (("Face", source.face_label.clone()), ("Source format", source.source_format_label.to_owned())),
+        (("Color model", source.color_model_label.to_owned()), ("Bit depth", format!("{}-bit", source.bit_depth))),
+        (("Channels", source.channel_count.to_string()), ("Compression", source.lossiness.label().to_owned())),
+        (("Transparency", source.transparency.label().to_owned()), ("Saved state", save_gate_label(source.save_gate).to_owned())),
+        (("Production Source ICC", source.profile_label.clone()), ("Snapshot", snapshot)),
+    ];
+
     egui::Grid::new("conversion-source-summary")
-        .num_columns(2)
+        .num_columns(4)
         .striped(true)
-        .spacing([16.0, 6.0])
+        .spacing([12.0, 5.0])
         .show(ui, |ui| {
-            for (label, value) in [
-                ("Face", source.face_label.clone()),
-                ("Source", source.source_path.display().to_string()),
-                ("Source format", source.source_format_label.to_owned()),
-                ("Color model", source.color_model_label.to_owned()),
-                ("Transparency", source.transparency.label().to_owned()),
-                ("Compression", source.lossiness.label().to_owned()),
-                ("Bit depth", format!("{}-bit", source.bit_depth)),
-                ("Channels", source.channel_count.to_string()),
-                ("Production Source ICC", source.profile_label.clone()),
-                ("Saved state", save_gate_label(source.save_gate).to_owned()),
-                (
-                    "Snapshot",
-                    source
-                        .snapshot_id
-                        .map(|id| format!("#{id}"))
-                        .unwrap_or_else(|| "Current saved project state".to_owned()),
-                ),
-            ] {
-                ui.strong(label);
-                ui.label(value);
+            for ((left_label, left_value), (right_label, right_value)) in rows {
+                ui.strong(left_label);
+                ui.label(left_value);
+                ui.strong(right_label);
+                ui.label(right_value);
                 ui.end_row();
             }
         });
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Source");
+        ui.small(source.source_path.display().to_string())
+            .on_hover_text(source.source_path.display().to_string());
+    });
 }
 
 fn render_source_profile_actions(
@@ -905,11 +931,6 @@ fn render_source_preflight(
     assign_profile: &mut bool,
     open_preview: &mut bool,
 ) {
-    ui.add_space(10.0);
-    ui.separator();
-    ui.strong("Source preflight");
-    ui.add_space(4.0);
-
     if source.report.findings.is_empty() {
         ui.label(egui::RichText::new("Ready").color(egui::Color32::LIGHT_GREEN));
         return;
@@ -1014,9 +1035,10 @@ fn render_target_setup(
     select_output_path: &mut bool,
     start_conversion: &mut bool,
 ) {
-    ui.separator();
-    ui.heading("Target Setup");
-
+    egui::CollapsingHeader::new("Target setup")
+        .id_salt("conversion-target-setup-foldout")
+        .default_open(true)
+        .show(ui, |ui| {
     let previous_mode = state.engine_mode;
     egui::ComboBox::from_label("Conversion engine")
         .selected_text(engine_mode_label(state.engine_mode))
@@ -1095,7 +1117,7 @@ fn render_target_setup(
             let mut visible_count = 0usize;
             egui::ScrollArea::vertical()
                 .id_salt("conversion-installed-production-profiles")
-                .max_height(220.0)
+                .max_height(160.0)
                 .show(ui, |ui| {
                     for candidate in &state.installed_target_profiles {
                         if !candidate.profile.matches_query(&state.target_profile_query) {
@@ -1276,8 +1298,12 @@ fn render_target_setup(
         });
     });
 
-    ui.separator();
-    ui.strong("Production destination");
+    });
+
+    egui::CollapsingHeader::new("Production destination")
+        .id_salt("conversion-production-destination-foldout")
+        .default_open(true)
+        .show(ui, |ui| {
     ui.horizontal_wrapped(|ui| {
         ui.radio_value(
             &mut state.destination_mode,
@@ -1379,8 +1405,12 @@ fn render_target_setup(
         });
     }
 
-    ui.separator();
-    ui.strong("Recipe review");
+    });
+
+    egui::CollapsingHeader::new("Recipe review")
+        .id_salt("conversion-recipe-review-foldout")
+        .default_open(true)
+        .show(ui, |ui| {
     match build_target_setup_review(state, source) {
         Ok(review) => {
             egui::Grid::new("conversion-recipe-review")
@@ -1459,6 +1489,7 @@ fn render_target_setup(
                 .on_hover_text("Complete all target setup fields first.");
         }
     }
+    });
 }
 
 fn seed_state_from_existing_destination(
@@ -1696,10 +1727,7 @@ fn render_conversion_queue(
 ) {
     use windows_shade_editor::conversion_queue::ConversionQueueStatus;
 
-    ui.add_space(10.0);
-    ui.separator();
     ui.horizontal_wrapped(|ui| {
-        ui.heading("Conversion Queue");
         if ui
             .button(if paused {
                 "Resume queue"
@@ -2016,6 +2044,23 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn conversion_window_layout_stays_scrollable_and_foldable() {
+        let source = include_str!("color_conversion.rs");
+        for required in [
+            "production-color-conversion-scroll",
+            "conversion-source-information-preflight",
+            "conversion-source-preflight-foldout",
+            "conversion-target-setup-foldout",
+            "conversion-production-destination-foldout",
+            "conversion-recipe-review-foldout",
+            "conversion-queue-foldout",
+            ".num_columns(4)",
+        ] {
+            assert!(source.contains(required), "missing compact conversion layout token: {required}");
+        }
+    }
+
     fn production_execution_support_matrix_keeps_non_rgb_non_tiff_fail_closed() {
         assert!(production_execution_supported(
             SourceImageFormat::Tiff,
