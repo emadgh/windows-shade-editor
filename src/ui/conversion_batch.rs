@@ -359,6 +359,7 @@ impl ShadeApp {
                 for inspection in &inspections {
                     render_batch_face_preflight(ui, inspection, &mut config);
                 }
+                render_batch_source_profile_consistency(ui, &inspections);
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -1146,7 +1147,7 @@ fn batch_source_profile_state(
         };
     }
 
-    match color_management::production_embedded_profile_identity_for_runtime(
+    match color_management::production_source_profile_identity_or_rgb_fallback_for_runtime(
         source_model,
         descriptor.embedded_icc,
     ) {
@@ -1155,10 +1156,15 @@ fn batch_source_profile_state(
                 description: identity.description,
                 sha256: identity.sha256,
             };
+            let profile_label = if windows_shade_editor::source_profile_fallback::is_srgb_fallback_identity(&identity) {
+                format!("No Source ICC · fallback: {}", identity.description)
+            } else {
+                format!("Embedded: {}", identity.description)
+            };
             (
-                SourceProfileState::Embedded(identity.clone()),
+                SourceProfileState::Embedded(identity),
                 CapturedSourceProfile::Embedded,
-                format!("Embedded: {}", identity.description),
+                profile_label,
             )
         }
         Ok(None) => (
@@ -1242,6 +1248,39 @@ fn render_batch_face_preflight(
                 finding.title,
                 finding.detail
             )).color(color));
+        }
+    });
+}
+
+fn render_batch_source_profile_consistency(
+    ui: &mut egui::Ui,
+    inspections: &[BatchFaceInspection],
+) {
+    let mut groups = BTreeMap::<String, (String, Vec<String>)>::new();
+    for inspection in inspections {
+        let Some(identity) = inspection.profile_identity.as_ref() else {
+            continue;
+        };
+        let key = identity.sha256.trim().to_ascii_lowercase();
+        let entry = groups
+            .entry(key)
+            .or_insert_with(|| (identity.description.clone(), Vec::new()));
+        entry.1.push(format!("Face {} ({})", inspection.index + 1, inspection.label));
+    }
+    if groups.len() <= 1 {
+        return;
+    }
+    ui.group(|ui| {
+        ui.label(
+            egui::RichText::new("Warning: selected Faces use different Source ICC interpretations")
+                .color(egui::Color32::YELLOW)
+                .strong(),
+        );
+        ui.small(
+            "Batch conversion is allowed. Each Face keeps its own captured Source ICC or sRGB fallback; profiles are not forced to match the first Face.",
+        );
+        for (_hash, (description, faces)) in groups {
+            ui.small(format!("{description}: {}", faces.join(", ")));
         }
     });
 }

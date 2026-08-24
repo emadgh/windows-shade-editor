@@ -25,6 +25,7 @@ use crate::jpeg_source::{DecodedJpegSource, JpegSourceModel, decode_jpeg_source}
 use crate::model::{MASTER_ADJUSTMENT_KEY, ShadeProject, apply_curve, apply_levels};
 use crate::nchannel_icc::ProductionNChannelTransform;
 use crate::png_source::{DecodedPngSource, PngSourceModel, decode_png_source};
+use crate::source_profile_fallback::{is_srgb_fallback_identity, srgb_fallback_icc};
 use crate::source_transparency::{SourceTransparencyPolicy, composite_rgb_u16};
 use crate::tiff_io::{self, ColorModel, StreamInfo};
 use crate::{dpi, export};
@@ -369,12 +370,18 @@ fn load_verified_source_icc(
     embedded_icc: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     let source_icc = match &capture.source_profile {
-        CapturedSourceProfile::Embedded => embedded_icc
-            .map(|bytes| bytes.to_vec())
-            .ok_or_else(|| {
-                "Captured source expects an embedded ICC, but the decoded source has none."
-                    .to_owned()
-            })?,
+        CapturedSourceProfile::Embedded => match embedded_icc {
+            Some(bytes) => bytes.to_vec(),
+            None if is_srgb_fallback_identity(&capture.conversion_recipe.source_profile_identity) => {
+                srgb_fallback_icc()?
+            }
+            None => {
+                return Err(
+                    "Captured source expects an embedded ICC, but the decoded source has none."
+                        .to_owned(),
+                );
+            }
+        },
         CapturedSourceProfile::External { path } => fs::read(path).map_err(|err| {
             format!(
                 "Cannot reopen assigned production Source ICC {}: {err}",

@@ -702,6 +702,21 @@ pub fn production_embedded_profile_identity_for_runtime(
     }))
 }
 
+pub fn production_source_profile_identity_or_rgb_fallback_for_runtime(
+    model: RuntimeColorModel,
+    embedded_icc: Option<&[u8]>,
+) -> Result<Option<IccProfileIdentity>, String> {
+    let embedded = production_embedded_profile_identity_for_runtime(model, embedded_icc)?;
+    if embedded.is_some() || model != RuntimeColorModel::Rgb {
+        return Ok(embedded);
+    }
+    let fallback = windows_shade_editor::source_profile_fallback::srgb_fallback_identity()?;
+    Ok(Some(IccProfileIdentity {
+        description: fallback.description,
+        sha256: fallback.sha256,
+    }))
+}
+
 pub fn inspect_production_source_profile_runtime(
     path: &Path,
     expected_identity: &IccProfileIdentity,
