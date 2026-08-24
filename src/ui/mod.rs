@@ -120,10 +120,14 @@ mod tests {
     fn color_conversion_has_one_operator_surface_and_shared_runtime_cores() {
         let main = include_str!("../main.rs");
         let status_bar = include_str!("status_bar.rs");
-        let conversion = include_str!("color_conversion.rs");
-        let plan = include_str!("conversion_plan.rs");
-        let batch = include_str!("conversion_batch.rs");
-        let candidate = include_str!("conversion_candidate_preview.rs");
+        let conversion_source = include_str!("color_conversion.rs");
+        let plan_source = include_str!("conversion_plan.rs");
+        let batch_source = include_str!("conversion_batch.rs");
+        let candidate_source = include_str!("conversion_candidate_preview.rs");
+        let conversion = conversion_source.split("\n#[cfg(test)]").next().unwrap_or(conversion_source);
+        let plan = plan_source.split("\n#[cfg(test)]").next().unwrap_or(plan_source);
+        let batch = batch_source.split("\n#[cfg(test)]").next().unwrap_or(batch_source);
+        let candidate = candidate_source.split("\n#[cfg(test)]").next().unwrap_or(candidate_source);
 
         assert!(status_bar.contains("ui_color_conversion_window"));
         assert!(status_bar.contains("poll_conversion_candidate_runtime"));

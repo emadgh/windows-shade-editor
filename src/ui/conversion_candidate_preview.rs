@@ -670,10 +670,11 @@ mod tests {
     #[test]
     fn candidate_controller_contains_no_independent_target_config_or_window() {
         let source = include_str!("conversion_candidate_preview.rs");
-        assert!(!source.contains("struct CandidateConfig"));
-        assert!(!source.contains("egui::Window::new"));
-        assert!(!source.contains("Queue this exact conversion"));
-        assert!(source.contains("sync_conversion_candidate"));
-        assert!(source.contains("render_candidate_preview"));
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(!runtime.contains("struct CandidateConfig"));
+        assert!(!runtime.contains("egui::Window::new"));
+        assert!(!runtime.contains("Queue this exact conversion"));
+        assert!(runtime.contains("sync_conversion_candidate"));
+        assert!(runtime.contains("render_candidate_preview"));
     }
 }

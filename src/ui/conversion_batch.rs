@@ -526,16 +526,15 @@ fn paths_match(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn batch_runtime_contains_no_operator_target_config_or_window() {
         let source = include_str!("conversion_batch.rs");
-        assert!(!source.contains("struct ConversionBatchUiConfig"));
-        assert!(!source.contains("egui::Window::new"));
-        assert!(!source.contains("Batch Convert"));
-        assert!(source.contains("ConversionBatchCapture::capture"));
-        assert!(source.contains("ConversionBatchQueue::load_persistent"));
-        assert!(source.contains("queue_unified_conversion_plan"));
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(!runtime.contains("struct ConversionBatchUiConfig"));
+        assert!(!runtime.contains("egui::Window::new"));
+        assert!(!runtime.contains("Batch Convert"));
+        assert!(runtime.contains("ConversionBatchCapture::capture"));
+        assert!(runtime.contains("ConversionBatchQueue::load_persistent"));
+        assert!(runtime.contains("queue_unified_conversion_plan"));
     }
 }

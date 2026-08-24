@@ -1095,6 +1095,7 @@ mod tests {
     #[test]
     fn unified_window_owns_scope_target_destination_and_preview_controls() {
         let source = include_str!("color_conversion.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         for required in [
             "Production Color Conversion",
             "Current Face",
@@ -1106,17 +1107,18 @@ mod tests {
             "sync_conversion_candidate",
             "queue_unified_conversion_plan",
         ] {
-            assert!(source.contains(required), "missing unified conversion token: {required}");
+            assert!(runtime.contains(required), "missing unified conversion token: {required}");
         }
-        assert!(!source.contains("Choose output TIFF"));
-        assert!(!source.contains("next_versioned_output_path"));
+        assert!(!runtime.contains("Choose output TIFF"));
+        assert!(!runtime.contains("next_versioned_output_path"));
     }
 
     #[test]
     fn operator_state_contains_one_shared_target() {
         let source = include_str!("color_conversion.rs");
-        assert!(source.contains("target: ConversionTargetState"));
-        assert!(!source.contains("CandidateConfig"));
-        assert!(!source.contains("ConversionBatchUiConfig"));
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("target: ConversionTargetState"));
+        assert!(!runtime.contains("CandidateConfig"));
+        assert!(!runtime.contains("ConversionBatchUiConfig"));
     }
 }
