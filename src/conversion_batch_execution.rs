@@ -277,7 +277,22 @@ where
         project_path,
         batch.source_project_path(),
     )?;
-    ProductionProjectDisposition::append_existing(loaded.file_sha256, &compatibility)
+    match &batch.production_project_disposition {
+        ProductionProjectDisposition::UpdateExistingRoute {
+            route_policy_sha256,
+            allow_production_work_discard,
+            ..
+        } => ProductionProjectDisposition::update_existing_route(
+            loaded.file_sha256,
+            &compatibility,
+            route_policy_sha256.clone(),
+            *allow_production_work_discard,
+        ),
+        ProductionProjectDisposition::CreateNew
+        | ProductionProjectDisposition::AppendExisting { .. } => {
+            ProductionProjectDisposition::append_existing(loaded.file_sha256, &compatibility)
+        }
+    }
 }
 
 fn halted_step_before_face(

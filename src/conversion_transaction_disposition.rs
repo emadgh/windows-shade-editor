@@ -5,8 +5,11 @@ use crate::conversion_transaction::{
     ConversionJobCapture, ConversionPhase, ConversionProgress, ConversionTransactionBackend,
     ConversionTransactionOutcome, run_conversion_transaction,
 };
+use crate::conversion_batch::batch_recipe_policy_sha256;
 use crate::icc_conversion_worker::{FilesystemIccConversionBackend, sha256_file};
 use crate::model::ShadeProject;
+use crate::production_replacement::prepare_production_replacement_plan;
+use crate::reconversion_policy::analyze_replacement_risk;
 use crate::production_project_compat::{
     AppendConvertedFaceSpec, append_converted_face_to_production_project_at_path,
     validate_existing_production_project_for_append_at_path,
@@ -100,6 +103,8 @@ struct ProductionDispositionBackend<'a, B> {
     disposition: &'a ProductionProjectDisposition,
     source_project_path: &'a Path,
     appended_project: Option<ShadeProject>,
+    prepared_existing: Option<LoadedExistingProductionProject>,
+    prepared_replace_index: Option<usize>,
 }
 
 impl<B> ConversionTransactionBackend for ProductionDispositionBackend<'_, B>
@@ -112,6 +117,120 @@ where
         cancellation: &ConversionCancellation,
         report: &mut dyn FnMut(ConversionProgress),
     ) -> Result<CommittedConversionOutput, String> {
+        if let ProductionProjectDisposition::UpdateExistingRoute {
+            expected_project_sha256,
+            expected_compatibility,
+            route_policy_sha256,
+            allow_production_work_discard,
+        } = self.disposition
+        {
+            if capture.output_policy
+                != crate::conversion_transaction::CapturedOutputPolicy::TransactionalReplace
+            {
+                return Err(
+                    "Existing-route conversion must use transactional output replacement policy."
+                        .to_owned(),
+                );
+            }
+            let loaded = self.inner.load_existing_production_project(&capture.production_project_path)?;
+            if !loaded
+                .file_sha256
+                .eq_ignore_ascii_case(expected_project_sha256.trim())
+            {
+                return Err(
+                    "Existing Production project changed after the route update was captured."
+                        .to_owned(),
+                );
+            }
+            let compatibility = validate_existing_production_project_baseline_at_path(
+                &loaded.project,
+                &capture.production_project_path,
+                self.source_project_path,
+            )?;
+            if !expected_compatibility.matches_runtime(&compatibility) {
+                return Err(
+                    "Existing Production route target compatibility changed after capture."
+                        .to_owned(),
+                );
+            }
+            let incoming_policy = batch_recipe_policy_sha256(&capture.conversion_recipe)?;
+            if !incoming_policy.eq_ignore_ascii_case(route_policy_sha256.trim()) {
+                return Err(
+                    "Captured conversion settings no longer match the selected Production route."
+                        .to_owned(),
+                );
+            }
+
+            let matching = loaded
+                .project
+                .production_provenance
+                .iter()
+                .enumerate()
+                .filter(|(_, provenance)| {
+                    paths_match_str(
+                        &provenance.source.source_project_path,
+                        &capture.source_project_path.to_string_lossy(),
+                    ) && paths_match_str(
+                        &provenance.source.source_face_path,
+                        &capture.source_face_path.to_string_lossy(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                return Err(
+                    "Selected Production route contains duplicate provenance for this Source Face."
+                        .to_owned(),
+                );
+            }
+            let replace_index = if let Some((index, previous)) = matching.first().copied() {
+                let previous_policy = batch_recipe_policy_sha256(&previous.recipe)?;
+                if !previous_policy.eq_ignore_ascii_case(route_policy_sha256.trim()) {
+                    return Err(
+                        "Existing output belongs to a different conversion route; overwrite is blocked."
+                            .to_owned(),
+                    );
+                }
+                if !paths_match(
+                    Path::new(&previous.output_path),
+                    &capture.output_tiff_path,
+                ) {
+                    return Err(
+                        "Same-route Source Face maps to a different recorded TIFF path; overwrite is blocked."
+                            .to_owned(),
+                    );
+                }
+                if capture.output_tiff_path.exists() {
+                    let actual = sha256_file(&capture.output_tiff_path)?;
+                    if !actual.eq_ignore_ascii_case(previous.output_sha256.trim()) {
+                        return Err(
+                            "Existing Production TIFF bytes no longer match route provenance; automatic overwrite is blocked."
+                                .to_owned(),
+                        );
+                    }
+                }
+                let risk = analyze_replacement_risk(
+                    &loaded.project,
+                    &capture.production_project_path,
+                    previous,
+                )?;
+                if risk.requires_explicit_confirmation && !*allow_production_work_discard {
+                    return Err(risk.warning.unwrap_or_else(|| {
+                        "Production-side work requires explicit replacement confirmation.".to_owned()
+                    }));
+                }
+                Some(index)
+            } else {
+                if capture.output_tiff_path.exists() {
+                    return Err(
+                        "Deterministic TIFF path already exists but is not owned by this Source Face + conversion route."
+                            .to_owned(),
+                    );
+                }
+                None
+            };
+            self.prepared_existing = Some(loaded);
+            self.prepared_replace_index = replace_index;
+        }
         self.inner
             .render_convert_and_commit(capture, cancellation, report)
     }
@@ -172,9 +291,6 @@ where
                         provenance: incoming,
                     },
                 )?;
-
-                // Capture the fully mutated in-memory project before the save so
-                // a post-TIFF-commit save failure can surface exact recovery state.
                 self.appended_project = Some(appended.clone());
                 self.inner.save_existing_production_project(
                     path,
@@ -182,7 +298,67 @@ where
                     &appended,
                 )
             }
+            ProductionProjectDisposition::UpdateExistingRoute {
+                expected_project_sha256,
+                allow_production_work_discard,
+                ..
+            } => {
+                if generated_project.faces.len() != 1
+                    || generated_project.production_provenance.len() != 1
+                {
+                    return Err(
+                        "Existing-route update expected exactly one converted Face/provenance pair."
+                            .to_owned(),
+                    );
+                }
+                let loaded = self.prepared_existing.take().ok_or_else(|| {
+                    "Existing-route ownership was not prepared before output commit.".to_owned()
+                })?;
+                let mut updated = loaded.project;
+                let incoming = generated_project.production_provenance[0].clone();
+                if let Some(index) = self.prepared_replace_index.take() {
+                    let previous = updated
+                        .production_provenance
+                        .get(index)
+                        .cloned()
+                        .ok_or_else(|| "Prepared route replacement Face disappeared.".to_owned())?;
+                    let plan = prepare_production_replacement_plan(
+                        &updated,
+                        path,
+                        &previous,
+                        incoming.clone(),
+                    )?;
+                    if plan.risk.requires_explicit_confirmation && !*allow_production_work_discard {
+                        return Err(plan.risk.warning.unwrap_or_else(|| {
+                            "Production-side work requires explicit replacement confirmation."
+                                .to_owned()
+                        }));
+                    }
+                    updated.faces[index] = generated_project.faces[0].clone();
+                    updated.production_provenance[index] = incoming;
+                } else {
+                    append_converted_face_to_production_project_at_path(
+                        &mut updated,
+                        path,
+                        AppendConvertedFaceSpec {
+                            source_project_path: self.source_project_path,
+                            output_face_label: &generated_project.faces[0].label,
+                            provenance: incoming,
+                        },
+                    )?;
+                }
+                self.appended_project = Some(updated.clone());
+                self.inner.save_existing_production_project(
+                    path,
+                    expected_project_sha256,
+                    &updated,
+                )
+            }
         }
+    }
+}
+
+/// Execute one conversion with explicit Production-project destination intent.
     }
 }
 
@@ -209,19 +385,22 @@ where
         };
     }
 
-    let is_append = matches!(
+    let uses_existing_project = matches!(
         disposition,
         ProductionProjectDisposition::AppendExisting { .. }
+            | ProductionProjectDisposition::UpdateExistingRoute { .. }
     );
     let mut adapter = ProductionDispositionBackend {
         inner: backend,
         disposition,
         source_project_path: &capture.source_project_path,
         appended_project: None,
+        prepared_existing: None,
+        prepared_replace_index: None,
     };
     let outcome = run_conversion_transaction(capture, cancellation, &mut adapter, report);
 
-    if !is_append {
+    if !uses_existing_project {
         return outcome;
     }
 
@@ -252,6 +431,18 @@ where
         },
         other => other,
     }
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .replace('/', "\\")
+        .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
+}
+
+fn paths_match_str(left: &str, right: &str) -> bool {
+    left.trim()
+        .replace('/', "\\")
+        .eq_ignore_ascii_case(&right.trim().replace('/', "\\"))
 }
 
 #[cfg(test)]

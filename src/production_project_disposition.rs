@@ -17,6 +17,12 @@ pub enum ProductionProjectDisposition {
         expected_project_sha256: String,
         expected_compatibility: CapturedProductionCompatibilityKey,
     },
+    UpdateExistingRoute {
+        expected_project_sha256: String,
+        expected_compatibility: CapturedProductionCompatibilityKey,
+        route_policy_sha256: String,
+        allow_production_work_discard: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +132,22 @@ impl ProductionProjectDisposition {
         Ok(disposition)
     }
 
+    pub fn update_existing_route(
+        expected_project_sha256: impl Into<String>,
+        compatibility: &ProductionCompatibilityKey,
+        route_policy_sha256: impl Into<String>,
+        allow_production_work_discard: bool,
+    ) -> Result<Self, String> {
+        let disposition = Self::UpdateExistingRoute {
+            expected_project_sha256: expected_project_sha256.into(),
+            expected_compatibility: CapturedProductionCompatibilityKey::from_runtime(compatibility),
+            route_policy_sha256: route_policy_sha256.into(),
+            allow_production_work_discard,
+        };
+        disposition.validate()?;
+        Ok(disposition)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::CreateNew => Ok(()),
@@ -136,6 +158,26 @@ impl ProductionProjectDisposition {
                 if !is_bare_sha256(expected_project_sha256) {
                     return Err(
                         "Append-existing Production capture requires canonical lowercase project SHA-256."
+                            .to_owned(),
+                    );
+                }
+                expected_compatibility.validate()
+            }
+            Self::UpdateExistingRoute {
+                expected_project_sha256,
+                expected_compatibility,
+                route_policy_sha256,
+                ..
+            } => {
+                if !is_bare_sha256(expected_project_sha256) {
+                    return Err(
+                        "Existing-route update requires canonical lowercase project SHA-256."
+                            .to_owned(),
+                    );
+                }
+                if !is_bare_sha256(route_policy_sha256) {
+                    return Err(
+                        "Existing-route update requires canonical lowercase route-policy SHA-256."
                             .to_owned(),
                     );
                 }
@@ -212,5 +254,27 @@ mod tests {
         let mut captured = CapturedProductionCompatibilityKey::from_runtime(&key);
         captured.channel_names.swap(0, 1);
         assert!(!captured.matches_runtime(&key));
+    }
+
+    #[test]
+    fn route_update_freezes_project_target_policy_and_confirmation_intent() {
+        let key = runtime_key();
+        let disposition = ProductionProjectDisposition::update_existing_route(
+            "b".repeat(64),
+            &key,
+            "c".repeat(64),
+            true,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&disposition).unwrap();
+        let restored: ProductionProjectDisposition = serde_json::from_str(&json).unwrap();
+        assert_eq!(disposition, restored);
+        assert!(matches!(
+            restored,
+            ProductionProjectDisposition::UpdateExistingRoute {
+                allow_production_work_discard: true,
+                ..
+            }
+        ));
     }
 }
