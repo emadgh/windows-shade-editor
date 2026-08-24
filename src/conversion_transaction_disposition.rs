@@ -359,10 +359,6 @@ where
 }
 
 /// Execute one conversion with explicit Production-project destination intent.
-    }
-}
-
-/// Execute one conversion with explicit Production-project destination intent.
 ///
 /// `CreateNew` is byte-for-byte the existing transaction behavior. Append mode
 /// reuses that same TIFF/provenance transaction and intercepts only the small
