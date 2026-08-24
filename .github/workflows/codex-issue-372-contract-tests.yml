@@ -1,0 +1,35 @@
+name: Apply Issue 372 Contract Test Fix
+
+on:
+  push:
+    branches:
+      - codex/issue-372-unified-color-conversion
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[issue-372-contract-tests]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/issue-372-unified-color-conversion
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Patch regression tests
+        run: python scripts/issue372_contract_test_patch.py
+      - name: Verify diff
+        run: git diff --check
+      - name: Remove temporary patch scaffolding
+        run: git rm .github/workflows/codex-issue-372-contract-tests.yml scripts/issue372_contract_test_patch.py
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix unified conversion contract tests [issue-372-contract-tests]"
+          git push origin HEAD:codex/issue-372-unified-color-conversion
