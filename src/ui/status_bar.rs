@@ -17,17 +17,14 @@ impl ShadeApp {
     }
 
     pub(crate) fn ui_status(&mut self, ui: &mut egui::Ui) {
+        // Keep render/queue runtimes alive without exposing duplicate operator entry points.
+        self.poll_conversion_candidate_runtime(ui.ctx());
+        self.poll_conversion_batch_runtime();
+
         ui.horizontal(|ui| {
-            let dirty = if self.project_dirty {
-                " * modified"
-            } else {
-                ""
-            };
+            let dirty = if self.project_dirty { " * modified" } else { "" };
             ui.label(format!("{}{}", self.status_message, dirty));
             self.ui_linked_project_navigation(ui);
-            self.ui_color_conversion_status(ui);
-            self.ui_conversion_candidate_status(ui);
-            self.ui_conversion_batch_status(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(path) = &self.project_path {
                     ui.label(path.display().to_string());
@@ -35,7 +32,5 @@ impl ShadeApp {
             });
         });
         self.ui_color_conversion_window(ui.ctx());
-        self.ui_conversion_candidate_window(ui.ctx());
-        self.ui_conversion_batch_window(ui.ctx());
     }
 }
