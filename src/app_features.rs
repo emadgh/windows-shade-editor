@@ -16,11 +16,15 @@ mod tests {
     const CANDIDATE_UI: &str = include_str!("ui/conversion_candidate_preview.rs");
     const BATCH_UI: &str = include_str!("ui/conversion_batch.rs");
 
+    fn production_source(source: &str) -> &str {
+        source.split("\n#[cfg(test)]").next().unwrap_or(source)
+    }
+
     fn production_ui_contains(needle: &str) -> bool {
         MAIN.contains(needle)
             || PROJECT_NAVIGATION_UI.contains(needle)
             || STATUS_BAR_UI.contains(needle)
-            || COLOR_CONVERSION_UI.contains(needle)
+            || production_source(COLOR_CONVERSION_UI).contains(needle)
     }
 
     #[test]
@@ -68,6 +72,11 @@ mod tests {
 
     #[test]
     fn production_color_conversion_has_one_operator_entry_and_shared_cores() {
+        let conversion = production_source(COLOR_CONVERSION_UI);
+        let plan = production_source(CONVERSION_PLAN_UI);
+        let candidate = production_source(CANDIDATE_UI);
+        let batch = production_source(BATCH_UI);
+
         assert!(MAIN.contains("app_features::COLOR_CONVERSION_LABEL"));
         assert!(MAIN.contains("open_color_conversion(ui.ctx())"));
         assert!(STATUS_BAR_UI.contains("ui_color_conversion_window"));
@@ -83,23 +92,23 @@ mod tests {
             assert!(!STATUS_BAR_UI.contains(removed));
         }
 
-        assert!(COLOR_CONVERSION_UI.contains("target: ConversionTargetState"));
-        assert!(COLOR_CONVERSION_UI.contains("Current Face"));
-        assert!(COLOR_CONVERSION_UI.contains("Selected Faces"));
-        assert!(COLOR_CONVERSION_UI.contains("All Faces"));
-        assert!(COLOR_CONVERSION_UI.contains("Destination folder"));
-        assert!(COLOR_CONVERSION_UI.contains("sync_conversion_candidate"));
-        assert!(COLOR_CONVERSION_UI.contains("queue_unified_conversion_plan"));
+        assert!(conversion.contains("target: ConversionTargetState"));
+        assert!(conversion.contains("Current Face"));
+        assert!(conversion.contains("Selected Faces"));
+        assert!(conversion.contains("All Faces"));
+        assert!(conversion.contains("Destination folder"));
+        assert!(conversion.contains("sync_conversion_candidate"));
+        assert!(conversion.contains("queue_unified_conversion_plan"));
 
-        assert!(CONVERSION_PLAN_UI.contains("build_conversion_preflight_for_source_with_policy"));
-        assert!(CONVERSION_PLAN_UI.contains("build_conversion_recipe"));
-        assert!(CONVERSION_PLAN_UI.contains("deterministic_converted_filename"));
-        assert!(!CONVERSION_PLAN_UI.contains("next_versioned_output_path"));
-        assert!(CANDIDATE_UI.contains("render_candidate_preview"));
-        assert!(!CANDIDATE_UI.contains("CandidateConfig"));
-        assert!(BATCH_UI.contains("ConversionBatchCapture::capture"));
-        assert!(BATCH_UI.contains("ConversionBatchQueue::load_persistent"));
-        assert!(!BATCH_UI.contains("ConversionBatchUiConfig"));
+        assert!(plan.contains("build_conversion_preflight_for_source_with_policy"));
+        assert!(plan.contains("build_conversion_recipe"));
+        assert!(plan.contains("deterministic_converted_filename"));
+        assert!(!plan.contains("next_versioned_output_path"));
+        assert!(candidate.contains("render_candidate_preview"));
+        assert!(!candidate.contains("CandidateConfig"));
+        assert!(batch.contains("ConversionBatchCapture::capture"));
+        assert!(batch.contains("ConversionBatchQueue::load_persistent"));
+        assert!(!batch.contains("ConversionBatchUiConfig"));
     }
 
     #[test]
