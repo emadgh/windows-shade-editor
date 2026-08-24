@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::color_conversion::ConversionEngineMode;
@@ -29,9 +31,35 @@ pub enum ProductionProjectDisposition {
         new_compatibility: CapturedProductionCompatibilityKey,
         previous_route_policy_sha256: String,
         new_route_policy_sha256: String,
+        route_faces: Vec<CapturedRouteFaceOwnership>,
+        migration_ordinal: usize,
+        migration_face_count: usize,
         confirm_destructive_migration: bool,
         allow_production_work_discard: bool,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedRouteFaceOwnership {
+    pub source_face_path: String,
+    pub output_path: String,
+    pub previous_recipe_sha256: String,
+}
+
+impl CapturedRouteFaceOwnership {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.source_face_path.trim().is_empty() || self.output_path.trim().is_empty() {
+            return Err("Route migration Face ownership paths cannot be empty.".to_owned());
+        }
+        if !is_bare_sha256(&self.previous_recipe_sha256) {
+            return Err(
+                "Route migration Face ownership requires canonical previous recipe SHA-256."
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +192,9 @@ impl ProductionProjectDisposition {
         new_compatibility: &ProductionCompatibilityKey,
         previous_route_policy_sha256: impl Into<String>,
         new_route_policy_sha256: impl Into<String>,
+        route_faces: Vec<CapturedRouteFaceOwnership>,
+        migration_ordinal: usize,
+        migration_face_count: usize,
         confirm_destructive_migration: bool,
         allow_production_work_discard: bool,
     ) -> Result<Self, String> {
@@ -175,6 +206,9 @@ impl ProductionProjectDisposition {
             new_compatibility: CapturedProductionCompatibilityKey::from_runtime(new_compatibility),
             previous_route_policy_sha256: previous_route_policy_sha256.into(),
             new_route_policy_sha256: new_route_policy_sha256.into(),
+            route_faces,
+            migration_ordinal,
+            migration_face_count,
             confirm_destructive_migration,
             allow_production_work_discard,
         };
@@ -227,6 +261,9 @@ impl ProductionProjectDisposition {
                 new_compatibility,
                 previous_route_policy_sha256,
                 new_route_policy_sha256,
+                route_faces,
+                migration_ordinal,
+                migration_face_count,
                 confirm_destructive_migration,
                 ..
             } => {
@@ -244,20 +281,41 @@ impl ProductionProjectDisposition {
                             .to_owned(),
                     );
                 }
-                if previous_route_policy_sha256.eq_ignore_ascii_case(new_route_policy_sha256) {
-                    return Err(
-                        "Route migration requires a changed recipe policy; use same-route update when policy is unchanged."
-                            .to_owned(),
-                    );
-                }
                 if !*confirm_destructive_migration {
                     return Err(
                         "Route migration requires explicit destructive migration confirmation."
                             .to_owned(),
                     );
                 }
+                if *migration_face_count == 0
+                    || *migration_ordinal >= *migration_face_count
+                    || route_faces.len() != *migration_face_count
+                {
+                    return Err(
+                        "Route migration ordinal/count does not match the frozen route Face set."
+                            .to_owned(),
+                    );
+                }
                 previous_compatibility.validate()?;
-                new_compatibility.validate()
+                new_compatibility.validate()?;
+                let mut sources = BTreeSet::new();
+                let mut outputs = BTreeSet::new();
+                for face in route_faces {
+                    face.validate()?;
+                    if !sources.insert(path_key(&face.source_face_path)) {
+                        return Err(
+                            "Route migration contains duplicate Source Face ownership."
+                                .to_owned(),
+                        );
+                    }
+                    if !outputs.insert(path_key(&face.output_path)) {
+                        return Err(
+                            "Route migration contains duplicate output path ownership."
+                                .to_owned(),
+                        );
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -272,6 +330,10 @@ fn is_bare_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn path_key(value: &str) -> String {
+    value.trim().replace('/', "\\").to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -292,6 +354,14 @@ mod tests {
             ],
             bit_depth: 16,
         }
+    }
+
+    fn route_faces() -> Vec<CapturedRouteFaceOwnership> {
+        vec![CapturedRouteFaceOwnership {
+            source_face_path: r"C:\Design\Face.tif".to_owned(),
+            output_path: r"C:\Production\Face.tif".to_owned(),
+            previous_recipe_sha256: "f".repeat(64),
+        }]
     }
 
     #[test]
@@ -358,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn route_migration_requires_policy_change_and_explicit_confirmation() {
+    fn route_migration_requires_explicit_confirmation_and_freezes_face_ownership() {
         let previous = runtime_key();
         let mut new = runtime_key();
         new.output_profile_sha256 = Some("d".repeat(64));
@@ -368,6 +438,9 @@ mod tests {
             &new,
             "c".repeat(64),
             "e".repeat(64),
+            route_faces(),
+            0,
+            1,
             false,
             true,
         )
@@ -380,6 +453,9 @@ mod tests {
             &new,
             "c".repeat(64),
             "e".repeat(64),
+            route_faces(),
+            0,
+            1,
             true,
             true,
         )
