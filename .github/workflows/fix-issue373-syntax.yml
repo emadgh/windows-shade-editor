@@ -1,0 +1,42 @@
+name: Fix issue 373 syntax
+
+on:
+  push:
+    branches:
+      - codex/issue-373-conversion-routes
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/issue-373-conversion-routes
+      - name: Fix duplicated delimiter block
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('src/conversion_transaction_disposition.rs')
+          text = path.read_text()
+          bad = '''/// Execute one conversion with explicit Production-project destination intent.\n    }\n}\n\n/// Execute one conversion with explicit Production-project destination intent.\n'''
+          good = '''/// Execute one conversion with explicit Production-project destination intent.\n'''
+          if bad not in text:
+              raise SystemExit('expected duplicated delimiter block not found')
+          path.write_text(text.replace(bad, good, 1))
+      - name: Remove temporary workflow and triggers
+        shell: bash
+        run: |
+          rm -f .github/workflows/fix-issue373-syntax.yml
+          rm -f .ci-trigger-issue373-route .ci-trigger-issue373-transaction
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix conversion route transaction syntax"
+          git push origin HEAD:codex/issue-373-conversion-routes
