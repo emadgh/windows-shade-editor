@@ -94,6 +94,7 @@ mod tests {
         assert!(CONVERSION_PLAN_UI.contains("build_conversion_preflight_for_source_with_policy"));
         assert!(CONVERSION_PLAN_UI.contains("build_conversion_recipe"));
         assert!(CONVERSION_PLAN_UI.contains("deterministic_converted_filename"));
+        assert!(!CONVERSION_PLAN_UI.contains("next_versioned_output_path"));
         assert!(CANDIDATE_UI.contains("render_candidate_preview"));
         assert!(!CANDIDATE_UI.contains("CandidateConfig"));
         assert!(BATCH_UI.contains("ConversionBatchCapture::capture"));
