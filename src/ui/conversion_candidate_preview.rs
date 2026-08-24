@@ -645,6 +645,7 @@ fn short_hash(hash: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_shade_editor::color_conversion::TargetChannelDefinition;
 
     #[test]
     fn solo_candidate_uses_direct_ink_coverage_polarity() {
