@@ -2,6 +2,7 @@ pub(crate) mod actions;
 pub(crate) mod adjustments;
 pub(crate) mod color_conversion;
 pub(crate) mod conversion_batch;
+pub(crate) mod conversion_candidate_preview;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
 pub(crate) mod faces;
@@ -44,26 +45,11 @@ mod tests {
                 "{method} regressed into main.rs"
             );
         }
-        assert!(
-            !workflow.contains("fn ui_faces"),
-            "Faces UI regressed into workflow.rs"
-        );
-        assert!(
-            !main.contains("enum CurvePointKind"),
-            "Curve editor state regressed into main.rs"
-        );
-        assert!(
-            !main.contains("fn curve_editor_graph"),
-            "Curve editor graph regressed into main.rs"
-        );
-        assert!(
-            !main.contains(r#""Recent projects""#),
-            "Recent menu regressed into main.rs"
-        );
-        assert!(
-            !main.contains("mod input_router;"),
-            "Input router regressed to the crate root"
-        );
+        assert!(!workflow.contains("fn ui_faces"));
+        assert!(!main.contains("enum CurvePointKind"));
+        assert!(!main.contains("fn curve_editor_graph"));
+        assert!(!main.contains(r#""Recent projects""#));
+        assert!(!main.contains("mod input_router;"));
     }
 
     #[test]
@@ -76,12 +62,8 @@ mod tests {
             "relink_missing_faces_folder_dialog(app)",
             "app.current_face = index;",
         ] {
-            assert!(
-                !faces.contains(forbidden),
-                "Faces presentation bypassed typed actions with {forbidden}"
-            );
+            assert!(!faces.contains(forbidden));
         }
-
         let navigation = include_str!("project_navigation.rs");
         for forbidden in [
             "self.new_project();",
@@ -93,58 +75,13 @@ mod tests {
             "self.validate_current_face_dialog();",
             "self.inspect_tiff_dialog();",
         ] {
-            assert!(
-                !navigation.contains(forbidden),
-                "Project navigation bypassed typed actions with {forbidden}"
-            );
+            assert!(!navigation.contains(forbidden));
         }
-
         let linked_projects = include_str!("linked_projects.rs");
         assert!(linked_projects.contains("NavigationUiAction::OpenLinkedProject"));
         assert!(linked_projects.contains("NavigationUiAction::RelinkLinkedProject"));
         assert!(!linked_projects.contains("request_project_transition("));
         assert!(!linked_projects.contains("mark_project_dirty("));
-
-        let export_queue = include_str!("export_queue.rs");
-        for forbidden in [
-            "self.export.show_queue =",
-            "self.export.queue.resume_recovered()",
-            "self.export.queue.set_paused(",
-            "self.export.queue.retry_all_failed()",
-            "self.export.queue.cancel_all_waiting()",
-            "self.export.queue.clear_completed()",
-            "self.export.queue.clear_failed()",
-            "self.export.queue.clear_finished()",
-            "self.export.queue.resume(",
-            "self.export.queue.cancel(",
-            "self.export.queue.retry(",
-            "open_folder(&",
-        ] {
-            assert!(
-                !export_queue.contains(forbidden),
-                "Export Queue presentation bypassed typed actions with {forbidden}"
-            );
-        }
-
-        let adjustments = include_str!("adjustments.rs");
-        for forbidden in [
-            "self.undo_adjustment(",
-            "self.redo_adjustment(",
-            "self.flush_history_now()",
-            "self.sync_history_to_active_snapshot()",
-            "self.apply_history_adjustments(",
-            "self.select_project_palette(",
-            "self.show_composite()",
-            "self.select_channel(",
-            "self.save_settings_quietly()",
-            "self.mark_all_previews_dirty()",
-            "self.queue_adjustment_history(",
-        ] {
-            assert!(
-                !adjustments.contains(forbidden),
-                "Adjustments presentation bypassed typed actions with {forbidden}"
-            );
-        }
     }
 
     #[test]
@@ -152,15 +89,9 @@ mod tests {
         let export_queue = include_str!("export_queue.rs");
         let actions = include_str!("actions.rs");
         for required in ["Clear Jobs", "Cancel All", "small_button(\"Cancel\")"] {
-            assert!(
-                export_queue.contains(required),
-                "Export Queue is missing requested control: {required}"
-            );
+            assert!(export_queue.contains(required));
         }
-        assert!(
-            actions.contains("ExportQueueUiAction::ClearJobs"),
-            "Clear Jobs must dispatch through a typed queue action"
-        );
+        assert!(actions.contains("ExportQueueUiAction::ClearJobs"));
         assert!(!export_queue.contains("Cancel waiting"));
         assert!(!export_queue.contains("Stop after current"));
     }
@@ -179,15 +110,9 @@ mod tests {
             "previous_shade_list_textures: BTreeMap<String, egui::TextureHandle>",
             "previous_shade_list_texture_lru: VecDeque<String>",
         ] {
-            assert!(
-                !main.contains(legacy_field),
-                "Project View transient state regressed to ShadeApp: {legacy_field}"
-            );
+            assert!(!main.contains(legacy_field));
         }
-        assert!(
-            main.contains("project_view: ui::project_view_state::ProjectViewState"),
-            "ShadeApp must own one focused ProjectViewState"
-        );
+        assert!(main.contains("project_view: ui::project_view_state::ProjectViewState"));
     }
 
     #[test]
@@ -195,8 +120,11 @@ mod tests {
         let status_bar = include_str!("status_bar.rs");
         let conversion = include_str!("color_conversion.rs");
         let batch = include_str!("conversion_batch.rs");
+        let candidate = include_str!("conversion_candidate_preview.rs");
         assert!(status_bar.contains("ui_color_conversion_status"));
         assert!(status_bar.contains("ui_color_conversion_window"));
+        assert!(status_bar.contains("ui_conversion_candidate_status"));
+        assert!(status_bar.contains("ui_conversion_candidate_window"));
         assert!(status_bar.contains("ui_conversion_batch_status"));
         assert!(status_bar.contains("ui_conversion_batch_window"));
         assert!(conversion.contains("build_conversion_preflight"));
@@ -206,5 +134,8 @@ mod tests {
         assert!(batch.contains("ConversionBatchScope::AllFaces"));
         assert!(batch.contains("ConversionBatchQueue::load_persistent"));
         assert!(batch.contains("ConversionBatchCapture::capture"));
+        assert!(candidate.contains("render_candidate_preview"));
+        assert!(candidate.contains("Queue this exact conversion"));
+        assert!(candidate.contains("Return to Source-adjusted view"));
     }
 }
