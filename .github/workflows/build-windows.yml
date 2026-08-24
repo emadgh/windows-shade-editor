@@ -53,6 +53,9 @@ jobs:
         run: |
           git fetch origin "refs/heads/$env:GITHUB_HEAD_REF`:refs/remotes/origin/$env:GITHUB_HEAD_REF" --depth=1
           git checkout -B $env:GITHUB_HEAD_REF "origin/$env:GITHUB_HEAD_REF"
+          $routePlan = Get-Content -Raw scripts/issue373_route_plan.py
+          $routePlan = $routePlan.Replace('end = "fn source_stem_occurrences(\n"', 'end = "fn source_stem_occurrences("')
+          Set-Content -Path scripts/issue373_route_plan.py -Value $routePlan -Encoding utf8 -NoNewline
           python scripts/issue373_finalize.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
