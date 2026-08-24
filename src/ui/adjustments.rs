@@ -91,6 +91,9 @@ impl ShadeApp {
     }
 
     pub(crate) fn ui_channels_histogram(&mut self, ui: &mut egui::Ui) {
+        if self.ui_conversion_candidate_channels_histogram(ui) {
+            return;
+        }
         let Some(face) = self.faces.get(self.current_face) else {
             ui.heading("Channels");
             ui.label("No active face");
