@@ -344,18 +344,24 @@ impl ShadeApp {
                         .is_some_and(|current| paths_match(current, source_path))
                 });
                 if current_source {
-                    match production_project::link_source_project_to_production(
+                    let source_project_path = self
+                        .project_path
+                        .as_deref()
+                        .expect("current Source path was verified above");
+                    match production_project::sync_source_project_to_production_route(
                         &mut self.project,
+                        source_project_path,
                         &completed.production_project_path,
+                        &completed.production_project,
                     ) {
                         Ok(()) => {
                             self.mark_project_dirty();
                             self.log.info(
-                                "Production linkage changed the open Source project; explicit Save is required.",
+                                "Production linkage/route changed the open Source project; explicit Save is required.",
                             );
                         }
                         Err(error) => self.log.error(&format!(
-                            "Could not mirror Production link in the open Source project: {error}"
+                            "Could not mirror Production conversion route in the open Source project: {error}"
                         )),
                     }
                 }

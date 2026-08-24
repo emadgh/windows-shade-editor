@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::color_conversion::production_provenance::validate_production_provenance;
 use crate::color_conversion::{LinkedProjectRef, ProductionProvenance, ProjectRole};
+use crate::conversion_route::{build_conversion_route_record, upsert_conversion_route};
 use crate::model::{FaceRef, FaceStatus, ShadeProject};
 
 /// Immutable inputs needed after a converted TIFF has been validated and
@@ -103,6 +104,25 @@ pub fn link_source_project_to_production(
         });
     }
     Ok(())
+}
+
+/// Synchronize the Source-side link and persisted conversion-route mirror from an exact,
+/// already-committed Production project. This is called after each durable batch checkpoint so a
+/// restart never has to infer route settings from filenames or UI state.
+pub fn sync_source_project_to_production_route(
+    source: &mut ShadeProject,
+    source_project_path: &Path,
+    production_project_path: &Path,
+    production_project: &ShadeProject,
+) -> Result<(), String> {
+    let route = build_conversion_route_record(
+        source,
+        source_project_path,
+        production_project,
+        production_project_path,
+    )?;
+    link_source_project_to_production(source, production_project_path)?;
+    upsert_conversion_route(source, route)
 }
 
 fn paths_match(recorded: &str, actual: &Path) -> bool {

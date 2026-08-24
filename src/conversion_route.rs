@@ -1,11 +1,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use crate::color_conversion::{ConversionRecipe, ProductionProvenance, ProjectRole};
 use crate::conversion_batch::batch_recipe_policy_sha256;
-use crate::model::ShadeProject;
+use crate::model::{ConversionRouteFaceRecord, ConversionRouteRecord, ShadeProject};
 
 pub const CONVERSION_ROUTE_SCHEMA_VERSION: u32 = 1;
 
@@ -16,22 +14,6 @@ pub const CONVERSION_ROUTE_SCHEMA_VERSION: u32 = 1;
 /// after restart, even before the linked Production project is opened. `faces` deliberately keeps
 /// the immutable Production provenance plus the external Source ICC locator (when one was used),
 /// because the locator is execution state and is not part of `ProductionProvenance` itself.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ConversionRouteRecord {
-    pub schema_version: u32,
-    pub production_project_path: String,
-    pub output_folder: String,
-    pub batch_recipe_policy_sha256: String,
-    pub faces: Vec<ConversionRouteFaceRecord>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ConversionRouteFaceRecord {
-    pub provenance: ProductionProvenance,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_profile_path: Option<String>,
-}
-
 impl ConversionRouteRecord {
     pub fn baseline_recipe(&self) -> Option<&ConversionRecipe> {
         self.faces.first().map(|face| &face.provenance.recipe)
