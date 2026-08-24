@@ -15,6 +15,7 @@ pub mod conversion_presets;
 pub mod conversion_queue;
 pub mod conversion_recipe;
 pub mod conversion_recovery;
+pub mod conversion_route;
 pub mod conversion_tiff;
 pub mod conversion_transaction;
 pub mod conversion_transaction_disposition;
