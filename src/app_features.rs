@@ -12,6 +12,9 @@ mod tests {
     const PROJECT_NAVIGATION_UI: &str = include_str!("ui/project_navigation.rs");
     const STATUS_BAR_UI: &str = include_str!("ui/status_bar.rs");
     const COLOR_CONVERSION_UI: &str = include_str!("ui/color_conversion.rs");
+    const CONVERSION_PLAN_UI: &str = include_str!("ui/conversion_plan.rs");
+    const CANDIDATE_UI: &str = include_str!("ui/conversion_candidate_preview.rs");
+    const BATCH_UI: &str = include_str!("ui/conversion_batch.rs");
 
     fn production_ui_contains(needle: &str) -> bool {
         MAIN.contains(needle)
@@ -30,10 +33,7 @@ mod tests {
             "mod production_project;",
             "mod project_lifecycle;",
         ] {
-            assert!(
-                MAIN.contains(module),
-                "missing production module wiring: {module}"
-            );
+            assert!(MAIN.contains(module), "missing production module wiring: {module}");
         }
     }
 
@@ -67,23 +67,38 @@ mod tests {
     }
 
     #[test]
-    fn color_conversion_entry_remains_bound_to_shared_preflight_contract() {
-        assert!(STATUS_BAR_UI.contains("ui_color_conversion_status"));
+    fn production_color_conversion_has_one_operator_entry_and_shared_cores() {
+        assert!(MAIN.contains("app_features::COLOR_CONVERSION_LABEL"));
+        assert!(MAIN.contains("open_color_conversion(ui.ctx())"));
         assert!(STATUS_BAR_UI.contains("ui_color_conversion_window"));
-        assert!(COLOR_CONVERSION_UI.contains("build_conversion_preflight"));
-        assert!(COLOR_CONVERSION_UI.contains("Assign Production Source ICC"));
-        assert!(COLOR_CONVERSION_UI.contains("production_source_profile"));
-        assert!(COLOR_CONVERSION_UI.contains("IccProfileRegistry"));
-        assert!(COLOR_CONVERSION_UI.contains("verify_production_profile_candidate"));
-        assert!(COLOR_CONVERSION_UI.contains("Browse installed profiles"));
-        assert!(COLOR_CONVERSION_UI.contains("Continue to Target Setup"));
-        assert!(COLOR_CONVERSION_UI.contains("Browse Output ICC file"));
-        assert!(COLOR_CONVERSION_UI.contains("verify_production_target_profile"));
-        assert!(COLOR_CONVERSION_UI.contains("build_target_setup_review"));
-        assert!(COLOR_CONVERSION_UI.contains("Queue Production Conversion"));
-        assert!(COLOR_CONVERSION_UI.contains("Conversion Queue"));
-        assert!(MAIN.contains("poll_conversion_queue"));
-        assert!(COLOR_CONVERSION_UI.contains("RGB source — not production separated"));
+        assert!(STATUS_BAR_UI.contains("poll_conversion_candidate_runtime"));
+        assert!(STATUS_BAR_UI.contains("poll_conversion_batch_runtime"));
+        for removed in [
+            "ui_color_conversion_status",
+            "ui_conversion_candidate_status",
+            "ui_conversion_candidate_window",
+            "ui_conversion_batch_status",
+            "ui_conversion_batch_window",
+        ] {
+            assert!(!STATUS_BAR_UI.contains(removed));
+        }
+
+        assert!(COLOR_CONVERSION_UI.contains("target: ConversionTargetState"));
+        assert!(COLOR_CONVERSION_UI.contains("Current Face"));
+        assert!(COLOR_CONVERSION_UI.contains("Selected Faces"));
+        assert!(COLOR_CONVERSION_UI.contains("All Faces"));
+        assert!(COLOR_CONVERSION_UI.contains("Destination folder"));
+        assert!(COLOR_CONVERSION_UI.contains("sync_conversion_candidate"));
+        assert!(COLOR_CONVERSION_UI.contains("queue_unified_conversion_plan"));
+
+        assert!(CONVERSION_PLAN_UI.contains("build_conversion_preflight_for_source_with_policy"));
+        assert!(CONVERSION_PLAN_UI.contains("build_conversion_recipe"));
+        assert!(CONVERSION_PLAN_UI.contains("deterministic_converted_filename"));
+        assert!(CANDIDATE_UI.contains("render_candidate_preview"));
+        assert!(!CANDIDATE_UI.contains("CandidateConfig"));
+        assert!(BATCH_UI.contains("ConversionBatchCapture::capture"));
+        assert!(BATCH_UI.contains("ConversionBatchQueue::load_persistent"));
+        assert!(!BATCH_UI.contains("ConversionBatchUiConfig"));
     }
 
     #[test]
@@ -92,5 +107,6 @@ mod tests {
         assert!(MAIN.contains("ProjectTransition::Open"));
         assert!(MAIN.contains("request_project_transition(ProjectTransition::Exit"));
         assert!(MAIN.contains("request_project_transition(ProjectTransition::Recover"));
+        assert!(MAIN.contains("conversion_batch_blocks_project_transition"));
     }
 }
