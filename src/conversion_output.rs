@@ -92,8 +92,29 @@ pub fn default_converted_filename(
     Ok(PathBuf::from(format!("{stem}_{suffix}.tif")))
 }
 
-/// Return the first free `_vN` path when `preferred` already exists. This never
-/// deletes or replaces anything and is therefore safe as the default reconversion policy.
+/// Build the canonical Production TIFF filename for one Source Face.
+///
+/// The name deliberately excludes target/profile labels so Current / Selected / All scopes map
+/// the same Source Face to the same path. `face_disambiguator` is supplied only when the Source
+/// project contains duplicate file stems, and must therefore come from stable Source Face identity.
+pub fn deterministic_converted_filename(
+    source: &Path,
+    face_disambiguator: Option<usize>,
+) -> Result<PathBuf, OutputPathError> {
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or(OutputPathError::MissingFileName)?;
+    let name = match face_disambiguator {
+        Some(index) => format!("{stem}_F{index:02}.tif"),
+        None => format!("{stem}.tif"),
+    };
+    Ok(PathBuf::from(name))
+}
+
+/// Return the first free `_vN` path when `preferred` already exists. This remains available for
+/// legacy workflows. Unified Production Color Conversion intentionally does not call it because
+/// versioned names break deterministic Source↔converted Face mapping.
 pub fn next_versioned_output_path(preferred: &Path) -> Result<PathBuf, OutputPathError> {
     validate_conversion_destination_path(preferred)?;
     if !preferred.exists() {
@@ -322,6 +343,18 @@ mod tests {
         assert_eq!(
             validate_conversion_output_path(source, Path::new(r"C:\Production\Face01_7C.png")),
             Err(OutputPathError::UnsupportedExtension)
+        );
+    }
+
+    #[test]
+    fn deterministic_name_is_scope_and_target_independent() {
+        assert_eq!(
+            deterministic_converted_filename(Path::new(r"C:\Design\Face01.png"), None).unwrap(),
+            PathBuf::from("Face01.tif")
+        );
+        assert_eq!(
+            deterministic_converted_filename(Path::new(r"C:\A\Face01.tif"), Some(3)).unwrap(),
+            PathBuf::from("Face01_F03.tif")
         );
     }
 

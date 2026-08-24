@@ -310,7 +310,7 @@ impl ShadeApp {
                                                     );
                                                     let response = ui.add_enabled(
                                                         candidate.selectable(),
-                                                        egui::SelectableLabel::new(selected, label),
+                                                        egui::Button::selectable(selected, label),
                                                     );
                                                     let response = if let Some(rejection) = candidate.rejection {
                                                         response.on_hover_text(rejection.label())
@@ -509,7 +509,7 @@ impl ShadeApp {
                                         let status = destination_status_label(candidate.availability);
                                         let response = ui.add_enabled(
                                             candidate.can_append(),
-                                            egui::SelectableLabel::new(
+                                            egui::Button::selectable(
                                                 selected,
                                                 format!(
                                                     "{} · {}",

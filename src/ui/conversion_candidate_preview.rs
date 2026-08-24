@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use windows_shade_editor::color_conversion::{ConversionRecipe, TargetChannelDefinition};
+use windows_shade_editor::color_conversion::ConversionRecipe;
 use windows_shade_editor::conversion_candidate_preview::{
     CandidatePreviewInput, CandidatePreviewResult, render_candidate_preview,
 };

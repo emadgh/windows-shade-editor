@@ -284,6 +284,8 @@ struct ShadeApp {
     settings_view: ui::settings_panel::SettingsViewState,
     color: ColorManagementController,
     color_conversion: ui::color_conversion::ColorConversionUiState,
+    conversion_candidate: ui::conversion_candidate_preview::CandidatePreviewController,
+    conversion_batch: ui::conversion_batch::ConversionBatchController,
     conversion_queue: windows_shade_editor::conversion_queue::ConversionQueue,
     show_about: bool,
     show_logs: bool,
@@ -379,6 +381,8 @@ impl ShadeApp {
             settings_view: ui::settings_panel::SettingsViewState::default(),
             color: ColorManagementController::default(),
             color_conversion: ui::color_conversion::ColorConversionUiState::default(),
+            conversion_candidate: ui::conversion_candidate_preview::CandidatePreviewController::default(),
+            conversion_batch: ui::conversion_batch::ConversionBatchController::load(),
             conversion_queue,
             show_about: false,
             show_logs: false,
@@ -450,10 +454,13 @@ impl ShadeApp {
         transition: ProjectTransition,
         ctx: Option<&egui::Context>,
     ) {
+        let conversion_work_pending = self.export.queue.has_pending()
+            || self.conversion_queue.has_pending()
+            || self.conversion_batch_blocks_project_transition();
         match self.lifecycle.request(
             transition,
             self.job.is_some(),
-            self.export.queue.has_pending() || self.conversion_queue.has_pending(),
+            conversion_work_pending,
             self.project_dirty,
             !self.faces.is_empty(),
             self.project_path.is_some(),
@@ -509,6 +516,8 @@ impl ShadeApp {
     fn bump_project_session(&mut self) {
         self.lifecycle.bump_session();
         self.snapshot_preview_cache.clear();
+        self.clear_conversion_candidate();
+        self.color_conversion = ui::color_conversion::ColorConversionUiState::default();
     }
 
     fn reset_to_new_project(&mut self) {
@@ -2759,6 +2768,14 @@ impl ShadeApp {
             );
             return;
         }
+        if let Some((value, text)) = self.conversion_batch_active_summary() {
+            ui.add(
+                egui::ProgressBar::new(value)
+                    .desired_width(340.0)
+                    .text(text),
+            );
+            return;
+        }
         if let Some((value, text)) = self.conversion_queue.active_summary() {
             ui.add(
                 egui::ProgressBar::new(value)
@@ -3937,6 +3954,13 @@ impl ShadeApp {
             if open_color_management {
                 self.color.show = true;
                 self.color.selected = self.project.preview_color.assigned_profile_path.clone();
+            }
+            if ui
+                .small_button(app_features::COLOR_CONVERSION_LABEL)
+                .on_hover_text("Production Color Conversion: exact candidate preview plus Current / Selected / All Face conversion.")
+                .clicked()
+            {
+                self.open_color_conversion(ui.ctx());
             }
         });
         ui.small("Hold right mouse: BEFORE adjustments with current color-management setup · Hold middle mouse: original source samples with Embedded ICC only (cached, no assigned profile / RIP Soft Proof).");
