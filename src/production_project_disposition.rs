@@ -465,4 +465,23 @@ mod tests {
         let restored: ProductionProjectDisposition = serde_json::from_str(&json).unwrap();
         assert_eq!(disposition, restored);
     }
+
+    #[test]
+    fn route_migration_allows_same_target_policy_when_per_face_recipe_changes() {
+        let key = runtime_key();
+        let disposition = ProductionProjectDisposition::migrate_existing_route(
+            "b".repeat(64),
+            &key,
+            &key,
+            "c".repeat(64),
+            "c".repeat(64),
+            route_faces(),
+            0,
+            1,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(disposition.is_route_migration());
+    }
 }
