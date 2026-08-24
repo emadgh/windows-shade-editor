@@ -17,7 +17,8 @@ impl ShadeApp {
     }
 
     pub(crate) fn ui_status(&mut self, ui: &mut egui::Ui) {
-        // Keep render/queue runtimes alive without exposing duplicate operator entry points.
+        // Candidate rendering and the durable batch queue are runtimes of the single
+        // Production Color Conversion workflow, not independent operator surfaces.
         self.poll_conversion_candidate_runtime(ui.ctx());
         self.poll_conversion_batch_runtime();
 
