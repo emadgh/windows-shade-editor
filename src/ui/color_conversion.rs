@@ -302,7 +302,9 @@ impl ShadeApp {
         let mut queue_actions = Vec::new();
 
         let state = &mut self.color_conversion;
-        let scroll_height = (ctx.available_rect().height() - 120.0).clamp(360.0, 720.0);
+        // Keep the content region bounded so the outer conversion UI always scrolls.
+        // A fixed cap avoids depending on viewport APIs that vary across egui releases.
+        let scroll_height = 620.0;
         egui::Window::new("Production Color Conversion")
             .id(egui::Id::new("production-color-conversion-window"))
             .open(&mut open)
@@ -2044,7 +2046,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn conversion_window_layout_stays_scrollable_and_foldable() {
         let source = include_str!("color_conversion.rs");
         for required in [
@@ -2061,6 +2062,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn production_execution_support_matrix_keeps_non_rgb_non_tiff_fail_closed() {
         assert!(production_execution_supported(
             SourceImageFormat::Tiff,
