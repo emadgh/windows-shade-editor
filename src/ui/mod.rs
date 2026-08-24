@@ -1,6 +1,7 @@
 pub(crate) mod actions;
 pub(crate) mod adjustments;
 pub(crate) mod color_conversion;
+pub(crate) mod conversion_batch;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
 pub(crate) mod faces;
@@ -193,9 +194,17 @@ mod tests {
     fn color_conversion_ui_stays_decomposed_and_wired_through_status_bar() {
         let status_bar = include_str!("status_bar.rs");
         let conversion = include_str!("color_conversion.rs");
+        let batch = include_str!("conversion_batch.rs");
         assert!(status_bar.contains("ui_color_conversion_status"));
         assert!(status_bar.contains("ui_color_conversion_window"));
+        assert!(status_bar.contains("ui_conversion_batch_status"));
+        assert!(status_bar.contains("ui_conversion_batch_window"));
         assert!(conversion.contains("build_conversion_preflight"));
         assert!(!conversion.contains("K *= 2"));
+        assert!(batch.contains("ConversionBatchScope::CurrentFace"));
+        assert!(batch.contains("ConversionBatchScope::SelectedFaces"));
+        assert!(batch.contains("ConversionBatchScope::AllFaces"));
+        assert!(batch.contains("ConversionBatchQueue::load_persistent"));
+        assert!(batch.contains("ConversionBatchCapture::capture"));
     }
 }
