@@ -26,6 +26,7 @@ impl ShadeApp {
             ui.label(format!("{}{}", self.status_message, dirty));
             self.ui_linked_project_navigation(ui);
             self.ui_color_conversion_status(ui);
+            self.ui_conversion_candidate_status(ui);
             self.ui_conversion_batch_status(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(path) = &self.project_path {
@@ -34,6 +35,7 @@ impl ShadeApp {
             });
         });
         self.ui_color_conversion_window(ui.ctx());
+        self.ui_conversion_candidate_window(ui.ctx());
         self.ui_conversion_batch_window(ui.ctx());
     }
 }
