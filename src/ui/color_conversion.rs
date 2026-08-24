@@ -404,7 +404,7 @@ impl ShadeApp {
                 ui.small(
                     "Target Setup does not write pixels. The original Source file remains byte-identical; production conversion starts only through the transactional worker.",
                 );
-                egui::CollapsingHeader::new(format!("Conversion queue ({})", queue_rows.len()))
+                egui::CollapsingHeader::new(format!("Conversion Queue ({})", queue_rows.len()))
                     .id_salt("conversion-queue-foldout")
                     .default_open(false)
                     .show(ui, |ui| {
