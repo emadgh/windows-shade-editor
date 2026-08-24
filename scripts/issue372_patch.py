@@ -11,8 +11,8 @@ def replace_once(path: str, old: str, new: str) -> None:
     print(f"patched {path}")
 
 
-# Canonical filename core: scope/profile-independent Face mapping. Existing suffix/version helpers
-# stay for legacy callers, but the unified conversion path never uses them.
+# One canonical deterministic filename core. The unified route intentionally does not use
+# `_vN` allocation because scope must never change the Face destination.
 replace_once(
     "src/conversion_output.rs",
     '''/// Return the first free `_vN` path when `preferred` already exists. This never
@@ -22,8 +22,7 @@ pub fn next_versioned_output_path(preferred: &Path) -> Result<PathBuf, OutputPat
 ///
 /// The name deliberately excludes target/profile labels so Current / Selected / All scopes map
 /// the same Source Face to the same path. `face_disambiguator` is supplied only when the Source
-/// project contains duplicate file stems, and must therefore be derived from stable Source Face
-/// identity (the unified UI uses the 1-based Source Face index).
+/// project contains duplicate file stems, and must therefore come from stable Source Face identity.
 pub fn deterministic_converted_filename(
     source: &Path,
     face_disambiguator: Option<usize>,
@@ -47,9 +46,9 @@ pub fn next_versioned_output_path(preferred: &Path) -> Result<PathBuf, OutputPat
 replace_once(
     "src/conversion_output.rs",
     '''    #[test]
-    fn default_name_sanitizes_target() {''',
+    fn default_filename_uses_sanitized_target_suffix() {''',
     '''    #[test]
-    fn deterministic_name_is_target_independent_and_face_stable() {
+    fn deterministic_name_is_scope_and_target_independent() {
         assert_eq!(
             deterministic_converted_filename(Path::new(r"C:\\Design\\Face01.png"), None).unwrap(),
             PathBuf::from("Face01.tif")
@@ -61,10 +60,11 @@ replace_once(
     }
 
     #[test]
-    fn default_name_sanitizes_target() {''',
+    fn default_filename_uses_sanitized_target_suffix() {''',
 )
 
-# Converted candidate owns the main Channels/Histogram panel while visible.
+# Converted candidate owns the ordinary Channels/Histogram surface only while Converted view is
+# active. Returning to Source falls through to the existing source analysis unchanged.
 replace_once(
     "src/ui/adjustments.rs",
     '''    pub(crate) fn ui_channels_histogram(&mut self, ui: &mut egui::Ui) {
@@ -76,8 +76,8 @@ replace_once(
         let Some(face) = self.faces.get(self.current_face) else {''',
 )
 
-# ShadeApp owns one operator state plus two narrow runtime controllers. The old single queue stays
-# only to drain/recover persisted pre-#372 jobs; no new unified conversion is enqueued into it.
+# ShadeApp owns one operator state plus two narrow runtime controllers. The old single queue is
+# retained only for jobs persisted by builds before #372.
 replace_once(
     "src/main.rs",
     '''    color: ColorManagementController,
@@ -102,10 +102,27 @@ replace_once(
 )
 replace_once(
     "src/main.rs",
-    '''            self.export.queue.has_pending() || self.conversion_queue.has_pending(),''',
-    '''            self.export.queue.has_pending()
-                || self.conversion_queue.has_pending()
-                || self.conversion_batch_blocks_project_transition(),''',
+    '''    fn request_project_transition(
+        &mut self,
+        transition: ProjectTransition,
+        ctx: Option<&egui::Context>,
+    ) {
+        match self.lifecycle.request(
+            transition,
+            self.job.is_some(),
+            self.export.queue.has_pending() || self.conversion_queue.has_pending(),''',
+    '''    fn request_project_transition(
+        &mut self,
+        transition: ProjectTransition,
+        ctx: Option<&egui::Context>,
+    ) {
+        let conversion_work_pending = self.export.queue.has_pending()
+            || self.conversion_queue.has_pending()
+            || self.conversion_batch_blocks_project_transition();
+        match self.lifecycle.request(
+            transition,
+            self.job.is_some(),
+            conversion_work_pending,''',
 )
 replace_once(
     "src/main.rs",
@@ -116,9 +133,8 @@ replace_once(
     '''    fn bump_project_session(&mut self) {
         self.lifecycle.bump_session();
         self.snapshot_preview_cache.clear();
+        self.clear_conversion_candidate();
         self.color_conversion = ui::color_conversion::ColorConversionUiState::default();
-        self.conversion_candidate =
-            ui::conversion_candidate_preview::CandidatePreviewController::default();
     }''',
 )
 replace_once(
@@ -148,6 +164,8 @@ replace_once(
             return;
         }''',
 )
+# The dynamic ICC/profile button is the viewport's Color Management control. Place the sole
+# conversion entry immediately beside it in the same top viewport row.
 replace_once(
     "src/main.rs",
     '''            if open_color_management {
@@ -161,12 +179,63 @@ replace_once(
             }
             if ui
                 .small_button(app_features::COLOR_CONVERSION_LABEL)
-                .on_hover_text("Production Color Conversion: target preview, Current / Selected / All Faces, and durable conversion queue.")
+                .on_hover_text("Production Color Conversion: exact candidate preview plus Current / Selected / All Face conversion.")
                 .clicked()
             {
                 self.open_color_conversion(ui.ctx());
             }
         });''',
+)
+
+# egui 0.35 replaced SelectableLabel with selectable Button construction.
+replace_once(
+    "src/ui/color_conversion.rs",
+    '''                                                    let response = ui.add_enabled(
+                                                        candidate.selectable(),
+                                                        egui::SelectableLabel::new(selected, label),
+                                                    );''',
+    '''                                                    let response = ui.add_enabled(
+                                                        candidate.selectable(),
+                                                        egui::Button::selectable(selected, label),
+                                                    );''',
+)
+replace_once(
+    "src/ui/color_conversion.rs",
+    '''                                        let response = ui.add_enabled(
+                                            candidate.can_append(),
+                                            egui::SelectableLabel::new(
+                                                selected,
+                                                format!(
+                                                    "{} · {}",
+                                                    candidate
+                                                        .project_name
+                                                        .as_deref()
+                                                        .unwrap_or("Production"),
+                                                    status
+                                                ),
+                                            ),
+                                        );''',
+    '''                                        let response = ui.add_enabled(
+                                            candidate.can_append(),
+                                            egui::Button::selectable(
+                                                selected,
+                                                format!(
+                                                    "{} · {}",
+                                                    candidate
+                                                        .project_name
+                                                        .as_deref()
+                                                        .unwrap_or("Production"),
+                                                    status
+                                                ),
+                                            ),
+                                        );''',
+)
+
+# Keep the candidate runtime dependency surface narrow.
+replace_once(
+    "src/ui/conversion_candidate_preview.rs",
+    '''use windows_shade_editor::color_conversion::{ConversionRecipe, TargetChannelDefinition};''',
+    '''use windows_shade_editor::color_conversion::ConversionRecipe;''',
 )
 
 print("issue 372 shell wiring patch complete")
