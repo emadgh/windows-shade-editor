@@ -151,7 +151,7 @@ mod tests {
         assert!(plan.contains("build_conversion_recipe"));
         assert!(plan.contains("deterministic_converted_filename"));
         assert!(plan.contains("restore_target_from_route"));
-        assert!(plan.contains("UpdateExistingRoute"));
+        assert!(plan.contains("update_existing_route"));
         assert!(conversion.contains("Restore saved route settings"));
         assert!(conversion.contains("allow_production_work_discard"));
 
