@@ -3,6 +3,7 @@ pub(crate) mod adjustments;
 pub(crate) mod color_conversion;
 pub(crate) mod conversion_batch;
 pub(crate) mod conversion_candidate_preview;
+pub(crate) mod conversion_plan;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
 pub(crate) mod faces;
@@ -116,26 +117,45 @@ mod tests {
     }
 
     #[test]
-    fn color_conversion_ui_stays_decomposed_and_wired_through_status_bar() {
+    fn color_conversion_has_one_operator_surface_and_shared_runtime_cores() {
+        let main = include_str!("../main.rs");
         let status_bar = include_str!("status_bar.rs");
         let conversion = include_str!("color_conversion.rs");
+        let plan = include_str!("conversion_plan.rs");
         let batch = include_str!("conversion_batch.rs");
         let candidate = include_str!("conversion_candidate_preview.rs");
-        assert!(status_bar.contains("ui_color_conversion_status"));
+
         assert!(status_bar.contains("ui_color_conversion_window"));
-        assert!(status_bar.contains("ui_conversion_candidate_status"));
-        assert!(status_bar.contains("ui_conversion_candidate_window"));
-        assert!(status_bar.contains("ui_conversion_batch_status"));
-        assert!(status_bar.contains("ui_conversion_batch_window"));
-        assert!(conversion.contains("build_conversion_preflight"));
-        assert!(!conversion.contains("K *= 2"));
-        assert!(batch.contains("ConversionBatchScope::CurrentFace"));
-        assert!(batch.contains("ConversionBatchScope::SelectedFaces"));
-        assert!(batch.contains("ConversionBatchScope::AllFaces"));
+        assert!(status_bar.contains("poll_conversion_candidate_runtime"));
+        assert!(status_bar.contains("poll_conversion_batch_runtime"));
+        for removed in [
+            "ui_color_conversion_status",
+            "ui_conversion_candidate_status",
+            "ui_conversion_candidate_window",
+            "ui_conversion_batch_status",
+            "ui_conversion_batch_window",
+        ] {
+            assert!(!status_bar.contains(removed), "duplicate conversion surface remains: {removed}");
+        }
+
+        assert!(conversion.contains("target: ConversionTargetState"));
+        assert!(conversion.contains("Current Face"));
+        assert!(conversion.contains("Selected Faces"));
+        assert!(conversion.contains("All Faces"));
+        assert!(conversion.contains("Destination folder"));
+        assert!(plan.contains("build_conversion_preflight_for_source_with_policy"));
+        assert!(plan.contains("build_conversion_recipe"));
+        assert!(plan.contains("deterministic_converted_filename"));
+
         assert!(batch.contains("ConversionBatchQueue::load_persistent"));
         assert!(batch.contains("ConversionBatchCapture::capture"));
+        assert!(!batch.contains("ConversionBatchUiConfig"));
+        assert!(!batch.contains("egui::Window::new"));
+
         assert!(candidate.contains("render_candidate_preview"));
-        assert!(candidate.contains("Queue this exact conversion"));
-        assert!(candidate.contains("Return to Source-adjusted view"));
+        assert!(candidate.contains("sync_conversion_candidate"));
+        assert!(!candidate.contains("CandidateConfig"));
+        assert!(!candidate.contains("egui::Window::new"));
+        assert!(main.contains("app_features::COLOR_CONVERSION_LABEL"));
     }
 }
