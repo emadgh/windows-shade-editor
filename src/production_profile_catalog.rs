@@ -87,6 +87,23 @@ pub fn production_profile_candidates(
                     .to_lowercase()
                     .cmp(&right.profile.filename().to_lowercase())
             })
+            // Installed-profile enumeration order is platform-dependent. Profiles may
+            // legitimately share both their embedded description and filename (for
+            // example in per-user and system profile stores), so use the full locator
+            // and finally the content identity to make the catalog order total.
+            .then_with(|| {
+                left.profile
+                    .path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .cmp(&right.profile.path.to_string_lossy().to_lowercase())
+            })
+            .then_with(|| {
+                left.profile
+                    .identity
+                    .sha256
+                    .cmp(&right.profile.identity.sha256)
+            })
     });
     rows
 }
@@ -242,6 +259,57 @@ mod tests {
 
         let _ = fs::remove_file(display_path);
         let _ = fs::remove_file(link_path);
+    }
+
+    #[test]
+    fn catalog_order_is_deterministic_when_description_and_filename_match() {
+        let root = std::env::temp_dir().join(format!(
+            "shade-production-profile-order-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first_path = root.join("a").join("duplicate.icc");
+        let second_path = root.join("b").join("duplicate.icc");
+        fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+
+        let mut profile = Profile::new_srgb();
+        profile.save_profile_to_file(&first_path).unwrap();
+        profile.save_profile_to_file(&second_path).unwrap();
+        let first = IccProfileRegistry.inspect(&first_path).unwrap();
+        let second = IccProfileRegistry.inspect(&second_path).unwrap();
+        assert_eq!(first.description, second.description);
+        assert_eq!(first.filename(), second.filename());
+
+        let forward = production_profile_candidates(
+            vec![first.clone(), second.clone()],
+            ConversionEngineMode::Icc,
+            ColorModel::Rgb,
+            "",
+            true,
+        );
+        let reverse = production_profile_candidates(
+            vec![second, first],
+            ConversionEngineMode::Icc,
+            ColorModel::Rgb,
+            "",
+            true,
+        );
+        let forward_paths = forward
+            .iter()
+            .map(|candidate| &candidate.profile.path)
+            .collect::<Vec<_>>();
+        let reverse_paths = reverse
+            .iter()
+            .map(|candidate| &candidate.profile.path)
+            .collect::<Vec<_>>();
+        assert_eq!(forward_paths, reverse_paths);
+        assert_eq!(forward_paths, vec![&first_path, &second_path]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
