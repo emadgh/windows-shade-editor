@@ -14,6 +14,7 @@ pub mod conversion_preset_library;
 pub mod conversion_presets;
 pub mod conversion_queue;
 pub mod conversion_recipe;
+#[path = "conversion_recovery_route.rs"]
 pub mod conversion_recovery;
 pub mod conversion_route;
 pub mod conversion_tiff;
