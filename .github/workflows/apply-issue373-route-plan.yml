@@ -1,0 +1,33 @@
+name: Apply issue 373 route plan
+
+on:
+  push:
+    branches:
+      - codex/issue-373-conversion-routes
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/issue-373-conversion-routes
+      - name: Apply route-aware planning and UI patch
+        run: python scripts/issue373_route_plan.py
+      - name: Remove patch helpers
+        shell: bash
+        run: |
+          rm -f scripts/issue373_route_plan.py
+          rm -f .github/workflows/apply-issue373-route-plan.yml
+      - name: Commit route-aware planning
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Wire persisted conversion routes into unified planning"
+          git push origin HEAD:codex/issue-373-conversion-routes
