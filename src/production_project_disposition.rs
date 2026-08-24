@@ -23,6 +23,15 @@ pub enum ProductionProjectDisposition {
         route_policy_sha256: String,
         allow_production_work_discard: bool,
     },
+    MigrateExistingRoute {
+        expected_project_sha256: String,
+        previous_compatibility: CapturedProductionCompatibilityKey,
+        new_compatibility: CapturedProductionCompatibilityKey,
+        previous_route_policy_sha256: String,
+        new_route_policy_sha256: String,
+        confirm_destructive_migration: bool,
+        allow_production_work_discard: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +157,35 @@ impl ProductionProjectDisposition {
         Ok(disposition)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_existing_route(
+        expected_project_sha256: impl Into<String>,
+        previous_compatibility: &ProductionCompatibilityKey,
+        new_compatibility: &ProductionCompatibilityKey,
+        previous_route_policy_sha256: impl Into<String>,
+        new_route_policy_sha256: impl Into<String>,
+        confirm_destructive_migration: bool,
+        allow_production_work_discard: bool,
+    ) -> Result<Self, String> {
+        let disposition = Self::MigrateExistingRoute {
+            expected_project_sha256: expected_project_sha256.into(),
+            previous_compatibility: CapturedProductionCompatibilityKey::from_runtime(
+                previous_compatibility,
+            ),
+            new_compatibility: CapturedProductionCompatibilityKey::from_runtime(new_compatibility),
+            previous_route_policy_sha256: previous_route_policy_sha256.into(),
+            new_route_policy_sha256: new_route_policy_sha256.into(),
+            confirm_destructive_migration,
+            allow_production_work_discard,
+        };
+        disposition.validate()?;
+        Ok(disposition)
+    }
+
+    pub fn is_route_migration(&self) -> bool {
+        matches!(self, Self::MigrateExistingRoute { .. })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::CreateNew => Ok(()),
@@ -182,6 +220,44 @@ impl ProductionProjectDisposition {
                     );
                 }
                 expected_compatibility.validate()
+            }
+            Self::MigrateExistingRoute {
+                expected_project_sha256,
+                previous_compatibility,
+                new_compatibility,
+                previous_route_policy_sha256,
+                new_route_policy_sha256,
+                confirm_destructive_migration,
+                ..
+            } => {
+                if !is_bare_sha256(expected_project_sha256) {
+                    return Err(
+                        "Route migration requires canonical lowercase project SHA-256."
+                            .to_owned(),
+                    );
+                }
+                if !is_bare_sha256(previous_route_policy_sha256)
+                    || !is_bare_sha256(new_route_policy_sha256)
+                {
+                    return Err(
+                        "Route migration requires canonical previous/new policy SHA-256 identities."
+                            .to_owned(),
+                    );
+                }
+                if previous_route_policy_sha256.eq_ignore_ascii_case(new_route_policy_sha256) {
+                    return Err(
+                        "Route migration requires a changed recipe policy; use same-route update when policy is unchanged."
+                            .to_owned(),
+                    );
+                }
+                if !*confirm_destructive_migration {
+                    return Err(
+                        "Route migration requires explicit destructive migration confirmation."
+                            .to_owned(),
+                    );
+                }
+                previous_compatibility.validate()?;
+                new_compatibility.validate()
             }
         }
     }
@@ -220,7 +296,10 @@ mod tests {
 
     #[test]
     fn create_new_is_backward_default() {
-        assert_eq!(ProductionProjectDisposition::default(), ProductionProjectDisposition::CreateNew);
+        assert_eq!(
+            ProductionProjectDisposition::default(),
+            ProductionProjectDisposition::CreateNew
+        );
     }
 
     #[test]
@@ -276,5 +355,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn route_migration_requires_policy_change_and_explicit_confirmation() {
+        let previous = runtime_key();
+        let mut new = runtime_key();
+        new.output_profile_sha256 = Some("d".repeat(64));
+        let denied = ProductionProjectDisposition::migrate_existing_route(
+            "b".repeat(64),
+            &previous,
+            &new,
+            "c".repeat(64),
+            "e".repeat(64),
+            false,
+            true,
+        )
+        .expect_err("migration confirmation is mandatory");
+        assert!(denied.contains("explicit destructive"));
+
+        let disposition = ProductionProjectDisposition::migrate_existing_route(
+            "b".repeat(64),
+            &previous,
+            &new,
+            "c".repeat(64),
+            "e".repeat(64),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(disposition.is_route_migration());
+        let json = serde_json::to_string(&disposition).unwrap();
+        let restored: ProductionProjectDisposition = serde_json::from_str(&json).unwrap();
+        assert_eq!(disposition, restored);
     }
 }
