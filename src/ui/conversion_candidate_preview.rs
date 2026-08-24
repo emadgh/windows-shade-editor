@@ -31,8 +31,7 @@ use windows_shade_editor::tiff_io::ColorModel as ConversionColorModel;
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(220);
 
 thread_local! {
-    static CANDIDATE_CONTROLLER: RefCell<CandidateController> =
-        RefCell::new(CandidateController::default());
+    static CANDIDATE: RefCell<CandidateController> = RefCell::new(CandidateController::default());
 }
 
 #[derive(Clone)]
@@ -65,8 +64,8 @@ impl Default for CandidateConfig {
 }
 
 struct PendingCandidate {
-    generation: u64,
     key: String,
+    generation: u64,
     cancellation: ConversionCancellation,
     rx: mpsc::Receiver<Result<CandidatePreviewResult, String>>,
 }
@@ -75,12 +74,12 @@ struct ActiveCandidate {
     key: String,
     face_index: usize,
     project_revision: u64,
-    recipe: ConversionRecipe,
     result: CandidatePreviewResult,
     solo_channel: Option<usize>,
     texture: egui::TextureHandle,
 }
 
+#[derive(Default)]
 struct CandidateController {
     open: bool,
     config: CandidateConfig,
@@ -91,22 +90,6 @@ struct CandidateController {
     pending: Option<PendingCandidate>,
     active: Option<ActiveCandidate>,
     error: Option<String>,
-}
-
-impl Default for CandidateController {
-    fn default() -> Self {
-        Self {
-            open: false,
-            config: CandidateConfig::default(),
-            desired_key: None,
-            desired_recipe: None,
-            debounce_started: None,
-            generation: 0,
-            pending: None,
-            active: None,
-            error: None,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -129,13 +112,9 @@ impl ShadeApp {
         self.poll_candidate_preview(ui.ctx());
         self.apply_candidate_texture();
 
-        let (active, pending, open) = CANDIDATE_CONTROLLER.with(|cell| {
-            let controller = cell.borrow();
-            (
-                controller.active.is_some(),
-                controller.pending.is_some(),
-                controller.open,
-            )
+        let (active, pending, open) = CANDIDATE.with(|cell| {
+            let state = cell.borrow();
+            (state.active.is_some(), state.pending.is_some(), state.open)
         });
         if self.faces.get(self.current_face).is_none() && !open {
             return;
@@ -151,51 +130,45 @@ impl ShadeApp {
         if ui
             .small_button(label)
             .on_hover_text(
-                "Preview the exact ICC/DeviceLink production separation in the main viewport before committing output.",
+                "Render the exact production separation on the main viewport before creating output.",
             )
             .clicked()
         {
-            CANDIDATE_CONTROLLER.with(|cell| cell.borrow_mut().open = true);
+            CANDIDATE.with(|cell| cell.borrow_mut().open = true);
         }
     }
 
     pub(crate) fn ui_conversion_candidate_window(&mut self, ctx: &egui::Context) {
-        let (mut open, mut config, active_summary, error) = CANDIDATE_CONTROLLER.with(|cell| {
-            let controller = cell.borrow();
-            (
-                controller.open,
-                controller.config.clone(),
-                controller.active.as_ref().map(|active| {
-                    (
-                        active.result.recipe_sha256.clone(),
-                        active.result.channel_count(),
-                        active.solo_channel,
-                    )
-                }),
-                controller.error.clone(),
-            )
+        let (mut open, mut config, error) = CANDIDATE.with(|cell| {
+            let state = cell.borrow();
+            (state.open, state.config.clone(), state.error.clone())
         });
         if !open {
             return;
         }
 
-        if config.output_path.is_none() {
-            config.output_path = self
-                .faces
-                .get(self.current_face)
-                .and_then(|face| recommended_candidate_output(&face.path, &config.target_name, config.channel_names.len()).ok());
-        }
-
         let source = self.candidate_source();
+        if config.output_path.is_none() {
+            if let Ok(source) = source.as_ref() {
+                config.output_path = recommended_output(
+                    &source.source_path,
+                    &config.target_name,
+                    config.channel_names.len(),
+                )
+                .ok();
+            }
+        }
         let recipe = source
             .as_ref()
+            .ok()
             .and_then(|source| build_candidate_recipe(&config, source).ok());
+
         let mut select_profile = false;
         let mut select_output = false;
         let mut queue_exact = false;
         let mut return_source = false;
-        let mut force_refresh = false;
-        let mut requested_solo: Option<Option<usize>> = None;
+        let mut refresh_now = false;
+        let mut requested_solo = None;
 
         egui::Window::new("Live Production Candidate")
             .id(egui::Id::new("live-production-candidate-preview"))
@@ -206,39 +179,34 @@ impl ShadeApp {
             .show(ctx, |ui| {
                 ui.heading("Live Production Candidate");
                 ui.label(
-                    "The main viewport shows the candidate target separation. No TIFF or Production project is created until you explicitly queue the conversion.",
+                    "The main viewport shows a non-destructive candidate separation before conversion is committed.",
                 );
                 ui.small(
-                    "Preview samples use the production ICC / N-channel / DeviceLink transform primitives. Target profile bytes and Source ICC identity are reverified before every candidate render.",
+                    "Candidate samples use the same ICC/N-channel/DeviceLink production transforms used by final conversion. Profile identities are reverified before every render.",
                 );
 
                 ui.add_space(8.0);
                 ui.separator();
-                ui.strong("Source readiness");
-                match &source {
+                ui.strong("Source");
+                match source.as_ref() {
                     Ok(source) => {
                         ui.label(format!(
-                            "Face {} · {} · {}×{} preview raster",
+                            "Face {} · {} · {}×{} candidate raster",
                             source.face_index + 1,
                             source.face_label,
                             source.width,
                             source.height
                         ));
-                        if self.project_dirty {
+                        if self.project_path.is_none() || self.project_dirty {
                             ui.label(
                                 egui::RichText::new(
-                                    "Save the Source project before previewing/queueing so candidate adjustments and the final captured source state are identical.",
+                                    "Save the Source project first. Candidate and final capture must reference the same saved adjustment state.",
                                 )
                                 .color(egui::Color32::LIGHT_RED),
                             );
-                        } else if self.project_path.is_none() {
-                            ui.label(
-                                egui::RichText::new("Save the Source project first.")
-                                    .color(egui::Color32::LIGHT_RED),
-                            );
                         } else {
                             ui.label(
-                                egui::RichText::new("Saved Source state is ready")
+                                egui::RichText::new("Saved Source state ready")
                                     .color(egui::Color32::LIGHT_GREEN),
                             );
                         }
@@ -267,13 +235,7 @@ impl ShadeApp {
                         );
                     });
                 if previous_engine != config.engine_mode {
-                    config.target_profile = None;
-                    config.target_name.clear();
-                    config.channel_names.clear();
-                    config.channel_names_confirmed = false;
-                    config.output_path = None;
-                    config.black_point_compensation =
-                        config.engine_mode == ConversionEngineMode::Icc;
+                    clear_target(&mut config);
                 }
 
                 ui.horizontal_wrapped(|ui| {
@@ -329,13 +291,15 @@ impl ShadeApp {
                             "Black Point Compensation",
                         );
                     }
-
-                    ui.add_space(5.0);
+                    ui.add_space(4.0);
                     ui.strong("Validated target topology");
                     for (index, name) in config.channel_names.iter_mut().enumerate() {
+                        let rgb = target_channel_rgb(name, index);
                         ui.horizontal(|ui| {
-                            let rgb = target_channel_rgb(name, index);
-                            ui.colored_label(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]), "■");
+                            ui.colored_label(
+                                egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                                "■",
+                            );
                             ui.label(format!("{}", index + 1));
                             ui.text_edit_singleline(name);
                         });
@@ -356,58 +320,29 @@ impl ShadeApp {
 
                 ui.add_space(8.0);
                 ui.separator();
-                ui.heading("Candidate analysis");
-                match recipe.as_ref() {
-                    Some(recipe) if !self.project_dirty && self.project_path.is_some() => {
-                        let sha = recipe_sha256(recipe).unwrap_or_default();
-                        ui.small(format!("Immutable recipe SHA-256: {sha}"));
+                ui.heading("Candidate target-channel analysis");
+                if let Some(recipe) = recipe.as_ref() {
+                    let hash = recipe_sha256(recipe).unwrap_or_default();
+                    ui.small(format!("Recipe SHA-256: {hash}"));
+                    if self.project_path.is_some() && !self.project_dirty {
                         if ui.button("Refresh candidate now").clicked() {
-                            force_refresh = true;
+                            refresh_now = true;
                         }
                     }
-                    Some(_) => {
-                        ui.label(
-                            egui::RichText::new("Save the Source project to activate candidate preview.")
-                                .color(egui::Color32::YELLOW),
-                        );
-                    }
-                    None => {
-                        ui.label(
-                            egui::RichText::new("Complete a valid production target setup.")
-                                .color(egui::Color32::LIGHT_RED),
-                        );
-                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new("Complete a valid target setup.")
+                            .color(egui::Color32::YELLOW),
+                    );
                 }
-
                 if let Some(message) = error.as_deref() {
                     ui.label(egui::RichText::new(message).color(egui::Color32::LIGHT_RED));
                 }
-
-                if let Some((sha, channel_count, solo)) = active_summary.as_ref() {
-                    ui.group(|ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Candidate active · {channel_count} target channels"
-                                ))
-                                .color(egui::Color32::LIGHT_GREEN)
-                                .strong(),
-                            );
-                            ui.small(format!("recipe {}", short_hash(sha)));
-                        });
-                        if ui
-                            .selectable_label(solo.is_none(), "Composite converted preview")
-                            .clicked()
-                        {
-                            requested_solo = Some(None);
-                        }
-                    });
-                    render_active_candidate_analysis(ui, &mut requested_solo);
-                }
+                render_active_analysis(ui, &mut requested_solo);
 
                 ui.add_space(8.0);
                 ui.separator();
-                ui.heading("Commit this exact recipe");
+                ui.heading("Commit this exact candidate recipe");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Choose output TIFF…").clicked() {
                         select_output = true;
@@ -417,38 +352,33 @@ impl ShadeApp {
                     }
                 });
                 let can_queue = recipe.is_some()
-                    && active_summary.is_some()
-                    && !self.project_dirty
+                    && candidate_matches_current(self.current_face, self.project_revision, recipe.as_ref())
                     && self.project_path.is_some()
+                    && !self.project_dirty
                     && self.job.is_none()
                     && !self.export.queue.has_pending();
                 if ui
                     .add_enabled(can_queue, egui::Button::new("Queue this exact conversion"))
                     .on_hover_text(
-                        "Captures the saved Source state and queues the same immutable recipe currently represented by the candidate preview.",
+                        "Queue the same immutable recipe represented by the active candidate preview.",
                     )
                     .clicked()
                 {
                     queue_exact = true;
                 }
-                if self.export.queue.has_pending() {
-                    ui.small("Finish or cancel Export Queue before queueing production conversion.");
-                }
-
-                ui.add_space(6.0);
                 if ui.button("Return to Source-adjusted view").clicked() {
                     return_source = true;
                 }
             });
 
         if select_profile {
-            if let Some(source) = source.as_ref().ok() {
+            if let Ok(source) = source.as_ref() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("ICC / DeviceLink profiles", &["icc", "icm"])
                     .set_title(match config.engine_mode {
                         ConversionEngineMode::Icc => "Select Production Output ICC",
                         ConversionEngineMode::DeviceLink => "Select Production DeviceLink",
-                        ConversionEngineMode::CustomOptimizer => "Select target",
+                        ConversionEngineMode::CustomOptimizer => "Select production target",
                     })
                     .pick_file()
                 {
@@ -461,7 +391,7 @@ impl ShadeApp {
                             config.target_name = profile.identity.description.clone();
                             config.channel_names = profile.channel_names.clone();
                             config.channel_names_confirmed = profile.channel_names_authoritative;
-                            config.output_path = recommended_candidate_output(
+                            config.output_path = recommended_output(
                                 &source.source_path,
                                 &config.target_name,
                                 profile.output_channel_count,
@@ -476,19 +406,19 @@ impl ShadeApp {
         }
 
         if select_output {
-            let mut dialog = rfd::FileDialog::new()
-                .add_filter("Production TIFF", &["tif", "tiff"])
-                .set_title("Select candidate Production TIFF destination");
-            if let Some(path) = config.output_path.as_deref() {
-                if let Some(parent) = path.parent() {
-                    dialog = dialog.set_directory(parent);
+            if let Ok(source) = source.as_ref() {
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("Production TIFF", &["tif", "tiff"])
+                    .set_title("Select Production TIFF destination");
+                if let Some(path) = config.output_path.as_deref() {
+                    if let Some(parent) = path.parent() {
+                        dialog = dialog.set_directory(parent);
+                    }
+                    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                        dialog = dialog.set_file_name(name);
+                    }
                 }
-                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                    dialog = dialog.set_file_name(name);
-                }
-            }
-            if let Some(path) = dialog.save_file() {
-                if let Some(source) = source.as_ref().ok() {
+                if let Some(path) = dialog.save_file() {
                     match validate_conversion_output_path(&source.source_path, &path) {
                         Ok(()) => config.output_path = Some(path),
                         Err(error) => self.report_error(error.to_string()),
@@ -497,32 +427,32 @@ impl ShadeApp {
             }
         }
 
-        CANDIDATE_CONTROLLER.with(|cell| {
-            let mut controller = cell.borrow_mut();
-            controller.open = open;
-            controller.config = config.clone();
+        CANDIDATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            state.open = open;
+            state.config = config.clone();
         });
 
-        if return_source || !open {
+        if !open || return_source {
             self.clear_candidate_preview();
-            CANDIDATE_CONTROLLER.with(|cell| cell.borrow_mut().open = open && !return_source);
+            CANDIDATE.with(|cell| cell.borrow_mut().open = open && !return_source);
             return;
         }
 
         if let (Ok(source), Some(recipe)) = (source.as_ref(), recipe.clone()) {
-            if !self.project_dirty && self.project_path.is_some() {
+            if self.project_path.is_some() && !self.project_dirty {
                 let key = candidate_key(
                     self.current_face,
                     self.project_revision,
-                    &recipe,
                     &source.source_path,
+                    &recipe,
                 );
-                self.observe_candidate_desire(key, recipe, force_refresh, ctx);
+                self.observe_candidate(key, recipe, refresh_now, ctx);
             } else {
-                self.invalidate_candidate_desire();
+                self.invalidate_candidate();
             }
         } else {
-            self.invalidate_candidate_desire();
+            self.invalidate_candidate();
         }
 
         if let Some(solo) = requested_solo {
@@ -541,7 +471,7 @@ impl ShadeApp {
             .get(self.current_face)
             .ok_or_else(|| "No active Source Face.".to_owned())?;
         if !face.available {
-            return Err("Active Source Face is missing; relink it before candidate preview.".to_owned());
+            return Err("Active Source Face is missing. Relink it first.".to_owned());
         }
         let descriptor = face
             .preview
@@ -549,23 +479,23 @@ impl ShadeApp {
             .ok_or_else(|| "Active Face has no production source descriptor.".to_owned())?;
         if descriptor.transparency != windows_shade_editor::design_source::TransparencyState::None {
             return Err(
-                "Candidate preview currently requires an opaque source. Resolve PNG alpha with an explicit production flatten policy in Converter before previewing."
+                "Live candidate preview requires an opaque Source. Resolve PNG alpha with the explicit Converter flatten policy first."
                     .to_owned(),
             );
         }
         if !matches!(descriptor.bit_depth, 8 | 16) {
             return Err(format!(
-                "Candidate preview requires 8/16-bit Source data; found {}-bit.",
+                "Candidate preview supports 8/16-bit Source data; found {}-bit.",
                 descriptor.bit_depth
             ));
         }
         let (source_model, conversion_color_model) = match face.preview.color_model() {
             RuntimeColorModel::Rgb => (IccSourceModel::Rgb, ConversionColorModel::Rgb),
             RuntimeColorModel::Cmyk => (IccSourceModel::Cmyk, ConversionColorModel::Cmyk),
-            other => {
+            model => {
                 return Err(format!(
-                    "Candidate production conversion requires RGB or CMYK Source data; found {}.",
-                    other.title()
+                    "Candidate conversion requires RGB or CMYK Source data; found {}.",
+                    model.title()
                 ));
             }
         };
@@ -578,7 +508,7 @@ impl ShadeApp {
                     face.preview.color_model(),
                 )?;
                 (
-                    conversion_identity(inspected.identity()),
+                    library_identity(inspected.identity()),
                     CapturedSourceProfile::External {
                         path: PathBuf::from(&assignment.path),
                     },
@@ -594,7 +524,7 @@ impl ShadeApp {
                         .to_owned()
                 })?;
                 (
-                    conversion_identity(&identity),
+                    library_identity(&identity),
                     CapturedSourceProfile::Embedded,
                     face.preview.embedded_icc().map(ToOwned::to_owned),
                 )
@@ -624,45 +554,47 @@ impl ShadeApp {
         })
     }
 
-    fn observe_candidate_desire(
+    fn observe_candidate(
         &mut self,
         key: String,
         recipe: ConversionRecipe,
-        force_refresh: bool,
+        force: bool,
         ctx: &egui::Context,
     ) {
-        let mut should_start = false;
-        CANDIDATE_CONTROLLER.with(|cell| {
-            let mut controller = cell.borrow_mut();
-            let changed = controller.desired_key.as_deref() != Some(key.as_str());
-            if changed || force_refresh {
-                if let Some(pending) = controller.pending.take() {
+        let mut removed_stale_active = false;
+        let mut start = false;
+        CANDIDATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let changed = state.desired_key.as_deref() != Some(key.as_str());
+            if changed || force {
+                if let Some(pending) = state.pending.take() {
                     pending.cancellation.request();
                 }
-                controller.desired_key = Some(key.clone());
-                controller.desired_recipe = Some(recipe.clone());
-                controller.debounce_started = Some(if force_refresh {
+                removed_stale_active = state.active.take().is_some();
+                state.desired_key = Some(key.clone());
+                state.desired_recipe = Some(recipe.clone());
+                state.debounce_started = Some(if force {
                     Instant::now() - PREVIEW_DEBOUNCE
                 } else {
                     Instant::now()
                 });
-                controller.error = None;
-                if controller.active.as_ref().is_some_and(|active| active.key != key) {
-                    controller.active = None;
-                }
+                state.error = None;
             }
-            if controller.active.as_ref().is_some_and(|active| active.key == key) {
-                controller.debounce_started = None;
-            } else if controller.pending.is_none()
-                && controller
+            if state.active.as_ref().is_some_and(|active| active.key == key) {
+                state.debounce_started = None;
+            } else if state.pending.is_none()
+                && state
                     .debounce_started
                     .is_some_and(|started| started.elapsed() >= PREVIEW_DEBOUNCE)
             {
-                should_start = true;
-                controller.debounce_started = None;
+                state.debounce_started = None;
+                start = true;
             }
         });
-        if should_start {
+        if removed_stale_active {
+            self.force_source_preview_refresh();
+        }
+        if start {
             self.start_candidate_preview(key, recipe, ctx);
         } else {
             ctx.request_repaint_after(Duration::from_millis(40));
@@ -678,10 +610,12 @@ impl ShadeApp {
         let source = match self.candidate_source() {
             Ok(source) => source,
             Err(error) => {
-                CANDIDATE_CONTROLLER.with(|cell| cell.borrow_mut().error = Some(error));
+                CANDIDATE.with(|cell| cell.borrow_mut().error = Some(error));
                 return;
             }
         };
+        let cancellation = ConversionCancellation::default();
+        let worker_cancel = cancellation.clone();
         let input = CandidatePreviewInput {
             width: source.width,
             height: source.height,
@@ -689,24 +623,21 @@ impl ShadeApp {
             source_planes: source.adjusted_planes,
             source_profile: source.captured_profile,
             embedded_source_icc: source.embedded_source_icc,
-            recipe: recipe.clone(),
+            recipe,
         };
-        let cancellation = ConversionCancellation::default();
-        let worker_cancellation = cancellation.clone();
         let (tx, rx) = mpsc::channel();
-        let generation = CANDIDATE_CONTROLLER.with(|cell| {
-            let mut controller = cell.borrow_mut();
-            controller.generation = controller.generation.wrapping_add(1).max(1);
-            controller.generation
+        let generation = CANDIDATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            state.generation = state.generation.wrapping_add(1).max(1);
+            state.generation
         });
         thread::spawn(move || {
-            let result = render_candidate_preview(input, &worker_cancellation);
-            let _ = tx.send(result);
+            let _ = tx.send(render_candidate_preview(input, &worker_cancel));
         });
-        CANDIDATE_CONTROLLER.with(|cell| {
+        CANDIDATE.with(|cell| {
             cell.borrow_mut().pending = Some(PendingCandidate {
-                generation,
                 key,
+                generation,
                 cancellation,
                 rx,
             });
@@ -715,61 +646,66 @@ impl ShadeApp {
     }
 
     fn poll_candidate_preview(&mut self, ctx: &egui::Context) {
-        let completion = CANDIDATE_CONTROLLER.with(|cell| {
-            let mut controller = cell.borrow_mut();
-            let pending = controller.pending.as_mut()?;
+        enum PollResult {
+            Empty,
+            Disconnected,
+            Ready(String, u64, Result<CandidatePreviewResult, String>),
+        }
+        let poll = CANDIDATE.with(|cell| {
+            let state = cell.borrow();
+            let Some(pending) = state.pending.as_ref() else {
+                return PollResult::Empty;
+            };
             match pending.rx.try_recv() {
-                Ok(result) => {
-                    let generation = pending.generation;
-                    let key = pending.key.clone();
-                    controller.pending = None;
-                    Some((generation, key, result))
-                }
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    controller.pending = None;
-                    Some((0, String::new(), Err("Candidate preview worker disconnected.".to_owned())))
-                }
+                Ok(result) => PollResult::Ready(pending.key.clone(), pending.generation, result),
+                Err(mpsc::TryRecvError::Empty) => PollResult::Empty,
+                Err(mpsc::TryRecvError::Disconnected) => PollResult::Disconnected,
             }
         });
-        let Some((generation, key, result)) = completion else {
-            return;
-        };
-        let desired = CANDIDATE_CONTROLLER.with(|cell| cell.borrow().desired_key.clone());
-        if desired.as_deref() != Some(key.as_str()) {
-            return;
-        }
-        match result {
-            Ok(result) => {
-                let recipe = CANDIDATE_CONTROLLER.with(|cell| cell.borrow().desired_recipe.clone());
-                let Some(recipe) = recipe else {
-                    return;
-                };
-                let rgba = candidate_rgba(&result, None);
-                let texture = candidate_texture(ctx, generation, None, &result, rgba);
-                CANDIDATE_CONTROLLER.with(|cell| {
-                    let mut controller = cell.borrow_mut();
-                    controller.error = None;
-                    controller.active = Some(ActiveCandidate {
-                        key,
-                        face_index: self.current_face,
-                        project_revision: self.project_revision,
-                        recipe,
-                        result,
-                        solo_channel: None,
-                        texture,
-                    });
+        match poll {
+            PollResult::Empty => return,
+            PollResult::Disconnected => {
+                CANDIDATE.with(|cell| {
+                    let mut state = cell.borrow_mut();
+                    state.pending = None;
+                    state.error = Some("Candidate preview worker disconnected.".to_owned());
                 });
-                self.report_info("Production candidate preview ready");
+                return;
             }
-            Err(error) => {
-                CANDIDATE_CONTROLLER.with(|cell| cell.borrow_mut().error = Some(error));
+            PollResult::Ready(key, generation, result) => {
+                CANDIDATE.with(|cell| cell.borrow_mut().pending = None);
+                let desired = CANDIDATE.with(|cell| cell.borrow().desired_key.clone());
+                if desired.as_deref() != Some(key.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(result) => {
+                        let rgba = candidate_rgba(&result, None);
+                        let texture = load_candidate_texture(ctx, generation, None, &result, &rgba);
+                        CANDIDATE.with(|cell| {
+                            let mut state = cell.borrow_mut();
+                            state.error = None;
+                            state.active = Some(ActiveCandidate {
+                                key,
+                                face_index: self.current_face,
+                                project_revision: self.project_revision,
+                                result,
+                                solo_channel: None,
+                                texture,
+                            });
+                        });
+                        self.report_info("Production candidate preview ready");
+                    }
+                    Err(error) => {
+                        CANDIDATE.with(|cell| cell.borrow_mut().error = Some(error));
+                    }
+                }
             }
         }
     }
 
     fn apply_candidate_texture(&mut self) {
-        let active = CANDIDATE_CONTROLLER.with(|cell| {
+        let active = CANDIDATE.with(|cell| {
             cell.borrow().active.as_ref().map(|active| {
                 (
                     active.face_index,
@@ -791,48 +727,48 @@ impl ShadeApp {
     }
 
     fn set_candidate_solo(&mut self, solo: Option<usize>, ctx: &egui::Context) {
-        CANDIDATE_CONTROLLER.with(|cell| {
-            let mut controller = cell.borrow_mut();
-            let generation = controller.generation;
-            if let Some(active) = controller.active.as_mut() {
+        CANDIDATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let generation = state.generation;
+            if let Some(active) = state.active.as_mut() {
                 let solo = solo.filter(|index| *index < active.result.channel_count());
-                active.solo_channel = solo;
                 let rgba = candidate_rgba(&active.result, solo);
-                active.texture = candidate_texture(ctx, generation, solo, &active.result, rgba);
+                active.texture = load_candidate_texture(ctx, generation, solo, &active.result, &rgba);
+                active.solo_channel = solo;
             }
         });
         self.apply_candidate_texture();
     }
 
-    fn invalidate_candidate_desire(&mut self) {
-        let had_active = CANDIDATE_CONTROLLER.with(|cell| {
-            let mut controller = cell.borrow_mut();
-            if let Some(pending) = controller.pending.take() {
+    fn invalidate_candidate(&mut self) {
+        let removed = CANDIDATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            if let Some(pending) = state.pending.take() {
                 pending.cancellation.request();
             }
-            controller.desired_key = None;
-            controller.desired_recipe = None;
-            controller.debounce_started = None;
-            controller.active.take().is_some()
+            state.desired_key = None;
+            state.desired_recipe = None;
+            state.debounce_started = None;
+            state.active.take().is_some()
         });
-        if had_active {
+        if removed {
             self.force_source_preview_refresh();
         }
     }
 
     fn clear_candidate_preview(&mut self) {
-        let had_active = CANDIDATE_CONTROLLER.with(|cell| {
-            let mut controller = cell.borrow_mut();
-            if let Some(pending) = controller.pending.take() {
+        let removed = CANDIDATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            if let Some(pending) = state.pending.take() {
                 pending.cancellation.request();
             }
-            controller.desired_key = None;
-            controller.desired_recipe = None;
-            controller.debounce_started = None;
-            controller.error = None;
-            controller.active.take().is_some()
+            state.desired_key = None;
+            state.desired_recipe = None;
+            state.debounce_started = None;
+            state.error = None;
+            state.active.take().is_some()
         });
-        if had_active {
+        if removed {
             self.force_source_preview_refresh();
         }
     }
@@ -845,55 +781,43 @@ impl ShadeApp {
     }
 
     fn queue_candidate_conversion(&mut self, source: CandidateSource, recipe: ConversionRecipe) {
-        let active_matches = CANDIDATE_CONTROLLER.with(|cell| {
-            cell.borrow().active.as_ref().is_some_and(|active| {
-                active.face_index == source.face_index
-                    && active.project_revision == self.project_revision
-                    && active.result.recipe_sha256 == recipe_sha256(&recipe).unwrap_or_default()
-            })
-        });
-        if !active_matches {
-            self.report_error(
-                "Candidate preview is stale. Wait for the current recipe preview before queueing conversion.",
-            );
+        if !candidate_matches_current(source.face_index, self.project_revision, Some(&recipe)) {
+            self.report_error("Candidate preview is stale. Wait for the current recipe preview first.");
             return;
         }
-        if self.project_dirty {
+        if self.project_dirty || self.project_path.is_none() {
             self.report_error("Save the Source project before queueing candidate conversion.");
             return;
         }
         if self.job.is_some() || self.export.queue.has_pending() {
-            self.report_info("Finish the current foreground/Export operation before queueing conversion.");
+            self.report_info("Finish the current foreground/Export operation first.");
             return;
         }
-        let Some(source_project_path) = self.project_path.clone() else {
-            self.report_error("Save the Source project before queueing candidate conversion.");
-            return;
-        };
-        let output_path = CANDIDATE_CONTROLLER.with(|cell| cell.borrow().config.output_path.clone());
-        let Some(preferred_output) = output_path else {
+        let preferred = CANDIDATE.with(|cell| cell.borrow().config.output_path.clone());
+        let Some(preferred) = preferred else {
             self.report_error("Choose a Production TIFF destination first.");
             return;
         };
-        let effective_output = match next_versioned_output_path(&preferred_output) {
+        let output = match next_versioned_output_path(&preferred) {
             Ok(path) => path,
             Err(error) => {
                 self.report_error(error.to_string());
                 return;
             }
         };
-        if let Err(error) = validate_conversion_output_path(&source.source_path, &effective_output) {
+        if let Err(error) = validate_conversion_output_path(&source.source_path, &output) {
             self.report_error(error.to_string());
             return;
         }
-        let production_project_path = effective_output.with_extension("shade");
+        let production_project_path = output.with_extension("shade");
         if production_project_path.exists() {
             self.report_error(format!(
-                "Production project already exists: {}. Choose another destination.",
+                "Production project already exists: {}",
                 production_project_path.display()
             ));
             return;
         }
+        let source_project_path = self.project_path.clone().expect("saved project checked");
         let captured_project: windows_shade_editor::model::ShadeProject =
             match serde_json::to_value(&self.project)
                 .map_err(|error| error.to_string())
@@ -905,34 +829,32 @@ impl ShadeApp {
                     return;
                 }
             };
-        let source_project_sha =
-            match windows_shade_editor::icc_conversion_worker::sha256_file(&source_project_path) {
-                Ok(hash) => hash,
-                Err(error) => {
-                    self.report_error(error);
-                    return;
-                }
-            };
-        let source_file_sha =
-            match windows_shade_editor::icc_conversion_worker::sha256_file(&source.source_path) {
-                Ok(hash) => hash,
-                Err(error) => {
-                    self.report_error(error);
-                    return;
-                }
-            };
+        let project_sha = match windows_shade_editor::icc_conversion_worker::sha256_file(&source_project_path) {
+            Ok(hash) => hash,
+            Err(error) => {
+                self.report_error(error);
+                return;
+            }
+        };
+        let source_sha = match windows_shade_editor::icc_conversion_worker::sha256_file(&source.source_path) {
+            Ok(hash) => hash,
+            Err(error) => {
+                self.report_error(error);
+                return;
+            }
+        };
         let target_name = recipe.target.name.clone();
         let capture = match ConversionJobCapture::capture(
             &captured_project,
             source_project_path,
-            source_project_sha,
+            project_sha,
             source.source_path,
             self.project.active_snapshot_id,
-            source_file_sha,
+            source_sha,
             source.captured_profile,
             recipe,
             CapturedOutputPolicy::MustNotExist,
-            effective_output,
+            output,
             production_project_path,
             format!("{} - {target_name}", self.project.name),
             format!("{} - {target_name}", source.face_label),
@@ -977,23 +899,16 @@ fn build_candidate_recipe(
         return Err("Output bit depth must be 8 or 16.".to_owned());
     }
     let profile_path = verified.path.to_string_lossy().into_owned();
-    let profile_identity = verified.identity.clone();
+    let identity = verified.identity.clone();
     let (output_profile_path, output_profile_identity, device_link_path, device_link_identity) =
         match config.engine_mode {
-            ConversionEngineMode::Icc => (
-                Some(profile_path),
-                Some(profile_identity),
-                None,
-                None,
-            ),
-            ConversionEngineMode::DeviceLink => (
-                None,
-                None,
-                Some(profile_path),
-                Some(profile_identity),
-            ),
+            ConversionEngineMode::Icc => (Some(profile_path), Some(identity), None, None),
+            ConversionEngineMode::DeviceLink => (None, None, Some(profile_path), Some(identity)),
             ConversionEngineMode::CustomOptimizer => {
-                return Err("Custom Optimizer candidate preview requires characterized-target authorization.".to_owned());
+                return Err(
+                    "Custom Optimizer candidate preview requires characterized-target authorization."
+                        .to_owned(),
+                );
             }
         };
     let recipe = ConversionRecipe {
@@ -1028,22 +943,51 @@ fn build_candidate_recipe(
         strategy: SeparationStrategy::default(),
         custom_optimizer_solver: None,
     };
-    recipe
-        .validate()
-        .map_err(|errors| errors.join(" "))?;
+    recipe.validate().map_err(|errors| errors.join(" "))?;
     Ok(recipe)
 }
 
-fn render_active_candidate_analysis(
-    ui: &mut egui::Ui,
-    requested_solo: &mut Option<Option<usize>>,
-) {
-    CANDIDATE_CONTROLLER.with(|cell| {
-        let controller = cell.borrow();
-        let Some(active) = controller.active.as_ref() else {
+fn candidate_matches_current(
+    face_index: usize,
+    project_revision: u64,
+    recipe: Option<&ConversionRecipe>,
+) -> bool {
+    let Some(recipe) = recipe else {
+        return false;
+    };
+    let expected = recipe_sha256(recipe).unwrap_or_default();
+    CANDIDATE.with(|cell| {
+        cell.borrow().active.as_ref().is_some_and(|active| {
+            active.face_index == face_index
+                && active.project_revision == project_revision
+                && active.result.recipe_sha256 == expected
+        })
+    })
+}
+
+fn render_active_analysis(ui: &mut egui::Ui, requested_solo: &mut Option<Option<usize>>) {
+    CANDIDATE.with(|cell| {
+        let state = cell.borrow();
+        let Some(active) = state.active.as_ref() else {
+            if state.pending.is_some() {
+                ui.label(egui::RichText::new("Rendering candidate…").color(egui::Color32::YELLOW));
+            }
             return;
         };
-        ui.add_space(5.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "Candidate active · {} target channels",
+                active.result.channel_count()
+            ))
+            .color(egui::Color32::LIGHT_GREEN)
+            .strong(),
+        );
+        if ui
+            .selectable_label(active.solo_channel.is_none(), "Composite converted preview")
+            .clicked()
+        {
+            *requested_solo = Some(None);
+        }
         for (index, channel) in active.result.channels.iter().enumerate() {
             let rgb = channel
                 .display_rgb
@@ -1059,44 +1003,37 @@ fn render_active_candidate_analysis(
                     *requested_solo = Some(Some(index));
                 }
                 ui.colored_label(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]), "■");
-                ui.small(format!("Solidity {:.0}%", channel.solidity * 100.0));
             });
             if let Some(histogram) = active.result.histograms.get(index) {
-                draw_candidate_histogram(ui, histogram, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                draw_histogram(ui, histogram, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
             }
-        }
-        if active.solo_channel.is_some() && ui.small_button("Return to composite").clicked() {
-            *requested_solo = Some(None);
         }
     });
 }
 
-fn draw_candidate_histogram(ui: &mut egui::Ui, histogram: &[u32; 256], color: egui::Color32) {
-    let desired = egui::vec2(ui.available_width().max(120.0), 62.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-    let max = histogram.iter().copied().max().unwrap_or(1).max(1) as f32;
-    let painter = ui.painter_at(rect);
-    painter.rect_stroke(
-        rect,
-        2.0,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-        egui::StrokeKind::Inside,
+fn draw_histogram(ui: &mut egui::Ui, histogram: &[u32; 256], color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(120.0), 56.0),
+        egui::Sense::hover(),
     );
+    let max = histogram.iter().copied().max().unwrap_or(1).max(1) as f32;
     let points = histogram
         .iter()
         .enumerate()
         .map(|(index, count)| {
-            let x = rect.left() + index as f32 / 255.0 * rect.width();
-            let y = rect.bottom() - (*count as f32 / max) * rect.height();
-            egui::pos2(x, y)
+            egui::pos2(
+                rect.left() + index as f32 / 255.0 * rect.width(),
+                rect.bottom() - (*count as f32 / max) * rect.height(),
+            )
         })
         .collect::<Vec<_>>();
-    painter.add(egui::Shape::line(points, egui::Stroke::new(1.4, color)));
+    ui.painter_at(rect)
+        .add(egui::Shape::line(points, egui::Stroke::new(1.35, color)));
 }
 
 fn candidate_rgba(result: &CandidatePreviewResult, solo: Option<usize>) -> Vec<u8> {
-    let pixel_count = result.width.saturating_mul(result.height);
-    let mut rgba = Vec::with_capacity(pixel_count.saturating_mul(4));
+    let pixels = result.width.saturating_mul(result.height);
+    let mut rgba = Vec::with_capacity(pixels.saturating_mul(4));
     if let Some(channel) = solo.filter(|index| *index < result.planes.len()) {
         for sample in &result.planes[channel] {
             let gray = 255u8.saturating_sub((*sample >> 8) as u8);
@@ -1104,16 +1041,10 @@ fn candidate_rgba(result: &CandidatePreviewResult, solo: Option<usize>) -> Vec<u
         }
         return rgba;
     }
-    for pixel in 0..pixel_count {
+    for pixel in 0..pixels {
         let mut rgb = [1.0f32; 3];
         for (index, channel) in result.channels.iter().enumerate() {
-            let Some(plane) = result.planes.get(index) else {
-                continue;
-            };
-            let coverage = plane[pixel] as f32 / u16::MAX as f32;
-            if coverage <= 0.000_1 {
-                continue;
-            }
+            let coverage = result.planes[index][pixel] as f32 / u16::MAX as f32;
             let tint = channel
                 .display_rgb
                 .unwrap_or_else(|| target_channel_rgb(&channel.name, index));
@@ -1137,16 +1068,16 @@ fn candidate_rgba(result: &CandidatePreviewResult, solo: Option<usize>) -> Vec<u
     rgba
 }
 
-fn candidate_texture(
+fn load_candidate_texture(
     ctx: &egui::Context,
     generation: u64,
     solo: Option<usize>,
     result: &CandidatePreviewResult,
-    rgba: Vec<u8>,
+    rgba: &[u8],
 ) -> egui::TextureHandle {
-    let image = egui::ColorImage::from_rgba_unmultiplied([result.width, result.height], &rgba);
+    let image = egui::ColorImage::from_rgba_unmultiplied([result.width, result.height], rgba);
     ctx.load_texture(
-        format!("production-candidate-{generation}-{:?}", solo),
+        format!("production-candidate-{generation}-{solo:?}"),
         image,
         egui::TextureOptions::LINEAR,
     )
@@ -1155,19 +1086,17 @@ fn candidate_texture(
 fn candidate_key(
     face_index: usize,
     project_revision: u64,
-    recipe: &ConversionRecipe,
     source_path: &Path,
+    recipe: &ConversionRecipe,
 ) -> String {
     format!(
-        "{}|{}|{}|{}",
-        face_index,
-        project_revision,
+        "{face_index}|{project_revision}|{}|{}",
         source_path.to_string_lossy().to_ascii_lowercase(),
         recipe_sha256(recipe).unwrap_or_default()
     )
 }
 
-fn recommended_candidate_output(
+fn recommended_output(
     source: &Path,
     target_name: &str,
     channel_count: usize,
@@ -1191,7 +1120,16 @@ fn recommended_candidate_output(
         .join(filename))
 }
 
-fn conversion_identity(identity: &model::IccProfileIdentity) -> windows_shade_editor::model::IccProfileIdentity {
+fn clear_target(config: &mut CandidateConfig) {
+    config.target_profile = None;
+    config.target_name.clear();
+    config.channel_names.clear();
+    config.channel_names_confirmed = false;
+    config.output_path = None;
+    config.black_point_compensation = config.engine_mode == ConversionEngineMode::Icc;
+}
+
+fn library_identity(identity: &model::IccProfileIdentity) -> windows_shade_editor::model::IccProfileIdentity {
     windows_shade_editor::model::IccProfileIdentity {
         description: identity.description.clone(),
         sha256: identity.sha256.clone(),
@@ -1199,39 +1137,21 @@ fn conversion_identity(identity: &model::IccProfileIdentity) -> windows_shade_ed
 }
 
 fn target_channel_rgb(name: &str, index: usize) -> [u8; 3] {
-    let normalized = name.trim().to_ascii_lowercase();
-    if normalized.contains("cyan") {
-        [0, 174, 239]
-    } else if normalized.contains("magenta") || normalized.contains("pink") {
-        [236, 0, 140]
-    } else if normalized.contains("yellow") {
-        [255, 221, 0]
-    } else if normalized.contains("black") || normalized == "k" {
-        [28, 28, 28]
-    } else if normalized.contains("blue") {
-        [33, 102, 214]
-    } else if normalized.contains("green") {
-        [34, 160, 90]
-    } else if normalized.contains("brown") {
-        [139, 90, 43]
-    } else if normalized.contains("beige") {
-        [211, 184, 142]
-    } else if normalized.contains("orange") {
-        [239, 126, 34]
-    } else if normalized.contains("red") {
-        [214, 51, 63]
-    } else if normalized.contains("violet") || normalized.contains("purple") {
-        [133, 82, 196]
-    } else {
+    let name = name.trim().to_ascii_lowercase();
+    if name.contains("cyan") { [0, 174, 239] }
+    else if name.contains("magenta") || name.contains("pink") { [236, 0, 140] }
+    else if name.contains("yellow") { [255, 221, 0] }
+    else if name.contains("black") || name == "k" { [28, 28, 28] }
+    else if name.contains("blue") { [33, 102, 214] }
+    else if name.contains("green") { [34, 160, 90] }
+    else if name.contains("brown") { [139, 90, 43] }
+    else if name.contains("beige") { [211, 184, 142] }
+    else if name.contains("orange") { [239, 126, 34] }
+    else if name.contains("red") { [214, 51, 63] }
+    else {
         const FALLBACK: [[u8; 3]; 8] = [
-            [39, 126, 220],
-            [214, 65, 75],
-            [45, 164, 103],
-            [224, 151, 38],
-            [145, 91, 201],
-            [36, 166, 181],
-            [191, 96, 51],
-            [105, 113, 127],
+            [39, 126, 220], [214, 65, 75], [45, 164, 103], [224, 151, 38],
+            [145, 91, 201], [36, 166, 181], [191, 96, 51], [105, 113, 127],
         ];
         FALLBACK[index % FALLBACK.len()]
     }
@@ -1254,61 +1174,12 @@ fn intent_label(intent: ConversionRenderingIntent) -> &'static str {
     }
 }
 
-fn short_hash(hash: &str) -> &str {
-    hash.get(..12).unwrap_or(hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_shade_editor::color_conversion::{
-        ConversionTargetDefinition, TargetChannelDefinition,
-    };
 
     #[test]
-    fn candidate_key_changes_with_recipe_or_source_revision() {
-        let recipe = ConversionRecipe {
-            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
-            engine_mode: ConversionEngineMode::Icc,
-            source_profile_identity: windows_shade_editor::model::IccProfileIdentity {
-                description: "Source".to_owned(),
-                sha256: "a".repeat(64),
-            },
-            source_transparency_policy: None,
-            target: ConversionTargetDefinition {
-                name: "Target".to_owned(),
-                channels: ["Cyan", "Magenta", "Yellow", "Black"]
-                    .into_iter()
-                    .map(|name| TargetChannelDefinition {
-                        name: name.to_owned(),
-                        display_rgb: Some(target_channel_rgb(name, 0)),
-                        solidity: 1.0,
-                        max_coverage: None,
-                    })
-                    .collect(),
-                bit_depth: 16,
-                output_profile_identity: Some(windows_shade_editor::model::IccProfileIdentity {
-                    description: "Target".to_owned(),
-                    sha256: "b".repeat(64),
-                }),
-                output_profile_path: Some(r"C:\Color\Target.icc".to_owned()),
-                device_link_identity: None,
-                device_link_path: None,
-                characterization_id: None,
-                total_ink_limit: None,
-            },
-            rendering_intent: ConversionRenderingIntent::Perceptual,
-            black_point_compensation: false,
-            strategy: SeparationStrategy::default(),
-            custom_optimizer_solver: None,
-        };
-        let first = candidate_key(0, 7, &recipe, Path::new(r"C:\Face.tif"));
-        let second = candidate_key(0, 8, &recipe, Path::new(r"C:\Face.tif"));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn solo_candidate_uses_ink_coverage_polarity() {
+    fn solo_candidate_uses_direct_ink_coverage_polarity() {
         let result = CandidatePreviewResult {
             width: 2,
             height: 1,
@@ -1328,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn seven_channel_topology_keeps_authoritative_order() {
+    fn seven_channel_target_order_is_preserved() {
         let names = ["Blue", "Brown", "Beige", "Black", "Yellow", "Pink", "Green"];
         let channels = names
             .iter()
