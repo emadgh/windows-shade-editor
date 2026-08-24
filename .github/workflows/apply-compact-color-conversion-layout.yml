@@ -1,0 +1,121 @@
+name: Apply compact color conversion layout
+
+on:
+  push:
+    branches:
+      - codex/compact-color-conversion-window
+
+permissions:
+  contents: write
+
+jobs:
+  apply-layout:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/compact-color-conversion-window
+          fetch-depth: 0
+
+      - name: Refactor conversion window layout
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/ui/color_conversion.rs')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_once(old: str, new: str, label: str):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly one match, found {count}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              '        let state = &mut self.color_conversion;\n        egui::Window::new("Production Color Conversion")',
+              '        let state = &mut self.color_conversion;\n        let scroll_height = (ctx.available_rect().height() - 120.0).clamp(360.0, 720.0);\n        egui::Window::new("Production Color Conversion")',
+              'window scroll height',
+          )
+          replace_once(
+              '            .default_size([820.0, 720.0])',
+              '            .default_size([900.0, 680.0])',
+              'window default size',
+          )
+          replace_once(
+              '            .show(ctx, |ui| {\n                ui.heading("Production Color Conversion");',
+              '            .show(ctx, |ui| {\n                egui::ScrollArea::vertical()\n                    .id_salt("production-color-conversion-scroll")\n                    .auto_shrink([false, false])\n                    .max_height(scroll_height)\n                    .show(ui, |ui| {\n                ui.heading("Production Color Conversion");',
+              'window scroll area open',
+          )
+
+          old_stage = '''                render_source_summary(ui, &source);\n\n                match state.stage {\n                    ConversionStage::SourcePreflight => {\n                        render_source_profile_actions(\n                            ui,\n                            &source,\n                            &mut assign_production_profile,\n                            &mut clear_production_profile,\n                        );\n                        render_transparency_policy(ui, state, &source);\n                        render_source_preflight(\n                            ui,\n                            &source,\n                            &mut navigation_action,\n                            &mut assign_production_profile,\n                            &mut open_preview_color_management,\n                        );\n\n                        ui.add_space(8.0);\n                        ui.separator();\n                        let ready = source.report.can_convert();\n                        ui.horizontal_wrapped(|ui| {\n                            if ui\n                                .add_enabled(ready, egui::Button::new("Continue to Target Setup"))\n                                .on_hover_text(if ready {\n                                    "Configure a verified Output ICC or DeviceLink, target topology and safe TIFF destination."\n                                } else {\n                                    "Resolve all blocking source-preflight findings first."\n                                })\n                                .clicked()\n                            {\n                                state.stage = ConversionStage::TargetSetup;\n                            }\n                            readiness_label(ui, ready, "Source preflight ready", "Conversion blocked");\n                        });\n                    }\n                    ConversionStage::TargetSetup => {\n                        ui.horizontal_wrapped(|ui| {\n                            if ui.button("← Back to Source Preflight").clicked() {\n                                state.stage = ConversionStage::SourcePreflight;\n                            }\n                            ui.label(\n                                egui::RichText::new("Source preflight ready")\n                                    .color(egui::Color32::LIGHT_GREEN),\n                            );\n                        });\n                        ui.add_space(8.0);\n                        render_target_setup(\n                            ui,\n                            state,\n                            &source,\n                            &production_candidates,\n                            &mut select_target_profile,\n                            &mut select_output_path,\n                            &mut start_conversion,\n                        );\n                    }\n                }'''
+          new_stage = '''                match state.stage {\n                    ConversionStage::SourcePreflight => {\n                        egui::CollapsingHeader::new("Source information")\n                            .id_salt("conversion-source-information-preflight")\n                            .default_open(true)\n                            .show(ui, |ui| {\n                                render_source_summary(ui, &source);\n                                ui.add_space(4.0);\n                                render_source_profile_actions(\n                                    ui,\n                                    &source,\n                                    &mut assign_production_profile,\n                                    &mut clear_production_profile,\n                                );\n                                render_transparency_policy(ui, state, &source);\n                            });\n\n                        egui::CollapsingHeader::new("Source preflight")\n                            .id_salt("conversion-source-preflight-foldout")\n                            .default_open(true)\n                            .show(ui, |ui| {\n                                render_source_preflight(\n                                    ui,\n                                    &source,\n                                    &mut navigation_action,\n                                    &mut assign_production_profile,\n                                    &mut open_preview_color_management,\n                                );\n                            });\n\n                        ui.add_space(6.0);\n                        let ready = source.report.can_convert();\n                        ui.horizontal_wrapped(|ui| {\n                            if ui\n                                .add_enabled(ready, egui::Button::new("Continue to Target Setup"))\n                                .on_hover_text(if ready {\n                                    "Configure a verified Output ICC or DeviceLink, target topology and safe TIFF destination."\n                                } else {\n                                    "Resolve all blocking source-preflight findings first."\n                                })\n                                .clicked()\n                            {\n                                state.stage = ConversionStage::TargetSetup;\n                            }\n                            readiness_label(ui, ready, "Source preflight ready", "Conversion blocked");\n                        });\n                    }\n                    ConversionStage::TargetSetup => {\n                        ui.horizontal_wrapped(|ui| {\n                            if ui.button("← Back to Source Preflight").clicked() {\n                                state.stage = ConversionStage::SourcePreflight;\n                            }\n                            ui.label(\n                                egui::RichText::new("Source preflight ready")\n                                    .color(egui::Color32::LIGHT_GREEN),\n                            );\n                        });\n                        ui.add_space(6.0);\n                        egui::CollapsingHeader::new("Source information")\n                            .id_salt("conversion-source-information-target")\n                            .default_open(false)\n                            .show(ui, |ui| render_source_summary(ui, &source));\n                        render_target_setup(\n                            ui,\n                            state,\n                            &source,\n                            &production_candidates,\n                            &mut select_target_profile,\n                            &mut select_output_path,\n                            &mut start_conversion,\n                        );\n                    }\n                }'''
+          replace_once(old_stage, new_stage, 'stage foldouts')
+
+          old_queue = '''                ui.add_space(8.0);\n                ui.separator();\n                ui.small(\n                    "Target Setup does not write pixels. The original Source file remains byte-identical; production conversion starts only through the transactional worker.",\n                );\n                render_conversion_queue(\n                    ui,\n                    &queue_rows,\n                    queue_paused,\n                    recovered_waiting,\n                    &mut queue_actions,\n                );\n            });'''
+          new_queue = '''                ui.add_space(6.0);\n                ui.small(\n                    "Target Setup does not write pixels. The original Source file remains byte-identical; production conversion starts only through the transactional worker.",\n                );\n                egui::CollapsingHeader::new(format!("Conversion queue ({})", queue_rows.len()))\n                    .id_salt("conversion-queue-foldout")\n                    .default_open(false)\n                    .show(ui, |ui| {\n                        render_conversion_queue(\n                            ui,\n                            &queue_rows,\n                            queue_paused,\n                            recovered_waiting,\n                            &mut queue_actions,\n                        );\n                    });\n                    });\n            });'''
+          replace_once(old_queue, new_queue, 'queue foldout and scroll close')
+
+          old_summary_start = text.index('fn render_source_summary(ui: &mut egui::Ui, source: &CurrentConversionSource) {')
+          old_summary_end = text.index('\nfn render_source_profile_actions(', old_summary_start)
+          new_summary = '''fn render_source_summary(ui: &mut egui::Ui, source: &CurrentConversionSource) {\n    let snapshot = source\n        .snapshot_id\n        .map(|id| format!("#{id}"))\n        .unwrap_or_else(|| "Current saved project state".to_owned());\n    let rows = [\n        (("Face", source.face_label.clone()), ("Source format", source.source_format_label.to_owned())),\n        (("Color model", source.color_model_label.to_owned()), ("Bit depth", format!("{}-bit", source.bit_depth))),\n        (("Channels", source.channel_count.to_string()), ("Compression", source.lossiness.label().to_owned())),\n        (("Transparency", source.transparency.label().to_owned()), ("Saved state", save_gate_label(source.save_gate).to_owned())),\n        (("Production Source ICC", source.profile_label.clone()), ("Snapshot", snapshot)),\n    ];\n\n    egui::Grid::new("conversion-source-summary")\n        .num_columns(4)\n        .striped(true)\n        .spacing([12.0, 5.0])\n        .show(ui, |ui| {\n            for ((left_label, left_value), (right_label, right_value)) in rows {\n                ui.strong(left_label);\n                ui.label(left_value);\n                ui.strong(right_label);\n                ui.label(right_value);\n                ui.end_row();\n            }\n        });\n    ui.horizontal_wrapped(|ui| {\n        ui.strong("Source");\n        ui.small(source.source_path.display().to_string())\n            .on_hover_text(source.source_path.display().to_string());\n    });\n}\n'''
+          text = text[:old_summary_start] + new_summary + text[old_summary_end:]
+
+          replace_once(
+              '''    ui.add_space(10.0);\n    ui.separator();\n    ui.strong("Source preflight");\n    ui.add_space(4.0);\n\n''',
+              '',
+              'preflight redundant heading',
+          )
+
+          replace_once(
+              '''\n) {\n    ui.separator();\n    ui.heading("Target Setup");\n\n    let previous_mode = state.engine_mode;''',
+              '''\n) {\n    egui::CollapsingHeader::new("Target setup")\n        .id_salt("conversion-target-setup-foldout")\n        .default_open(true)\n        .show(ui, |ui| {\n    let previous_mode = state.engine_mode;''',
+              'target setup foldout open',
+          )
+          replace_once(
+              '                .max_height(220.0)',
+              '                .max_height(160.0)',
+              'installed profile list height',
+          )
+          replace_once(
+              '''\n    ui.separator();\n    ui.strong("Production destination");\n    ui.horizontal_wrapped(|ui| {''',
+              '''\n    });\n\n    egui::CollapsingHeader::new("Production destination")\n        .id_salt("conversion-production-destination-foldout")\n        .default_open(true)\n        .show(ui, |ui| {\n    ui.horizontal_wrapped(|ui| {''',
+              'destination foldout',
+          )
+          replace_once(
+              '''\n    ui.separator();\n    ui.strong("Recipe review");\n    match build_target_setup_review(state, source) {''',
+              '''\n    });\n\n    egui::CollapsingHeader::new("Recipe review")\n        .id_salt("conversion-recipe-review-foldout")\n        .default_open(true)\n        .show(ui, |ui| {\n    match build_target_setup_review(state, source) {''',
+              'recipe foldout open',
+          )
+          replace_once(
+              '''        }\n    }\n}\n\nfn seed_state_from_existing_destination(''',
+              '''        }\n    }\n    });\n}\n\nfn seed_state_from_existing_destination(''',
+              'recipe foldout close',
+          )
+
+          replace_once(
+              '''    ui.add_space(10.0);\n    ui.separator();\n    ui.horizontal_wrapped(|ui| {\n        ui.heading("Conversion Queue");''',
+              '''    ui.horizontal_wrapped(|ui| {''',
+              'queue internal heading removal',
+          )
+
+          test_anchor = '''    fn production_execution_support_matrix_keeps_non_rgb_non_tiff_fail_closed() {'''
+          if test_anchor not in text:
+              raise SystemExit('layout test anchor missing')
+          insert = '''    #[test]\n    fn conversion_window_layout_stays_scrollable_and_foldable() {\n        let source = include_str!("color_conversion.rs");\n        for required in [\n            "production-color-conversion-scroll",\n            "conversion-source-information-preflight",\n            "conversion-source-preflight-foldout",\n            "conversion-target-setup-foldout",\n            "conversion-production-destination-foldout",\n            "conversion-recipe-review-foldout",\n            "conversion-queue-foldout",\n            ".num_columns(4)",\n        ] {\n            assert!(source.contains(required), "missing compact conversion layout token: {required}");\n        }\n    }\n\n'''
+          text = text.replace(test_anchor, insert + test_anchor, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Commit compact layout
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-compact-color-conversion-layout.yml
+          git add src/ui/color_conversion.rs
+          git commit -m "Compact production color conversion window"
+          git push origin HEAD:codex/compact-color-conversion-window
