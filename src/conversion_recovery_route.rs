@@ -315,7 +315,7 @@ fn recover_update_existing_route_project(
                 &capture.source_face_path.to_string_lossy(),
             )
         })
-        .map(|(index, provenance)| (index, provenance))
+        .map(|(index, provenance)| (index, provenance.clone()))
         .collect::<Vec<_>>();
     if matching_current.len() > 1 {
         return Err(
@@ -325,7 +325,8 @@ fn recover_update_existing_route_project(
     }
 
     let mut reconstructed = current;
-    if let Some((index, previous)) = matching_current.first().copied() {
+    if let Some((index, previous)) = matching_current.first() {
+        let index = *index;
         let previous_policy = batch_recipe_policy_sha256(&previous.recipe)?;
         if !previous_policy.eq_ignore_ascii_case(route_policy_sha256.trim()) {
             return Err(

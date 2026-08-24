@@ -16,7 +16,8 @@ use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 use super::conversion_plan::{
     ConversionFaceInspection, ConversionTargetState, UnifiedDestinationMode,
     build_conversion_recipe, build_unified_plan, conversion_color_model, default_output_folder,
-    inspect_conversion_face, production_candidates, scope_indices,
+    inspect_conversion_face, production_candidates, production_routes, restore_target_from_route,
+    scope_indices,
 };
 
 const CONVERSION_WINDOW_ID: &str = "shade-editor-color-conversion-open";
@@ -36,6 +37,7 @@ pub(crate) struct ColorConversionUiState {
     pub(crate) output_folder: Option<PathBuf>,
     pub(crate) destination_mode: UnifiedDestinationMode,
     pub(crate) selected_existing: Option<PathBuf>,
+    pub(crate) allow_production_work_discard: bool,
 }
 
 impl Default for ColorConversionUiState {
@@ -54,6 +56,7 @@ impl Default for ColorConversionUiState {
             output_folder: None,
             destination_mode: UnifiedDestinationMode::CreateNew,
             selected_existing: None,
+            allow_production_work_discard: false,
         }
     }
 }
@@ -133,6 +136,30 @@ impl ShadeApp {
             })
             .collect::<Vec<_>>();
         let candidates = production_candidates(self);
+        let routes = production_routes(self);
+        if state.destination_mode == UnifiedDestinationMode::AppendExisting
+            && state.selected_existing.is_none()
+        {
+            if let (Some(folder), Ok(recipe)) = (
+                state.output_folder.as_deref(),
+                build_conversion_recipe(&state.target, &current_inspection, current_policy.copied()),
+            ) {
+                let matching = routes
+                    .iter()
+                    .filter(|route| {
+                        route.matches_recipe_policy(&recipe).unwrap_or(false)
+                            && route
+                                .output_folder()
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(&folder.to_string_lossy())
+                    })
+                    .take(2)
+                    .collect::<Vec<_>>();
+                if let [route] = matching.as_slice() {
+                    state.selected_existing = Some(route.production_project_path());
+                }
+            }
+        }
         let plan_preview = state.output_folder.as_deref().map(|folder| {
             build_unified_plan(
                 self,
@@ -144,6 +171,8 @@ impl ShadeApp {
                 state.destination_mode,
                 state.selected_existing.as_deref(),
                 &candidates,
+                &routes,
+                state.allow_production_work_discard,
             )
         });
 
@@ -156,6 +185,7 @@ impl ShadeApp {
         let mut clear_source_profile: Option<usize> = None;
         let mut force_candidate_refresh = false;
         let mut requested_candidate_visibility: Option<bool> = None;
+        let mut restore_route_requested: Option<PathBuf> = None;
         let mut queue_requested = false;
 
         egui::Window::new("Production Color Conversion")
@@ -503,6 +533,39 @@ impl ShadeApp {
                                     );
                                 });
                                 if state.destination_mode == UnifiedDestinationMode::AppendExisting {
+                                    if let Some(selected_path) = state.selected_existing.as_deref() {
+                                        if let Some(route) = routes.iter().find(|route| {
+                                            route.production_project_path()
+                                                .to_string_lossy()
+                                                .eq_ignore_ascii_case(&selected_path.to_string_lossy())
+                                        }) {
+                                            let missing_outputs = route
+                                                .faces
+                                                .iter()
+                                                .filter(|face| !PathBuf::from(&face.provenance.output_path).exists())
+                                                .count();
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Saved route · {} committed Face(s) · {} missing output(s) · policy {}",
+                                                    route.converted_face_count(),
+                                                    missing_outputs,
+                                                    short_hash(&route.batch_recipe_policy_sha256)
+                                                ))
+                                                .color(if missing_outputs == 0 {
+                                                    egui::Color32::LIGHT_GREEN
+                                                } else {
+                                                    egui::Color32::YELLOW
+                                                }),
+                                            );
+                                            if ui.button("Restore saved route settings").clicked() {
+                                                restore_route_requested = Some(route.production_project_path());
+                                            }
+                                            ui.checkbox(
+                                                &mut state.allow_production_work_discard,
+                                                "Allow same-route replacement when Production-side adjustments/Snapshots require explicit discard confirmation",
+                                            );
+                                        }
+                                    }
                                     for candidate in &candidates {
                                         let selected = state.selected_existing.as_deref()
                                             == Some(candidate.path.as_path());
@@ -522,6 +585,11 @@ impl ShadeApp {
                                             ),
                                         );
                                         if response.clicked() && candidate.can_append() {
+                                            if state.selected_existing.as_deref()
+                                                != Some(candidate.path.as_path())
+                                            {
+                                                state.allow_production_work_discard = false;
+                                            }
                                             state.selected_existing = Some(candidate.path.clone());
                                         }
                                         ui.small(candidate.path.display().to_string());
@@ -665,6 +733,40 @@ impl ShadeApp {
                     });
             });
 
+        if let Some(route_path) = restore_route_requested {
+            if let Some(route) = routes.iter().find(|route| {
+                route
+                    .production_project_path()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&route_path.to_string_lossy())
+            }) {
+                match restore_target_from_route(route, current_inspection.source_model) {
+                    Ok(target) => match self.restore_source_bindings_from_route(route, &mut state) {
+                        Ok(source_changed) => {
+                            state.target = target;
+                            state.output_folder = Some(route.output_folder());
+                            state.destination_mode = UnifiedDestinationMode::AppendExisting;
+                            state.selected_existing = Some(route.production_project_path());
+                            state.allow_production_work_discard = false;
+                            state.clear_profile_catalog();
+                            force_candidate_refresh = true;
+                            if source_changed {
+                                self.report_info(
+                                    "Restored saved conversion route. Source ICC bindings changed; Save the Source project before final conversion."
+                                );
+                            } else {
+                                self.report_info("Restored and reverified saved conversion route settings.");
+                            }
+                        }
+                        Err(error) => self.report_error(error),
+                    },
+                    Err(error) => self.report_error(format!(
+                        "Saved conversion route requires repair before restore: {error}"
+                    )),
+                }
+            }
+        }
+
         if refresh_profile_catalog {
             state.clear_profile_catalog();
             ensure_installed_profile_catalog(&mut state, &current_inspection);
@@ -782,6 +884,8 @@ impl ShadeApp {
                         state.destination_mode,
                         state.selected_existing.as_deref(),
                         &candidates,
+                        &routes,
+                        state.allow_production_work_discard,
                     )
                 });
             match result {
@@ -795,6 +899,86 @@ impl ShadeApp {
                 Err(errors) => self.report_error(errors.join(" ")),
             }
         }
+    }
+
+    fn restore_source_bindings_from_route(
+        &mut self,
+        route: &windows_shade_editor::model::ConversionRouteRecord,
+        state: &mut ColorConversionUiState,
+    ) -> Result<bool, String> {
+        let mut desired = Vec::new();
+        for (index, runtime) in self.faces.iter().enumerate() {
+            let Some(route_face) = route.face_for_source(&runtime.path) else {
+                continue;
+            };
+            let source_model = runtime.preview.color_model();
+            let desired_assignment = if let Some(recorded_path) = route_face.source_profile_path.as_deref() {
+                let path = PathBuf::from(recorded_path);
+                let verified = IccProfileRegistry.verify_identity(
+                    &path,
+                    &route_face.provenance.recipe.source_profile_identity,
+                )?;
+                if !verified.compatible_with_source_model(conversion_color_model(source_model)) {
+                    return Err(format!(
+                        "Saved Source ICC '{}' no longer matches {} source data for Face {}.",
+                        verified.description,
+                        source_model.title(),
+                        index + 1
+                    ));
+                }
+                Some(model::ProductionSourceProfileAssignment {
+                    path: path.to_string_lossy().into_owned(),
+                    identity: model::IccProfileIdentity {
+                        description: verified.identity.description,
+                        sha256: verified.identity.sha256,
+                    },
+                })
+            } else {
+                let descriptor = runtime.preview.source_descriptor().ok_or_else(|| {
+                    format!("Cannot inspect Source ICC state for Face {}.", index + 1)
+                })?;
+                let actual = color_management::production_source_profile_identity_or_rgb_fallback_for_runtime(
+                    source_model,
+                    descriptor.embedded_icc,
+                )?
+                .ok_or_else(|| format!("Saved route requires a Source ICC for Face {}.", index + 1))?;
+                let expected = &route_face.provenance.recipe.source_profile_identity;
+                if !actual.sha256.eq_ignore_ascii_case(expected.sha256.trim()) {
+                    return Err(format!(
+                        "Embedded/fallback Source ICC for Face {} no longer matches the saved route. Relink the original Source ICC before reconversion.",
+                        index + 1
+                    ));
+                }
+                None
+            };
+            desired.push((
+                index,
+                desired_assignment,
+                route_face.provenance.recipe.source_transparency_policy,
+            ));
+        }
+
+        let mut changed = false;
+        for (index, assignment, transparency) in desired {
+            if let Some(face) = self.project.faces.get_mut(index) {
+                if face.production_source_profile != assignment {
+                    face.production_source_profile = assignment;
+                    changed = true;
+                }
+            }
+            match transparency {
+                Some(policy) => {
+                    state.transparency_policies.insert(index, policy);
+                }
+                None => {
+                    state.transparency_policies.remove(&index);
+                }
+            }
+        }
+        if changed {
+            self.mark_project_dirty();
+        }
+        Ok(changed)
     }
 
     fn assign_production_source_profile(&mut self, index: usize, path: PathBuf) {

@@ -14,7 +14,7 @@ use windows_shade_editor::conversion_preflight::{
     ConversionPreflightReport, SourceProfileState,
     build_conversion_preflight_for_source_with_policy,
 };
-use windows_shade_editor::conversion_transaction::CapturedSourceProfile;
+use windows_shade_editor::conversion_transaction::{CapturedOutputPolicy, CapturedSourceProfile};
 use windows_shade_editor::conversion_workflow::{
     ConversionSourceState, conversion_save_gate,
 };
@@ -22,7 +22,9 @@ use windows_shade_editor::design_source::{
     DesignSourceColorModel, SourceImageFormat, TransparencyState,
 };
 use windows_shade_editor::icc_profile_registry::IccProfileRegistry;
-use windows_shade_editor::model::IccProfileIdentity as ConversionIccProfileIdentity;
+use windows_shade_editor::model::{
+    ConversionRouteRecord, IccProfileIdentity as ConversionIccProfileIdentity,
+};
 use windows_shade_editor::production_destination::{
     ProductionDestinationCandidate, inspect_linked_production_destinations,
 };
@@ -115,6 +117,7 @@ impl ConversionFaceInspection {
 pub(crate) struct UnifiedConversionPlan {
     pub(crate) production_project_path: PathBuf,
     pub(crate) disposition: ProductionProjectDisposition,
+    pub(crate) output_policy: CapturedOutputPolicy,
     pub(crate) output_paths: Vec<PathBuf>,
     pub(crate) recipes: Vec<ConversionRecipe>,
 }
@@ -402,6 +405,8 @@ pub(crate) fn build_unified_plan(
     destination_mode: UnifiedDestinationMode,
     selected_existing: Option<&Path>,
     candidates: &[ProductionDestinationCandidate],
+    routes: &[ConversionRouteRecord],
+    allow_production_work_discard: bool,
 ) -> Result<UnifiedConversionPlan, Vec<String>> {
     let mut errors = Vec::new();
     if inspections.is_empty() {
@@ -436,45 +441,116 @@ pub(crate) fn build_unified_plan(
         return Err(errors);
     }
 
-    let output_paths = match deterministic_output_paths(app, output_folder, inspections) {
+    let destination: Result<(
+        PathBuf,
+        ProductionProjectDisposition,
+        CapturedOutputPolicy,
+        Option<&ConversionRouteRecord>,
+    ), String> = match destination_mode {
+        UnifiedDestinationMode::CreateNew => {
+            let project_path = deterministic_production_project_path(
+                output_folder,
+                &app.project.name,
+                &target.target_name,
+            );
+            if project_path.exists() {
+                Err(format!(
+                    "Production project already exists: {}. Select its saved route or choose a new destination; Shade Editor will not infer overwrite ownership.",
+                    project_path.display()
+                ))
+            } else {
+                FrozenProductionDestination::create_new(project_path).map(|frozen| {
+                    (
+                        frozen.production_project_path,
+                        frozen.disposition,
+                        CapturedOutputPolicy::MustNotExist,
+                        None,
+                    )
+                })
+            }
+        }
+        UnifiedDestinationMode::AppendExisting => selected_existing
+            .and_then(|path| candidates.iter().find(|candidate| paths_match(&candidate.path, path)))
+            .ok_or_else(|| "Select a compatible linked Production project.".to_owned())
+            .and_then(|candidate| {
+                let route = routes.iter().find(|route| {
+                    paths_match(
+                        Path::new(&route.production_project_path),
+                        &candidate.path,
+                    )
+                });
+                if let Some(route) = route {
+                    route.validate()?;
+                    if !route.matches_recipe_policy(&recipes[0])? {
+                        return Err(
+                            "Current conversion settings differ from the selected saved route. Restore the saved route settings or create a new Production route; route mutation is never implicit."
+                                .to_owned(),
+                        );
+                    }
+                    if !paths_match(&route.output_folder(), output_folder) {
+                        return Err(format!(
+                            "Selected route owns destination folder {}. Restore the route destination instead of redirecting an existing route.",
+                            route.output_folder().display()
+                        ));
+                    }
+                    let compatibility = candidate.compatibility.as_ref().ok_or_else(|| {
+                        "Selected Production route has no validated compatibility identity."
+                            .to_owned()
+                    })?;
+                    let project_sha = candidate.project_sha256.as_ref().ok_or_else(|| {
+                        "Selected Production route has no stable project SHA-256."
+                            .to_owned()
+                    })?;
+                    let disposition = ProductionProjectDisposition::update_existing_route(
+                        project_sha.clone(),
+                        compatibility,
+                        route.batch_recipe_policy_sha256.clone(),
+                        allow_production_work_discard,
+                    )?;
+                    Ok((
+                        candidate.path.clone(),
+                        disposition,
+                        CapturedOutputPolicy::TransactionalReplace,
+                        Some(route),
+                    ))
+                } else {
+                    FrozenProductionDestination::append_existing(candidate, &recipes[0]).map(
+                        |frozen| {
+                            (
+                                frozen.production_project_path,
+                                frozen.disposition,
+                                CapturedOutputPolicy::MustNotExist,
+                                None,
+                            )
+                        },
+                    )
+                }
+            }),
+    };
+    let (production_project_path, disposition, output_policy, route) = match destination {
+        Ok(destination) => destination,
+        Err(error) => {
+            errors.push(error);
+            return Err(errors);
+        }
+    };
+
+    let output_paths = match deterministic_output_paths(app, output_folder, inspections, &recipes, route) {
         Ok(paths) => paths,
         Err(error) => {
             errors.push(error);
             Vec::new()
         }
     };
-
-    let frozen = match destination_mode {
-        UnifiedDestinationMode::CreateNew => {
-            FrozenProductionDestination::create_new(deterministic_production_project_path(
-                output_folder,
-                &app.project.name,
-                &target.target_name,
-            ))
-        }
-        UnifiedDestinationMode::AppendExisting => selected_existing
-            .and_then(|path| candidates.iter().find(|candidate| candidate.path == path))
-            .ok_or_else(|| "Select a compatible linked Production project.".to_owned())
-            .and_then(|candidate| {
-                FrozenProductionDestination::append_existing(candidate, &recipes[0])
-            }),
-    };
-    let frozen = match frozen {
-        Ok(frozen) => Some(frozen),
-        Err(error) => {
-            errors.push(error);
-            None
-        }
-    };
-
     if !errors.is_empty() {
         return Err(errors);
     }
-    let frozen = frozen.expect("frozen destination exists when plan validation passes");
+
     let _ = scope;
     Ok(UnifiedConversionPlan {
-        production_project_path: frozen.production_project_path,
-        disposition: frozen.disposition,
+        production_project_path,
+        disposition,
+        output_policy,
         output_paths,
         recipes,
     })
@@ -484,10 +560,12 @@ fn deterministic_output_paths(
     app: &ShadeApp,
     folder: &Path,
     inspections: &[ConversionFaceInspection],
+    recipes: &[ConversionRecipe],
+    route: Option<&ConversionRouteRecord>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut reserved = BTreeSet::new();
     let mut output_paths = Vec::with_capacity(inspections.len());
-    for inspection in inspections {
+    for (inspection, recipe) in inspections.iter().zip(recipes) {
         let duplicate_stem = source_stem_occurrences(app, &inspection.source_path) > 1;
         let filename = deterministic_converted_filename(
             &inspection.source_path,
@@ -504,9 +582,27 @@ fn deterministic_output_paths(
                 output.display()
             ));
         }
-        if output.exists() {
+
+        let owned = route.and_then(|route| route.face_for_source(&inspection.source_path));
+        if let Some(owned) = owned {
+            if owned.provenance.recipe != *recipe {
+                return Err(format!(
+                    "Source Face '{}' no longer matches its saved route recipe (Source ICC/transparency or conversion settings changed). Restore the saved route or create a new route.",
+                    inspection.label
+                ));
+            }
+            if !paths_match(Path::new(&owned.provenance.output_path), &output) {
+                return Err(format!(
+                    "Saved route maps Source Face '{}' to {}, not {}. Route output mapping cannot drift implicitly.",
+                    inspection.label,
+                    owned.provenance.output_path,
+                    output.display()
+                ));
+            }
+        }
+        if output.exists() && owned.is_none() {
             return Err(format!(
-                "Deterministic output already exists: {}. Route-owned transactional replacement is handled by conversion-route safety (#373); Shade Editor will not create a versioned duplicate.",
+                "Deterministic output already exists but is not owned by this Source Face + saved conversion route: {}. Different-route collisions fail closed.",
                 output.display()
             ));
         }
@@ -578,6 +674,93 @@ pub(crate) fn production_candidates(app: &ShadeApp) -> Vec<ProductionDestination
     inspect_linked_production_destinations(&source_project, source_project_path)
 }
 
+pub(crate) fn restore_target_from_route(
+    route: &ConversionRouteRecord,
+    source_model: RuntimeColorModel,
+) -> Result<ConversionTargetState, String> {
+    route.validate()?;
+    let recipe = route
+        .baseline_recipe()
+        .ok_or_else(|| "Saved conversion route has no baseline recipe.".to_owned())?;
+    let (path, expected_identity) = match recipe.engine_mode {
+        ConversionEngineMode::Icc => (
+            recipe
+                .target
+                .output_profile_path
+                .as_deref()
+                .ok_or_else(|| "Saved ICC route has no target profile path.".to_owned())?,
+            recipe
+                .target
+                .output_profile_identity
+                .as_ref()
+                .ok_or_else(|| "Saved ICC route has no target profile identity.".to_owned())?,
+        ),
+        ConversionEngineMode::DeviceLink => (
+            recipe
+                .target
+                .device_link_path
+                .as_deref()
+                .ok_or_else(|| "Saved DeviceLink route has no profile path.".to_owned())?,
+            recipe
+                .target
+                .device_link_identity
+                .as_ref()
+                .ok_or_else(|| "Saved DeviceLink route has no profile identity.".to_owned())?,
+        ),
+        ConversionEngineMode::CustomOptimizer => {
+            return Err(
+                "Saved Custom Optimizer route restore is not enabled in the unified ICC/DeviceLink UI."
+                    .to_owned(),
+            );
+        }
+    };
+    let verified = verify_production_target_profile(
+        Path::new(path),
+        expected_identity,
+        recipe.engine_mode,
+        conversion_color_model(source_model),
+    )?;
+    if verified.output_channel_count != recipe.target.channels.len() {
+        return Err(
+            "Saved route target topology no longer matches the verified external profile."
+                .to_owned(),
+        );
+    }
+    let channel_names = recipe
+        .target
+        .channels
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect::<Vec<_>>();
+    validate_target_channel_names(&channel_names, verified.output_channel_count)?;
+    Ok(ConversionTargetState {
+        engine_mode: recipe.engine_mode,
+        target_profile: Some(verified),
+        target_name: recipe.target.name.clone(),
+        channel_names,
+        channel_names_confirmed: true,
+        output_bit_depth: recipe.target.bit_depth,
+        rendering_intent: recipe.rendering_intent,
+        black_point_compensation: recipe.black_point_compensation,
+    })
+}
+
+pub(crate) fn production_routes(app: &ShadeApp) -> Vec<ConversionRouteRecord> {
+    let Ok(value) = serde_json::to_value(&app.project) else {
+        return Vec::new();
+    };
+    let Ok(source_project) =
+        serde_json::from_value::<windows_shade_editor::model::ShadeProject>(value)
+    else {
+        return Vec::new();
+    };
+    source_project
+        .conversion_routes
+        .into_iter()
+        .filter(|route| route.validate().is_ok())
+        .collect()
+}
+
 pub(crate) fn default_output_folder(app: &ShadeApp) -> Option<PathBuf> {
     app.project_path
         .as_deref()
@@ -609,6 +792,10 @@ fn path_key(path: &Path) -> String {
     path.to_string_lossy()
         .replace('/', "\\")
         .to_ascii_lowercase()
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    path_key(left) == path_key(right)
 }
 
 pub(crate) fn target_channel_rgb(name: &str, index: usize) -> [u8; 3] {

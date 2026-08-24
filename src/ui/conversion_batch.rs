@@ -218,7 +218,7 @@ impl ShadeApp {
                 source_file_sha256,
                 inspection.captured_profile.clone(),
                 recipe.clone(),
-                CapturedOutputPolicy::MustNotExist,
+                plan.output_policy,
                 output_path.clone(),
                 plan.production_project_path.clone(),
                 production_project_name.clone(),
