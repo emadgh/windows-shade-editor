@@ -9,9 +9,7 @@ use windows_shade_editor::conversion_batch_queue::{
     ConversionBatchQueue, ConversionBatchQueueCompletion, ConversionBatchQueueCompletionResult,
     ConversionBatchQueueItem, ConversionBatchQueueStatus,
 };
-use windows_shade_editor::conversion_transaction::{
-    CapturedOutputPolicy, ConversionJobCapture,
-};
+use windows_shade_editor::conversion_transaction::ConversionJobCapture;
 
 use super::conversion_plan::{ConversionFaceInspection, UnifiedConversionPlan};
 
@@ -348,7 +346,7 @@ impl ShadeApp {
                         .project_path
                         .as_deref()
                         .expect("current Source path was verified above");
-                    match production_project::sync_source_project_to_production_route(
+                    match sync_open_source_project_to_production_route(
                         &mut self.project,
                         source_project_path,
                         &completed.production_project_path,
@@ -403,6 +401,34 @@ impl ShadeApp {
             }
         }
     }
+}
+
+fn sync_open_source_project_to_production_route(
+    source: &mut model::ShadeProject,
+    source_project_path: &Path,
+    production_project_path: &Path,
+    production_project: &windows_shade_editor::model::ShadeProject,
+) -> Result<(), String> {
+    let value = serde_json::to_value(&*source)
+        .map_err(|error| format!("Cannot bridge open Source project for route persistence: {error}"))?;
+    let mut shared_source = serde_json::from_value::<windows_shade_editor::model::ShadeProject>(value)
+        .map_err(|error| format!("Cannot decode open Source project for route persistence: {error}"))?;
+    let route = windows_shade_editor::conversion_route::build_conversion_route_record(
+        &shared_source,
+        source_project_path,
+        production_project,
+        production_project_path,
+    )?;
+    windows_shade_editor::production_project::link_source_project_to_production(
+        &mut shared_source,
+        production_project_path,
+    )?;
+    windows_shade_editor::conversion_route::upsert_conversion_route(&mut shared_source, route)?;
+    let value = serde_json::to_value(shared_source)
+        .map_err(|error| format!("Cannot serialize persisted Source conversion route: {error}"))?;
+    *source = serde_json::from_value::<model::ShadeProject>(value)
+        .map_err(|error| format!("Cannot restore open Source project after route persistence: {error}"))?;
+    Ok(())
 }
 
 fn render_batch_queue(

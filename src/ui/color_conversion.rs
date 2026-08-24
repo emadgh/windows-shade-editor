@@ -119,8 +119,9 @@ impl ShadeApp {
             self.project.faces.len(),
         );
 
-        let current_policy = state.transparency_policies.get(&self.current_face);
-        let current_inspection = inspect_conversion_face(self, self.current_face, current_policy);
+        let current_policy = state.transparency_policies.get(&self.current_face).copied();
+        let current_inspection =
+            inspect_conversion_face(self, self.current_face, current_policy.as_ref());
         ensure_installed_profile_catalog(&mut state, &current_inspection);
 
         let indices = scope_indices(
@@ -142,7 +143,7 @@ impl ShadeApp {
         {
             if let (Some(folder), Ok(recipe)) = (
                 state.output_folder.as_deref(),
-                build_conversion_recipe(&state.target, &current_inspection, current_policy.copied()),
+                build_conversion_recipe(&state.target, &current_inspection, current_policy),
             ) {
                 let matching = routes
                     .iter()
@@ -939,7 +940,7 @@ impl ShadeApp {
                 })?;
                 let actual = color_management::production_source_profile_identity_or_rgb_fallback_for_runtime(
                     source_model,
-                    descriptor.embedded_icc,
+                    descriptor.embedded_icc.as_deref(),
                 )?
                 .ok_or_else(|| format!("Saved route requires a Source ICC for Face {}.", index + 1))?;
                 let expected = &route_face.provenance.recipe.source_profile_identity;

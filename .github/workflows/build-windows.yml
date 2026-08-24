@@ -1,7 +1,7 @@
 name: Build Shade Editor for Windows
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   pull_request:
@@ -47,28 +47,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Apply issue 373 compile fixes
-        if: github.event_name == 'pull_request' && github.head_ref == 'codex/issue-373-conversion-routes'
-        shell: pwsh
-        run: |
-          git fetch origin "refs/heads/$env:GITHUB_HEAD_REF`:refs/remotes/origin/$env:GITHUB_HEAD_REF" --depth=1
-          git checkout -B $env:GITHUB_HEAD_REF "origin/$env:GITHUB_HEAD_REF"
-          python scripts/issue373_compile_fixes.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          git fetch origin main --depth=1
-          git checkout origin/main -- .github/workflows/build-windows.yml
-          Remove-Item scripts/issue373_compile_fixes.py -ErrorAction SilentlyContinue
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet
-          if ($LASTEXITCODE -eq 0) { exit 0 }
-          git commit -m "Fix route persistence binary/library boundary"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git push origin "HEAD:$env:GITHUB_HEAD_REF"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
