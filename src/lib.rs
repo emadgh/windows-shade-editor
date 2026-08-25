@@ -98,6 +98,7 @@ pub mod source_transparency;
 pub mod staging;
 pub mod test_stack;
 pub mod tiff_output;
+pub mod tiff_performance;
 #[path = "tiff_io.rs"]
 pub mod tiff_io;
 
