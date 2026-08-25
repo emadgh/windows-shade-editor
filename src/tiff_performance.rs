@@ -1,6 +1,12 @@
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const MIB: f64 = 1024.0 * 1024.0;
+
+static PERF_LOG_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TiffPerfPhase {
@@ -134,13 +140,12 @@ impl TiffPerfTrace {
 }
 
 pub fn enabled() -> bool {
-    std::env::var_os("SHADE_TIFF_PERF")
-        .is_some_and(|value| !value.is_empty() && value != "0")
+    env_flag_enabled("SHADE_TIFF_PERF") || std::env::var_os("SHADE_TIFF_PERF_LOG").is_some()
 }
 
 pub fn emit_if_enabled(report: &TiffPerfReport) {
     if enabled() {
-        eprintln!("{}", report.format_text());
+        emit_text(&report.format_text());
     }
 }
 
@@ -163,7 +168,40 @@ pub fn emit_phase_if_enabled(
     };
     let mut line = format!("[tiff-perf] operation={operation}");
     append_sample_text(&mut line, &sample, false);
-    eprintln!("{line}");
+    emit_text(&line);
+}
+
+fn emit_text(text: &str) {
+    if let Some(file) = perf_log_file() {
+        if let Ok(mut file) = file.lock() {
+            for line in text.lines() {
+                let _ = writeln!(file, "{line}");
+            }
+            return;
+        }
+    }
+    eprintln!("{text}");
+}
+
+fn perf_log_file() -> Option<&'static Mutex<File>> {
+    PERF_LOG_FILE
+        .get_or_init(|| {
+            let path = std::env::var_os("SHADE_TIFF_PERF_LOG").map(PathBuf::from)?;
+            if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
+        })
+        .as_ref()
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 fn append_sample_text(output: &mut String, sample: &TiffPerfSample, leading_newline: bool) {
