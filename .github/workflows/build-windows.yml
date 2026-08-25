@@ -39,6 +39,9 @@ jobs:
       - name: Test TIFF performance summarizer
         shell: pwsh
         run: .\scripts\test-summarize-tiff-perf.ps1
+      - name: Test TIFF performance comparison gate
+        shell: pwsh
+        run: .\scripts\test-compare-tiff-perf.ps1
       - name: Check application targets
         run: cargo check --locked --target x86_64-pc-windows-msvc
       - name: Test library
@@ -95,6 +98,9 @@ jobs:
       - name: Test TIFF performance summarizer
         shell: pwsh
         run: .\scripts\test-summarize-tiff-perf.ps1
+      - name: Test TIFF performance comparison gate
+        shell: pwsh
+        run: .\scripts\test-compare-tiff-perf.ps1
       - name: Test
         run: cargo test --locked --target x86_64-pc-windows-msvc
       - name: Build release
