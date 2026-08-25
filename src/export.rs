@@ -31,6 +31,14 @@ impl Default for ExportOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExportCropRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
 pub fn export_face(
     source: &Path,
     destination: &Path,
@@ -468,6 +476,210 @@ pub(crate) fn adjusted_strip(
         }
     }
     output
+}
+
+/// Render only the source crop needed by a Test Stack cell while preserving the
+/// exact normal Export adjustment and Test Code semantics. Streamable sources
+/// decode regions/strips and only adjust the intersection with `crop`; legacy
+/// non-streamable TIFFs retain a decode fallback but never create an intermediate
+/// exported TIFF.
+pub(crate) fn render_adjusted_crop_u16<F>(
+    source: &Path,
+    stream: &StreamInfo,
+    project: &ShadeProject,
+    default_dpi: f64,
+    crop: ExportCropRect,
+    mut progress: F,
+) -> Result<Vec<u16>, String>
+where
+    F: FnMut(f32, &str),
+{
+    let metadata = &stream.metadata;
+    if !matches!(metadata.color_model, ColorModel::Rgb | ColorModel::Cmyk | ColorModel::Gray) {
+        return Err(format!(
+            "Crop rendering supports RGB, CMYK and Gray TIFF; this file is {}.",
+            metadata.color_model.title()
+        ));
+    }
+    if !matches!(metadata.bit_depth, 8 | 16) {
+        return Err(format!(
+            "Crop rendering supports 8/16-bit TIFF; this source is {}-bit.",
+            metadata.bit_depth
+        ));
+    }
+    let channels = metadata.samples_per_pixel;
+    if channels == 0 || channels < metadata.base_channel_count {
+        return Err("Invalid TIFF channel layout for crop rendering.".to_owned());
+    }
+    let image_width = metadata.width as usize;
+    let image_height = metadata.height as usize;
+    let crop_x1 = crop
+        .x
+        .checked_add(crop.width)
+        .ok_or_else(|| "Crop x range overflow.".to_owned())?;
+    let crop_y1 = crop
+        .y
+        .checked_add(crop.height)
+        .ok_or_else(|| "Crop y range overflow.".to_owned())?;
+    if crop.width == 0
+        || crop.height == 0
+        || crop_x1 > image_width
+        || crop_y1 > image_height
+    {
+        return Err(format!(
+            "Crop ({}, {}, {}, {}) exceeds source {}×{}.",
+            crop.x, crop.y, crop.width, crop.height, image_width, image_height
+        ));
+    }
+    let crop_pixels = crop
+        .width
+        .checked_mul(crop.height)
+        .ok_or_else(|| "Crop pixel count overflow.".to_owned())?;
+    let crop_samples = crop_pixels
+        .checked_mul(channels)
+        .ok_or_else(|| "Crop sample count overflow.".to_owned())?;
+    let dpi_info = dpi::read_dpi(source, default_dpi);
+    let overlay = build_project_test_code_overlay(
+        image_width,
+        image_height,
+        metadata,
+        project,
+        dpi_info,
+    )?;
+
+    if !stream.streamable {
+        progress(0.0, "Decoding compatibility TIFF crop");
+        let decoded = decode_full(source)?;
+        if decoded.metadata.width != metadata.width
+            || decoded.metadata.height != metadata.height
+            || decoded.metadata.samples_per_pixel != channels
+        {
+            return Err("Decoded TIFF topology changed during crop rendering.".to_owned());
+        }
+        let mut raw = Vec::with_capacity(crop_samples);
+        for local_y in 0..crop.height {
+            let start = ((crop.y + local_y) * image_width + crop.x)
+                .checked_mul(channels)
+                .ok_or_else(|| "Decoded crop source offset overflow.".to_owned())?;
+            let row_samples = crop
+                .width
+                .checked_mul(channels)
+                .ok_or_else(|| "Decoded crop row sample overflow.".to_owned())?;
+            let end = start
+                .checked_add(row_samples)
+                .ok_or_else(|| "Decoded crop source end overflow.".to_owned())?;
+            raw.extend_from_slice(
+                decoded
+                    .samples
+                    .get(start..end)
+                    .ok_or_else(|| "Decoded TIFF crop is outside the sample buffer.".to_owned())?,
+            );
+        }
+        let mut adjusted = adjusted_strip(&raw, metadata, project);
+        if let Some(overlay) = overlay.as_ref() {
+            apply_text_overlay_to_region(
+                &mut adjusted,
+                crop.x,
+                crop.y,
+                crop.width,
+                crop.height,
+                channels,
+                overlay,
+            );
+        }
+        progress(1.0, "Rendered Snapshot crop");
+        return Ok(adjusted);
+    }
+
+    let mut output = vec![0u16; crop_samples];
+    let mut covered_pixels = 0usize;
+    for_each_decoded_region(source, stream, |region_x, region_y, region_width, region_height, input| {
+        let rx0 = region_x as usize;
+        let ry0 = region_y as usize;
+        let rw = region_width as usize;
+        let rh = region_height as usize;
+        let rx1 = rx0
+            .checked_add(rw)
+            .ok_or_else(|| "Decoded region x range overflow.".to_owned())?;
+        let ry1 = ry0
+            .checked_add(rh)
+            .ok_or_else(|| "Decoded region y range overflow.".to_owned())?;
+        let ix0 = rx0.max(crop.x);
+        let iy0 = ry0.max(crop.y);
+        let ix1 = rx1.min(crop_x1);
+        let iy1 = ry1.min(crop_y1);
+        if ix0 >= ix1 || iy0 >= iy1 {
+            return Ok(());
+        }
+        let iw = ix1 - ix0;
+        let ih = iy1 - iy0;
+        let intersection_samples = iw
+            .checked_mul(ih)
+            .and_then(|pixels| pixels.checked_mul(channels))
+            .ok_or_else(|| "Crop intersection sample count overflow.".to_owned())?;
+        let mut raw = Vec::with_capacity(intersection_samples);
+        let row_samples = iw
+            .checked_mul(channels)
+            .ok_or_else(|| "Crop intersection row sample overflow.".to_owned())?;
+        for local_y in 0..ih {
+            let region_local_y = iy0 - ry0 + local_y;
+            let region_local_x = ix0 - rx0;
+            let start = (region_local_y * rw + region_local_x)
+                .checked_mul(channels)
+                .ok_or_else(|| "Crop intersection source offset overflow.".to_owned())?;
+            let end = start
+                .checked_add(row_samples)
+                .ok_or_else(|| "Crop intersection source end overflow.".to_owned())?;
+            raw.extend_from_slice(
+                input
+                    .get(start..end)
+                    .ok_or_else(|| "Decoded region does not contain crop intersection.".to_owned())?,
+            );
+        }
+        let mut adjusted = adjusted_strip(&raw, metadata, project);
+        if adjusted.len() != intersection_samples {
+            return Err("Adjusted crop intersection sample count mismatch.".to_owned());
+        }
+        if let Some(overlay) = overlay.as_ref() {
+            apply_text_overlay_to_region(
+                &mut adjusted,
+                ix0,
+                iy0,
+                iw,
+                ih,
+                channels,
+                overlay,
+            );
+        }
+        for local_y in 0..ih {
+            let source_start = local_y * row_samples;
+            let destination_x = ix0 - crop.x;
+            let destination_y = iy0 - crop.y + local_y;
+            let destination_start = (destination_y * crop.width + destination_x)
+                .checked_mul(channels)
+                .ok_or_else(|| "Crop destination offset overflow.".to_owned())?;
+            let destination_end = destination_start
+                .checked_add(row_samples)
+                .ok_or_else(|| "Crop destination end overflow.".to_owned())?;
+            output[destination_start..destination_end]
+                .copy_from_slice(&adjusted[source_start..source_start + row_samples]);
+        }
+        covered_pixels = covered_pixels
+            .checked_add(iw.saturating_mul(ih))
+            .ok_or_else(|| "Crop coverage counter overflow.".to_owned())?;
+        progress(
+            (covered_pixels as f32 / crop_pixels.max(1) as f32).min(1.0),
+            "Rendering Snapshot crop",
+        );
+        Ok(())
+    })?;
+    if covered_pixels != crop_pixels {
+        return Err(format!(
+            "Decoded regions covered {covered_pixels} crop pixels; expected {crop_pixels}."
+        ));
+    }
+    progress(1.0, "Rendered Snapshot crop");
+    Ok(output)
 }
 
 #[inline]
