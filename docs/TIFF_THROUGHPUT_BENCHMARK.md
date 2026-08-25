@@ -32,12 +32,32 @@ At minimum use:
 
 For each fixture record dimensions, bit depth, samples/channel count, source compression, rows-per-strip/tile layout, ICC presence, Spot/N-channel topology, orientation, physical resolution and source file SHA-256.
 
+## Capturing phase logs from the Windows release build
+
+Shade Editor is a Windows GUI-subsystem executable, so benchmark evidence must not rely on an attached console. Set `SHADE_TIFF_PERF_LOG` to an explicit file before starting the release executable. Supplying the log path also enables instrumentation; `SHADE_TIFF_PERF=1` remains useful for development stderr output when no log file is configured.
+
+```powershell
+$log = Join-Path $PWD 'tiff-perf-release.log'
+Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+$env:SHADE_TIFF_PERF_LOG = $log
+.\target\release\ShadeEditor.exe
+```
+
+Run the required GUI operation(s), close the application after the measured set, and summarize the collected phase records with:
+
+```powershell
+.\scripts\summarize-tiff-perf.ps1 -Path $log
+.\scripts\summarize-tiff-perf.ps1 -Path $log -CsvPath .\tiff-perf-release-summary.csv
+```
+
+The summarizer reports count, median phase time, p95 phase time and median MiB/s for every measured operation/phase. Keep the raw log with the benchmark record; the CSV is a convenience summary, not a replacement for raw evidence.
+
 ## Run protocol
 
 1. Build the exact commit in `--release` mode.
-2. Enable timing output with `SHADE_TIFF_PERF=1`.
+2. Set `SHADE_TIFF_PERF_LOG` to a new/empty log file for that build/profile.
 3. Close unrelated heavy disk/CPU workloads.
-4. Run one warm-up operation; do not include it in the median.
+4. Run one warm-up operation; do not include it in the median. Use a separate warm-up log or clear the log after warm-up.
 5. Run the same operation at least five measured times.
 6. Record every phase line and total wall time.
 7. Report median and p95 total time plus median effective MiB/s.
@@ -83,9 +103,18 @@ Record one row per measured run before calculating summary statistics.
 
 Compare the current production profile against `opt-level = 3` on the same fixtures. Record executable size as a secondary metric; raster throughput is the primary metric for the workstation application.
 
+The branch provides an independent throughput profile so this comparison does not change the normal release build before evidence exists:
+
+```powershell
+cargo build --release
+cargo build --profile release-throughput
+```
+
+Use a separate `SHADE_TIFF_PERF_LOG` file for each profile and compare the two summaries. Do not combine their samples into one log summary.
+
 ### Buffering
 
-Compare the current default `BufWriter` capacity against measured larger capacities. Do not merge a larger buffer solely because it appears intuitively better.
+Compare the historical default `BufWriter` capacity against measured larger capacities. The current #374 branch includes a 1 MiB shared TIFF encoder buffer as an experiment; retain it only if real fixture measurements show benefit without a compatibility regression.
 
 ### Compression/backend
 
