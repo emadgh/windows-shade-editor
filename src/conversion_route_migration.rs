@@ -502,10 +502,11 @@ mod tests {
             'p',
             'a',
         );
+        let first_output_path = first.output_path.clone();
         let mut project = build_production_project(ProductionProjectSpec {
             project_name: "Production",
             source_project_path: Path::new(r"C:\Design\Source.shade"),
-            output_tiff_path: Path::new(&first.output_path),
+            output_tiff_path: Path::new(&first_output_path),
             output_face_label: "Face 1",
             provenance: first,
         })
