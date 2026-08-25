@@ -19,6 +19,7 @@ pub mod conversion_recovery;
 pub mod conversion_route;
 pub mod conversion_route_migration;
 pub mod conversion_route_migration_checkpoint;
+pub mod conversion_route_migration_discovery;
 pub mod conversion_route_migration_executor;
 pub mod conversion_route_migration_project;
 pub mod conversion_tiff;
