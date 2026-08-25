@@ -11,22 +11,59 @@ if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     throw "TIFF performance log not found: $Path"
 }
 
-$records = foreach ($line in Get-Content -LiteralPath $Path) {
-    if ($line -notmatch '^\[tiff-perf\] operation=(?<operation>\S+).*?\[tiff-perf\] phase=(?<phase>\S+) ms=(?<ms>[0-9.]+)(?: bytes=(?<bytes>[0-9]+))?(?: mib_s=(?<mibs>[0-9.]+))?') {
-        continue
-    }
+function New-PerfRecord {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Operation,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Phase,
+
+        [Parameter(Mandatory = $true)]
+        [double]$Ms,
+
+        [Nullable[uint64]]$Bytes,
+        [Nullable[double]]$MiBPerSec
+    )
 
     [pscustomobject]@{
-        Operation = $Matches.operation
-        Phase     = $Matches.phase
-        Ms        = [double]$Matches.ms
-        Bytes     = if ($Matches.bytes) { [uint64]$Matches.bytes } else { $null }
-        MiBPerSec = if ($Matches.mibs) { [double]$Matches.mibs } else { $null }
+        Operation = $Operation
+        Phase     = $Phase
+        Ms        = $Ms
+        Bytes     = $Bytes
+        MiBPerSec = $MiBPerSec
     }
 }
 
-if (-not $records) {
-    throw "No phase records were found in $Path. Set SHADE_TIFF_PERF_LOG before running Shade Editor."
+$records = [System.Collections.Generic.List[object]]::new()
+$currentOperation = $null
+
+foreach ($line in Get-Content -LiteralPath $Path) {
+    if ($line -match '^\[tiff-perf\] operation=(?<operation>\S+)(?: total_ms=(?<total_ms>[0-9.]+))?') {
+        $currentOperation = $Matches.operation
+        $totalMs = $Matches.total_ms
+
+        if ($totalMs) {
+            $records.Add((New-PerfRecord -Operation $currentOperation -Phase 'total' -Ms ([double]$totalMs)))
+        }
+
+        if ($line -match '\[tiff-perf\] phase=(?<phase>\S+) ms=(?<ms>[0-9.]+)(?: bytes=(?<bytes>[0-9]+))?(?: mib_s=(?<mibs>[0-9.]+))?') {
+            $bytes = if ($Matches.bytes) { [Nullable[uint64]]([uint64]$Matches.bytes) } else { $null }
+            $mibPerSec = if ($Matches.mibs) { [Nullable[double]]([double]$Matches.mibs) } else { $null }
+            $records.Add((New-PerfRecord -Operation $currentOperation -Phase $Matches.phase -Ms ([double]$Matches.ms) -Bytes $bytes -MiBPerSec $mibPerSec))
+        }
+        continue
+    }
+
+    if ($currentOperation -and $line -match '^\[tiff-perf\] phase=(?<phase>\S+) ms=(?<ms>[0-9.]+)(?: bytes=(?<bytes>[0-9]+))?(?: mib_s=(?<mibs>[0-9.]+))?') {
+        $bytes = if ($Matches.bytes) { [Nullable[uint64]]([uint64]$Matches.bytes) } else { $null }
+        $mibPerSec = if ($Matches.mibs) { [Nullable[double]]([double]$Matches.mibs) } else { $null }
+        $records.Add((New-PerfRecord -Operation $currentOperation -Phase $Matches.phase -Ms ([double]$Matches.ms) -Bytes $bytes -MiBPerSec $mibPerSec))
+    }
+}
+
+if (-not $records.Count) {
+    throw "No TIFF performance records were found in $Path. Set SHADE_TIFF_PERF_LOG before running Shade Editor."
 }
 
 function Get-Percentile {
