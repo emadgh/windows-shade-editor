@@ -4,6 +4,7 @@ pub(crate) mod color_conversion;
 pub(crate) mod conversion_batch;
 pub(crate) mod conversion_candidate_preview;
 pub(crate) mod conversion_plan;
+pub(crate) mod conversion_route_migration;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
 pub(crate) mod faces;
@@ -121,15 +122,18 @@ mod tests {
         let main = include_str!("../main.rs");
         let status_bar = include_str!("status_bar.rs");
         let conversion_source = include_str!("color_conversion.rs");
+        let migration_source = include_str!("conversion_route_migration.rs");
         let plan_source = include_str!("conversion_plan.rs");
         let batch_source = include_str!("conversion_batch.rs");
         let candidate_source = include_str!("conversion_candidate_preview.rs");
         let conversion = conversion_source.split("\n#[cfg(test)]").next().unwrap_or(conversion_source);
+        let migration = migration_source.split("\n#[cfg(test)]").next().unwrap_or(migration_source);
         let plan = plan_source.split("\n#[cfg(test)]").next().unwrap_or(plan_source);
         let batch = batch_source.split("\n#[cfg(test)]").next().unwrap_or(batch_source);
         let candidate = candidate_source.split("\n#[cfg(test)]").next().unwrap_or(candidate_source);
 
         assert!(status_bar.contains("ui_color_conversion_window"));
+        assert!(status_bar.contains("ui_conversion_route_migration"));
         assert!(status_bar.contains("poll_conversion_candidate_runtime"));
         assert!(status_bar.contains("poll_conversion_batch_runtime"));
         for removed in [
@@ -154,6 +158,9 @@ mod tests {
         assert!(plan.contains("update_existing_route"));
         assert!(conversion.contains("Restore saved route settings"));
         assert!(conversion.contains("allow_production_work_discard"));
+        assert!(migration.contains("Replace / migrate this existing conversion route"));
+        assert!(migration.contains("Create new conversion route / Production link"));
+        assert!(migration.contains("Resume exact saved migration"));
 
         assert!(batch.contains("ConversionBatchQueue::load_persistent"));
         assert!(batch.contains("ConversionBatchCapture::capture"));
