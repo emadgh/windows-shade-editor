@@ -32,7 +32,10 @@ pub fn complete_route_migration_project(
                 "Route migration is marked complete but the Production project cannot be reopened: {error}"
             )
         })?;
-        validate_saved_migrated_project(journal, &project)?;
+        // Once Complete is durable, old-output backups are cleanup transients rather than recovery
+        // dependencies. A previous cleanup attempt may already have removed some/all backups before
+        // crashing, so validate only the migrated project and canonical final TIFFs here.
+        validate_completed_migrated_project(journal, &project)?;
         cleanup_completed_route_migration_outputs(journal)?;
         return Ok(project);
     }
@@ -242,20 +245,27 @@ fn replacement_provenance(
     })
 }
 
-fn verify_committed_route_outputs(journal: &RouteMigrationRecoveryJournal) -> Result<(), String> {
+fn verify_committed_final_outputs(journal: &RouteMigrationRecoveryJournal) -> Result<(), String> {
     for committed in &journal.checkpoint.committed_outputs {
         let actual_final = sha256_file(&committed.final_path).map_err(|error| {
             format!(
-                "Cannot verify migrated Production TIFF {} before project save: {error}",
+                "Cannot verify migrated Production TIFF {}: {error}",
                 committed.final_path.display()
             )
         })?;
         if !actual_final.eq_ignore_ascii_case(committed.new_sha256.trim()) {
             return Err(format!(
-                "Migrated Production TIFF {} changed before project save.",
+                "Migrated Production TIFF {} no longer matches the committed migration identity.",
                 committed.final_path.display()
             ));
         }
+    }
+    Ok(())
+}
+
+fn verify_committed_route_outputs(journal: &RouteMigrationRecoveryJournal) -> Result<(), String> {
+    verify_committed_final_outputs(journal)?;
+    for committed in &journal.checkpoint.committed_outputs {
         let actual_backup = sha256_file(&committed.backup_path).map_err(|error| {
             format!(
                 "Cannot verify previous-output migration backup {}: {error}",
@@ -398,6 +408,14 @@ fn validate_saved_migrated_project(
 ) -> Result<(), String> {
     validate_expected_new_project(journal, project)?;
     verify_committed_route_outputs(journal)
+}
+
+fn validate_completed_migrated_project(
+    journal: &RouteMigrationRecoveryJournal,
+    project: &ShadeProject,
+) -> Result<(), String> {
+    validate_expected_new_project(journal, project)?;
+    verify_committed_final_outputs(journal)
 }
 
 fn ensure_projects_equivalent_at_path(
