@@ -733,8 +733,10 @@ fn render_adjusted_rgb_source_spool(
     }
     mmap.flush()
         .map_err(|err| format!("Cannot flush RGB conversion source spool: {err}"))?;
-    file.sync_all()
-        .map_err(|err| format!("Cannot sync RGB conversion source spool: {err}"))?;
+    // This is same-process scratch data. The read-only conversion remap only needs completed bytes;
+    // crash durability belongs to the later staged/final TIFF boundary, not this disposable spool.
+    drop(mmap);
+    drop(file);
     Ok(())
 }
 
@@ -918,8 +920,10 @@ fn render_adjusted_tiff_source_spool(
     }
     mmap.flush()
         .map_err(|err| format!("Cannot flush conversion source spool: {err}"))?;
-    file.sync_all()
-        .map_err(|err| format!("Cannot sync conversion source spool: {err}"))?;
+    // The adjusted TIFF source spool is transient and is immediately reopened read-only by this
+    // process. Do not pay durable-file sync cost before the real TIFF output transaction starts.
+    drop(mmap);
+    drop(file);
     Ok(())
 }
 
