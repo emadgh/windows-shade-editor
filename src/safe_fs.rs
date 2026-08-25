@@ -11,7 +11,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 
-use crate::tiff_performance::{self, TiffPerfPhase};
+#[path = "tiff_performance.rs"]
+pub mod tiff_performance;
+use tiff_performance::TiffPerfPhase;
 
 #[path = "staging.rs"]
 pub mod staging;
