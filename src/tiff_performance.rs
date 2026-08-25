@@ -70,17 +70,7 @@ impl TiffPerfReport {
             self.elapsed.as_secs_f64() * 1000.0
         );
         for sample in &self.samples {
-            output.push_str(&format!(
-                "\n[tiff-perf] phase={} ms={:.3}",
-                sample.phase.label(),
-                sample.elapsed.as_secs_f64() * 1000.0
-            ));
-            if let Some(bytes) = sample.logical_bytes {
-                output.push_str(&format!(" bytes={bytes}"));
-            }
-            if let Some(rate) = sample.throughput_mib_per_second() {
-                output.push_str(&format!(" mib_s={rate:.2}"));
-            }
+            append_sample_text(&mut output, sample, true);
         }
         output
     }
@@ -154,6 +144,47 @@ pub fn emit_if_enabled(report: &TiffPerfReport) {
     }
 }
 
+/// Emit one independently measured low-level phase. This is used at shared
+/// filesystem boundaries where there is no operation-owned `TiffPerfTrace`
+/// available, while retaining the same stable phase labels and MiB/s math.
+pub fn emit_phase_if_enabled(
+    operation: &str,
+    phase: TiffPerfPhase,
+    elapsed: Duration,
+    logical_bytes: Option<u64>,
+) {
+    if !enabled() {
+        return;
+    }
+    let sample = TiffPerfSample {
+        phase,
+        elapsed,
+        logical_bytes,
+    };
+    let mut line = format!("[tiff-perf] operation={operation}");
+    append_sample_text(&mut line, &sample, false);
+    eprintln!("{line}");
+}
+
+fn append_sample_text(output: &mut String, sample: &TiffPerfSample, leading_newline: bool) {
+    if leading_newline {
+        output.push('\n');
+    } else {
+        output.push(' ');
+    }
+    output.push_str(&format!(
+        "[tiff-perf] phase={} ms={:.3}",
+        sample.phase.label(),
+        sample.elapsed.as_secs_f64() * 1000.0
+    ));
+    if let Some(bytes) = sample.logical_bytes {
+        output.push_str(&format!(" bytes={bytes}"));
+    }
+    if let Some(rate) = sample.throughput_mib_per_second() {
+        output.push_str(&format!(" mib_s={rate:.2}"));
+    }
+}
+
 pub fn throughput_mib_per_second(bytes: u64, elapsed: Duration) -> Option<f64> {
     let seconds = elapsed.as_secs_f64();
     if bytes == 0 || seconds <= 0.0 || !seconds.is_finite() {
@@ -174,10 +205,7 @@ mod tests {
 
     #[test]
     fn zero_duration_or_zero_bytes_has_no_rate() {
-        assert_eq!(
-            throughput_mib_per_second(1024, Duration::ZERO),
-            None
-        );
+        assert_eq!(throughput_mib_per_second(1024, Duration::ZERO), None);
         assert_eq!(
             throughput_mib_per_second(0, Duration::from_secs(1)),
             None
@@ -209,6 +237,19 @@ mod tests {
         let text = trace.finish().format_text();
         assert!(text.contains("operation=export"));
         assert!(text.contains("phase=source_spool_write"));
+        assert!(text.contains("bytes=1048576"));
+    }
+
+    #[test]
+    fn single_phase_format_uses_same_stable_label() {
+        let sample = TiffPerfSample {
+            phase: TiffPerfPhase::FinalDurability,
+            elapsed: Duration::from_millis(10),
+            logical_bytes: Some(1024 * 1024),
+        };
+        let mut text = String::new();
+        append_sample_text(&mut text, &sample, false);
+        assert!(text.contains("phase=final_durability"));
         assert!(text.contains("bytes=1048576"));
     }
 }
