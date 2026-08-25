@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
+use std::time::Instant;
 
 use tiff::encoder::{colortype, Compression, Predictor, TiffEncoder};
 use tiff::tags::{ExtraSamples, Tag};
@@ -8,6 +9,7 @@ use tiff::tags::{ExtraSamples, Tag};
 use crate::dpi::{self, DpiInfo};
 use crate::tiff_io::{ColorModel, TiffMetadata};
 use crate::tiff_output::{self, TiffLayout};
+use crate::tiff_performance::{self, TiffPerfPhase};
 
 /// Pixel storage supplied by a renderer to the shared RGB/CMYK/Gray writer.
 #[derive(Clone, Copy)]
@@ -27,20 +29,39 @@ pub fn write_tiff_pixels(
     rows_per_strip: Option<u32>,
     pixels: OutputPixels<'_>,
 ) -> Result<(), String> {
-    let file =
-        File::create(destination).map_err(|err| format!("Cannot create export TIFF: {err}"))?;
-    let writer = BufWriter::new(file);
-    if should_write_bigtiff(source, metadata)? {
-        let encoder = TiffEncoder::new_big(writer)
-            .map_err(|err| format!("Cannot initialize BigTIFF encoder: {err}"))?;
-        let mut encoder = configure_tiff_encoder(encoder, metadata, force_lzw);
-        write_tiff_with_encoder(&mut encoder, metadata, dpi_info, rows_per_strip, pixels)
-    } else {
-        let encoder = TiffEncoder::new(writer)
-            .map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?;
-        let mut encoder = configure_tiff_encoder(encoder, metadata, force_lzw);
-        write_tiff_with_encoder(&mut encoder, metadata, dpi_info, rows_per_strip, pixels)
-    }
+    let layout = TiffLayout {
+        width: metadata.width,
+        height: metadata.height,
+        channels: metadata.samples_per_pixel,
+        bit_depth: metadata.bit_depth,
+    };
+    let logical_bytes = tiff_output::raw_image_bytes(layout);
+    let encode_started = Instant::now();
+
+    let result = (|| {
+        let file =
+            File::create(destination).map_err(|err| format!("Cannot create export TIFF: {err}"))?;
+        let writer = BufWriter::new(file);
+        if should_write_bigtiff(source, metadata)? {
+            let encoder = TiffEncoder::new_big(writer)
+                .map_err(|err| format!("Cannot initialize BigTIFF encoder: {err}"))?;
+            let mut encoder = configure_tiff_encoder(encoder, metadata, force_lzw);
+            write_tiff_with_encoder(&mut encoder, metadata, dpi_info, rows_per_strip, pixels)
+        } else {
+            let encoder = TiffEncoder::new(writer)
+                .map_err(|err| format!("Cannot initialize TIFF encoder: {err}"))?;
+            let mut encoder = configure_tiff_encoder(encoder, metadata, force_lzw);
+            write_tiff_with_encoder(&mut encoder, metadata, dpi_info, rows_per_strip, pixels)
+        }
+    })();
+
+    tiff_performance::emit_phase_if_enabled(
+        "source_tiff_writer",
+        TiffPerfPhase::CompressionEncode,
+        encode_started.elapsed(),
+        logical_bytes,
+    );
+    result
 }
 
 fn should_write_bigtiff(source: &Path, metadata: &TiffMetadata) -> Result<bool, String> {
