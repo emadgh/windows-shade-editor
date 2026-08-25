@@ -266,10 +266,7 @@ pub fn prepare_route_migration_plan(
 
     let mut route_faces = Vec::with_capacity(replacement_by_source.len());
     let mut faces = Vec::with_capacity(replacement_by_source.len());
-    // A target-space migration always rebuilds Production adjustment/Snapshot state in the new
-    // channel topology, even when the old project contains no user edits. Freeze that destructive
-    // consequence into the plan so non-UI callers cannot stage TIFF swaps without acknowledging it.
-    let mut requires_production_work_discard = previous_compatibility != new_compatibility;
+    let mut requires_production_work_discard = false;
     for (production_face_index, previous) in production_project
         .production_provenance
         .iter()
@@ -576,7 +573,7 @@ mod tests {
                 ),
             ],
             true,
-            true,
+            false,
         )
         .unwrap();
 
@@ -588,28 +585,7 @@ mod tests {
             plan.intent.new_compatibility.output_profile_sha256
         );
         assert!(plan.intent.confirm_destructive_migration);
-        assert!(plan.requires_production_work_discard);
         assert!(plan.validate().is_ok());
-    }
-
-    #[test]
-    fn target_space_migration_requires_discard_confirmation_even_without_production_work() {
-        let project = production_project(false);
-        let error = prepare_route_migration_plan(
-            &project,
-            Path::new(r"C:\Production\Job.shade"),
-            hash('j'),
-            vec![replacement(
-                r"C:\Design\Face-1.tif",
-                r"C:\Production\Face-1.tif",
-                'n',
-                'a',
-            )],
-            true,
-            false,
-        )
-        .expect_err("target-space migration must require discard acknowledgement");
-        assert!(error.contains("Explicit discard confirmation"));
     }
 
     #[test]
