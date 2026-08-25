@@ -34,6 +34,8 @@ use crate::{dpi, export};
 
 #[path = "icc_conversion_worker/direct_rgb.rs"]
 mod direct_rgb;
+#[path = "icc_conversion_worker/direct_tiff.rs"]
+mod direct_tiff;
 
 static CONVERSION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DESIGN_SOURCE_ROWS_PER_STRIP: u32 = 64;
@@ -519,6 +521,17 @@ fn render_convert_and_commit(
                 source.height,
                 &source.samples,
                 None,
+                target_icc,
+                transform,
+                default_dpi,
+            );
+        }
+        ProductionSourceRaster::Tiff(stream) if stream.row_streamable => {
+            return direct_tiff::render_convert_and_commit(
+                capture,
+                cancellation,
+                report,
+                stream,
                 target_icc,
                 transform,
                 default_dpi,
