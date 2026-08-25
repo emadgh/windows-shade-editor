@@ -1076,6 +1076,7 @@ mod tests {
         assert!(source.contains("Create new conversion route / Production link"));
         assert!(source.contains("Resume exact saved migration"));
         assert!(source.contains("global operation lock"));
-        assert!(!source.contains("std::thread::spawn"));
+        let direct_spawn = ["std::thread", "::spawn"].concat();
+        assert!(!source.contains(&direct_spawn));
     }
 }
