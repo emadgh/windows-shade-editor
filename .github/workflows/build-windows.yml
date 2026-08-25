@@ -45,6 +45,9 @@ jobs:
       - name: Test TIFF benchmark runner
         shell: pwsh
         run: .\scripts\test-run-tiff-perf-benchmark.ps1
+      - name: Test TIFF buffer benchmark plan
+        shell: pwsh
+        run: .\scripts\test-run-tiff-buffer-benchmark.ps1
       - name: Check application targets
         run: cargo check --locked --target x86_64-pc-windows-msvc
       - name: Test library
@@ -107,6 +110,9 @@ jobs:
       - name: Test TIFF benchmark runner
         shell: pwsh
         run: .\scripts\test-run-tiff-perf-benchmark.ps1
+      - name: Test TIFF buffer benchmark plan
+        shell: pwsh
+        run: .\scripts\test-run-tiff-buffer-benchmark.ps1
       - name: Test
         run: cargo test --locked --target x86_64-pc-windows-msvc
       - name: Build release
