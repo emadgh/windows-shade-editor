@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use crate::conversion_tiff::{
-    ConversionTiffSpec, write_conversion_tiff_u8_atomic, write_conversion_tiff_u16_atomic,
+    ConversionTiffSpec, write_conversion_tiff_u8_atomic_with_precommit,
+    write_conversion_tiff_u16_atomic_with_precommit,
 };
 use crate::conversion_transaction::{
     CapturedOutputPolicy, CapturedSourceProfile, CommittedConversionOutput, ConversionCancellation,
@@ -500,7 +501,7 @@ fn render_convert_and_commit(
         let height = source_height.max(1) as f32;
 
         match capture.conversion_recipe.target.bit_depth {
-            16 => write_conversion_tiff_u16_atomic(
+            16 => write_conversion_tiff_u16_atomic_with_precommit(
                 &capture.output_tiff_path,
                 &spec,
                 |start_row, row_count, output| {
@@ -515,8 +516,9 @@ fn render_convert_and_commit(
                     ));
                     Ok(())
                 },
+                || cancellation.check_before_commit(),
             ),
-            8 => write_conversion_tiff_u8_atomic(
+            8 => write_conversion_tiff_u8_atomic_with_precommit(
                 &capture.output_tiff_path,
                 &spec,
                 |start_row, row_count, output| {
@@ -531,6 +533,7 @@ fn render_convert_and_commit(
                     ));
                     Ok(())
                 },
+                || cancellation.check_before_commit(),
             ),
             depth => Err(format!(
                 "Unsupported captured conversion precision: {depth}-bit."

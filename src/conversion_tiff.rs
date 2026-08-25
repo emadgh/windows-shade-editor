@@ -161,10 +161,27 @@ pub fn write_conversion_tiff_u8_atomic<F>(
 where
     F: FnMut(u32, u32, &mut [u8]) -> Result<(), String>,
 {
+    write_conversion_tiff_u8_atomic_with_precommit(destination, spec, render_strip, || Ok(()))
+}
+
+pub fn write_conversion_tiff_u8_atomic_with_precommit<F, C>(
+    destination: &Path,
+    spec: &ConversionTiffSpec<'_>,
+    render_strip: F,
+    before_commit: C,
+) -> Result<(), String>
+where
+    F: FnMut(u32, u32, &mut [u8]) -> Result<(), String>,
+    C: FnOnce() -> Result<(), String>,
+{
     validate_spec(destination, spec, 8)?;
-    write_atomic(destination, spec, 8, |staged| {
-        write_u8(staged, spec, render_strip)
-    })
+    write_atomic(
+        destination,
+        spec,
+        8,
+        |staged| write_u8(staged, spec, render_strip),
+        before_commit,
+    )
 }
 
 pub fn write_conversion_tiff_u16_atomic<F>(
@@ -175,22 +192,41 @@ pub fn write_conversion_tiff_u16_atomic<F>(
 where
     F: FnMut(u32, u32, &mut [u16]) -> Result<(), String>,
 {
-    validate_spec(destination, spec, 16)?;
-    write_atomic(destination, spec, 16, |staged| {
-        write_u16(staged, spec, render_strip)
-    })
+    write_conversion_tiff_u16_atomic_with_precommit(destination, spec, render_strip, || Ok(()))
 }
 
-fn write_atomic<F>(
+pub fn write_conversion_tiff_u16_atomic_with_precommit<F, C>(
+    destination: &Path,
+    spec: &ConversionTiffSpec<'_>,
+    render_strip: F,
+    before_commit: C,
+) -> Result<(), String>
+where
+    F: FnMut(u32, u32, &mut [u16]) -> Result<(), String>,
+    C: FnOnce() -> Result<(), String>,
+{
+    validate_spec(destination, spec, 16)?;
+    write_atomic(
+        destination,
+        spec,
+        16,
+        |staged| write_u16(staged, spec, render_strip),
+        before_commit,
+    )
+}
+
+fn write_atomic<F, C>(
     destination: &Path,
     spec: &ConversionTiffSpec<'_>,
     bit_depth: u8,
     write_staged: F,
+    before_commit: C,
 ) -> Result<(), String>
 where
     F: FnOnce(&Path) -> Result<(), String>,
+    C: FnOnce() -> Result<(), String>,
 {
-    tiff_output::write_atomic(
+    tiff_output::write_atomic_with_precommit(
         destination,
         ".conversion.tmp",
         if spec.replace_existing {
@@ -200,6 +236,7 @@ where
         },
         write_staged,
         |staged| verify_staged(staged, spec, bit_depth),
+        before_commit,
     )
 }
 
@@ -1088,6 +1125,41 @@ mod tests {
             !leaked,
             "failed conversion must remove its local output spool"
         );
+        let _ = fs::remove_file(destination);
+    }
+
+    #[test]
+    fn precommit_rejection_after_encode_and_validation_preserves_destination() {
+        let destination = temp_path("precommit-cancel");
+        fs::write(&destination, b"existing-production").unwrap();
+        let names = ["Cyan", "Magenta", "Yellow", "Black"].map(str::to_owned);
+        let profile = profile_bytes();
+        let spec = ConversionTiffSpec {
+            width: 2,
+            height: 1,
+            channel_names: &names,
+            target_icc: Some(&profile),
+            dpi_x: 220.0,
+            dpi_y: 220.0,
+            orientation: Some(1),
+            rows_per_strip: 1,
+            force_bigtiff: false,
+            replace_existing: true,
+        };
+
+        let error = write_conversion_tiff_u8_atomic_with_precommit(
+            &destination,
+            &spec,
+            |_, _, samples| {
+                samples.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+                Ok(())
+            },
+            || Err("conversion cancelled before TIFF publication".to_owned()),
+        )
+        .expect_err("pre-commit cancellation must abort publication");
+
+        assert!(error.contains("cancelled before TIFF publication"));
+        assert_eq!(fs::read(&destination).unwrap(), b"existing-production");
         let _ = fs::remove_file(destination);
     }
 
