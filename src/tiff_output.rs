@@ -52,10 +52,9 @@ pub fn staged_path(destination: &Path, suffix: &str) -> PathBuf {
 /// Maximum UTF-16 code units appended to a destination file name by the normal
 /// unique staging convention: `{suffix}.{process_id}-{sequence}`.
 ///
-/// Production path validation can conservatively reserve this amount. The
-/// runtime writer additionally has a compact sibling-name fallback, so a valid
-/// destination component near the Windows 255-code-unit limit does not fail
-/// merely because the normal descriptive staging name would be too long.
+/// This remains available for diagnostics and compatibility tests. Runtime path
+/// validation must not require the descriptive form to fit because the writer
+/// has a compact same-directory fallback for long destination components.
 #[allow(dead_code)]
 pub fn staging_suffix_utf16_reserve(suffix: &str) -> usize {
     let suffix = staging::canonical_tiff_suffix(suffix);
@@ -121,6 +120,37 @@ where
     F: FnOnce(&Path) -> Result<(), String>,
     V: FnOnce(&Path) -> Result<(), String>,
 {
+    write_atomic_with_precommit(
+        destination,
+        staging_suffix,
+        policy,
+        write_staged,
+        verify_staged,
+        || Ok(()),
+    )
+}
+
+/// Variant of [`write_atomic`] with a final caller-owned gate that executes
+/// after the expensive staged write + validation and immediately before the
+/// irreversible publication boundary.
+///
+/// Conversion uses this to honor cancellation through encode/verification
+/// without teaching the generic TIFF storage layer about conversion state. A
+/// rejected gate leaves the existing destination untouched and the staged file
+/// is removed by `StagedOutput::drop`.
+pub fn write_atomic_with_precommit<F, V, C>(
+    destination: &Path,
+    staging_suffix: &str,
+    policy: DestinationPolicy,
+    write_staged: F,
+    verify_staged: V,
+    before_commit: C,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+    V: FnOnce(&Path) -> Result<(), String>,
+    C: FnOnce() -> Result<(), String>,
+{
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|err| {
         format!(
@@ -134,6 +164,7 @@ where
     (|| {
         write_staged(staged.path())?;
         verify_staged(staged.path())?;
+        before_commit()?;
         match policy {
             DestinationPolicy::ReplaceExisting => {
                 safe_fs::commit_staged_file(staged.path(), destination)
@@ -319,6 +350,34 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("verification failed"));
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn precommit_rejection_preserves_destination_and_cleans_verified_stage() {
+        let folder = temp_folder("precommit-rejection");
+        fs::create_dir_all(&folder).unwrap();
+        let destination = folder.join("output.tif");
+        fs::write(&destination, b"previous").unwrap();
+        let mut verified = false;
+
+        let error = write_atomic_with_precommit(
+            &destination,
+            staging::CONVERSION_STAGED_SUFFIX,
+            DestinationPolicy::ReplaceExisting,
+            |staged| fs::write(staged, b"complete").map_err(|err| err.to_string()),
+            |staged| {
+                verified = fs::read(staged).map_err(|err| err.to_string())? == b"complete";
+                verified.then_some(()).ok_or_else(|| "verification failed".to_owned())
+            },
+            || Err("cancelled immediately before publication".to_owned()),
+        )
+        .unwrap_err();
+
+        assert!(verified, "pre-commit gate must run after staged verification");
+        assert!(error.contains("cancelled immediately before publication"));
         assert_eq!(fs::read(&destination).unwrap(), b"previous");
         assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
         let _ = fs::remove_dir_all(folder);
