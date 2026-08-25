@@ -64,6 +64,22 @@ pub struct ProductionSourceProfileAssignment {
     pub identity: IccProfileIdentity,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ConversionRouteRecord {
+    pub schema_version: u32,
+    pub production_project_path: String,
+    pub output_folder: String,
+    pub batch_recipe_policy_sha256: String,
+    pub faces: Vec<ConversionRouteFaceRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ConversionRouteFaceRecord {
+    pub provenance: ProductionProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_profile_path: Option<String>,
+}
+
 /// Project-owned display-only color setup. It is serialized in `.shade`, but is
 /// never consumed by TIFF export and never changes source TIFF metadata/samples.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +133,11 @@ pub struct ShadeProject {
     /// entry per converted Face/version.
     #[serde(default)]
     pub production_provenance: Vec<ProductionProvenance>,
+    /// Source-side persisted mirrors of linked Production conversion routes.
+    /// Legacy schema-v9 projects deserialize this as empty; Production provenance remains
+    /// authoritative for committed output history.
+    #[serde(default)]
+    pub conversion_routes: Vec<ConversionRouteRecord>,
     pub faces: Vec<FaceRef>,
     pub adjustments: BTreeMap<String, ChannelAdjustment>,
     #[serde(default)]
@@ -152,6 +173,7 @@ impl Default for ShadeProject {
             project_role: ProjectRole::Standalone,
             linked_projects: Vec::new(),
             production_provenance: Vec::new(),
+            conversion_routes: Vec::new(),
             faces: Vec::new(),
             adjustments: BTreeMap::new(),
             snapshots: Vec::new(),

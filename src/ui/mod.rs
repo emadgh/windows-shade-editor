@@ -150,6 +150,10 @@ mod tests {
         assert!(plan.contains("build_conversion_preflight_for_source_with_policy"));
         assert!(plan.contains("build_conversion_recipe"));
         assert!(plan.contains("deterministic_converted_filename"));
+        assert!(plan.contains("restore_target_from_route"));
+        assert!(plan.contains("update_existing_route"));
+        assert!(conversion.contains("Restore saved route settings"));
+        assert!(conversion.contains("allow_production_work_discard"));
 
         assert!(batch.contains("ConversionBatchQueue::load_persistent"));
         assert!(batch.contains("ConversionBatchCapture::capture"));

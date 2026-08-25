@@ -14,9 +14,12 @@ pub mod conversion_preset_library;
 pub mod conversion_presets;
 pub mod conversion_queue;
 pub mod conversion_recipe;
+#[path = "conversion_recovery_route.rs"]
 pub mod conversion_recovery;
+pub mod conversion_route;
 pub mod conversion_tiff;
 pub mod conversion_transaction;
+#[path = "conversion_transaction_disposition_wrapper.rs"]
 pub mod conversion_transaction_disposition;
 pub mod conversion_workflow;
 pub mod custom_optimizer_config;

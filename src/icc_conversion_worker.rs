@@ -59,11 +59,9 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
     ) -> Result<CommittedConversionOutput, String> {
         cancellation.check_before_commit()?;
         self.replace_existing = capture.output_policy == CapturedOutputPolicy::TransactionalReplace;
-        if !self.replace_existing
-            && (capture.output_tiff_path.exists() || capture.production_project_path.exists())
-        {
+        if !self.replace_existing && capture.output_tiff_path.exists() {
             return Err(
-                "Queued versioned conversion destination is no longer free; review and queue a new version."
+                "Queued conversion TIFF destination is no longer free; review route ownership and queue again."
                     .to_owned(),
             );
         }

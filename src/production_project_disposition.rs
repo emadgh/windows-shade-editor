@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::color_conversion::ConversionEngineMode;
@@ -17,6 +19,56 @@ pub enum ProductionProjectDisposition {
         expected_project_sha256: String,
         expected_compatibility: CapturedProductionCompatibilityKey,
     },
+    UpdateExistingRoute {
+        expected_project_sha256: String,
+        expected_compatibility: CapturedProductionCompatibilityKey,
+        route_policy_sha256: String,
+        allow_production_work_discard: bool,
+    },
+}
+
+/// Immutable domain capture for an explicitly destructive route migration.
+///
+/// Route migration is deliberately not a `ProductionProjectDisposition` until
+/// project-wide execution/recovery semantics are wired. Keeping the intent as a
+/// separate validated capture prevents an incomplete enum variant from entering
+/// the durable queue and being mistaken for an executable destination policy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteMigrationCapture {
+    pub expected_project_sha256: String,
+    pub previous_compatibility: CapturedProductionCompatibilityKey,
+    pub new_compatibility: CapturedProductionCompatibilityKey,
+    pub previous_route_policy_sha256: String,
+    pub new_route_policy_sha256: String,
+    pub route_faces: Vec<CapturedRouteFaceOwnership>,
+    pub migration_ordinal: usize,
+    pub migration_face_count: usize,
+    pub confirm_destructive_migration: bool,
+    pub allow_production_work_discard: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedRouteFaceOwnership {
+    pub source_face_path: String,
+    pub output_path: String,
+    pub previous_recipe_sha256: String,
+}
+
+impl CapturedRouteFaceOwnership {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.source_face_path.trim().is_empty() || self.output_path.trim().is_empty() {
+            return Err("Route migration Face ownership paths cannot be empty.".to_owned());
+        }
+        if !is_bare_sha256(&self.previous_recipe_sha256) {
+            return Err(
+                "Route migration Face ownership requires canonical previous recipe SHA-256."
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +165,97 @@ impl CapturedProductionCompatibilityKey {
     }
 }
 
+impl RouteMigrationCapture {
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture(
+        expected_project_sha256: impl Into<String>,
+        previous_compatibility: &ProductionCompatibilityKey,
+        new_compatibility: &ProductionCompatibilityKey,
+        previous_route_policy_sha256: impl Into<String>,
+        new_route_policy_sha256: impl Into<String>,
+        route_faces: Vec<CapturedRouteFaceOwnership>,
+        migration_ordinal: usize,
+        migration_face_count: usize,
+        confirm_destructive_migration: bool,
+        allow_production_work_discard: bool,
+    ) -> Result<Self, String> {
+        let capture = Self {
+            expected_project_sha256: expected_project_sha256.into(),
+            previous_compatibility: CapturedProductionCompatibilityKey::from_runtime(
+                previous_compatibility,
+            ),
+            new_compatibility: CapturedProductionCompatibilityKey::from_runtime(new_compatibility),
+            previous_route_policy_sha256: previous_route_policy_sha256.into(),
+            new_route_policy_sha256: new_route_policy_sha256.into(),
+            route_faces,
+            migration_ordinal,
+            migration_face_count,
+            confirm_destructive_migration,
+            allow_production_work_discard,
+        };
+        capture.validate()?;
+        Ok(capture)
+    }
+
+    pub fn is_route_migration(&self) -> bool {
+        true
+    }
+
+    pub fn with_progress(
+        &self,
+        expected_project_sha256: impl Into<String>,
+        migration_ordinal: usize,
+    ) -> Result<Self, String> {
+        let mut next = self.clone();
+        next.expected_project_sha256 = expected_project_sha256.into();
+        next.migration_ordinal = migration_ordinal;
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_bare_sha256(&self.expected_project_sha256) {
+            return Err("Route migration requires canonical lowercase project SHA-256.".to_owned());
+        }
+        if !is_bare_sha256(&self.previous_route_policy_sha256)
+            || !is_bare_sha256(&self.new_route_policy_sha256)
+        {
+            return Err(
+                "Route migration requires canonical previous/new policy SHA-256 identities."
+                    .to_owned(),
+            );
+        }
+        if !self.confirm_destructive_migration {
+            return Err(
+                "Route migration requires explicit destructive migration confirmation.".to_owned(),
+            );
+        }
+        if self.migration_face_count == 0
+            || self.migration_ordinal >= self.migration_face_count
+            || self.route_faces.len() != self.migration_face_count
+        {
+            return Err(
+                "Route migration ordinal/count does not match the frozen route Face set."
+                    .to_owned(),
+            );
+        }
+        self.previous_compatibility.validate()?;
+        self.new_compatibility.validate()?;
+        let mut sources = BTreeSet::new();
+        let mut outputs = BTreeSet::new();
+        for face in &self.route_faces {
+            face.validate()?;
+            if !sources.insert(path_key(&face.source_face_path)) {
+                return Err("Route migration contains duplicate Source Face ownership.".to_owned());
+            }
+            if !outputs.insert(path_key(&face.output_path)) {
+                return Err("Route migration contains duplicate output path ownership.".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ProductionProjectDisposition {
     pub fn append_existing(
         expected_project_sha256: impl Into<String>,
@@ -126,6 +269,49 @@ impl ProductionProjectDisposition {
         Ok(disposition)
     }
 
+    pub fn update_existing_route(
+        expected_project_sha256: impl Into<String>,
+        compatibility: &ProductionCompatibilityKey,
+        route_policy_sha256: impl Into<String>,
+        allow_production_work_discard: bool,
+    ) -> Result<Self, String> {
+        let disposition = Self::UpdateExistingRoute {
+            expected_project_sha256: expected_project_sha256.into(),
+            expected_compatibility: CapturedProductionCompatibilityKey::from_runtime(compatibility),
+            route_policy_sha256: route_policy_sha256.into(),
+            allow_production_work_discard,
+        };
+        disposition.validate()?;
+        Ok(disposition)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_existing_route(
+        expected_project_sha256: impl Into<String>,
+        previous_compatibility: &ProductionCompatibilityKey,
+        new_compatibility: &ProductionCompatibilityKey,
+        previous_route_policy_sha256: impl Into<String>,
+        new_route_policy_sha256: impl Into<String>,
+        route_faces: Vec<CapturedRouteFaceOwnership>,
+        migration_ordinal: usize,
+        migration_face_count: usize,
+        confirm_destructive_migration: bool,
+        allow_production_work_discard: bool,
+    ) -> Result<RouteMigrationCapture, String> {
+        RouteMigrationCapture::capture(
+            expected_project_sha256,
+            previous_compatibility,
+            new_compatibility,
+            previous_route_policy_sha256,
+            new_route_policy_sha256,
+            route_faces,
+            migration_ordinal,
+            migration_face_count,
+            confirm_destructive_migration,
+            allow_production_work_discard,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::CreateNew => Ok(()),
@@ -136,6 +322,26 @@ impl ProductionProjectDisposition {
                 if !is_bare_sha256(expected_project_sha256) {
                     return Err(
                         "Append-existing Production capture requires canonical lowercase project SHA-256."
+                            .to_owned(),
+                    );
+                }
+                expected_compatibility.validate()
+            }
+            Self::UpdateExistingRoute {
+                expected_project_sha256,
+                expected_compatibility,
+                route_policy_sha256,
+                ..
+            } => {
+                if !is_bare_sha256(expected_project_sha256) {
+                    return Err(
+                        "Existing-route update requires canonical lowercase project SHA-256."
+                            .to_owned(),
+                    );
+                }
+                if !is_bare_sha256(route_policy_sha256) {
+                    return Err(
+                        "Existing-route update requires canonical lowercase route-policy SHA-256."
                             .to_owned(),
                     );
                 }
@@ -154,6 +360,10 @@ fn is_bare_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn path_key(value: &str) -> String {
+    value.trim().replace('/', "\\").to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -176,9 +386,20 @@ mod tests {
         }
     }
 
+    fn route_faces() -> Vec<CapturedRouteFaceOwnership> {
+        vec![CapturedRouteFaceOwnership {
+            source_face_path: r"C:\Design\Face.tif".to_owned(),
+            output_path: r"C:\Production\Face.tif".to_owned(),
+            previous_recipe_sha256: "f".repeat(64),
+        }]
+    }
+
     #[test]
     fn create_new_is_backward_default() {
-        assert_eq!(ProductionProjectDisposition::default(), ProductionProjectDisposition::CreateNew);
+        assert_eq!(
+            ProductionProjectDisposition::default(),
+            ProductionProjectDisposition::CreateNew
+        );
     }
 
     #[test]
@@ -212,5 +433,108 @@ mod tests {
         let mut captured = CapturedProductionCompatibilityKey::from_runtime(&key);
         captured.channel_names.swap(0, 1);
         assert!(!captured.matches_runtime(&key));
+    }
+
+    #[test]
+    fn route_update_freezes_project_target_policy_and_confirmation_intent() {
+        let key = runtime_key();
+        let disposition = ProductionProjectDisposition::update_existing_route(
+            "b".repeat(64),
+            &key,
+            "c".repeat(64),
+            true,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&disposition).unwrap();
+        let restored: ProductionProjectDisposition = serde_json::from_str(&json).unwrap();
+        assert_eq!(disposition, restored);
+        assert!(matches!(
+            restored,
+            ProductionProjectDisposition::UpdateExistingRoute {
+                allow_production_work_discard: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn route_migration_requires_explicit_confirmation_and_freezes_face_ownership() {
+        let previous = runtime_key();
+        let mut new = runtime_key();
+        new.output_profile_sha256 = Some("d".repeat(64));
+        let denied = ProductionProjectDisposition::migrate_existing_route(
+            "b".repeat(64),
+            &previous,
+            &new,
+            "c".repeat(64),
+            "e".repeat(64),
+            route_faces(),
+            0,
+            1,
+            false,
+            true,
+        )
+        .expect_err("migration confirmation is mandatory");
+        assert!(denied.contains("explicit destructive"));
+
+        let capture = ProductionProjectDisposition::migrate_existing_route(
+            "b".repeat(64),
+            &previous,
+            &new,
+            "c".repeat(64),
+            "e".repeat(64),
+            route_faces(),
+            0,
+            1,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(capture.is_route_migration());
+        let json = serde_json::to_string(&capture).unwrap();
+        let restored: RouteMigrationCapture = serde_json::from_str(&json).unwrap();
+        assert_eq!(capture, restored);
+    }
+
+    #[test]
+    fn route_migration_progress_updates_only_sha_and_ordinal() {
+        let key = runtime_key();
+        let capture = ProductionProjectDisposition::migrate_existing_route(
+            "b".repeat(64),
+            &key,
+            &key,
+            "c".repeat(64),
+            "d".repeat(64),
+            route_faces(),
+            0,
+            1,
+            true,
+            false,
+        )
+        .unwrap();
+        let advanced = capture.with_progress("e".repeat(64), 0).unwrap();
+        assert_eq!(advanced.expected_project_sha256, "e".repeat(64));
+        assert_eq!(advanced.route_faces, capture.route_faces);
+        assert_eq!(advanced.previous_compatibility, capture.previous_compatibility);
+        assert_eq!(advanced.new_compatibility, capture.new_compatibility);
+    }
+
+    #[test]
+    fn route_migration_allows_same_target_policy_when_per_face_recipe_changes() {
+        let key = runtime_key();
+        let capture = ProductionProjectDisposition::migrate_existing_route(
+            "b".repeat(64),
+            &key,
+            &key,
+            "c".repeat(64),
+            "c".repeat(64),
+            route_faces(),
+            0,
+            1,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(capture.is_route_migration());
     }
 }
