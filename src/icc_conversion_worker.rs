@@ -32,6 +32,9 @@ use crate::source_transparency::{SourceTransparencyPolicy, composite_rgb_u16};
 use crate::tiff_io::{self, ColorModel, StreamInfo};
 use crate::{dpi, export};
 
+#[path = "icc_conversion_worker/direct_rgb.rs"]
+mod direct_rgb;
+
 static CONVERSION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DESIGN_SOURCE_ROWS_PER_STRIP: u32 = 64;
 
@@ -492,6 +495,38 @@ fn render_convert_and_commit(
     transform: &mut RuntimeProductionTransform,
     default_dpi: f64,
 ) -> Result<(), String> {
+    match source {
+        ProductionSourceRaster::Png(source) => {
+            return direct_rgb::render_convert_and_commit(
+                capture,
+                cancellation,
+                report,
+                source.width,
+                source.height,
+                &source.samples,
+                source.alpha.as_deref(),
+                target_icc,
+                transform,
+                default_dpi,
+            );
+        }
+        ProductionSourceRaster::Jpeg(source) => {
+            return direct_rgb::render_convert_and_commit(
+                capture,
+                cancellation,
+                report,
+                source.width,
+                source.height,
+                &source.samples,
+                None,
+                target_icc,
+                transform,
+                default_dpi,
+            );
+        }
+        ProductionSourceRaster::Tiff(_) => {}
+    }
+
     let spool_path = conversion_spool_path()?;
     let result = (|| {
         render_adjusted_source_spool(capture, cancellation, report, source, &spool_path)?;
