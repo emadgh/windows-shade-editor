@@ -5,9 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tiff::encoder::{TiffEncoder, colortype};
 
-use crate::export::ExportOptions;
+use crate::export::{self, ExportCropRect, ExportOptions};
 use crate::model::{
-    AdjustmentSnapshot, ChannelAdjustment, MASTER_ADJUSTMENT_KEY, ShadeProject,
+    AdjustmentSnapshot, ChannelAdjustment, MASTER_ADJUSTMENT_KEY, ShadeProject, TestCodePosition,
 };
 use crate::test_stack::{
     TestStackAnchor, TestStackLayout, export_test_stack_with_progress,
@@ -118,6 +118,77 @@ fn two_by_two_pipeline_renders_each_saved_snapshot_state_and_writes_same_size_ti
     assert!(output.is_file());
     assert!(!output.with_file_name("stack.tif.test-stack.tmp").exists());
 
+    let _ = std::fs::remove_dir_all(folder);
+}
+
+#[test]
+fn direct_crop_renderer_matches_full_export_with_adjustments_and_test_code() {
+    const WIDTH: usize = 64;
+    const HEIGHT: usize = 64;
+    const CROP: usize = 32;
+
+    let folder = temp_folder("direct-crop-equivalence");
+    std::fs::create_dir_all(&folder).unwrap();
+    let source = folder.join("source.tif");
+    let full_export = folder.join("full-export.tif");
+
+    let file = File::create(&source).unwrap();
+    let mut encoder = TiffEncoder::new(file).unwrap();
+    let image = encoder
+        .new_image::<colortype::Gray8>(WIDTH as u32, HEIGHT as u32)
+        .unwrap();
+    let source_pixels = (0..WIDTH * HEIGHT)
+        .map(|index| 96u8.saturating_add((index % 128) as u8))
+        .collect::<Vec<_>>();
+    image.write_data(&source_pixels).unwrap();
+
+    let mut project = ShadeProject::default();
+    let mut master = ChannelAdjustment::default();
+    master.levels.output_black = 0.15;
+    master.levels.output_white = 0.85;
+    project
+        .adjustments
+        .insert(MASTER_ADJUSTMENT_KEY.to_owned(), master);
+    project.test_code.enabled = true;
+    project.test_code.text = "A1".to_owned();
+    project.test_code.font_size_pt = 6.0;
+    project.test_code.margin_cm = 0.0;
+    project.test_code.position = TestCodePosition::TopLeft;
+
+    export::export_face_with_progress_options(
+        &source,
+        &full_export,
+        &project,
+        220.0,
+        ExportOptions { force_lzw: false },
+        |_, _| {},
+    )
+    .unwrap();
+
+    let stream = tiff_io::stream_info(&source).unwrap();
+    let direct = export::render_adjusted_crop_u16(
+        &source,
+        &stream,
+        &project,
+        220.0,
+        ExportCropRect {
+            x: 0,
+            y: 0,
+            width: CROP,
+            height: CROP,
+        },
+        |_, _| {},
+    )
+    .unwrap();
+
+    let full = decode_full(&full_export).unwrap();
+    let mut expected = Vec::with_capacity(CROP * CROP);
+    for y in 0..CROP {
+        let start = y * WIDTH;
+        expected.extend_from_slice(&full.samples[start..start + CROP]);
+    }
+
+    assert_eq!(direct, expected);
     let _ = std::fs::remove_dir_all(folder);
 }
 
