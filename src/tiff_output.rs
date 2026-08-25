@@ -49,6 +49,14 @@ pub fn staged_path(destination: &Path, suffix: &str) -> PathBuf {
     destination.with_file_name(staged_name)
 }
 
+/// Return the longest compact sibling name the runtime staging fallback can
+/// require. Path preflight uses this instead of reserving the descriptive
+/// destination-derived suffix, keeping validation aligned with `unique_staged_path`.
+pub fn compact_staged_path_for_validation(destination: &Path, suffix: &str) -> PathBuf {
+    let suffix = staging::canonical_tiff_suffix(suffix);
+    destination.with_file_name(compact_stage_name(u32::MAX, u64::MAX, suffix))
+}
+
 /// Maximum UTF-16 code units appended to a destination file name by the normal
 /// unique staging convention: `{suffix}.{process_id}-{sequence}`.
 ///
@@ -302,9 +310,13 @@ mod tests {
         assert!(component_utf16_len(destination.file_name().unwrap()) <= MAX_WINDOWS_COMPONENT_UTF16);
 
         let staged = unique_staged_path(&destination, staging::CONVERSION_STAGED_SUFFIX);
+        let validation_stage =
+            compact_staged_path_for_validation(&destination, staging::CONVERSION_STAGED_SUFFIX);
 
         assert_eq!(staged.parent(), destination.parent());
+        assert_eq!(validation_stage.parent(), destination.parent());
         assert!(component_utf16_len(staged.file_name().unwrap()) <= MAX_WINDOWS_COMPONENT_UTF16);
+        assert!(component_utf16_len(validation_stage.file_name().unwrap()) <= MAX_WINDOWS_COMPONENT_UTF16);
         assert!(staged
             .file_name()
             .unwrap()
