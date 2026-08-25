@@ -236,36 +236,29 @@ pub fn persist_route_migration_journal(
     safe_fs::atomic_write(&route_migration_journal_path(&journal.plan), &bytes, None)
 }
 
+/// The durable journal follows the Production project because it describes the project-wide
+/// migration transaction. Per-output stage/backup files deliberately do not use this parent.
 pub fn route_migration_journal_path(plan: &RouteMigrationPlan) -> PathBuf {
-    migration_sibling_path(plan, "journal", "json")
+    project_migration_sibling_path(plan, "journal", "json")
 }
 
+/// Staging must be a sibling of the exact final TIFF. `safe_fs::commit_staged_file` rejects
+/// cross-directory/cross-volume publication, so deriving this path from the Production `.shade`
+/// folder would make otherwise valid routes fail when their project and TIFF folders differ.
 pub fn route_migration_staged_path(
     plan: &RouteMigrationPlan,
     ordinal: usize,
 ) -> Result<PathBuf, String> {
-    if ordinal >= plan.faces.len() {
-        return Err("Route migration staging ordinal is outside the plan.".to_owned());
-    }
-    Ok(migration_sibling_path(
-        plan,
-        &format!("stage-{ordinal:04}"),
-        "tif",
-    ))
+    output_migration_sibling_path(plan, ordinal, "stage")
 }
 
+/// The previous-output backup is also a sibling of its final TIFF. This keeps old→backup and
+/// staged→final on one local filesystem namespace and lets both moves use write-through boundaries.
 pub fn route_migration_backup_path(
     plan: &RouteMigrationPlan,
     ordinal: usize,
 ) -> Result<PathBuf, String> {
-    if ordinal >= plan.faces.len() {
-        return Err("Route migration backup ordinal is outside the plan.".to_owned());
-    }
-    Ok(migration_sibling_path(
-        plan,
-        &format!("old-{ordinal:04}"),
-        "tif",
-    ))
+    output_migration_sibling_path(plan, ordinal, "old")
 }
 
 pub fn cleanup_completed_route_migration_outputs(
@@ -496,23 +489,13 @@ fn move_previous_output_to_backup(
                 .to_owned(),
         );
     }
-    fs::rename(final_path, backup_path).map_err(|error| {
+    safe_fs::commit_staged_file_if_absent(final_path, backup_path).map_err(|error| {
         format!(
-            "Cannot move previous Production TIFF {} to migration backup {}: {error}",
+            "Cannot move previous Production TIFF {} to durable migration backup {}: {error}",
             final_path.display(),
             backup_path.display()
         )
     })?;
-    OpenOptions::new()
-        .read(true)
-        .open(backup_path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| {
-            format!(
-                "Cannot sync route migration backup {}: {error}",
-                backup_path.display()
-            )
-        })?;
     let backup_sha = sha256_file(backup_path)?;
     if !backup_sha.eq_ignore_ascii_case(expected_sha256.trim()) {
         return Err(
@@ -548,17 +531,46 @@ fn optional_sha256(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-fn migration_sibling_path(plan: &RouteMigrationPlan, role: &str, extension: &str) -> PathBuf {
+fn project_migration_sibling_path(
+    plan: &RouteMigrationPlan,
+    role: &str,
+    extension: &str,
+) -> PathBuf {
     let parent = plan
         .production_project_path
         .parent()
         .unwrap_or_else(|| Path::new("."));
+    parent.join(migration_file_name(plan, role, extension))
+}
+
+fn output_migration_sibling_path(
+    plan: &RouteMigrationPlan,
+    ordinal: usize,
+    role: &str,
+) -> Result<PathBuf, String> {
+    let face = plan
+        .faces
+        .get(ordinal)
+        .ok_or_else(|| format!("Route migration {role} ordinal is outside the plan."))?;
+    let parent = face
+        .replacement
+        .output_tiff_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(migration_file_name(
+        plan,
+        &format!("{role}-{ordinal:04}"),
+        "tif",
+    )))
+}
+
+fn migration_file_name(plan: &RouteMigrationPlan, role: &str, extension: &str) -> String {
     let token = plan
         .intent
         .expected_project_sha256
         .get(..12)
         .unwrap_or("migration");
-    parent.join(format!(".shade-migrate-{token}-{role}.{extension}"))
+    format!(".shade-migrate-{token}-{role}.{extension}")
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -746,6 +758,27 @@ mod tests {
     }
 
     #[test]
+    fn migration_output_transients_follow_owned_tiff_not_project_folder() {
+        let project_folder = temp_folder("split-project");
+        let output_folder = temp_folder("split-output");
+        let mut plan = plan(&project_folder, b"old-project", b"old-output");
+        plan.faces[0].replacement.output_tiff_path = output_folder.join("Face.tif");
+
+        assert_eq!(
+            route_migration_journal_path(&plan).parent(),
+            Some(project_folder.as_path())
+        );
+        assert_eq!(
+            route_migration_staged_path(&plan, 0).unwrap().parent(),
+            Some(output_folder.as_path())
+        );
+        assert_eq!(
+            route_migration_backup_path(&plan, 0).unwrap().parent(),
+            Some(output_folder.as_path())
+        );
+    }
+
+    #[test]
     fn filesystem_boundary_stages_everything_then_swaps_with_backup() {
         let folder = temp_folder("full");
         fs::create_dir_all(&folder).unwrap();
@@ -804,7 +837,11 @@ mod tests {
         journal.checkpoint.begin_commit(&plan).unwrap();
         persist_route_migration_journal(&journal).unwrap();
         let backup_path = route_migration_backup_path(&plan, 0).unwrap();
-        fs::rename(&plan.faces[0].replacement.output_tiff_path, &backup_path).unwrap();
+        safe_fs::commit_staged_file_if_absent(
+            &plan.faces[0].replacement.output_tiff_path,
+            &backup_path,
+        )
+        .unwrap();
 
         let mut backend = MockStager { bytes: Vec::new() };
         continue_route_migration_outputs(
