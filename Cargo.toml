@@ -41,3 +41,10 @@ lto = "thin"
 codegen-units = 1
 panic = "unwind"
 strip = "symbols"
+
+# Measurement-only counterpart for Issue #374. Keep normal release semantics
+# unchanged until representative ceramic-workload benchmarks prove which profile
+# should become the production default.
+[profile.release-throughput]
+inherits = "release"
+opt-level = 3

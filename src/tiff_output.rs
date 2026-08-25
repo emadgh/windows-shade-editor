@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
 use crate::safe_fs::{self, staging};
+use crate::safe_fs::tiff_performance::{self, TiffPerfPhase};
 
 /// Conservative ceiling for classic TIFF pixel payloads. The remaining space
 /// is reserved for strip tables, metadata, ICC/Photoshop resources and encoder
@@ -171,7 +173,22 @@ where
 
     (|| {
         write_staged(staged.path())?;
-        verify_staged(staged.path())?;
+
+        let verification_bytes = if tiff_performance::enabled() {
+            fs::metadata(staged.path()).ok().map(|metadata| metadata.len())
+        } else {
+            None
+        };
+        let verification_started = Instant::now();
+        let verification_result = verify_staged(staged.path());
+        tiff_performance::emit_phase_if_enabled(
+            "tiff_output",
+            TiffPerfPhase::StagedValidation,
+            verification_started.elapsed(),
+            verification_bytes,
+        );
+        verification_result?;
+
         before_commit()?;
         match policy {
             DestinationPolicy::ReplaceExisting => {

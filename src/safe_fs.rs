@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -9,6 +10,10 @@ use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
+
+#[path = "tiff_performance.rs"]
+pub mod tiff_performance;
+use tiff_performance::TiffPerfPhase;
 
 #[path = "staging.rs"]
 pub mod staging;
@@ -166,8 +171,31 @@ pub fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
 /// fallback avoids exceeding the normal 255 UTF-16 component limit while keeping the same volume.
 pub fn commit_staged_file(staged: &Path, destination: &Path) -> Result<(), String> {
     validate_staged_sibling(staged, destination)?;
-    sync_staged_file(staged)?;
-    replace_path(staged, destination)
+    let tracked_bytes = tracked_tiff_bytes(staged, destination);
+
+    let sync_started = Instant::now();
+    let sync_result = sync_staged_file(staged);
+    if let Some(bytes) = tracked_bytes {
+        tiff_performance::emit_phase_if_enabled(
+            "tiff_commit_replace",
+            TiffPerfPhase::FinalDurability,
+            sync_started.elapsed(),
+            Some(bytes),
+        );
+    }
+    sync_result?;
+
+    let publish_started = Instant::now();
+    let publish_result = replace_path(staged, destination);
+    if let Some(bytes) = tracked_bytes {
+        tiff_performance::emit_phase_if_enabled(
+            "tiff_commit_replace",
+            TiffPerfPhase::AtomicPublication,
+            publish_started.elapsed(),
+            Some(bytes),
+        );
+    }
+    publish_result
 }
 
 /// Atomically publish a fully written staged file only if the destination is still absent.
@@ -180,8 +208,46 @@ pub fn commit_staged_file(staged: &Path, destination: &Path) -> Result<(), Strin
 /// hard-link create boundary, removes the staging name, and fsyncs the parent directory.
 pub fn commit_staged_file_if_absent(staged: &Path, destination: &Path) -> Result<(), String> {
     validate_staged_sibling(staged, destination)?;
-    sync_staged_file(staged)?;
-    move_path_if_absent(staged, destination)
+    let tracked_bytes = tracked_tiff_bytes(staged, destination);
+
+    let sync_started = Instant::now();
+    let sync_result = sync_staged_file(staged);
+    if let Some(bytes) = tracked_bytes {
+        tiff_performance::emit_phase_if_enabled(
+            "tiff_commit_new",
+            TiffPerfPhase::FinalDurability,
+            sync_started.elapsed(),
+            Some(bytes),
+        );
+    }
+    sync_result?;
+
+    let publish_started = Instant::now();
+    let publish_result = move_path_if_absent(staged, destination);
+    if let Some(bytes) = tracked_bytes {
+        tiff_performance::emit_phase_if_enabled(
+            "tiff_commit_new",
+            TiffPerfPhase::AtomicPublication,
+            publish_started.elapsed(),
+            Some(bytes),
+        );
+    }
+    publish_result
+}
+
+fn tracked_tiff_bytes(staged: &Path, destination: &Path) -> Option<u64> {
+    if !tiff_performance::enabled() || !is_tiff_path(destination) {
+        return None;
+    }
+    fs::metadata(staged).ok().map(|metadata| metadata.len())
+}
+
+fn is_tiff_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff")
+        })
 }
 
 fn validate_staged_sibling(staged: &Path, destination: &Path) -> Result<(), String> {
@@ -400,5 +466,12 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"new");
         assert!(!staged.exists());
         let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn tiff_tracking_is_scoped_to_tiff_destinations() {
+        assert!(is_tiff_path(Path::new("output.tif")));
+        assert!(is_tiff_path(Path::new("OUTPUT.TIFF")));
+        assert!(!is_tiff_path(Path::new("project.shade")));
     }
 }

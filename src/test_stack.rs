@@ -1,9 +1,8 @@
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::dpi::{self, DpiInfo};
-use crate::export::{self, ExportOptions};
+use crate::export::{self, ExportCropRect, ExportOptions};
 use crate::model::ShadeProject;
 use crate::source_tiff_writer;
 use crate::tiff_output::{self, DestinationPolicy};
@@ -232,9 +231,10 @@ pub fn compose_u16(
     Ok(output)
 }
 
-/// Render selected saved Snapshot states through the same production Snapshot
-/// export path, retain the requested code-corner crop from each render, and
-/// atomically write one same-size TIFF Test Stack.
+/// Render selected saved Snapshot states through the production adjustment/Test
+/// Code renderer, retain only the requested code-corner crop from each state,
+/// and atomically write one same-size TIFF Test Stack. No per-Snapshot TIFF is
+/// created or decoded.
 pub fn export_test_stack_with_progress<F>(
     source: &Path,
     destination: &Path,
@@ -293,62 +293,39 @@ where
     let total = projects.len().max(1);
 
     for (index, project) in projects.iter().enumerate() {
-        let temp = rendered_snapshot_temp_path(index)?;
-        if temp.exists() {
-            fs::remove_file(&temp).map_err(|err| {
-                format!("Cannot remove stale Test Stack render {}: {err}", temp.display())
-            })?;
-        }
-        let base = index as f32 / total as f32;
-        let span = 0.80 / total as f32;
-        let render_result = export::export_face_with_progress_options(
+        let cell = layout.cell_rect(width, height, index)?;
+        let crop = layout.crop_rect(width, height, index, anchor)?;
+        let base = index as f32 / total as f32 * 0.88;
+        let span = 0.88 / total as f32;
+        let rendered = export::render_adjusted_crop_u16(
             source,
-            &temp,
+            &source_info,
             project,
             default_dpi,
-            options,
-            |fraction, detail| {
-                progress(
-                    (base * 0.80 + fraction.clamp(0.0, 1.0) * span).min(0.80),
-                    detail,
-                )
+            ExportCropRect {
+                x: crop.x,
+                y: crop.y,
+                width: crop.width,
+                height: crop.height,
             },
-        );
-        if let Err(err) = render_result {
-            let _ = fs::remove_file(&temp);
-            return Err(format!(
-                "Cannot render Snapshot {} for Test Stack: {err}",
+            |fraction, detail| {
+                progress((base + fraction.clamp(0.0, 1.0) * span).min(0.88), detail)
+            },
+        )
+        .map_err(|err| {
+            format!(
+                "Cannot render Snapshot {} crop for Test Stack: {err}",
                 project.active_snapshot_name().unwrap_or("Unknown")
-            ));
-        }
-
-        progress(
-            0.80 + (index as f32 / total as f32) * 0.10,
-            "Reading rendered Snapshot crop",
-        );
-        let decoded = match tiff_io::decode_full(&temp) {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                let _ = fs::remove_file(&temp);
-                return Err(format!("Cannot reopen rendered Snapshot TIFF: {err}"));
-            }
-        };
-        let compatibility = validate_compatible_metadata(&source_info.metadata, &decoded.metadata);
-        if let Err(err) = compatibility {
-            let _ = fs::remove_file(&temp);
-            return Err(err);
-        }
-        copy_snapshot_crop_into(
+            )
+        })?;
+        copy_rendered_crop_into(
             &mut output,
-            &decoded.samples,
-            layout,
-            anchor,
+            &rendered,
+            cell,
             width,
             height,
             channels,
-            index,
         )?;
-        let _ = fs::remove_file(&temp);
     }
 
     progress(0.92, "Writing Test Stack TIFF");
@@ -376,6 +353,44 @@ fn expected_sample_count(width: usize, height: usize, channels: usize) -> Result
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(channels))
         .ok_or_else(|| "Test Stack sample count is too large.".to_owned())
+}
+
+fn copy_rendered_crop_into(
+    output: &mut [u16],
+    rendered: &[u16],
+    cell: TestStackRect,
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> Result<(), String> {
+    let expected_output = expected_sample_count(width, height, channels)?;
+    let expected_crop = cell
+        .width
+        .checked_mul(cell.height)
+        .and_then(|pixels| pixels.checked_mul(channels))
+        .ok_or_else(|| "Rendered Test Stack crop sample count overflow.".to_owned())?;
+    if output.len() != expected_output || rendered.len() != expected_crop {
+        return Err(format!(
+            "Rendered Test Stack crop mismatch: crop {}, output {}, expected crop {expected_crop}, output {expected_output}.",
+            rendered.len(),
+            output.len()
+        ));
+    }
+    let row_samples = cell
+        .width
+        .checked_mul(channels)
+        .ok_or_else(|| "Rendered Test Stack crop row overflow.".to_owned())?;
+    for local_y in 0..cell.height {
+        let source_start = local_y * row_samples;
+        let destination_start = (cell.y + local_y)
+            .checked_mul(width)
+            .and_then(|offset| offset.checked_add(cell.x))
+            .and_then(|pixel| pixel.checked_mul(channels))
+            .ok_or_else(|| "Rendered Test Stack destination offset overflow.".to_owned())?;
+        output[destination_start..destination_start + row_samples]
+            .copy_from_slice(&rendered[source_start..source_start + row_samples]);
+    }
+    Ok(())
 }
 
 fn copy_snapshot_crop_into(
@@ -438,36 +453,6 @@ fn validate_supported_metadata(metadata: &TiffMetadata) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn validate_compatible_metadata(expected: &TiffMetadata, actual: &TiffMetadata) -> Result<(), String> {
-    let compatible = expected.width == actual.width
-        && expected.height == actual.height
-        && expected.bit_depth == actual.bit_depth
-        && expected.samples_per_pixel == actual.samples_per_pixel
-        && expected.base_channel_count == actual.base_channel_count
-        && expected.color_model == actual.color_model
-        && expected.non_cmyk_separated == actual.non_cmyk_separated
-        && expected.channel_names == actual.channel_names;
-    if compatible {
-        Ok(())
-    } else {
-        Err("Rendered Snapshot topology changed during Test Stack creation; refusing to compose incompatible TIFF samples.".to_owned())
-    }
-}
-
-fn rendered_snapshot_temp_path(index: usize) -> Result<PathBuf, String> {
-    let root = std::env::temp_dir().join("ShadeEditor").join("test-stack");
-    fs::create_dir_all(&root)
-        .map_err(|err| format!("Cannot create Test Stack temp folder {}: {err}", root.display()))?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    Ok(root.join(format!(
-        "snapshot-{}-{index}-{nonce}.tif",
-        std::process::id()
-    )))
 }
 
 fn write_test_stack_tiff(
@@ -653,6 +638,30 @@ mod tests {
         assert_eq!(second, TestStackRect { x: 2, y: 0, width: 3, height: 2 });
         assert_eq!(third, TestStackRect { x: 0, y: 2, width: 2, height: 3 });
         assert_eq!(fourth, TestStackRect { x: 2, y: 2, width: 3, height: 3 });
+    }
+
+    #[test]
+    fn crop_sized_render_copies_directly_into_destination_cell() {
+        let mut output = vec![0u16; 4 * 4];
+        let rendered = vec![10, 11, 12, 13];
+        copy_rendered_crop_into(
+            &mut output,
+            &rendered,
+            TestStackRect { x: 2, y: 2, width: 2, height: 2 },
+            4,
+            4,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            vec![
+                0, 0, 0, 0,
+                0, 0, 0, 0,
+                0, 0, 10, 11,
+                0, 0, 12, 13,
+            ]
+        );
     }
 
     #[test]

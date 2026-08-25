@@ -91,6 +91,7 @@ pub mod queue_core;
 pub mod reconversion_policy;
 #[path = "safe_fs.rs"]
 pub mod safe_fs;
+pub use safe_fs::tiff_performance;
 pub mod separation_optimizer;
 pub mod source_tiff_writer;
 pub mod source_profile_fallback;
