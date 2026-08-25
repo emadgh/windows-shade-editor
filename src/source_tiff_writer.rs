@@ -7,9 +7,9 @@ use tiff::encoder::{colortype, Compression, Predictor, TiffEncoder};
 use tiff::tags::{ExtraSamples, Tag};
 
 use crate::dpi::{self, DpiInfo};
+use crate::safe_fs::tiff_performance::{self, TiffPerfPhase};
 use crate::tiff_io::{ColorModel, TiffMetadata};
 use crate::tiff_output::{self, TiffLayout};
-use crate::tiff_performance::{self, TiffPerfPhase};
 
 /// Pixel storage supplied by a renderer to the shared RGB/CMYK/Gray writer.
 #[derive(Clone, Copy)]
