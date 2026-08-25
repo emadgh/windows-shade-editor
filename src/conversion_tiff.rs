@@ -5,12 +5,15 @@ use std::io::{BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use tiff::encoder::compression::{CompressionAlgorithm, Lzw};
 use tiff::encoder::{DirectoryEncoder, TiffEncoder, TiffKind, TiffValue};
 use tiff::tags::{Tag, Type};
 
 use crate::safe_fs::tiff_performance::{self, TiffPerfPhase};
 use crate::{dpi, tiff_io, tiff_output};
+
+#[path = "lzw_strip_writer.rs"]
+pub(crate) mod lzw_strip_writer;
+use lzw_strip_writer::LzwStripWriter;
 
 const TIFF_ENCODER_BUFFER_BYTES: usize = 1024 * 1024;
 const TIFF_COMPRESSION_LZW: u16 = 5;
@@ -237,9 +240,7 @@ where
         .and_then(|rows| rows.checked_mul(row_samples))
         .ok_or_else(|| "Conversion output strip buffer is too large.".to_owned())?;
     let mut samples = vec![0u8; max_samples];
-    let mut compressed = Vec::<u8>::new();
-    let mut strip_offsets = Vec::<K::OffsetType>::new();
-    let mut strip_byte_counts = Vec::<K::OffsetType>::new();
+    let mut strip_writer = LzwStripWriter::new(directory);
     let mut start_row = 0u32;
 
     while start_row < spec.height {
@@ -255,28 +256,11 @@ where
         timings.transform += transform_started.elapsed();
         render_result?;
 
-        compressed.clear();
-        let compression_started = Instant::now();
-        Lzw.write_to(&mut compressed, strip)
-            .map_err(|err| format!("Cannot LZW-compress 8-bit conversion strip: {err}"))?;
-        let offset = directory
-            .write_data(compressed.as_slice())
-            .map_err(|err| format!("Cannot write 8-bit compressed conversion strip: {err}"))?;
-        timings.compression += compression_started.elapsed();
-
-        strip_offsets.push(
-            K::convert_offset(offset)
-                .map_err(|err| format!("8-bit conversion strip offset exceeds TIFF kind: {err}"))?,
-        );
-        strip_byte_counts.push(
-            K::convert_offset(compressed.len() as u64).map_err(|err| {
-                format!("8-bit conversion strip byte count exceeds TIFF kind: {err}")
-            })?,
-        );
+        timings.compression += strip_writer.write_u8_strip(strip)?;
         start_row += row_count;
     }
 
-    finish_directory(directory, &strip_offsets, &strip_byte_counts)
+    strip_writer.finish()
 }
 
 fn write_u16_with_encoder<W, K, F>(
@@ -301,14 +285,8 @@ where
         .ok()
         .and_then(|rows| rows.checked_mul(row_samples))
         .ok_or_else(|| "Conversion output strip buffer is too large.".to_owned())?;
-    let max_bytes = max_samples
-        .checked_mul(std::mem::size_of::<u16>())
-        .ok_or_else(|| "Conversion output strip byte buffer is too large.".to_owned())?;
     let mut samples = vec![0u16; max_samples];
-    let mut bytes = vec![0u8; max_bytes];
-    let mut compressed = Vec::<u8>::new();
-    let mut strip_offsets = Vec::<K::OffsetType>::new();
-    let mut strip_byte_counts = Vec::<K::OffsetType>::new();
+    let mut strip_writer = LzwStripWriter::new(directory);
     let mut start_row = 0u32;
 
     while start_row < spec.height {
@@ -324,37 +302,11 @@ where
         timings.transform += transform_started.elapsed();
         render_result?;
 
-        let byte_count = sample_count
-            .checked_mul(std::mem::size_of::<u16>())
-            .ok_or_else(|| "16-bit conversion strip byte count overflow.".to_owned())?;
-        let compression_started = Instant::now();
-        for (target, sample) in bytes[..byte_count]
-            .chunks_exact_mut(2)
-            .zip(strip.iter().copied())
-        {
-            target.copy_from_slice(&sample.to_ne_bytes());
-        }
-        compressed.clear();
-        Lzw.write_to(&mut compressed, &bytes[..byte_count])
-            .map_err(|err| format!("Cannot LZW-compress 16-bit conversion strip: {err}"))?;
-        let offset = directory
-            .write_data(compressed.as_slice())
-            .map_err(|err| format!("Cannot write 16-bit compressed conversion strip: {err}"))?;
-        timings.compression += compression_started.elapsed();
-
-        strip_offsets.push(
-            K::convert_offset(offset)
-                .map_err(|err| format!("16-bit conversion strip offset exceeds TIFF kind: {err}"))?,
-        );
-        strip_byte_counts.push(
-            K::convert_offset(compressed.len() as u64).map_err(|err| {
-                format!("16-bit conversion strip byte count exceeds TIFF kind: {err}")
-            })?,
-        );
+        timings.compression += strip_writer.write_u16_strip(strip)?;
         start_row += row_count;
     }
 
-    finish_directory(directory, &strip_offsets, &strip_byte_counts)
+    strip_writer.finish()
 }
 
 fn configure_directory<W, K>(
@@ -443,26 +395,6 @@ where
         .write_tag(Tag::Software, "Shade Editor Color Conversion")
         .map_err(|err| format!("Cannot write conversion Software tag: {err}"))?;
     Ok(())
-}
-
-fn finish_directory<W, K>(
-    mut directory: DirectoryEncoder<'_, W, K>,
-    strip_offsets: &[K::OffsetType],
-    strip_byte_counts: &[K::OffsetType],
-) -> Result<(), String>
-where
-    W: std::io::Write + std::io::Seek,
-    K: TiffKind,
-{
-    directory
-        .write_tag(Tag::StripOffsets, K::convert_slice(strip_offsets))
-        .map_err(|err| format!("Cannot write conversion StripOffsets: {err}"))?;
-    directory
-        .write_tag(Tag::StripByteCounts, K::convert_slice(strip_byte_counts))
-        .map_err(|err| format!("Cannot write conversion StripByteCounts: {err}"))?;
-    directory
-        .finish()
-        .map_err(|err| format!("Cannot finalize conversion TIFF directory: {err}"))
 }
 
 fn effective_rows_per_strip(spec: &ConversionTiffSpec<'_>) -> u32 {
