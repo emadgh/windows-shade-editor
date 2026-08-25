@@ -187,11 +187,20 @@ where
     }
 
     if journal.checkpoint.stage == RouteMigrationExecutionStage::CommitPending {
-        // Do not honor cancellation after this durable boundary. All expensive transforms are done;
-        // completing the small deterministic swap keeps the route recoverable and homogeneous.
+        // Do not honor cancellation after this durable boundary. All normal expensive transforms
+        // are done; if recovery discovers that a stage must be reconstructed, that restage is part
+        // of completing the already-committed migration transaction and must likewise ignore a
+        // stale operator cancellation request.
+        let commit_boundary_cancellation = ConversionCancellation::default();
         while let Some(ordinal) = journal.checkpoint.next_commit_ordinal(&journal.plan)? {
             verify_project_identity(&journal.plan)?;
-            recover_or_commit_one_output(journal, backend, cancellation, ordinal, &mut report)?;
+            recover_or_commit_one_output(
+                journal,
+                backend,
+                &commit_boundary_cancellation,
+                ordinal,
+                &mut report,
+            )?;
         }
         journal
             .checkpoint
@@ -741,9 +750,10 @@ mod tests {
             &mut self,
             _capture: &ConversionJobCapture,
             staged_path: &Path,
-            _cancellation: &ConversionCancellation,
+            cancellation: &ConversionCancellation,
             _report: &mut dyn FnMut(ConversionProgress),
         ) -> Result<CommittedConversionOutput, String> {
+            cancellation.check_before_commit()?;
             fs::write(staged_path, &self.bytes).map_err(|error| error.to_string())?;
             OpenOptions::new()
                 .write(true)
@@ -861,6 +871,56 @@ mod tests {
         assert_eq!(
             journal.checkpoint.stage,
             RouteMigrationExecutionStage::ProductionProjectSavePending
+        );
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn commit_pending_restage_ignores_stale_operator_cancellation() {
+        let folder = temp_folder("commit-pending-restage-cancel");
+        fs::create_dir_all(&folder).unwrap();
+        let project_bytes = b"old-project";
+        let old_output = b"old-output";
+        let new_output = b"new-output";
+        let plan = plan(&folder, project_bytes, old_output);
+        fs::write(&plan.production_project_path, project_bytes).unwrap();
+        fs::write(&plan.faces[0].replacement.output_tiff_path, old_output).unwrap();
+
+        let mut journal = initialize_route_migration_journal(plan.clone()).unwrap();
+        let staged_path = route_migration_staged_path(&plan, 0).unwrap();
+        fs::write(&staged_path, new_output).unwrap();
+        journal
+            .checkpoint
+            .record_staged(&plan, staged_path.clone(), hash_bytes(new_output), 123)
+            .unwrap();
+        journal.checkpoint.begin_commit(&plan).unwrap();
+        persist_route_migration_journal(&journal).unwrap();
+        fs::remove_file(&staged_path).unwrap();
+
+        let cancellation = ConversionCancellation::default();
+        cancellation.request();
+        let mut backend = MockStager {
+            bytes: new_output.to_vec(),
+        };
+        continue_route_migration_outputs(
+            &mut journal,
+            &mut backend,
+            &cancellation,
+            |_ordinal, _total, _progress| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            journal.checkpoint.stage,
+            RouteMigrationExecutionStage::ProductionProjectSavePending
+        );
+        assert_eq!(
+            fs::read(&plan.faces[0].replacement.output_tiff_path).unwrap(),
+            new_output
+        );
+        assert_eq!(
+            fs::read(route_migration_backup_path(&plan, 0).unwrap()).unwrap(),
+            old_output
         );
         let _ = fs::remove_dir_all(folder);
     }
