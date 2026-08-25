@@ -11,6 +11,8 @@ use crate::safe_fs::tiff_performance::{self, TiffPerfPhase};
 use crate::tiff_io::{ColorModel, TiffMetadata};
 use crate::tiff_output::{self, TiffLayout};
 
+const TIFF_ENCODER_BUFFER_BYTES: usize = 1024 * 1024;
+
 /// Pixel storage supplied by a renderer to the shared RGB/CMYK/Gray writer.
 #[derive(Clone, Copy)]
 pub enum OutputPixels<'a> {
@@ -41,7 +43,7 @@ pub fn write_tiff_pixels(
     let result = (|| {
         let file =
             File::create(destination).map_err(|err| format!("Cannot create export TIFF: {err}"))?;
-        let writer = BufWriter::new(file);
+        let writer = BufWriter::with_capacity(TIFF_ENCODER_BUFFER_BYTES, file);
         if should_write_bigtiff(source, metadata)? {
             let encoder = TiffEncoder::new_big(writer)
                 .map_err(|err| format!("Cannot initialize BigTIFF encoder: {err}"))?;
