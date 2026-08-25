@@ -188,7 +188,16 @@ fn direct_crop_renderer_matches_full_export_with_adjustments_and_test_code() {
         expected.extend_from_slice(&full.samples[start..start + CROP]);
     }
 
-    assert_eq!(direct, expected);
+    // The direct renderer deliberately keeps full u16 working precision until
+    // the final Test Stack writer. A Gray8 source/export quantizes each sample
+    // with `>> 8` and the decoder expands the stored byte back to u16 via *257.
+    // Compare the direct path after the identical write/decode quantization so
+    // this test checks exported TIFF equivalence rather than internal precision.
+    let direct_as_written = direct
+        .into_iter()
+        .map(|value| u16::from((value >> 8) as u8) * 257)
+        .collect::<Vec<_>>();
+    assert_eq!(direct_as_written, expected);
     let _ = std::fs::remove_dir_all(folder);
 }
 
