@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::MmapOptions;
 use sha2::{Digest, Sha256};
@@ -26,6 +26,7 @@ use crate::jpeg_source::{DecodedJpegSource, JpegSourceModel, decode_jpeg_source}
 use crate::model::{MASTER_ADJUSTMENT_KEY, ShadeProject, apply_curve, apply_levels};
 use crate::nchannel_icc::ProductionNChannelTransform;
 use crate::png_source::{DecodedPngSource, PngSourceModel, decode_png_source};
+use crate::safe_fs::tiff_performance::{self, TiffPerfPhase};
 use crate::source_profile_fallback::{is_srgb_fallback_identity, srgb_fallback_icc};
 use crate::source_transparency::{SourceTransparencyPolicy, composite_rgb_u16};
 use crate::tiff_io::{self, ColorModel, StreamInfo};
@@ -66,23 +67,45 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
                     .to_owned(),
             );
         }
+        let perf_enabled = tiff_performance::enabled();
         report(ConversionProgress::new(
             ConversionPhase::CaptureValidation,
             0.02,
             "Revalidating source file identity",
         ));
+        let source_identity_bytes = perf_enabled
+            .then(|| fs::metadata(&capture.source_face_path).ok().map(|metadata| metadata.len()))
+            .flatten();
+        let source_identity_started = perf_enabled.then(Instant::now);
         verify_file_sha256(
             &capture.source_face_path,
             &capture.source_file_sha256,
             "Source Face",
         )?;
+        if let Some(started) = source_identity_started {
+            tiff_performance::emit_phase_if_enabled(
+                "conversion",
+                TiffPerfPhase::SourceIdentity,
+                started.elapsed(),
+                source_identity_bytes,
+            );
+        }
 
         report(ConversionProgress::new(
             ConversionPhase::Decode,
             0.04,
             "Inspecting production source topology",
         ));
+        let inspect_started = perf_enabled.then(Instant::now);
         let source = ProductionSourceRaster::load(&capture.source_face_path)?;
+        if let Some(started) = inspect_started {
+            tiff_performance::emit_phase_if_enabled(
+                "conversion",
+                TiffPerfPhase::InspectDecode,
+                started.elapsed(),
+                source_identity_bytes,
+            );
+        }
         let source_model = source.source_model()?;
         source.validate_transparency_policy(&capture.conversion_recipe)?;
 
@@ -161,9 +184,22 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
             self.default_dpi,
         )?;
 
+        let output_identity_bytes = perf_enabled
+            .then(|| fs::metadata(&capture.output_tiff_path).ok().map(|metadata| metadata.len()))
+            .flatten();
+        let output_identity_started = perf_enabled.then(Instant::now);
+        let output_sha256 = sha256_file(&capture.output_tiff_path)?;
+        if let Some(started) = output_identity_started {
+            tiff_performance::emit_phase_if_enabled(
+                "conversion",
+                TiffPerfPhase::OutputIdentity,
+                started.elapsed(),
+                output_identity_bytes,
+            );
+        }
         Ok(CommittedConversionOutput {
             path: capture.output_tiff_path.clone(),
-            sha256: sha256_file(&capture.output_tiff_path)?,
+            sha256: output_sha256,
             converted_at_unix_ms: unix_time_ms()?,
         })
     }
@@ -667,6 +703,9 @@ fn render_adjusted_rgb_source_spool(
     let project = capture.source_recipe.materialize_project();
     let chunk_rows = DESIGN_SOURCE_ROWS_PER_STRIP as usize;
     let mut processed_pixels = 0usize;
+    let perf_enabled = tiff_performance::enabled();
+    let mut adjustment_elapsed = Duration::ZERO;
+    let mut spool_write_elapsed = Duration::ZERO;
 
     for start_row in (0..height_usize).step_by(chunk_rows) {
         cancellation.check_before_commit()?;
@@ -689,6 +728,7 @@ fn render_adjusted_rgb_source_spool(
         let input = samples
             .get(start_sample..end_sample)
             .ok_or_else(|| "Decoded RGB source does not contain the requested rows.".to_owned())?;
+        let adjustment_started = perf_enabled.then(Instant::now);
         let mut adjusted = adjust_working_rgb(input, &project)?;
         if let (Some(alpha), Some(policy)) = (alpha, policy) {
             let alpha_end = start_pixel
@@ -702,7 +742,11 @@ fn render_adjusted_rgb_source_spool(
                 policy,
             )?;
         }
+        if let Some(started) = adjustment_started {
+            adjustment_elapsed += started.elapsed();
+        }
 
+        let spool_write_started = perf_enabled.then(Instant::now);
         let destination_start = start_sample
             .checked_mul(2)
             .ok_or_else(|| "RGB conversion spool byte offset overflow.".to_owned())?;
@@ -721,6 +765,9 @@ fn render_adjusted_rgb_source_spool(
         for (bytes, value) in destination.chunks_exact_mut(2).zip(adjusted.into_iter()) {
             bytes.copy_from_slice(&value.to_ne_bytes());
         }
+        if let Some(started) = spool_write_started {
+            spool_write_elapsed += started.elapsed();
+        }
         processed_pixels = processed_pixels.saturating_add(chunk_pixels);
         report(ConversionProgress::new(
             ConversionPhase::SourceAdjustments,
@@ -734,10 +781,32 @@ fn render_adjusted_rgb_source_spool(
             "Rendered {processed_pixels} RGB source pixels; expected {pixel_count}."
         ));
     }
+    let logical_bytes = u64::try_from(total_bytes).ok();
+    if perf_enabled {
+        tiff_performance::emit_phase_if_enabled(
+            "conversion_source_spool",
+            TiffPerfPhase::AdjustmentRender,
+            adjustment_elapsed,
+            logical_bytes,
+        );
+        tiff_performance::emit_phase_if_enabled(
+            "conversion_source_spool",
+            TiffPerfPhase::SourceSpoolWrite,
+            spool_write_elapsed,
+            logical_bytes,
+        );
+    }
+    let flush_started = perf_enabled.then(Instant::now);
     mmap.flush()
         .map_err(|err| format!("Cannot flush RGB conversion source spool: {err}"))?;
-    file.sync_all()
-        .map_err(|err| format!("Cannot sync RGB conversion source spool: {err}"))?;
+    if let Some(started) = flush_started {
+        tiff_performance::emit_phase_if_enabled(
+            "conversion_source_spool",
+            TiffPerfPhase::SourceSpoolFlush,
+            started.elapsed(),
+            logical_bytes,
+        );
+    }
     Ok(())
 }
 
@@ -868,6 +937,9 @@ fn render_adjusted_tiff_source_spool(
     let project = capture.source_recipe.materialize_project();
     let total_pixels = u64::from(metadata.width).saturating_mul(u64::from(metadata.height));
     let mut processed_pixels = 0u64;
+    let perf_enabled = tiff_performance::enabled();
+    let mut adjustment_elapsed = Duration::ZERO;
+    let mut spool_write_elapsed = Duration::ZERO;
     tiff_io::for_each_decoded_region(
         &capture.source_face_path,
         stream,
@@ -881,7 +953,11 @@ fn render_adjusted_tiff_source_spool(
                 metadata.width,
                 metadata.height,
             )?;
+            let adjustment_started = perf_enabled.then(Instant::now);
             let adjusted = export::adjusted_strip(input, metadata, &project);
+            if let Some(started) = adjustment_started {
+                adjustment_elapsed += started.elapsed();
+            }
             let region_width_usize = region_width as usize;
             let region_height_usize = region_height as usize;
             let expected = region_width_usize
@@ -894,6 +970,7 @@ fn render_adjusted_tiff_source_spool(
                     adjusted.len()
                 ));
             }
+            let spool_write_started = perf_enabled.then(Instant::now);
             for local_y in 0..region_height_usize {
                 let source_start = local_y * region_width_usize * channels;
                 let destination_sample = (((y as usize + local_y) * width) + x as usize) * channels;
@@ -903,6 +980,9 @@ fn render_adjusted_tiff_source_spool(
                     mmap[destination] = bytes[0];
                     mmap[destination + 1] = bytes[1];
                 }
+            }
+            if let Some(started) = spool_write_started {
+                spool_write_elapsed += started.elapsed();
             }
             processed_pixels = processed_pixels
                 .saturating_add(u64::from(region_width).saturating_mul(u64::from(region_height)));
@@ -919,10 +999,32 @@ fn render_adjusted_tiff_source_spool(
             "Decoded source regions covered {processed_pixels} pixels; expected {total_pixels}."
         ));
     }
+    let logical_bytes = u64::try_from(total_bytes).ok();
+    if perf_enabled {
+        tiff_performance::emit_phase_if_enabled(
+            "conversion_source_spool",
+            TiffPerfPhase::AdjustmentRender,
+            adjustment_elapsed,
+            logical_bytes,
+        );
+        tiff_performance::emit_phase_if_enabled(
+            "conversion_source_spool",
+            TiffPerfPhase::SourceSpoolWrite,
+            spool_write_elapsed,
+            logical_bytes,
+        );
+    }
+    let flush_started = perf_enabled.then(Instant::now);
     mmap.flush()
         .map_err(|err| format!("Cannot flush conversion source spool: {err}"))?;
-    file.sync_all()
-        .map_err(|err| format!("Cannot sync conversion source spool: {err}"))?;
+    if let Some(started) = flush_started {
+        tiff_performance::emit_phase_if_enabled(
+            "conversion_source_spool",
+            TiffPerfPhase::SourceSpoolFlush,
+            started.elapsed(),
+            logical_bytes,
+        );
+    }
     Ok(())
 }
 
