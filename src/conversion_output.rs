@@ -41,8 +41,8 @@ impl std::fmt::Display for OutputPathError {
 ///
 /// Production conversion output is TIFF/BigTIFF and can never be the source path.
 /// On Windows, the destination must also be a safe absolute drive/UNC path whose
-/// components and staged-write path fit the Win32 naming contract used by the
-/// atomic conversion writer.
+/// final path and compact same-directory staging fallback fit the Win32 naming
+/// contract used by the atomic TIFF writer.
 pub fn validate_conversion_output_path(
     source: &Path,
     destination: &Path,
@@ -196,26 +196,28 @@ fn validate_windows_destination_path(destination: &Path) -> Result<(), OutputPat
         }
     }
 
-    let file_name = destination
-        .file_name()
-        .ok_or(OutputPathError::MissingFileName)?;
-    let staging_reserve = tiff_output::staging_suffix_utf16_reserve(CONVERSION_STAGING_SUFFIX);
-    let staged_file_units = windows_utf16_len(file_name)
-        .checked_add(staging_reserve)
-        .ok_or(OutputPathError::MissingFileName)?;
-    if staged_file_units > MAX_WINDOWS_COMPONENT_UTF16 {
-        return Err(OutputPathError::MissingFileName);
-    }
-
-    let staged_path_units = windows_utf16_len(destination.as_os_str())
-        .checked_add(staging_reserve)
-        .ok_or(OutputPathError::MissingFileName)?;
     let max_path_units = if verbatim {
         MAX_VERBATIM_PATH_UTF16_WITHOUT_NUL
     } else {
         MAX_WIN32_PATH_UTF16_WITHOUT_NUL
     };
-    if staged_path_units > max_path_units {
+    let destination_units = windows_utf16_len(destination.as_os_str());
+    if destination_units > max_path_units {
+        return Err(OutputPathError::MissingFileName);
+    }
+
+    // The runtime first tries a descriptive destination-derived stage, then
+    // falls back to a compact sibling. Preflight therefore needs only prove
+    // that the final path and the longest compact fallback are valid; requiring
+    // the descriptive form to fit would reject destinations the writer can
+    // safely publish.
+    let compact_stage =
+        tiff_output::compact_staged_path_for_validation(destination, CONVERSION_STAGING_SUFFIX);
+    if compact_stage
+        .file_name()
+        .is_none_or(|name| windows_utf16_len(name) > MAX_WINDOWS_COMPONENT_UTF16)
+        || windows_utf16_len(compact_stage.as_os_str()) > max_path_units
+    {
         return Err(OutputPathError::MissingFileName);
     }
 
@@ -426,7 +428,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn non_verbatim_path_reserves_space_for_atomic_staging_name() {
+    fn compact_staging_allows_long_but_valid_destination_component() {
+        let source = Path::new(r"C:\Designs\Face01.tif");
+        let destination = PathBuf::from(format!(r"C:\P\{}.tif", "x".repeat(220)));
+        assert!(validate_conversion_output_path(source, &destination).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_verbatim_path_requires_compact_stage_to_fit() {
         let source = Path::new(r"C:\Designs\Face01.tif");
         let destination = PathBuf::from(format!(
             r"C:\{}\{}\Face01.tif",
@@ -450,9 +460,15 @@ mod tests {
         ));
         assert!(validate_conversion_output_path(source, &destination).is_ok());
 
-        let oversized_file = PathBuf::from(format!(
+        let long_but_valid_file = PathBuf::from(format!(
             r"\\?\C:\Production\{}.tif",
             "x".repeat(237)
+        ));
+        assert!(validate_conversion_output_path(source, &long_but_valid_file).is_ok());
+
+        let oversized_file = PathBuf::from(format!(
+            r"\\?\C:\Production\{}.tif",
+            "x".repeat(252)
         ));
         assert_eq!(
             validate_conversion_output_path(source, &oversized_file),
