@@ -165,8 +165,9 @@ pub struct StreamInfo {
     /// True when the source can be decoded one coding region at a time without
     /// allocating the full image.
     pub streamable: bool,
-    /// True only for chunky strip TIFFs, where each decoded region is already a
-    /// full-width row range and can use the older sequential spool path.
+    /// True for strip TIFFs whose geometric coding units decode to full-width
+    /// row ranges. Planar strips are assembled and interleaved across planes
+    /// before the callback; tiled sources remain region-only.
     pub row_streamable: bool,
     pub storage: ChunkStorage,
     pub planar_configuration: u16,
@@ -439,7 +440,7 @@ pub fn stream_info(path: &Path) -> Result<StreamInfo, String> {
             0
         },
         streamable,
-        row_streamable: streamable && storage == ChunkStorage::Strips && planar_configuration == 1,
+        row_streamable: streamable && storage == ChunkStorage::Strips,
         storage,
         planar_configuration,
         chunk_width,
@@ -1741,7 +1742,7 @@ mod tests {
         fs::write(&path, build_planar_rgb8_strip_tiff()).unwrap();
         let (info, canvas) = collect_regions(&path);
         assert!(info.streamable);
-        assert!(!info.row_streamable);
+        assert!(info.row_streamable);
         assert_eq!(info.storage, ChunkStorage::Strips);
         assert_eq!(info.planar_configuration, 2);
         let expected = vec![
