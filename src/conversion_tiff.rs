@@ -431,9 +431,11 @@ where
     }
     mmap.flush()
         .map_err(|err| format!("Cannot flush conversion output spool: {err}"))?;
+    // This spool is disposable same-process scratch data. Flushing the mapping makes the rendered
+    // bytes available before the read-only remap; forcing the file itself through sync_all() would
+    // add final-document durability semantics to a file that is deleted immediately after encode.
     drop(mmap);
-    file.sync_all()
-        .map_err(|err| format!("Cannot sync conversion output spool: {err}"))?;
+    drop(file);
     Ok(spool)
 }
 
@@ -477,9 +479,10 @@ where
     }
     mmap.flush()
         .map_err(|err| format!("Cannot flush conversion output spool: {err}"))?;
+    // The output spool is not a recoverable user document; only the staged/final TIFF commit below
+    // carries the durable sync/write-through contract.
     drop(mmap);
-    file.sync_all()
-        .map_err(|err| format!("Cannot sync conversion output spool: {err}"))?;
+    drop(file);
     Ok(spool)
 }
 
