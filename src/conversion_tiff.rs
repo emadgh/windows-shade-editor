@@ -4,14 +4,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use tiff::encoder::{Compression, TiffEncoder, TiffValue, colortype};
 use tiff::tags::{PhotometricInterpretation, SampleFormat, Tag, Type};
 
+use crate::safe_fs::tiff_performance::{self, TiffPerfPhase};
 use crate::{dpi, tiff_io, tiff_output};
 
 static CONVERSION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const TIFF_ENCODER_BUFFER_BYTES: usize = 1024 * 1024;
 
 struct ConversionSpool {
     path: PathBuf,
@@ -246,18 +249,28 @@ where
 {
     let spool = render_u8_spool(staged, spec, render_strip)?;
     let mmap = spool.map_read_only()?;
-    let file = File::create(staged)
-        .map_err(|err| format!("Cannot create staged conversion TIFF: {err}"))?;
-    let writer = BufWriter::new(file);
-    if should_write_bigtiff(spec, 8) {
-        let encoder = TiffEncoder::new_big(writer)
-            .map_err(|err| format!("Cannot initialize conversion BigTIFF: {err}"))?;
-        write_u8_with_encoder(encoder, spec, &mmap)
-    } else {
-        let encoder = TiffEncoder::new(writer)
-            .map_err(|err| format!("Cannot initialize conversion TIFF: {err}"))?;
-        write_u8_with_encoder(encoder, spec, &mmap)
-    }
+    let encode_started = Instant::now();
+    let result = (|| {
+        let file = File::create(staged)
+            .map_err(|err| format!("Cannot create staged conversion TIFF: {err}"))?;
+        let writer = BufWriter::with_capacity(TIFF_ENCODER_BUFFER_BYTES, file);
+        if should_write_bigtiff(spec, 8) {
+            let encoder = TiffEncoder::new_big(writer)
+                .map_err(|err| format!("Cannot initialize conversion BigTIFF: {err}"))?;
+            write_u8_with_encoder(encoder, spec, &mmap)
+        } else {
+            let encoder = TiffEncoder::new(writer)
+                .map_err(|err| format!("Cannot initialize conversion TIFF: {err}"))?;
+            write_u8_with_encoder(encoder, spec, &mmap)
+        }
+    })();
+    tiff_performance::emit_phase_if_enabled(
+        "conversion_tiff",
+        TiffPerfPhase::CompressionEncode,
+        encode_started.elapsed(),
+        Some(mmap.len() as u64),
+    );
+    result
 }
 
 fn write_u16<F>(staged: &Path, spec: &ConversionTiffSpec<'_>, render_strip: F) -> Result<(), String>
@@ -267,18 +280,28 @@ where
     let spool = render_u16_spool(staged, spec, render_strip)?;
     let mmap = spool.map_read_only()?;
     let samples = mmap_as_u16(&mmap)?;
-    let file = File::create(staged)
-        .map_err(|err| format!("Cannot create staged conversion TIFF: {err}"))?;
-    let writer = BufWriter::new(file);
-    if should_write_bigtiff(spec, 16) {
-        let encoder = TiffEncoder::new_big(writer)
-            .map_err(|err| format!("Cannot initialize conversion BigTIFF: {err}"))?;
-        write_u16_with_encoder(encoder, spec, samples)
-    } else {
-        let encoder = TiffEncoder::new(writer)
-            .map_err(|err| format!("Cannot initialize conversion TIFF: {err}"))?;
-        write_u16_with_encoder(encoder, spec, samples)
-    }
+    let encode_started = Instant::now();
+    let result = (|| {
+        let file = File::create(staged)
+            .map_err(|err| format!("Cannot create staged conversion TIFF: {err}"))?;
+        let writer = BufWriter::with_capacity(TIFF_ENCODER_BUFFER_BYTES, file);
+        if should_write_bigtiff(spec, 16) {
+            let encoder = TiffEncoder::new_big(writer)
+                .map_err(|err| format!("Cannot initialize conversion BigTIFF: {err}"))?;
+            write_u16_with_encoder(encoder, spec, samples)
+        } else {
+            let encoder = TiffEncoder::new(writer)
+                .map_err(|err| format!("Cannot initialize conversion TIFF: {err}"))?;
+            write_u16_with_encoder(encoder, spec, samples)
+        }
+    })();
+    tiff_performance::emit_phase_if_enabled(
+        "conversion_tiff",
+        TiffPerfPhase::CompressionEncode,
+        encode_started.elapsed(),
+        Some(mmap.len() as u64),
+    );
+    result
 }
 
 fn write_u8_with_encoder<W, K>(
@@ -447,6 +470,7 @@ where
             .map_err(|err| format!("Cannot map writable conversion output spool: {err}"))?
     };
     let mut start_row = 0u32;
+    let mut transform_elapsed = Duration::ZERO;
     while start_row < spec.height {
         let row_count = spec
             .rows_per_strip
@@ -463,11 +487,29 @@ where
             .checked_add(sample_count)
             .filter(|end| *end <= total_samples)
             .ok_or_else(|| "Conversion output spool range overflow.".to_owned())?;
-        render_strip(start_row, row_count, &mut mmap[start..end])?;
+        let transform_started = Instant::now();
+        let render_result = render_strip(start_row, row_count, &mut mmap[start..end]);
+        transform_elapsed += transform_started.elapsed();
+        render_result?;
         start_row += row_count;
     }
-    mmap.flush()
-        .map_err(|err| format!("Cannot flush conversion output spool: {err}"))?;
+    tiff_performance::emit_phase_if_enabled(
+        "conversion_tiff",
+        TiffPerfPhase::ColorTransform,
+        transform_elapsed,
+        Some(byte_len),
+    );
+    let flush_started = Instant::now();
+    let flush_result = mmap
+        .flush()
+        .map_err(|err| format!("Cannot flush conversion output spool: {err}"));
+    tiff_performance::emit_phase_if_enabled(
+        "conversion_tiff",
+        TiffPerfPhase::OutputSpoolFlush,
+        flush_started.elapsed(),
+        Some(byte_len),
+    );
+    flush_result?;
     // This spool is disposable same-process scratch data. Flushing the mapping makes the rendered
     // bytes available before the read-only remap; forcing the file itself through sync_all() would
     // add final-document durability semantics to a file that is deleted immediately after encode.
@@ -495,6 +537,7 @@ where
     };
     let samples = mmap_mut_as_u16(&mut mmap)?;
     let mut start_row = 0u32;
+    let mut transform_elapsed = Duration::ZERO;
     while start_row < spec.height {
         let row_count = spec
             .rows_per_strip
@@ -511,11 +554,29 @@ where
             .checked_add(sample_count)
             .filter(|end| *end <= total_samples)
             .ok_or_else(|| "Conversion output spool range overflow.".to_owned())?;
-        render_strip(start_row, row_count, &mut samples[start..end])?;
+        let transform_started = Instant::now();
+        let render_result = render_strip(start_row, row_count, &mut samples[start..end]);
+        transform_elapsed += transform_started.elapsed();
+        render_result?;
         start_row += row_count;
     }
-    mmap.flush()
-        .map_err(|err| format!("Cannot flush conversion output spool: {err}"))?;
+    tiff_performance::emit_phase_if_enabled(
+        "conversion_tiff",
+        TiffPerfPhase::ColorTransform,
+        transform_elapsed,
+        Some(byte_len),
+    );
+    let flush_started = Instant::now();
+    let flush_result = mmap
+        .flush()
+        .map_err(|err| format!("Cannot flush conversion output spool: {err}"));
+    tiff_performance::emit_phase_if_enabled(
+        "conversion_tiff",
+        TiffPerfPhase::OutputSpoolFlush,
+        flush_started.elapsed(),
+        Some(byte_len),
+    );
+    flush_result?;
     // The output spool is not a recoverable user document; only the staged/final TIFF commit below
     // carries the durable sync/write-through contract.
     drop(mmap);
