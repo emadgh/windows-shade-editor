@@ -33,5 +33,6 @@ impl ShadeApp {
             });
         });
         self.ui_color_conversion_window(ui.ctx());
+        self.ui_conversion_route_migration(ui.ctx());
     }
 }
