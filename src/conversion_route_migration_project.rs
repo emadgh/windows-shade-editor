@@ -174,7 +174,7 @@ pub fn build_migrated_production_project(
         source_project_path: &journal.plan.source_project_path,
         output_tiff_path: Path::new(&first_provenance.output_path),
         output_face_label: first_label,
-        provenance: first_provenance,
+        provenance: first_provenance.clone(),
     })?;
 
     for ordinal in 1..provenances.len() {
