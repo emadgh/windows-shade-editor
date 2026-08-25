@@ -167,13 +167,11 @@ where
                         .to_owned(),
                 );
             }
-            let actual = sha256_file(&staged_path)?;
-            if !actual.eq_ignore_ascii_case(staged.sha256.trim()) {
-                return Err(
-                    "Route migration staged TIFF changed before its checkpoint could be recorded."
-                        .to_owned(),
-                );
-            }
+            // The staging backend has already validated, durably committed, and hashed this exact
+            // path before returning. Do not immediately re-read a 200–300 MB TIFF solely to derive
+            // the same SHA again. The durable checkpoint records that identity, and every stage is
+            // re-observed from disk before the destructive swap boundary below (including after a
+            // restart), so later mutation still fails closed before the old final is replaced.
             journal.checkpoint.record_staged(
                 &journal.plan,
                 staged_path,
@@ -382,6 +380,9 @@ where
                 cancellation,
                 &mut face_report,
             )?;
+            // Restage is different from the initial non-destructive staging pass: the next
+            // operation moves the old final into its backup. Keep this pre-boundary readback so a
+            // faulty backend or external mutation cannot advance into the destructive swap.
             let actual = sha256_file(&staged_path)?;
             if !actual.eq_ignore_ascii_case(staged.sha256.trim()) {
                 return Err("Restaged route migration TIFF failed SHA verification.".to_owned());
@@ -768,6 +769,36 @@ mod tests {
         }
     }
 
+    struct MismatchedShaStager {
+        bytes: Vec<u8>,
+        claimed_sha256: String,
+        calls: usize,
+    }
+
+    impl RouteMigrationStagingBackend for MismatchedShaStager {
+        fn stage_replacement(
+            &mut self,
+            _capture: &ConversionJobCapture,
+            staged_path: &Path,
+            cancellation: &ConversionCancellation,
+            _report: &mut dyn FnMut(ConversionProgress),
+        ) -> Result<CommittedConversionOutput, String> {
+            cancellation.check_before_commit()?;
+            self.calls += 1;
+            fs::write(staged_path, &self.bytes).map_err(|error| error.to_string())?;
+            OpenOptions::new()
+                .write(true)
+                .open(staged_path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| error.to_string())?;
+            Ok(CommittedConversionOutput {
+                path: staged_path.to_path_buf(),
+                sha256: self.claimed_sha256.clone(),
+                converted_at_unix_ms: 123,
+            })
+        }
+    }
+
     #[test]
     fn migration_output_transients_follow_owned_tiff_not_project_folder() {
         let project_folder = temp_folder("split-project");
@@ -825,6 +856,41 @@ mod tests {
             old_output
         );
         assert!(route_migration_journal_path(&plan).exists());
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn mismatched_staging_backend_sha_fails_before_old_output_moves() {
+        let folder = temp_folder("mismatched-stage-sha");
+        fs::create_dir_all(&folder).unwrap();
+        let project_bytes = b"old-project";
+        let old_output = b"old-output";
+        let corrupt_output = b"corrupt-new-output";
+        let plan = plan(&folder, project_bytes, old_output);
+        fs::write(&plan.production_project_path, project_bytes).unwrap();
+        fs::write(&plan.faces[0].replacement.output_tiff_path, old_output).unwrap();
+
+        let mut journal = initialize_route_migration_journal(plan.clone()).unwrap();
+        let mut backend = MismatchedShaStager {
+            bytes: corrupt_output.to_vec(),
+            claimed_sha256: hash_bytes(b"claimed-new-output"),
+            calls: 0,
+        };
+        let error = continue_route_migration_outputs(
+            &mut journal,
+            &mut backend,
+            &ConversionCancellation::default(),
+            |_ordinal, _total, _progress| {},
+        )
+        .expect_err("A restaged TIFF whose bytes do not match the backend identity must fail");
+
+        assert!(error.contains("Restaged route migration TIFF failed SHA verification"));
+        assert_eq!(backend.calls, 2);
+        assert_eq!(
+            fs::read(&plan.faces[0].replacement.output_tiff_path).unwrap(),
+            old_output
+        );
+        assert!(!route_migration_backup_path(&plan, 0).unwrap().exists());
         let _ = fs::remove_dir_all(folder);
     }
 
