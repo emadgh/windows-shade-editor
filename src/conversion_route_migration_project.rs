@@ -98,9 +98,9 @@ pub fn complete_route_migration_project(
 /// Deterministically reconstruct the Production project that must exist after migration.
 ///
 /// Same target compatibility retains Production-side adjustment/Snapshot state after the operator
-/// has confirmed the route replacement risk. A target-space migration cannot reuse those states:
-/// it rebuilds a clean Production project with the new channel topology, and is allowed only when
-/// the immutable migration capture includes explicit Production-work discard confirmation.
+/// has confirmed the route replacement risk. A target-space migration rebuilds a clean Production
+/// project in the new channel topology. Explicit discard permission is required only when the
+/// frozen migration plan proves that real Production-side work would be discarded.
 pub fn build_migrated_production_project(
     journal: &RouteMigrationRecoveryJournal,
     original: &ShadeProject,
@@ -147,7 +147,9 @@ pub fn build_migrated_production_project(
         return Ok(migrated);
     }
 
-    if !journal.plan.intent.allow_production_work_discard {
+    if journal.plan.requires_production_work_discard
+        && !journal.plan.intent.allow_production_work_discard
+    {
         return Err(
             "Target-space route migration requires explicit permission to discard Production-side adjustment/Snapshot state."
                 .to_owned(),
@@ -644,6 +646,26 @@ mod tests {
         assert_eq!(
             recipe_sha256(&migrated.production_provenance[0].recipe).unwrap(),
             journal.plan.faces[0].new_recipe_sha256
+        );
+    }
+
+    #[test]
+    fn clean_target_space_migration_does_not_require_discard_permission() {
+        let (mut journal, original) = journal(true);
+        journal.plan.intent.allow_production_work_discard = false;
+        assert!(!journal.plan.requires_production_work_discard);
+        let migrated = build_migrated_production_project(&journal, &original).unwrap();
+        assert!(migrated.snapshots.is_empty());
+        assert_eq!(migrated.adjustments.get("Black").unwrap().levels.gamma, 1.0);
+        assert_eq!(
+            migrated.production_provenance[0]
+                .recipe
+                .target
+                .output_profile_identity
+                .as_ref()
+                .unwrap()
+                .sha256,
+            hash('n')
         );
     }
 
