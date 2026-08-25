@@ -52,13 +52,58 @@ Run the required GUI operation(s), close the application after the measured set,
 
 The summarizer reports count, median phase time, p95 phase time and median MiB/s for every measured operation/phase. Keep the raw log with the benchmark record; the CSV is a convenience summary, not a replacement for raw evidence.
 
+## Reproducible benchmark runner
+
+Prefer the checked-in runner for acceptance measurements so profile selection, executable path, commit identity, binary SHA-256, log location and summary output are captured consistently.
+
+Run warm-up and measured samples in separate runner invocations so the warm-up never enters the measured summary. The second invocation may use `-SkipBuild` because it reuses the exact profile binary built from the same clean checkout:
+
+```powershell
+.\scripts\run-tiff-perf-benchmark.ps1 `
+  -Profile release `
+  -LogPath .\bench\release-warmup.log
+
+.\scripts\run-tiff-perf-benchmark.ps1 `
+  -Profile release `
+  -LogPath .\bench\release.log `
+  -SkipBuild
+```
+
+Use the first GUI session only for the warm-up operation and close Shade Editor. In the second session run the same measured operation at least five times, then close the application. The runner starts each session with a fresh log, waits for Shade Editor to close, summarizes that session and writes a metadata sidecar.
+
+Use the same two-session pattern for the throughput profile:
+
+```powershell
+.\scripts\run-tiff-perf-benchmark.ps1 `
+  -Profile release-throughput `
+  -LogPath .\bench\release-throughput-warmup.log
+
+.\scripts\run-tiff-perf-benchmark.ps1 `
+  -Profile release-throughput `
+  -LogPath .\bench\release-throughput.log `
+  -SkipBuild
+```
+
+Use `-SkipBuild` only when the exact requested profile has already been built from the same checked-out commit. The runner rejects tracked working-tree modifications before recording evidence. `-PlanOnly` prints the resolved profile, target, executable, log/summary/metadata paths and Cargo build arguments without building or launching the application; CI uses that mode as a regression check for the runner itself.
+
+After both measured runs, compare the generated summary CSV files with the regression gate:
+
+```powershell
+.\scripts\compare-tiff-perf.ps1 `
+  -BaselineCsv .\bench\release.summary.csv `
+  -CandidateCsv .\bench\release-throughput.summary.csv `
+  -CsvPath .\bench\profile-comparison.csv
+```
+
+Do not enable a hard throughput threshold until a representative local-SSD/NVMe baseline has been recorded. Once a justified threshold exists, `-MinimumMedianMiBPerSec` and `-MaxThroughputRegressionPercent` can make severe regressions fail closed.
+
 ## Run protocol
 
 1. Build the exact commit in `--release` mode.
 2. Set `SHADE_TIFF_PERF_LOG` to a new/empty log file for that build/profile.
 3. Close unrelated heavy disk/CPU workloads.
-4. Run one warm-up operation; do not include it in the median. Use a separate warm-up log or clear the log after warm-up.
-5. Run the same operation at least five measured times.
+4. Run one warm-up operation; do not include it in the median. Use a separate warm-up log/session.
+5. Run the same operation at least five measured times in a fresh measured session/log.
 6. Record every phase line and total wall time.
 7. Report median and p95 total time plus median effective MiB/s.
 8. Do not mix local-drive and network-drive results.
