@@ -436,7 +436,8 @@ mod tests {
     };
 
     fn hash(character: char) -> String {
-        character.to_string().repeat(64)
+        assert!(character.is_ascii());
+        format!("{:02x}", character as u8).repeat(32)
     }
 
     fn identity(description: &str, character: char) -> IccProfileIdentity {
