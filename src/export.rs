@@ -13,6 +13,9 @@ use crate::model::{
 };
 static EXPORT_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[path = "export/row_streaming_lzw.rs"]
+mod row_streaming_lzw;
+
 use crate::tiff_io::{
     ColorModel, StreamInfo, TiffMetadata, decode_full, for_each_decoded_region,
     for_each_decoded_strip, stream_info, tiff_sample_from_working, working_sample_from_tiff,
@@ -311,6 +314,34 @@ where
         project,
         dpi_info,
     )?;
+
+    if stream.row_streamable && options.force_lzw {
+        progress(0.05, "Streaming adjustments directly into LZW TIFF");
+        match metadata.bit_depth {
+            8 => row_streaming_lzw::write_u8(
+                source,
+                destination,
+                stream,
+                project,
+                overlay.as_ref(),
+                dpi_info,
+                progress,
+            )?,
+            16 => row_streaming_lzw::write_u16(
+                source,
+                destination,
+                stream,
+                project,
+                overlay.as_ref(),
+                dpi_info,
+                progress,
+            )?,
+            _ => unreachable!(),
+        }
+        progress(1.0, "Export complete");
+        return Ok(());
+    }
+
     let spool_path = temporary_spool_path(destination)?;
     remove_stale_temp(&spool_path, "temporary export spool")?;
 
@@ -368,13 +399,9 @@ where
             ));
         }
 
-        // image-tiff 0.11.x only activates LZW/Deflate/PackBits in
-        // ImageEncoder::write_data(). Direct write_strip() calls do not turn
-        // the compressor on even though the Compression TIFF tag is present.
-        // Keep adjustment processing strip-streamed into a disk-backed spool,
-        // then memory-map that spool and let write_data() perform the final
-        // correctly compressed strip encoding without allocating the full
-        // image in RAM.
+        // Non-LZW row exports and tiled/region sources retain the compatibility spool path.
+        // The default LZW row-streamable path above no longer materializes or re-reads a full raw
+        // raster. Tiled sources still require row-major assembly before compression.
         progress(0.72, "Compressing TIFF from disk-backed spool");
         let spool_file =
             File::open(&spool_path).map_err(|err| format!("Cannot reopen export spool: {err}"))?;
@@ -1490,6 +1517,7 @@ mod streaming_tests {
 
         let info = stream_info(&source).unwrap();
         assert!(info.streamable);
+        assert!(info.row_streamable);
         assert_eq!(info.metadata.samples_per_pixel, 6);
         assert_eq!(info.metadata.compression, Some(5));
         assert_eq!(info.metadata.predictor, Some(2));
