@@ -2,7 +2,6 @@ use crate::*;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use windows_shade_editor::conversion_recipe::recipe_sha256;
 use windows_shade_editor::conversion_route_migration::prepare_route_migration_plan;
 use windows_shade_editor::conversion_route_migration_discovery::discover_pending_route_migration;
@@ -11,19 +10,17 @@ use windows_shade_editor::conversion_route_migration_runtime::{
 };
 use windows_shade_editor::conversion_transaction::{
     CapturedOutputPolicy, CapturedSourceProfile, ConversionCancellation, ConversionJobCapture,
-    ConversionProgress,
 };
 use windows_shade_editor::model::ConversionRouteRecord;
 use windows_shade_editor::reconversion_policy::analyze_replacement_risk;
 
 use super::conversion_plan::{
-    UnifiedDestinationMode, build_conversion_recipe, conversion_color_model, inspect_conversion_face,
-    production_routes,
+    UnifiedDestinationMode, build_conversion_recipe, inspect_conversion_face, production_routes,
 };
 
 const CONVERSION_WINDOW_ID: &str = "shade-editor-color-conversion-open";
 const ROUTE_MIGRATION_DECISION_ID: &str = "shade-editor-route-migration-decision";
-const ROUTE_MIGRATION_RUNTIME_ID: &str = "shade-editor-route-migration-runtime";
+const ROUTE_MIGRATION_MAILBOX_ID: &str = "shade-editor-route-migration-mailbox";
 
 #[derive(Clone, Default)]
 struct RouteMigrationDecisionState {
@@ -74,23 +71,6 @@ struct RouteMigrationCompletion {
     production_project: windows_shade_editor::model::ShadeProject,
 }
 
-#[derive(Clone, Default)]
-struct RouteMigrationRuntime {
-    shared: Arc<Mutex<RouteMigrationRuntimeState>>,
-}
-
-#[derive(Default)]
-struct RouteMigrationRuntimeState {
-    active: bool,
-    production_project_path: Option<PathBuf>,
-    source_project_path: Option<PathBuf>,
-    ordinal: usize,
-    total: usize,
-    progress: Option<ConversionProgress>,
-    cancellation: ConversionCancellation,
-    outcome: Option<Result<RouteMigrationCompletion, String>>,
-}
-
 #[derive(Clone)]
 struct RouteMigrationStartRequest {
     source_project: windows_shade_editor::model::ShadeProject,
@@ -100,102 +80,59 @@ struct RouteMigrationStartRequest {
     allow_production_work_discard: bool,
 }
 
-impl RouteMigrationRuntime {
-    fn start_new(&self, request: RouteMigrationStartRequest, default_dpi: f64) -> Result<(), String> {
-        let cancellation = ConversionCancellation::default();
-        {
-            let mut state = self
-                .shared
-                .lock()
-                .map_err(|_| "Route migration runtime lock is poisoned.".to_owned())?;
-            if state.active {
-                return Err("A route migration is already running.".to_owned());
-            }
-            *state = RouteMigrationRuntimeState {
-                active: true,
-                production_project_path: Some(request.production_project_path.clone()),
-                source_project_path: Some(request.source_project_path.clone()),
-                cancellation: cancellation.clone(),
-                ..RouteMigrationRuntimeState::default()
-            };
-        }
+/// Migration itself runs through ShadeApp's global `launch_job`, so New/Open/Exit and every other
+/// foreground operation see `self.job.is_some()`. This mailbox is intentionally not a second job
+/// runtime: it carries only cancellation/progress ownership metadata and the completed Production
+/// project needed to refresh the open Source-side route mirror after `poll_job` releases the lock.
+#[derive(Clone, Default)]
+struct RouteMigrationMailbox {
+    shared: Arc<Mutex<RouteMigrationMailboxState>>,
+}
 
-        let shared = self.shared.clone();
-        thread::spawn(move || {
-            let result = execute_migration_request(
-                request.clone(),
-                default_dpi,
-                &cancellation,
-                |ordinal, total, progress| {
-                    if let Ok(mut state) = shared.lock() {
-                        state.ordinal = ordinal;
-                        state.total = total;
-                        state.progress = Some(progress);
-                    }
-                },
-            )
-            .map(|production_project| RouteMigrationCompletion {
-                source_project_path: request.source_project_path,
-                production_project_path: request.production_project_path,
-                production_project,
-            });
-            if let Ok(mut state) = shared.lock() {
-                state.active = false;
-                state.outcome = Some(result);
-            }
-        });
+#[derive(Default)]
+struct RouteMigrationMailboxState {
+    active: bool,
+    production_project_path: Option<PathBuf>,
+    cancellation: ConversionCancellation,
+    outcome: Option<Result<RouteMigrationCompletion, String>>,
+    restore_export_reminder: Option<bool>,
+}
+
+#[derive(Clone, Default)]
+struct RouteMigrationMailboxSnapshot {
+    active: bool,
+    production_project_path: Option<PathBuf>,
+}
+
+impl RouteMigrationMailbox {
+    fn begin(
+        &self,
+        production_project_path: PathBuf,
+        cancellation: ConversionCancellation,
+        restore_export_reminder: bool,
+    ) -> Result<(), String> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_| "Route migration mailbox lock is poisoned.".to_owned())?;
+        if state.active {
+            return Err("A route migration is already running.".to_owned());
+        }
+        *state = RouteMigrationMailboxState {
+            active: true,
+            production_project_path: Some(production_project_path),
+            cancellation,
+            outcome: None,
+            restore_export_reminder: Some(restore_export_reminder),
+        };
         Ok(())
     }
 
-    fn start_resume(
-        &self,
-        production_project_path: PathBuf,
-        source_project_path: PathBuf,
-        default_dpi: f64,
-    ) -> Result<(), String> {
-        let cancellation = ConversionCancellation::default();
-        {
-            let mut state = self
-                .shared
-                .lock()
-                .map_err(|_| "Route migration runtime lock is poisoned.".to_owned())?;
-            if state.active {
-                return Err("A route migration is already running.".to_owned());
-            }
-            *state = RouteMigrationRuntimeState {
-                active: true,
-                production_project_path: Some(production_project_path.clone()),
-                source_project_path: Some(source_project_path.clone()),
-                cancellation: cancellation.clone(),
-                ..RouteMigrationRuntimeState::default()
-            };
+    fn finish(&self, outcome: Result<RouteMigrationCompletion, String>) {
+        if let Ok(mut state) = self.shared.lock() {
+            state.active = false;
+            state.outcome = Some(outcome);
         }
-
-        let shared = self.shared.clone();
-        thread::spawn(move || {
-            let result = resume_route_migration(
-                &production_project_path,
-                default_dpi,
-                &cancellation,
-                |ordinal, total, progress| {
-                    if let Ok(mut state) = shared.lock() {
-                        state.ordinal = ordinal;
-                        state.total = total;
-                        state.progress = Some(progress);
-                    }
-                },
-            )
-            .map(|production_project| RouteMigrationCompletion {
-                source_project_path,
-                production_project_path,
-                production_project,
-            });
-            if let Ok(mut state) = shared.lock() {
-                state.active = false;
-                state.outcome = Some(result);
-            }
-        });
-        Ok(())
     }
 
     fn cancel(&self) {
@@ -204,31 +141,28 @@ impl RouteMigrationRuntime {
         }
     }
 
-    fn snapshot(&self) -> RouteMigrationRuntimeSnapshot {
+    fn snapshot(&self) -> RouteMigrationMailboxSnapshot {
         match self.shared.lock() {
-            Ok(state) => RouteMigrationRuntimeSnapshot {
+            Ok(state) => RouteMigrationMailboxSnapshot {
                 active: state.active,
                 production_project_path: state.production_project_path.clone(),
-                ordinal: state.ordinal,
-                total: state.total,
-                progress: state.progress.clone(),
             },
-            Err(_) => RouteMigrationRuntimeSnapshot::default(),
+            Err(_) => RouteMigrationMailboxSnapshot::default(),
         }
     }
 
-    fn take_outcome(&self) -> Option<Result<RouteMigrationCompletion, String>> {
-        self.shared.lock().ok()?.outcome.take()
+    fn take_finished(
+        &self,
+    ) -> Option<(Result<RouteMigrationCompletion, String>, Option<bool>)> {
+        let mut state = self.shared.lock().ok()?;
+        if state.active {
+            return None;
+        }
+        let outcome = state.outcome.take()?;
+        let reminder = state.restore_export_reminder.take();
+        state.production_project_path = None;
+        Some((outcome, reminder))
     }
-}
-
-#[derive(Clone, Default)]
-struct RouteMigrationRuntimeSnapshot {
-    active: bool,
-    production_project_path: Option<PathBuf>,
-    ordinal: usize,
-    total: usize,
-    progress: Option<ConversionProgress>,
 }
 
 impl ShadeApp {
@@ -236,16 +170,25 @@ impl ShadeApp {
     /// Color Conversion workflow. Normal same-route reconversion remains in the durable batch
     /// runtime; only recipe drift for an already-owned route enters this explicit migration path.
     pub(crate) fn ui_conversion_route_migration(&mut self, ctx: &egui::Context) {
-        let runtime = route_migration_runtime(ctx);
-        if let Some(outcome) = runtime.take_outcome() {
-            self.handle_route_migration_outcome(outcome);
-        }
-
-        let snapshot = runtime.snapshot();
+        let mailbox = route_migration_mailbox(ctx);
+        let snapshot = mailbox.snapshot();
         if snapshot.active {
-            render_active_migration_window(ctx, &runtime, &snapshot);
+            render_active_migration_window(ctx, &mailbox, &snapshot);
             ctx.request_repaint();
             return;
+        }
+
+        // `poll_job` clears the global job before this status-bar surface is rendered. Only after
+        // that happens do we consume the migration result and restore the unrelated Export reminder
+        // bit that was temporarily suppressed because JobResult::Export is used solely as the
+        // existing no-op completion envelope for the global foreground worker.
+        if self.job.is_none() {
+            if let Some((outcome, restore_export_reminder)) = mailbox.take_finished() {
+                if let Some(value) = restore_export_reminder {
+                    self.export.remind_after_export = value;
+                }
+                self.handle_route_migration_outcome(outcome);
+            }
         }
 
         if !conversion_window_open(ctx) {
@@ -258,6 +201,7 @@ impl ShadeApp {
             return;
         };
 
+        let exclusion_error = self.route_migration_exclusion_error();
         match discover_pending_route_migration(&selected_path) {
             Ok(Some(journal)) => {
                 let stage = format!("{:?}", journal.checkpoint.stage);
@@ -266,6 +210,7 @@ impl ShadeApp {
                 let total = journal.plan.faces.len();
                 let source_project_path = journal.plan.source_project_path.clone();
                 let production_project_path = journal.plan.production_project_path.clone();
+                let mut resume_requested = false;
                 egui::Window::new("Recover Conversion Route Migration")
                     .id(egui::Id::new("route-migration-recovery-window"))
                     .collapsible(false)
@@ -283,20 +228,32 @@ impl ShadeApp {
                             "Stage: {stage} · staged {staged}/{total} · committed {committed}/{total}"
                         ));
                         ui.small(production_project_path.display().to_string());
+                        if let Some(error) = exclusion_error.as_deref() {
+                            ui.label(egui::RichText::new(error).color(egui::Color32::YELLOW));
+                        }
                         ui.add_space(8.0);
-                        if ui.button("Resume exact saved migration").clicked() {
-                            match runtime.start_resume(
-                                production_project_path.clone(),
-                                source_project_path.clone(),
-                                self.settings.default_dpi,
-                            ) {
-                                Ok(()) => self.report_info(
-                                    "Resuming the exact persisted conversion-route migration journal.",
-                                ),
-                                Err(error) => self.report_error(error),
-                            }
+                        if ui
+                            .add_enabled(
+                                exclusion_error.is_none(),
+                                egui::Button::new("Resume exact saved migration"),
+                            )
+                            .clicked()
+                        {
+                            resume_requested = true;
                         }
                     });
+                if resume_requested {
+                    match self.start_resume_route_migration_job(
+                        &mailbox,
+                        production_project_path,
+                        source_project_path,
+                    ) {
+                        Ok(()) => self.report_info(
+                            "Resuming the exact persisted conversion-route migration journal under the global operation lock.",
+                        ),
+                        Err(error) => self.report_error(error),
+                    }
+                }
                 return;
             }
             Ok(None) => {}
@@ -387,6 +344,9 @@ impl ShadeApp {
                 for warning in &draft.production_work_warnings {
                     ui.label(egui::RichText::new(warning).color(egui::Color32::YELLOW));
                 }
+                if let Some(error) = exclusion_error.as_deref() {
+                    ui.label(egui::RichText::new(error).color(egui::Color32::YELLOW));
+                }
 
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new(format!(
@@ -447,7 +407,8 @@ impl ShadeApp {
                             || decision.acknowledge_production_work)
                         && !self.project_dirty
                         && self.project_path.is_some()
-                        && draft.can_migrate();
+                        && draft.can_migrate()
+                        && exclusion_error.is_none();
                     if ui
                         .add_enabled(
                             confirmed,
@@ -480,7 +441,9 @@ impl ShadeApp {
                 self.color_conversion.output_folder = Some(route.output_folder());
                 self.color_conversion.allow_production_work_discard = false;
                 set_route_migration_decision(ctx, RouteMigrationDecisionState::default());
-                self.report_info("Selected the matching saved conversion route instead of migrating the previous route.");
+                self.report_info(
+                    "Selected the matching saved conversion route instead of migrating the previous route.",
+                );
             }
         } else if choose_new_route {
             self.select_new_route_mode();
@@ -493,13 +456,156 @@ impl ShadeApp {
                 faces: draft.faces,
                 allow_production_work_discard: decision.acknowledge_production_work,
             };
-            match runtime.start_new(request, self.settings.default_dpi) {
+            match self.start_new_route_migration_job(&mailbox, request) {
                 Ok(()) => self.report_info(
-                    "Started project-wide conversion-route migration. All replacement TIFFs will be staged before the destructive commit boundary.",
+                    "Started project-wide conversion-route migration under the global operation lock. All replacement TIFFs will be staged before the destructive commit boundary.",
                 ),
                 Err(error) => self.report_error(error),
             }
         }
+    }
+
+    fn route_migration_exclusion_error(&self) -> Option<String> {
+        if self.job.is_some() {
+            return Some(
+                "Finish the current foreground operation before starting or recovering route migration."
+                    .to_owned(),
+            );
+        }
+        if self.export.queue.has_pending() {
+            return Some(
+                "Finish or cancel the Export Queue before destructive route migration."
+                    .to_owned(),
+            );
+        }
+        if self.conversion_queue.has_pending() {
+            return Some(
+                "Finish or cancel the legacy Conversion Queue before destructive route migration."
+                    .to_owned(),
+            );
+        }
+        if self.conversion_batch_blocks_project_transition() {
+            return Some(
+                "Finish or recover the Production Color Conversion batch queue before destructive route migration."
+                    .to_owned(),
+            );
+        }
+        None
+    }
+
+    fn start_new_route_migration_job(
+        &mut self,
+        mailbox: &RouteMigrationMailbox,
+        request: RouteMigrationStartRequest,
+    ) -> Result<(), String> {
+        if let Some(error) = self.route_migration_exclusion_error() {
+            return Err(error);
+        }
+        let cancellation = ConversionCancellation::default();
+        let previous_export_reminder = self.export.remind_after_export;
+        self.export.remind_after_export = false;
+        mailbox.begin(
+            request.production_project_path.clone(),
+            cancellation.clone(),
+            previous_export_reminder,
+        )?;
+
+        let worker_mailbox = mailbox.clone();
+        let completion_source = request.source_project_path.clone();
+        let completion_production = request.production_project_path.clone();
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Migrating conversion route", move |progress| {
+            let outcome = worker_guard::catch_result("Route migration worker", || {
+                execute_migration_request(
+                    request,
+                    default_dpi,
+                    &cancellation,
+                    |ordinal, total, item| {
+                        Self::set_progress(
+                            &progress,
+                            Some(item.fraction),
+                            "Migrating conversion route",
+                            &format!(
+                                "Face {} of {} · {} — {}",
+                                ordinal + 1,
+                                total,
+                                item.phase.label(),
+                                item.detail
+                            ),
+                        );
+                    },
+                )
+            })
+            .map(|production_project| RouteMigrationCompletion {
+                source_project_path: completion_source,
+                production_project_path: completion_production,
+                production_project,
+            });
+            worker_mailbox.finish(outcome);
+            JobResult::Export(SnapshotExportBatchResult {
+                result: Ok("Conversion route migration worker finished".to_owned()),
+                marks: Vec::new(),
+            })
+        });
+        Ok(())
+    }
+
+    fn start_resume_route_migration_job(
+        &mut self,
+        mailbox: &RouteMigrationMailbox,
+        production_project_path: PathBuf,
+        source_project_path: PathBuf,
+    ) -> Result<(), String> {
+        if let Some(error) = self.route_migration_exclusion_error() {
+            return Err(error);
+        }
+        let cancellation = ConversionCancellation::default();
+        let previous_export_reminder = self.export.remind_after_export;
+        self.export.remind_after_export = false;
+        mailbox.begin(
+            production_project_path.clone(),
+            cancellation.clone(),
+            previous_export_reminder,
+        )?;
+
+        let worker_mailbox = mailbox.clone();
+        let completion_source = source_project_path.clone();
+        let completion_production = production_project_path.clone();
+        let default_dpi = self.settings.default_dpi;
+        self.launch_job("Recovering conversion route", move |progress| {
+            let outcome = worker_guard::catch_result("Route migration recovery worker", || {
+                resume_route_migration(
+                    &production_project_path,
+                    default_dpi,
+                    &cancellation,
+                    |ordinal, total, item| {
+                        Self::set_progress(
+                            &progress,
+                            Some(item.fraction),
+                            "Recovering conversion route",
+                            &format!(
+                                "Face {} of {} · {} — {}",
+                                ordinal + 1,
+                                total,
+                                item.phase.label(),
+                                item.detail
+                            ),
+                        );
+                    },
+                )
+            })
+            .map(|production_project| RouteMigrationCompletion {
+                source_project_path: completion_source,
+                production_project_path: completion_production,
+                production_project,
+            });
+            worker_mailbox.finish(outcome);
+            JobResult::Export(SnapshotExportBatchResult {
+                result: Ok("Conversion route recovery worker finished".to_owned()),
+                marks: Vec::new(),
+            })
+        });
+        Ok(())
     }
 
     fn build_route_migration_draft(
@@ -704,7 +810,7 @@ fn execute_migration_request<F>(
     report: F,
 ) -> Result<windows_shade_editor::model::ShadeProject, String>
 where
-    F: FnMut(usize, usize, ConversionProgress),
+    F: FnMut(usize, usize, windows_shade_editor::conversion_transaction::ConversionProgress),
 {
     if request.faces.is_empty() {
         return Err("Route migration requires at least one affected Face.".to_owned());
@@ -796,6 +902,7 @@ fn route_exactly_matches_current_recipes(
     faces: &[RouteMigrationDraftFace],
 ) -> bool {
     route.validate().is_ok()
+        && route.faces.len() == faces.len()
         && faces.iter().all(|face| {
             route
                 .face_for_source(&face.source_path)
@@ -826,8 +933,8 @@ fn same_target_compatibility(
 
 fn render_active_migration_window(
     ctx: &egui::Context,
-    runtime: &RouteMigrationRuntime,
-    snapshot: &RouteMigrationRuntimeSnapshot,
+    mailbox: &RouteMigrationMailbox,
+    snapshot: &RouteMigrationMailboxSnapshot,
 ) {
     egui::Window::new("Conversion Route Migration")
         .id(egui::Id::new("route-migration-active-window"))
@@ -837,46 +944,36 @@ fn render_active_migration_window(
         .show(ctx, |ui| {
             ui.label(
                 egui::RichText::new(
-                    "Project-wide destructive migration is running under a durable recovery journal.",
+                    "Project-wide destructive migration is running under the application's global operation lock and a durable recovery journal.",
                 )
                 .strong(),
             );
             if let Some(path) = snapshot.production_project_path.as_deref() {
                 ui.small(path.display().to_string());
             }
-            if snapshot.total > 0 {
-                ui.label(format!(
-                    "Face {} of {}",
-                    (snapshot.ordinal + 1).min(snapshot.total),
-                    snapshot.total
-                ));
-            }
-            if let Some(progress) = snapshot.progress.as_ref() {
-                ui.add(egui::ProgressBar::new(progress.fraction).show_percentage());
-                ui.small(format!("{} — {}", progress.phase.label(), progress.detail));
-            } else {
-                ui.spinner();
-                ui.small("Preparing migration capture and recovery journal...");
-            }
+            ui.spinner();
+            ui.small(
+                "Detailed Face/phase progress is also reported through the normal foreground-operation progress surface.",
+            );
             ui.add_space(6.0);
             if ui.button("Cancel before destructive commit").clicked() {
-                runtime.cancel();
+                mailbox.cancel();
             }
             ui.small(
-                "Cancellation is honored during staging. After all replacement TIFFs are durably staged, Shade Editor finishes the short commit boundary so the Production route cannot be left intentionally mixed.",
+                "Cancellation is honored during staging. After all replacement TIFFs are durably staged, Shade Editor finishes the short commit boundary so the Production route cannot be intentionally left mixed.",
             );
         });
 }
 
-fn route_migration_runtime(ctx: &egui::Context) -> RouteMigrationRuntime {
+fn route_migration_mailbox(ctx: &egui::Context) -> RouteMigrationMailbox {
     ctx.data_mut(|data| {
-        let id = egui::Id::new(ROUTE_MIGRATION_RUNTIME_ID);
-        if let Some(runtime) = data.get_temp::<RouteMigrationRuntime>(id) {
-            runtime
+        let id = egui::Id::new(ROUTE_MIGRATION_MAILBOX_ID);
+        if let Some(mailbox) = data.get_temp::<RouteMigrationMailbox>(id) {
+            mailbox
         } else {
-            let runtime = RouteMigrationRuntime::default();
-            data.insert_temp(id, runtime.clone());
-            runtime
+            let mailbox = RouteMigrationMailbox::default();
+            data.insert_temp(id, mailbox.clone());
+            mailbox
         }
     })
 }
@@ -978,5 +1075,7 @@ mod tests {
         assert!(source.contains("Replace / migrate this existing conversion route"));
         assert!(source.contains("Create new conversion route / Production link"));
         assert!(source.contains("Resume exact saved migration"));
+        assert!(source.contains("global operation lock"));
+        assert!(!source.contains("std::thread::spawn"));
     }
 }
