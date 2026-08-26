@@ -22,8 +22,8 @@ $profileDirectory = if ($Profile -eq 'release') { 'release' } else { $Profile }
 $summarizer = Join-Path $PSScriptRoot 'summarize-tiff-perf.ps1'
 $codecSource = 'src/lzw_strip_writer.rs'
 $compressionTagSources = @(
-    'src/source_tiff_writer.rs',
-    'src/conversion_tiff.rs'
+    'src/source_tiff_writer_impl.rs',
+    'src/conversion_tiff_impl.rs'
 )
 $codecImportPattern = '(?m)^use tiff::encoder::compression::\{CompressionAlgorithm, Lzw\};$'
 $codecImportRegex = [regex]::new($codecImportPattern)
