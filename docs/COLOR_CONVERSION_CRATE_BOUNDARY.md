@@ -1,68 +1,68 @@
 # Color Conversion binary/library module boundary
 
-Status: **Accepted integration decision**
+Status: **Superseded by the canonical library ownership migration in #396**
 
-Tracks: #84, #89, #131
+Historical tracks: #84, #89, #131
+Current cleanup: #396
 
-## Context
+## Historical context
 
-Shade Editor currently uses the same backend source files from two Rust crate roots:
+During the initial Color Conversion implementation, Shade Editor intentionally compiled the same backend source files from two Rust crate roots:
 
-- `src/main.rs` declares modules for the native GUI binary;
-- `src/lib.rs` declares backend modules used by conformance/unit tests.
+- `src/main.rs` declared modules for the native GUI binary;
+- `src/lib.rs` declared backend modules used by conformance/unit tests.
 
-A Rust module compiled under the binary crate and the same file compiled under the library crate are different crate-local type domains. Passing `lib::model::ShadeProject` into code expecting `bin::model::ShadeProject` would therefore be invalid even though both types originated from `src/model.rs`.
+That avoided a broad application refactor while Color Conversion itself was still being built, but it also meant the same source produced separate binary-local and library-local Rust type domains. In particular, `ShadeProject`, `IccProfileIdentity`, `ProjectRole`, `ProductionProvenance`, and related conversion types could not safely cross the crate-root boundary without adapters.
 
-Color Conversion must not introduce adapters or duplicate model structures merely to cross that boundary.
+The old document therefore required GUI conversion code to stay inside the binary-local type domain. That was a deliberate temporary compatibility decision, not the desired long-term architecture.
 
-## Decision
+## Current decision
 
-For the current architecture, Color Conversion backend files follow the existing Shade Editor pattern:
+Issue #396 removes the duplicate backend compilation incrementally while preserving historical GUI paths.
 
-1. The canonical implementation lives in normal source files such as `color_conversion.rs`, `conversion_workflow.rs`, `icc_conversion.rs`, etc.
-2. `src/lib.rs` declares those modules so unit/conformance tests compile and exercise the canonical implementation in the library crate.
-3. When GUI wiring begins, `src/main.rs` declares the same canonical module files in the binary crate and GUI code uses the binary-local `crate::model`, `crate::tiff_io`, and conversion types.
-4. No conversion value containing model/profile types is passed across the binary/library crate boundary.
-5. Logic is never copied into UI modules; only module declarations are duplicated, exactly as the project already does for existing backends such as `model`, `export`, `tiff_io`, `safe_fs`, and others.
+For the `model` + `color_conversion` ownership batch:
 
-This is a pragmatic compatibility decision, not a claim that duplicate crate roots are the ideal long-term architecture.
+1. The canonical project/domain model is compiled only by the package library from `src/model_impl.rs`.
+2. The canonical Color Conversion domain is compiled only by the package library from `src/color_conversion_impl/mod.rs`.
+3. `production_provenance` remains a child of the canonical Color Conversion module at `src/color_conversion_impl/production_provenance.rs`.
+4. The binary `src/model.rs` and `src/color_conversion.rs` files are compatibility facades only. They publicly re-export the canonical library modules so existing GUI code can continue to use `crate::model::...` and `crate::color_conversion::...` paths.
+5. No mirrored model, provenance, recipe, profile, or conversion structures are introduced.
+6. No value conversion/adaptation layer exists between GUI and library types because there is now one Rust type domain for these shared structures.
 
-## Why not refactor the entire application now?
+## Why `model` and `color_conversion` move together
 
-Making the binary consume all backend modules through the library crate would touch a large, production-hardened surface unrelated to Color Conversion. It would create unnecessary migration risk while the conversion subsystem itself is still being implemented.
+The modules are mutually type-sensitive:
 
-A broader crate-boundary cleanup can be evaluated separately after Color Conversion is production-stable.
+- `model` stores Color Conversion domain types such as project role, linked project references, and production provenance;
+- `color_conversion` consumes model-owned ICC profile identity data.
+
+Migrating only one side would leave the binary with a mixture of library-owned and binary-local definitions and recreate the exact type-identity problem this cleanup is intended to remove. They therefore move as one bounded ownership batch.
 
 ## UI integration rule
 
-The first PR that wires Color Conversion into the native GUI must add the required conversion module declarations to `src/main.rs` and compile them against the binary-local backend types.
-
-Examples of modules expected to be declared as they become used by the GUI:
+GUI and orchestration code continues to use the stable binary paths:
 
 ```text
-color_conversion
-conversion_capabilities
-conversion_preflight
-conversion_workflow
-conversion_presets
-conversion_recipe
-icc_conversion
-nchannel_icc
-separation_optimizer
-conversion_analytics
+crate::model::...
+crate::color_conversion::...
 ```
 
-Only modules actually present in `main` at that point should be declared.
+Those paths are facades, not independent implementations. UI code must not add alternate model/profile/conversion structures or copy backend logic locally.
+
+Other conversion backend modules can continue to be migrated incrementally. A module that still compiles in the binary must consume the canonical `crate::model` and `crate::color_conversion` facade types; it must not recreate either domain.
 
 ## Test parity rule
 
-A conversion behavior is not accepted merely because it works in a GUI-local code path. Production conversion semantics must remain implemented in canonical backend files that are also declared by `src/lib.rs` and covered by unit/conformance tests.
+Production conversion semantics remain implemented in library-owned backend code and covered by the existing unit/conformance suite. GUI wiring does not own alternate profile conversion, separation, constraint, provenance, TIFF-writing, or project-domain math.
 
-The GUI may own presentation state and orchestration, but it may not own alternate profile conversion, separation, constraint, provenance, or TIFF-writing math.
+## Distribution constraint
+
+This is a Rust compile-time ownership change only. It does not introduce a runtime DLL, service, sidecar process, or alternate executable. The main product remains the standalone `ShadeEditor.exe`; the existing optional native Shell extension remains a separate concern.
 
 ## Consequences
 
-- No incompatible `ShadeProject`/`IccProfileIdentity` values cross crate roots.
-- No broad crate refactor is required before Color Conversion UI work.
-- The same backend source implementation is compiled for tests and GUI, reducing semantic drift.
-- Module declarations are intentionally duplicated between crate roots, while implementation is not.
+- `ShadeProject`, `IccProfileIdentity`, project-role/linkage types, and production provenance have one canonical Rust type domain.
+- Color Conversion GUI code can use the same types exercised by library/conformance tests.
+- Duplicate compilation of `model` and `color_conversion` is removed from the application binary.
+- Existing `crate::...` GUI paths remain stable through zero-logic compatibility facades.
+- The earlier temporary duplicate-crate-root rule is no longer an architectural requirement for these two modules.
