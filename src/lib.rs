@@ -90,16 +90,16 @@ pub mod production_target;
 pub mod project_link_navigation;
 pub mod queue_core;
 pub mod reconversion_policy;
-#[path = "safe_fs.rs"]
+#[path = "safe_fs_impl.rs"]
 pub mod safe_fs;
-pub use safe_fs::tiff_performance;
+pub use safe_fs::{staging, tiff_performance};
 pub mod separation_optimizer;
 pub mod source_tiff_writer;
 pub mod source_profile_fallback;
 #[path = "source_transparency_impl.rs"]
 pub mod source_transparency;
-pub mod staging;
 pub mod test_stack;
+#[path = "tiff_output_impl.rs"]
 pub mod tiff_output;
 #[path = "tiff_io.rs"]
 pub mod tiff_io;
