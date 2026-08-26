@@ -23,6 +23,7 @@ pub mod conversion_route_migration_discovery;
 pub mod conversion_route_migration_executor;
 pub mod conversion_route_migration_project;
 pub mod conversion_route_migration_runtime;
+#[path = "conversion_tiff_impl.rs"]
 pub mod conversion_tiff;
 pub mod conversion_transaction;
 #[path = "conversion_transaction_disposition_wrapper.rs"]
@@ -94,6 +95,7 @@ pub mod reconversion_policy;
 pub mod safe_fs;
 pub use safe_fs::{staging, tiff_performance};
 pub mod separation_optimizer;
+#[path = "source_tiff_writer_impl.rs"]
 pub mod source_tiff_writer;
 pub mod source_profile_fallback;
 #[path = "source_transparency_impl.rs"]
