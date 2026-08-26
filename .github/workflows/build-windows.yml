@@ -58,8 +58,10 @@ jobs:
           $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_STARTED_MS) / 1000.0
           $seconds = [Math]::Round($elapsed, 2)
           $outcome = "${{ steps.cargo-cache.outcome }}"
+          $cacheHit = "${{ steps.cargo-cache.outputs.cache-hit }}"
+          Write-Host "CI timing: Cargo cache restore = ${seconds}s ($outcome), exact-key-hit=$cacheHit"
           "| Cargo cache restore | $seconds | $outcome |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          "Cache exact-key hit: `${{ steps.cargo-cache.outputs.cache-hit }}`" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Cache exact-key hit: $cacheHit" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
       - name: Test TIFF performance summarizer
         shell: pwsh
         run: .\scripts\test-summarize-tiff-perf.ps1
@@ -87,6 +89,7 @@ jobs:
         run: |
           $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_JOB_STARTED_MS) / 1000.0
           $seconds = [Math]::Round($elapsed, 2)
+          Write-Host "CI timing: Draft timed job total = ${seconds}s (${{ job.status }})"
           "| Draft timed job total | $seconds | ${{ job.status }} |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
   build:
@@ -132,8 +135,10 @@ jobs:
           $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_STARTED_MS) / 1000.0
           $seconds = [Math]::Round($elapsed, 2)
           $outcome = "${{ steps.cargo-cache.outcome }}"
+          $cacheHit = "${{ steps.cargo-cache.outputs.cache-hit }}"
+          Write-Host "CI timing: Cargo cache restore = ${seconds}s ($outcome), exact-key-hit=$cacheHit"
           "| Cargo cache restore | $seconds | $outcome |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          "Cache exact-key hit: `${{ steps.cargo-cache.outputs.cache-hit }}`" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Cache exact-key hit: $cacheHit" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
       - name: Validate version identity
         shell: pwsh
         run: |
@@ -212,6 +217,7 @@ jobs:
           $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_NATIVE_SHELL_STARTED_MS) / 1000.0
           $seconds = [Math]::Round($elapsed, 2)
           $outcome = "${{ steps.native-shell.outcome }}"
+          Write-Host "CI timing: Native Shell build/tests = ${seconds}s ($outcome)"
           "| Native Shell build/tests | $seconds | $outcome |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
       - name: Validate Shell property schema XML
         shell: pwsh
@@ -255,4 +261,5 @@ jobs:
         run: |
           $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_JOB_STARTED_MS) / 1000.0
           $seconds = [Math]::Round($elapsed, 2)
+          Write-Host "CI timing: Full timed job total = ${seconds}s (${{ job.status }})"
           "| Full timed job total | $seconds | ${{ job.status }} |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
