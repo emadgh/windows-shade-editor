@@ -41,16 +41,16 @@ The release Rust build is the dominant full-gate stage even with the current who
 
 The first #397 change adds lightweight in-workflow timing for:
 
-- Cargo cache restore and exact-key hit state;
+- Cargo cache restore, exact-key hit state, and cache save when a new cache is produced;
 - Draft `cargo check` and library tests;
 - full Rust tests;
 - release build;
 - native Shell build/tests;
-- timed Draft/full job totals.
+- timed Draft/full job totals including an explicit cache save when one occurs.
 
-Metrics are emitted to both the GitHub Actions log and Job Summary where applicable. No validation step is removed, and the existing cache strategy is intentionally unchanged in this phase so subsequent configurations can be compared against the same baseline.
+Metrics are emitted to both the GitHub Actions log and Job Summary where applicable. No validation step is removed, and the existing cache paths/key strategy is intentionally unchanged in this phase so subsequent configurations can be compared against the same baseline. The previous combined `actions/cache` step is expressed as explicit `restore` and successful-run `save` actions only so both transfer directions can be timed instead of hiding save work in an automatic post-step.
 
-The job-total timer starts at the first workflow step; GitHub queue/runner-provisioning time is outside that measurement. Cache timing includes the small step-transition overhead around the cache action and is intended for relative comparisons between equivalent workflow revisions.
+The job-total timer starts at the first workflow step; GitHub queue/runner-provisioning time is outside that measurement. Cache timing includes the small step-transition overhead around each cache action and is intended for relative comparisons between equivalent workflow revisions.
 
 ## Next comparison matrix
 
