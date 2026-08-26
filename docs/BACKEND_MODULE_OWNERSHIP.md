@@ -15,7 +15,7 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 | Module | Classification | Ownership status | Notes |
 | --- | --- | --- | --- |
 | `color_conversion` | shared backend/domain | duplicate implementation pending | High-risk/high-fan-out; migrate after low-risk pattern is proven. |
-| `conversion_tiff` | shared TIFF/conversion backend | duplicate implementation pending | Preserve TIFF/BigTIFF and conversion contracts. |
+| `conversion_tiff` | shared TIFF/conversion backend | duplicate implementation pending | Depends on the canonical safe/TIFF layer; evaluate after this batch passes. |
 | `custom_optimizer_config` | shared domain/config | library-owned | Binary module is a compatibility facade; implementation is `custom_optimizer_config_impl.rs`. |
 | `dpi` | shared TIFF/domain utility | library-owned | Binary `dpi.rs` is a compatibility facade; implementation is `dpi_impl.rs`. |
 | `export` | shared export backend | duplicate implementation pending | High fan-out; preserve row streaming and export semantics. |
@@ -23,11 +23,15 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 | `model` | shared domain | duplicate implementation pending | Highest type-identity sensitivity; migrate only with focused validation. |
 | `palette` | shared domain/config | library-owned | Binary `palette.rs` is a compatibility facade; implementation is `palette_impl.rs`. |
 | `production_project` | shared production/domain | duplicate implementation pending | Preserve project compatibility and persistence semantics. |
-| `safe_fs` | shared IO/safety backend | duplicate implementation pending | Preserve atomic/safe filesystem behavior and TIFF performance exports. |
-| `source_tiff_writer` | shared TIFF backend | duplicate implementation pending | Preserve source metadata and write behavior. |
+| `safe_fs` | shared IO/safety backend | library-owned | Binary module is a facade; implementation is `safe_fs_impl.rs`. Its `staging` and TIFF performance modules are canonical library-owned children. |
+| `source_tiff_writer` | shared TIFF backend | duplicate implementation pending | Depends on `conversion_tiff`, `dpi`, `safe_fs`, `tiff_io`, and `tiff_output`; migrate in dependency order. |
 | `source_transparency` | shared source/domain | library-owned | Binary `source_transparency.rs` is a compatibility facade; implementation is `source_transparency_impl.rs`. |
-| `tiff_output` | shared TIFF backend | duplicate implementation pending | Preserve output/conformance behavior. |
-| `tiff_io` | shared TIFF backend | duplicate implementation pending | Contains crate-visible internals; requires API-boundary review before migration. |
+| `tiff_output` | shared TIFF backend | library-owned | Binary module is a facade; implementation is `tiff_output_impl.rs` and consumes canonical `safe_fs`. |
+| `tiff_io` | shared TIFF backend | duplicate implementation pending | Contains crate-visible/API-boundary concerns; review callers before migration. |
+
+## Additional duplicate removed inside the library
+
+`safe_fs` already owns `staging.rs` as a child module. The previous library root also declared `pub mod staging;`, compiling the same source file a second time inside the library. The root now re-exports `safe_fs::staging` instead, so there is one canonical staging registry while existing `crate::staging::...` library paths remain valid.
 
 ## Migration rules
 
@@ -40,6 +44,7 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 
 ## Current migration sequence
 
-1. `dpi`, `palette`, `source_transparency`, `custom_optimizer_config` — first self-contained ownership batch.
-2. TIFF/export surfaces — migrate in dependency order after checking crate-visible helpers; keep `export_recipe` paired with/after `model` ownership migration.
-3. `model`, `production_project`, `color_conversion` — migrate last because they have the broadest type/API fan-out.
+1. `dpi`, `palette`, `source_transparency`, `custom_optimizer_config` — merged first self-contained ownership batch.
+2. `safe_fs`, root `staging`, `tiff_output` — second storage-boundary batch.
+3. `tiff_io`, `conversion_tiff`, `source_tiff_writer` — review and migrate in dependency order after the storage-boundary batch validates.
+4. `model`, `export_recipe`, `export`, `production_project`, `color_conversion` — migrate in coordinated higher-fan-out batches because shared domain types cross their public APIs.
