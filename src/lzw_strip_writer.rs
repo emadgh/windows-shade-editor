@@ -104,3 +104,22 @@ where
             .map_err(|err| format!("Cannot finalize TIFF directory: {err}"))
     }
 }
+
+#[cfg(test)]
+mod benchmark_codec_tests {
+    use super::*;
+    use tiff::encoder::compression::{Deflate, DeflateLevel};
+
+    #[test]
+    fn deflate_benchmark_levels_use_the_same_strip_compression_trait() {
+        let input = b"shade-editor-deflate-benchmark-probe-shade-editor-deflate-benchmark-probe";
+        for level in [DeflateLevel::Fast, DeflateLevel::Balanced] {
+            let mut output = Vec::new();
+            Deflate::with_level(level)
+                .write_to(&mut output, input)
+                .expect("Deflate benchmark compressor should be available");
+            assert!(!output.is_empty());
+            assert_ne!(output, input);
+        }
+    }
+}

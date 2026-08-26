@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
-$runner = Join-Path $PSScriptRoot 'run-tiff-buffer-benchmark.ps1'
+$bufferRunner = Join-Path $PSScriptRoot 'run-tiff-buffer-benchmark.ps1'
+$codecRunner = Join-Path $PSScriptRoot 'run-tiff-codec-benchmark.ps1'
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("shade-tiff-buffer-plan-" + [guid]::NewGuid().ToString('N'))
 
 try {
@@ -8,7 +9,7 @@ try {
 
     $logPath = Join-Path $tempRoot 'buffer-64k.log'
     $warmupPath = Join-Path $tempRoot 'buffer-64k-warmup.log'
-    $plan = (& $runner -Profile release-throughput -BufferBytes 65536 -LogPath $logPath -WarmupLogPath $warmupPath -PlanOnly | Out-String | ConvertFrom-Json)
+    $plan = (& $bufferRunner -Profile release-throughput -BufferBytes 65536 -LogPath $logPath -WarmupLogPath $warmupPath -PlanOnly | Out-String | ConvertFrom-Json)
     if ($plan.profile -ne 'release-throughput') {
         throw "Expected release-throughput profile, found $($plan.profile)."
     }
@@ -34,7 +35,7 @@ try {
         throw "Unexpected buffer summary path: $($plan.summary)"
     }
 
-    $largePlan = (& $runner -Profile release -BufferBytes 4194304 -LogPath (Join-Path $tempRoot 'buffer-4m.log') -PlanOnly | Out-String | ConvertFrom-Json)
+    $largePlan = (& $bufferRunner -Profile release -BufferBytes 4194304 -LogPath (Join-Path $tempRoot 'buffer-4m.log') -PlanOnly | Out-String | ConvertFrom-Json)
     if ([int]$largePlan.buffer_bytes -ne 4194304) {
         throw '4 MiB buffer plan was not preserved.'
     }
@@ -44,7 +45,7 @@ try {
 
     $rejected = $false
     try {
-        & $runner -BufferBytes 4096 -LogPath (Join-Path $tempRoot 'invalid.log') -PlanOnly | Out-Null
+        & $bufferRunner -BufferBytes 4096 -LogPath (Join-Path $tempRoot 'invalid.log') -PlanOnly | Out-Null
     }
     catch {
         $rejected = $true
@@ -53,7 +54,56 @@ try {
         throw 'Buffer benchmark accepted a value below the 8 KiB safety floor.'
     }
 
-    Write-Host 'TIFF buffer benchmark plan regression test passed.'
+    $codecWarmup = Join-Path $tempRoot 'codec-lzw-warmup.log'
+    $codecPlan = (& $codecRunner -Profile release-throughput -Codec lzw -LogPath (Join-Path $tempRoot 'codec-lzw.log') -WarmupLogPath $codecWarmup -PlanOnly | Out-String | ConvertFrom-Json)
+    if ($codecPlan.streaming_codec -ne 'lzw') {
+        throw "Default codec plan must remain LZW, found $($codecPlan.streaming_codec)."
+    }
+    if ($codecPlan.buffer_policy -ne 'production-default') {
+        throw "Codec benchmark must keep production buffer policy, found $($codecPlan.buffer_policy)."
+    }
+    if ($codecPlan.codec_source -ne 'src/lzw_strip_writer.rs') {
+        throw "Unexpected streaming codec source: $($codecPlan.codec_source)"
+    }
+    if (@($codecPlan.compression_tag_sources).Count -ne 2) {
+        throw "Expected two codec tag source files, found $(@($codecPlan.compression_tag_sources).Count)."
+    }
+    if ($codecPlan.codec_call_replacement -ne 'Lzw.write_to(') {
+        throw "Unexpected default codec call: $($codecPlan.codec_call_replacement)"
+    }
+    if ($codecPlan.compression_tag_replacement -ne 'const TIFF_COMPRESSION_LZW: u16 = 5;') {
+        throw "Unexpected default compression tag: $($codecPlan.compression_tag_replacement)"
+    }
+    if ($codecPlan.warmup_log -ne $codecWarmup) {
+        throw "Unexpected codec warm-up log path: $($codecPlan.warmup_log)"
+    }
+
+    $fastPlan = (& $codecRunner -Codec deflate-fast -LogPath (Join-Path $tempRoot 'codec-deflate-fast.log') -PlanOnly | Out-String | ConvertFrom-Json)
+    if ($fastPlan.streaming_codec -ne 'deflate-fast') {
+        throw "Deflate Fast plan lost its codec: $($fastPlan.streaming_codec)"
+    }
+    if ($fastPlan.codec_import_replacement -ne 'use tiff::encoder::compression::{CompressionAlgorithm, Deflate, DeflateLevel};') {
+        throw "Unexpected Deflate import replacement: $($fastPlan.codec_import_replacement)"
+    }
+    if ($fastPlan.codec_call_replacement -ne 'Deflate::with_level(DeflateLevel::Fast).write_to(') {
+        throw "Unexpected Deflate Fast call replacement: $($fastPlan.codec_call_replacement)"
+    }
+    if ($fastPlan.compression_tag_replacement -ne 'const TIFF_COMPRESSION_LZW: u16 = 8;') {
+        throw "Deflate Fast plan did not select TIFF compression tag 8: $($fastPlan.compression_tag_replacement)"
+    }
+
+    $balancedPlan = (& $codecRunner -Codec deflate-balanced -LogPath (Join-Path $tempRoot 'codec-deflate-balanced.log') -PlanOnly | Out-String | ConvertFrom-Json)
+    if ($balancedPlan.streaming_codec -ne 'deflate-balanced') {
+        throw "Deflate Balanced plan lost its codec: $($balancedPlan.streaming_codec)"
+    }
+    if ($balancedPlan.codec_call_replacement -ne 'Deflate::with_level(DeflateLevel::Balanced).write_to(') {
+        throw "Unexpected Deflate Balanced call replacement: $($balancedPlan.codec_call_replacement)"
+    }
+    if ($balancedPlan.compression_tag_replacement -ne 'const TIFF_COMPRESSION_LZW: u16 = 8;') {
+        throw "Deflate Balanced plan did not select TIFF compression tag 8: $($balancedPlan.compression_tag_replacement)"
+    }
+
+    Write-Host 'TIFF buffer/codec benchmark plan regression test passed.'
 }
 finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
