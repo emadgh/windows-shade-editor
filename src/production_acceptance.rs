@@ -42,7 +42,7 @@ mod tests {
     const PRODUCTION_TARGET_SRC: &str = include_str!("production_target.rs");
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
     const EXPORT_TESTS: &str = include_str!("export.rs");
-    const TIFF_IO_TESTS: &str = include_str!("tiff_io.rs");
+    const TIFF_IO_TESTS: &str = include_str!("tiff_io_impl.rs");
     const CONVERSION_TIFF_TESTS: &str = include_str!("conversion_tiff.rs");
     const NCHANNEL_ICC_TESTS: &str = include_str!("nchannel_icc.rs");
     const ICC_CONVERSION_WORKER_TESTS: &str = include_str!("icc_conversion_worker.rs");
