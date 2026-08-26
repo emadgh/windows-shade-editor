@@ -21,8 +21,8 @@ $targetTriple = 'x86_64-pc-windows-msvc'
 $profileDirectory = if ($Profile -eq 'release') { 'release' } else { $Profile }
 $summarizer = Join-Path $PSScriptRoot 'summarize-tiff-perf.ps1'
 $bufferSources = @(
-    'src/source_tiff_writer.rs',
-    'src/conversion_tiff.rs'
+    'src/source_tiff_writer_impl.rs',
+    'src/conversion_tiff_impl.rs'
 )
 $bufferPattern = '(?m)^const TIFF_ENCODER_BUFFER_BYTES: usize = [^;]+;$'
 $bufferRegex = [regex]::new($bufferPattern)

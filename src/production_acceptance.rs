@@ -43,7 +43,7 @@ mod tests {
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
     const EXPORT_TESTS: &str = include_str!("export.rs");
     const TIFF_IO_TESTS: &str = include_str!("tiff_io_impl.rs");
-    const CONVERSION_TIFF_TESTS: &str = include_str!("conversion_tiff.rs");
+    const CONVERSION_TIFF_TESTS: &str = include_str!("conversion_tiff_impl.rs");
     const NCHANNEL_ICC_TESTS: &str = include_str!("nchannel_icc.rs");
     const ICC_CONVERSION_WORKER_TESTS: &str = include_str!("icc_conversion_worker.rs");
     const DEVICELINK_CONVERSION_TESTS: &str = include_str!("devicelink_conversion.rs");
