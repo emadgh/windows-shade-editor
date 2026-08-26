@@ -101,7 +101,7 @@ pub mod source_transparency;
 pub mod test_stack;
 #[path = "tiff_output_impl.rs"]
 pub mod tiff_output;
-#[path = "tiff_io.rs"]
+#[path = "tiff_io_impl.rs"]
 pub mod tiff_io;
 
 #[cfg(test)]
