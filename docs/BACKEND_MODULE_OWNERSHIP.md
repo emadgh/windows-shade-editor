@@ -19,13 +19,13 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 | `custom_optimizer_config` | shared domain/config | duplicate implementation pending | Self-contained candidate for an early follow-up batch. |
 | `dpi` | shared TIFF/domain utility | library-owned | Binary `dpi.rs` is a compatibility facade; implementation is `dpi_impl.rs`. |
 | `export` | shared export backend | duplicate implementation pending | High fan-out; preserve row streaming and export semantics. |
-| `export_recipe` | shared export/domain | duplicate implementation pending | Keep serialized recipe identity unchanged. |
+| `export_recipe` | shared export/domain | duplicate implementation pending | Depends on `model`; do not migrate separately while `ShadeProject` still has duplicate ownership. |
 | `model` | shared domain | duplicate implementation pending | Highest type-identity sensitivity; migrate only with focused validation. |
 | `palette` | shared domain/config | library-owned | Binary `palette.rs` is a compatibility facade; implementation is `palette_impl.rs`. |
 | `production_project` | shared production/domain | duplicate implementation pending | Preserve project compatibility and persistence semantics. |
 | `safe_fs` | shared IO/safety backend | duplicate implementation pending | Preserve atomic/safe filesystem behavior and TIFF performance exports. |
 | `source_tiff_writer` | shared TIFF backend | duplicate implementation pending | Preserve source metadata and write behavior. |
-| `source_transparency` | shared source/domain | duplicate implementation pending | Preserve transparency contracts. |
+| `source_transparency` | shared source/domain | library-owned | Binary `source_transparency.rs` is a compatibility facade; implementation is `source_transparency_impl.rs`. |
 | `tiff_output` | shared TIFF backend | duplicate implementation pending | Preserve output/conformance behavior. |
 | `tiff_io` | shared TIFF backend | duplicate implementation pending | Contains crate-visible internals; requires API-boundary review before migration. |
 
@@ -40,7 +40,7 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 
 ## Current migration sequence
 
-1. `dpi`, `palette` — establish the compatibility-facade pattern with self-contained modules.
-2. `custom_optimizer_config`, `source_transparency`, `export_recipe` — review as lower-risk domain/config candidates.
-3. TIFF/export surfaces — migrate in dependency order after checking crate-visible helpers.
+1. `dpi`, `palette`, `source_transparency` — establish the compatibility-facade pattern with self-contained modules.
+2. `custom_optimizer_config` — next self-contained domain/config candidate after the first batch is validated.
+3. TIFF/export surfaces — migrate in dependency order after checking crate-visible helpers; keep `export_recipe` paired with/after `model` ownership migration.
 4. `model`, `production_project`, `color_conversion` — migrate last because they have the broadest type/API fan-out.
