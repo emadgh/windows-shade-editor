@@ -28,6 +28,7 @@ pub mod conversion_transaction;
 #[path = "conversion_transaction_disposition_wrapper.rs"]
 pub mod conversion_transaction_disposition;
 pub mod conversion_workflow;
+#[path = "custom_optimizer_config_impl.rs"]
 pub mod custom_optimizer_config;
 pub mod custom_optimizer_evidence;
 pub mod custom_optimizer_raster_transform;
