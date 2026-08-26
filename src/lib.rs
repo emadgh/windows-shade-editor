@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+#[path = "color_conversion_impl/mod.rs"]
 pub mod color_conversion;
 pub mod conversion_analytics;
 pub mod conversion_audit;
@@ -70,6 +71,7 @@ pub mod inverse_lut_validation_reference;
 pub mod inverse_lut_validation_runner;
 pub mod inverse_separation_solver;
 pub mod jpeg_source;
+#[path = "model_impl.rs"]
 pub mod model;
 pub mod nchannel_icc;
 #[path = "palette_impl.rs"]
