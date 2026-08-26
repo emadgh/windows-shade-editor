@@ -34,14 +34,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Start Cargo cache timer
+      - name: Start Cargo cache restore timer
         shell: pwsh
         run: |
           $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-          "CI_CACHE_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CI_CACHE_RESTORE_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Restore Cargo build cache
         id: cargo-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -55,7 +55,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_STARTED_MS) / 1000.0
+          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_RESTORE_STARTED_MS) / 1000.0
           $seconds = [Math]::Round($elapsed, 2)
           $outcome = "${{ steps.cargo-cache.outcome }}"
           $cacheHit = "${{ steps.cargo-cache.outputs.cache-hit }}"
@@ -83,6 +83,37 @@ jobs:
       - name: Test library
         shell: pwsh
         run: .\scripts\measure-ci-command.ps1 -Name "Library tests" -Command "cargo test --locked --target x86_64-pc-windows-msvc --lib"
+      - name: Start Cargo cache save timer
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          "CI_CACHE_SAVE_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Save Cargo build cache
+        id: cargo-cache-save
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msvc-draft-${{ hashFiles('Cargo.lock') }}
+      - name: Record Cargo cache save timing
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_SAVE_STARTED_MS) / 1000.0
+          $seconds = [Math]::Round($elapsed, 2)
+          $outcome = "${{ steps.cargo-cache-save.outcome }}"
+          Write-Host "CI timing: Cargo cache save = ${seconds}s ($outcome)"
+          "| Cargo cache save | $seconds | $outcome |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - name: Record Cargo cache save exact-hit skip
+        if: success() && steps.cargo-cache.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "CI timing: Cargo cache save skipped (exact-key hit)"
+          "| Cargo cache save | 0 | skipped: exact-key hit |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
       - name: Record total CI timing
         if: always()
         shell: pwsh
@@ -110,14 +141,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Start Cargo cache timer
+      - name: Start Cargo cache restore timer
         shell: pwsh
         run: |
           $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-          "CI_CACHE_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CI_CACHE_RESTORE_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Restore Cargo build cache
         id: cargo-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -132,7 +163,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_STARTED_MS) / 1000.0
+          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_RESTORE_STARTED_MS) / 1000.0
           $seconds = [Math]::Round($elapsed, 2)
           $outcome = "${{ steps.cargo-cache.outcome }}"
           $cacheHit = "${{ steps.cargo-cache.outputs.cache-hit }}"
@@ -255,6 +286,37 @@ jobs:
         with:
           name: ShadeEditor-v${{ env.SHADE_VERSION }}-win-x64
           path: artifact
+      - name: Start Cargo cache save timer
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          "CI_CACHE_SAVE_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Save Cargo build cache
+        id: cargo-cache-save
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msvc-full-${{ hashFiles('Cargo.lock') }}
+      - name: Record Cargo cache save timing
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_SAVE_STARTED_MS) / 1000.0
+          $seconds = [Math]::Round($elapsed, 2)
+          $outcome = "${{ steps.cargo-cache-save.outcome }}"
+          Write-Host "CI timing: Cargo cache save = ${seconds}s ($outcome)"
+          "| Cargo cache save | $seconds | $outcome |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - name: Record Cargo cache save exact-hit skip
+        if: success() && steps.cargo-cache.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "CI timing: Cargo cache save skipped (exact-key hit)"
+          "| Cargo cache save | 0 | skipped: exact-key hit |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
       - name: Record total CI timing
         if: always()
         shell: pwsh
