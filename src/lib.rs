@@ -103,6 +103,7 @@ pub mod test_stack;
 pub mod tiff_output;
 #[path = "tiff_io_impl.rs"]
 pub mod tiff_io;
+pub mod tiff_io_inspection;
 
 #[cfg(test)]
 pub(crate) mod color_conversion_test_support;
