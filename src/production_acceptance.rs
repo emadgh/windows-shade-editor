@@ -169,7 +169,7 @@ mod tests {
         }
         for required in [
             "supported_channel_counts_map_to_distinct_formats",
-            "unsupported_output_channel_counts_are_rejected_before_profile_transform",
+            "unsupported_channel_counts_are_rejected_before_profile_transform",
         ] {
             assert!(NCHANNEL_ICC_TESTS.contains(required), "missing required N-channel LittleCMS format test: {required}");
         }
