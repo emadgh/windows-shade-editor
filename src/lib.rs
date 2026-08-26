@@ -28,6 +28,7 @@ pub mod conversion_transaction;
 #[path = "conversion_transaction_disposition_wrapper.rs"]
 pub mod conversion_transaction_disposition;
 pub mod conversion_workflow;
+#[path = "custom_optimizer_config_impl.rs"]
 pub mod custom_optimizer_config;
 pub mod custom_optimizer_evidence;
 pub mod custom_optimizer_raster_transform;
@@ -37,7 +38,7 @@ pub mod device_characterization;
 pub mod device_characterization_model;
 pub mod device_characterization_package;
 pub mod devicelink_conversion;
-#[path = "dpi.rs"]
+#[path = "dpi_impl.rs"]
 pub mod dpi;
 pub mod export;
 pub mod export_recipe;
@@ -70,7 +71,7 @@ pub mod inverse_separation_solver;
 pub mod jpeg_source;
 pub mod model;
 pub mod nchannel_icc;
-#[path = "palette.rs"]
+#[path = "palette_impl.rs"]
 pub mod palette;
 pub mod png_source;
 pub mod production_acceptance;
@@ -95,6 +96,7 @@ pub use safe_fs::tiff_performance;
 pub mod separation_optimizer;
 pub mod source_tiff_writer;
 pub mod source_profile_fallback;
+#[path = "source_transparency_impl.rs"]
 pub mod source_transparency;
 pub mod staging;
 pub mod test_stack;
