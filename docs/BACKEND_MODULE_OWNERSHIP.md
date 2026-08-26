@@ -15,7 +15,7 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 | Module | Classification | Ownership status | Notes |
 | --- | --- | --- | --- |
 | `color_conversion` | shared backend/domain | duplicate implementation pending | High-risk/high-fan-out; migrate after lower-level shared types are canonical. |
-| `conversion_tiff` | shared TIFF/conversion backend | duplicate implementation pending | Depends on canonical `dpi`, `safe_fs`, `tiff_io`, and `tiff_output`; migrate after this `tiff_io` batch validates. |
+| `conversion_tiff` | shared TIFF/conversion backend | library-owned in stacked batch | Implementation is `conversion_tiff_impl.rs`; its crate-private `lzw_strip_writer` remains inside the library boundary. |
 | `custom_optimizer_config` | shared domain/config | library-owned | Binary module is a compatibility facade; implementation is `custom_optimizer_config_impl.rs`. |
 | `dpi` | shared TIFF/domain utility | library-owned | Binary `dpi.rs` is a compatibility facade; implementation is `dpi_impl.rs`. |
 | `export` | shared export backend | duplicate implementation pending | High fan-out; preserve row streaming and export semantics. |
@@ -24,10 +24,10 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 | `palette` | shared domain/config | library-owned | Binary `palette.rs` is a compatibility facade; implementation is `palette_impl.rs`. |
 | `production_project` | shared production/domain | duplicate implementation pending | Preserve project compatibility and persistence semantics. |
 | `safe_fs` | shared IO/safety backend | library-owned | Binary module is a facade; implementation is `safe_fs_impl.rs`. Its `staging` and TIFF performance modules are canonical library-owned children. |
-| `source_tiff_writer` | shared TIFF backend | duplicate implementation pending | Depends on `conversion_tiff::lzw_strip_writer` plus canonical TIFF types; migrate with/after `conversion_tiff`. |
+| `source_tiff_writer` | shared TIFF backend | library-owned in stacked batch | Implementation is `source_tiff_writer_impl.rs`; migrated with `conversion_tiff` so the private shared LZW writer stays crate-local. |
 | `source_transparency` | shared source/domain | library-owned | Binary `source_transparency.rs` is a compatibility facade; implementation is `source_transparency_impl.rs`. |
 | `tiff_output` | shared TIFF backend | library-owned | Binary module is a facade; implementation is `tiff_output_impl.rs` and consumes canonical `safe_fs`. |
-| `tiff_io` | shared TIFF backend/type domain | library-owned in current batch | Binary module is a facade; implementation remains byte-identical in `tiff_io_impl.rs`, giving metadata/decode/streaming types one canonical domain. |
+| `tiff_io` | shared TIFF backend/type domain | library-owned in prerequisite batch | Binary module is a facade; implementation remains byte-identical in `tiff_io_impl.rs`, giving metadata/decode/streaming types one canonical domain. |
 
 ## Additional duplicate removed inside the library
 
@@ -40,6 +40,12 @@ The first full binary test exposed one intentional crate boundary that source-on
 The parser itself remains byte-identical and crate-private. `tiff_io_inspection::declared_ink_names` is a narrow public forwarding API in the library, and the binary compatibility facade re-exports it at the historical `crate::tiff_io::declared_ink_names` path. No raw-tag parsing logic is duplicated, and no TIFF metadata/decode type is mirrored or converted.
 
 This preserves TIFF decoding, Photoshop spot-channel handling, planar/tiled streaming, metadata extraction, InkNames validation, and polarity behavior; only crate/module ownership and the necessary cross-crate inspection surface change.
+
+## Conversion/source TIFF writer boundary
+
+`source_tiff_writer` directly consumes `conversion_tiff::lzw_strip_writer::LzwStripWriter`. That child module is deliberately `pub(crate)` and should not become part of the public API merely to support an ownership refactor. Therefore `conversion_tiff` and `source_tiff_writer` move into the package library together. Their existing implementation blobs are reused unchanged, while the binary files become public-API re-export facades.
+
+This keeps the shared LZW strip writer private, removes duplicate writer compilation, and ensures `source_tiff_writer` consumes the same canonical `dpi`, `safe_fs`, `tiff_io`, and `tiff_output` types as conversion output.
 
 ## Migration rules
 
@@ -54,6 +60,6 @@ This preserves TIFF decoding, Photoshop spot-channel handling, planar/tiled stre
 
 1. `dpi`, `palette`, `source_transparency`, `custom_optimizer_config` — merged first self-contained ownership batch.
 2. `safe_fs`, root `staging`, `tiff_output` — merged second storage-boundary batch.
-3. `tiff_io` — current focused type-domain batch.
-4. `conversion_tiff` + `source_tiff_writer` — migrate together/serially after `tiff_io`; their crate-private LZW writer dependency must remain inside the library boundary.
+3. `tiff_io` — prerequisite focused type-domain batch; must pass and merge first.
+4. `conversion_tiff` + `source_tiff_writer` — current stacked batch; both implementations are library-owned together to preserve the private LZW dependency.
 5. `model`, `export_recipe`, `export`, `production_project`, `color_conversion` — migrate in coordinated higher-fan-out batches because shared domain types cross their public APIs.
