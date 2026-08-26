@@ -95,6 +95,7 @@ pub use safe_fs::tiff_performance;
 pub mod separation_optimizer;
 pub mod source_tiff_writer;
 pub mod source_profile_fallback;
+#[path = "source_transparency_impl.rs"]
 pub mod source_transparency;
 pub mod staging;
 pub mod test_stack;
