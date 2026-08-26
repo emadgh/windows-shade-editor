@@ -16,7 +16,7 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 | --- | --- | --- | --- |
 | `color_conversion` | shared backend/domain | duplicate implementation pending | High-risk/high-fan-out; migrate after low-risk pattern is proven. |
 | `conversion_tiff` | shared TIFF/conversion backend | duplicate implementation pending | Preserve TIFF/BigTIFF and conversion contracts. |
-| `custom_optimizer_config` | shared domain/config | duplicate implementation pending | Self-contained candidate for an early follow-up batch. |
+| `custom_optimizer_config` | shared domain/config | library-owned | Binary module is a compatibility facade; implementation is `custom_optimizer_config_impl.rs`. |
 | `dpi` | shared TIFF/domain utility | library-owned | Binary `dpi.rs` is a compatibility facade; implementation is `dpi_impl.rs`. |
 | `export` | shared export backend | duplicate implementation pending | High fan-out; preserve row streaming and export semantics. |
 | `export_recipe` | shared export/domain | duplicate implementation pending | Depends on `model`; do not migrate separately while `ShadeProject` still has duplicate ownership. |
@@ -40,7 +40,6 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 
 ## Current migration sequence
 
-1. `dpi`, `palette`, `source_transparency` — establish the compatibility-facade pattern with self-contained modules.
-2. `custom_optimizer_config` — next self-contained domain/config candidate after the first batch is validated.
-3. TIFF/export surfaces — migrate in dependency order after checking crate-visible helpers; keep `export_recipe` paired with/after `model` ownership migration.
-4. `model`, `production_project`, `color_conversion` — migrate last because they have the broadest type/API fan-out.
+1. `dpi`, `palette`, `source_transparency`, `custom_optimizer_config` — first self-contained ownership batch.
+2. TIFF/export surfaces — migrate in dependency order after checking crate-visible helpers; keep `export_recipe` paired with/after `model` ownership migration.
+3. `model`, `production_project`, `color_conversion` — migrate last because they have the broadest type/API fan-out.
