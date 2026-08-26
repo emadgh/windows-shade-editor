@@ -37,7 +37,7 @@ pub mod device_characterization;
 pub mod device_characterization_model;
 pub mod device_characterization_package;
 pub mod devicelink_conversion;
-#[path = "dpi.rs"]
+#[path = "dpi_impl.rs"]
 pub mod dpi;
 pub mod export;
 pub mod export_recipe;
@@ -70,7 +70,7 @@ pub mod inverse_separation_solver;
 pub mod jpeg_source;
 pub mod model;
 pub mod nchannel_icc;
-#[path = "palette.rs"]
+#[path = "palette_impl.rs"]
 pub mod palette;
 pub mod png_source;
 pub mod production_acceptance;
