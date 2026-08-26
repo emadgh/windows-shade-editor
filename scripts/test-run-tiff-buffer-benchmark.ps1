@@ -19,11 +19,11 @@ try {
     if (@($plan.buffer_sources).Count -ne 2) {
         throw "Expected two shared TIFF writer source files, found $(@($plan.buffer_sources).Count)."
     }
-    if (-not (@($plan.buffer_sources) -contains 'src/source_tiff_writer.rs')) {
-        throw 'Source TIFF writer is missing from the buffer benchmark contract.'
+    if (-not (@($plan.buffer_sources) -contains 'src/source_tiff_writer_impl.rs')) {
+        throw 'Source TIFF writer implementation is missing from the buffer benchmark contract.'
     }
-    if (-not (@($plan.buffer_sources) -contains 'src/conversion_tiff.rs')) {
-        throw 'Conversion TIFF writer is missing from the buffer benchmark contract.'
+    if (-not (@($plan.buffer_sources) -contains 'src/conversion_tiff_impl.rs')) {
+        throw 'Conversion TIFF writer implementation is missing from the buffer benchmark contract.'
     }
     if ($plan.replacement -ne 'const TIFF_ENCODER_BUFFER_BYTES: usize = 65536;') {
         throw "Unexpected buffer replacement text: $($plan.replacement)"
@@ -67,6 +67,12 @@ try {
     }
     if (@($codecPlan.compression_tag_sources).Count -ne 2) {
         throw "Expected two codec tag source files, found $(@($codecPlan.compression_tag_sources).Count)."
+    }
+    if (-not (@($codecPlan.compression_tag_sources) -contains 'src/source_tiff_writer_impl.rs')) {
+        throw 'Source TIFF writer implementation is missing from the codec benchmark contract.'
+    }
+    if (-not (@($codecPlan.compression_tag_sources) -contains 'src/conversion_tiff_impl.rs')) {
+        throw 'Conversion TIFF writer implementation is missing from the codec benchmark contract.'
     }
     if ($codecPlan.codec_call_replacement -ne 'Lzw.write_to(') {
         throw "Unexpected default codec call: $($codecPlan.codec_call_replacement)"
