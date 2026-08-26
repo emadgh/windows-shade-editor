@@ -6,3 +6,4 @@
 //! streaming and decoded-image types have one canonical ownership domain.
 
 pub use windows_shade_editor::tiff_io::*;
+pub use windows_shade_editor::tiff_io_inspection::declared_ink_names;
