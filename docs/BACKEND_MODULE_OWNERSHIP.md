@@ -27,7 +27,7 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 | `source_tiff_writer` | shared TIFF backend | duplicate implementation pending | Depends on `conversion_tiff::lzw_strip_writer` plus canonical TIFF types; migrate with/after `conversion_tiff`. |
 | `source_transparency` | shared source/domain | library-owned | Binary `source_transparency.rs` is a compatibility facade; implementation is `source_transparency_impl.rs`. |
 | `tiff_output` | shared TIFF backend | library-owned | Binary module is a facade; implementation is `tiff_output_impl.rs` and consumes canonical `safe_fs`. |
-| `tiff_io` | shared TIFF backend/type domain | library-owned in current batch | Binary module is a facade; implementation is byte-identical in `tiff_io_impl.rs`, giving metadata/decode/streaming types one canonical domain. |
+| `tiff_io` | shared TIFF backend/type domain | library-owned in current batch | Binary module is a facade; implementation remains byte-identical in `tiff_io_impl.rs`, giving metadata/decode/streaming types one canonical domain. |
 
 ## Additional duplicate removed inside the library
 
@@ -35,9 +35,11 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 
 ## TIFF IO boundary review
 
-Before migrating `tiff_io`, the full source was checked for crate-visible public restrictions. It exposes the binary-consumed metadata, decoded-image, streaming, spot-channel, and TIFF utility APIs publicly and contains no `pub(crate)` items. This allows the binary compatibility facade to re-export the complete consumed API without widening private helpers or creating adapters.
+The first full binary test exposed one intentional crate boundary that source-only inventory did not surface reliably: the binary TIFF inspector calls `declared_ink_names`, which is `pub(crate)` inside the canonical TIFF IO implementation. That visibility worked only while `tiff_io` was also compiled inside the binary crate.
 
-The canonical implementation is copied byte-for-byte before the ownership wiring changes. This preserves TIFF decoding, Photoshop spot-channel handling, planar/tiled streaming, metadata extraction, and polarity behavior; only the crate/module ownership changes.
+The parser itself remains byte-identical and crate-private. `tiff_io_inspection::declared_ink_names` is a narrow public forwarding API in the library, and the binary compatibility facade re-exports it at the historical `crate::tiff_io::declared_ink_names` path. No raw-tag parsing logic is duplicated, and no TIFF metadata/decode type is mirrored or converted.
+
+This preserves TIFF decoding, Photoshop spot-channel handling, planar/tiled streaming, metadata extraction, InkNames validation, and polarity behavior; only crate/module ownership and the necessary cross-crate inspection surface change.
 
 ## Migration rules
 
