@@ -41,7 +41,7 @@ mod tests {
     const COLOR_MANAGEMENT_SRC: &str = include_str!("color_management.rs");
     const PRODUCTION_TARGET_SRC: &str = include_str!("production_target.rs");
     const CONFORMANCE_TESTS: &str = include_str!("tiff_conformance_tests.rs");
-    const EXPORT_TESTS: &str = include_str!("export.rs");
+    const EXPORT_TESTS: &str = include_str!("export_impl.rs");
     const TIFF_IO_TESTS: &str = include_str!("tiff_io_impl.rs");
     const CONVERSION_TIFF_TESTS: &str = include_str!("conversion_tiff_impl.rs");
     const NCHANNEL_ICC_TESTS: &str = include_str!("nchannel_icc.rs");
