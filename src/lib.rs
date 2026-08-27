@@ -42,6 +42,7 @@ pub mod device_characterization_package;
 pub mod devicelink_conversion;
 #[path = "dpi_impl.rs"]
 pub mod dpi;
+#[path = "export_impl.rs"]
 pub mod export;
 #[path = "export_recipe_impl.rs"]
 pub mod export_recipe;

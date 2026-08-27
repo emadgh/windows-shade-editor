@@ -18,11 +18,11 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 | `conversion_tiff` | shared TIFF/conversion backend | library-owned | Implementation is `conversion_tiff_impl.rs`; its crate-private `lzw_strip_writer` remains inside the library boundary. |
 | `custom_optimizer_config` | shared domain/config | library-owned | Binary module is a compatibility facade; implementation is `custom_optimizer_config_impl.rs`. |
 | `dpi` | shared TIFF/domain utility | library-owned | Binary `dpi.rs` is a compatibility facade; implementation is `dpi_impl.rs`. |
-| `export` | shared export backend | duplicate implementation pending | Final high-risk root migration: child row-streaming module, crate-private crop type, TIFF/source-writer dependencies, and source-scanning acceptance guards require a focused batch. |
-| `export_recipe` | shared export/domain | library-owned in current batch | Binary `export_recipe.rs` is a zero-logic facade; canonical implementation is `export_recipe_impl.rs` and consumes the canonical model domain. |
+| `export` | shared export backend | library-owned in final batch | Binary `export.rs` is a zero-logic facade. Canonical implementation is `export_impl.rs`; the existing row-streaming child remains library-private under `export/row_streaming_lzw.rs`. |
+| `export_recipe` | shared export/domain | library-owned | Binary `export_recipe.rs` is a zero-logic facade; canonical implementation is `export_recipe_impl.rs` and consumes the canonical model domain. |
 | `model` | shared domain | library-owned | Binary `model.rs` is a zero-logic facade; implementation is `model_impl.rs`. Migrated with Color Conversion to preserve one type domain. |
 | `palette` | shared domain/config | library-owned | Binary `palette.rs` is a compatibility facade; implementation is `palette_impl.rs`. |
-| `production_project` | shared production/domain | library-owned in current batch | Binary `production_project.rs` is a zero-logic facade; canonical implementation is `production_project_impl.rs` and consumes canonical model + Color Conversion types. |
+| `production_project` | shared production/domain | library-owned | Binary `production_project.rs` is a zero-logic facade; canonical implementation is `production_project_impl.rs` and consumes canonical model + Color Conversion types. |
 | `safe_fs` | shared IO/safety backend | library-owned | Binary module is a facade; implementation is `safe_fs_impl.rs`. Its `staging` and TIFF performance modules are canonical library-owned children. |
 | `source_tiff_writer` | shared TIFF backend | library-owned | Implementation is `source_tiff_writer_impl.rs`; migrated with `conversion_tiff` so the private shared LZW writer stays crate-local. |
 | `source_transparency` | shared source/domain | library-owned | Binary `source_transparency.rs` is a compatibility facade; implementation is `source_transparency_impl.rs`. |
@@ -59,7 +59,11 @@ The historical decision documented in `COLOR_CONVERSION_CRATE_BOUNDARY.md` to co
 
 With `model` and `color_conversion` canonicalized, the remaining recipe and Production project builders no longer need binary-local copies of those type domains. Their original implementation blobs are preserved unchanged as `export_recipe_impl.rs` and `production_project_impl.rs`, while the historical root files are zero-logic facades.
 
-This batch intentionally stops before `export`. The export backend has a crate-private crop type, a row-streaming child module, and acceptance/benchmark checks that inspect source paths, so moving it independently keeps the final high-risk visibility and guard adjustments reviewable.
+## Export boundary
+
+The final duplicate root is `export`. Its implementation is preserved byte-identically as `export_impl.rs`; the historical binary `export.rs` becomes a zero-logic facade and `lib.rs` points at the canonical implementation.
+
+The existing `export/row_streaming_lzw.rs` child stays inside the canonical library module and continues to use its `pub(super)` helpers. `ExportCropRect` and `render_adjusted_crop_u16` remain `pub(crate)`: `test_stack` is already library-owned, so the Test Stack path remains inside the same crate boundary and no public bridge or mirrored crop type is needed. Production acceptance source scanning follows `export_impl.rs`, preserving the existing export transport guards without weakening them.
 
 ## Migration rules
 
@@ -77,5 +81,5 @@ This batch intentionally stops before `export`. The export backend has a crate-p
 3. `tiff_io` — merged focused type-domain prerequisite batch.
 4. `conversion_tiff` + `source_tiff_writer` — merged writer batch; both implementations are library-owned together to preserve the private LZW dependency.
 5. `model` + `color_conversion` — merged high-sensitivity type-domain batch.
-6. `export_recipe` + `production_project` — current bounded batch, now consuming the canonical model/Color Conversion domains.
-7. `export` — final focused duplicate-root migration after this batch validates, with its child module, visibility boundary, and source-scanning guards handled explicitly.
+6. `export_recipe` + `production_project` — preceding bounded batch consuming the canonical model/Color Conversion domains.
+7. `export` — current final duplicate-root migration; implementation logic remains byte-identical while the binary becomes a compatibility facade.
