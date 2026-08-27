@@ -14,15 +14,15 @@ Migration is intentionally incremental. Existing binary paths such as `crate::dp
 
 | Module | Classification | Ownership status | Notes |
 | --- | --- | --- | --- |
-| `color_conversion` | shared backend/domain | library-owned in stacked model/conversion batch | Binary `color_conversion.rs` is a zero-logic facade. Canonical implementation is `color_conversion_impl/mod.rs`; provenance stays a canonical child module. |
+| `color_conversion` | shared backend/domain | library-owned | Binary `color_conversion.rs` is a zero-logic facade. Canonical implementation is `color_conversion_impl/mod.rs`; provenance stays a canonical child module. |
 | `conversion_tiff` | shared TIFF/conversion backend | library-owned | Implementation is `conversion_tiff_impl.rs`; its crate-private `lzw_strip_writer` remains inside the library boundary. |
 | `custom_optimizer_config` | shared domain/config | library-owned | Binary module is a compatibility facade; implementation is `custom_optimizer_config_impl.rs`. |
 | `dpi` | shared TIFF/domain utility | library-owned | Binary `dpi.rs` is a compatibility facade; implementation is `dpi_impl.rs`. |
-| `export` | shared export backend | duplicate implementation pending | High fan-out; preserve row streaming and export semantics. |
-| `export_recipe` | shared export/domain | duplicate implementation pending | Depends on canonical `model`; migrate after the model/conversion batch stabilizes. |
-| `model` | shared domain | library-owned in stacked model/conversion batch | Binary `model.rs` is a zero-logic facade; implementation is `model_impl.rs`. Migrated with Color Conversion to preserve one type domain. |
+| `export` | shared export backend | duplicate implementation pending | Final high-risk root migration: child row-streaming module, crate-private crop type, TIFF/source-writer dependencies, and source-scanning acceptance guards require a focused batch. |
+| `export_recipe` | shared export/domain | library-owned in current batch | Binary `export_recipe.rs` is a zero-logic facade; canonical implementation is `export_recipe_impl.rs` and consumes the canonical model domain. |
+| `model` | shared domain | library-owned | Binary `model.rs` is a zero-logic facade; implementation is `model_impl.rs`. Migrated with Color Conversion to preserve one type domain. |
 | `palette` | shared domain/config | library-owned | Binary `palette.rs` is a compatibility facade; implementation is `palette_impl.rs`. |
-| `production_project` | shared production/domain | duplicate implementation pending | Depends on canonical model + Color Conversion types; migrate after that boundary is validated. |
+| `production_project` | shared production/domain | library-owned in current batch | Binary `production_project.rs` is a zero-logic facade; canonical implementation is `production_project_impl.rs` and consumes canonical model + Color Conversion types. |
 | `safe_fs` | shared IO/safety backend | library-owned | Binary module is a facade; implementation is `safe_fs_impl.rs`. Its `staging` and TIFF performance modules are canonical library-owned children. |
 | `source_tiff_writer` | shared TIFF backend | library-owned | Implementation is `source_tiff_writer_impl.rs`; migrated with `conversion_tiff` so the private shared LZW writer stays crate-local. |
 | `source_transparency` | shared source/domain | library-owned | Binary `source_transparency.rs` is a compatibility facade; implementation is `source_transparency_impl.rs`. |
@@ -53,7 +53,13 @@ This keeps the shared LZW strip writer private, removes duplicate writer compila
 
 They therefore migrate together. Their former implementation blobs are preserved as canonical library sources at `model_impl.rs` and `color_conversion_impl/mod.rs`; the historical root files become zero-logic binary compatibility facades. `production_provenance` moves with its parent module so there is no stale second source path.
 
-The historical decision documented in `COLOR_CONVERSION_CRATE_BOUNDARY.md` to compile Color Conversion separately in both crate roots was explicitly temporary. This batch supersedes that rule for `model` and `color_conversion` without changing GUI `crate::model` / `crate::color_conversion` call sites.
+The historical decision documented in `COLOR_CONVERSION_CRATE_BOUNDARY.md` to compile Color Conversion separately in both crate roots was explicitly temporary. That rule is now superseded for `model` and `color_conversion` without changing GUI `crate::model` / `crate::color_conversion` call sites.
+
+## Export recipe + Production project boundary
+
+With `model` and `color_conversion` canonicalized, the remaining recipe and Production project builders no longer need binary-local copies of those type domains. Their original implementation blobs are preserved unchanged as `export_recipe_impl.rs` and `production_project_impl.rs`, while the historical root files are zero-logic facades.
+
+This batch intentionally stops before `export`. The export backend has a crate-private crop type, a row-streaming child module, and acceptance/benchmark checks that inspect source paths, so moving it independently keeps the final high-risk visibility and guard adjustments reviewable.
 
 ## Migration rules
 
@@ -69,6 +75,7 @@ The historical decision documented in `COLOR_CONVERSION_CRATE_BOUNDARY.md` to co
 1. `dpi`, `palette`, `source_transparency`, `custom_optimizer_config` — merged first self-contained ownership batch.
 2. `safe_fs`, root `staging`, `tiff_output` — merged second storage-boundary batch.
 3. `tiff_io` — merged focused type-domain prerequisite batch.
-4. `conversion_tiff` + `source_tiff_writer` — validated writer batch; both implementations are library-owned together to preserve the private LZW dependency.
-5. `model` + `color_conversion` — current stacked high-sensitivity type-domain batch.
-6. `export_recipe`, `production_project`, `export` — migrate in subsequent bounded batches after the canonical project/conversion domain is validated.
+4. `conversion_tiff` + `source_tiff_writer` — merged writer batch; both implementations are library-owned together to preserve the private LZW dependency.
+5. `model` + `color_conversion` — merged high-sensitivity type-domain batch.
+6. `export_recipe` + `production_project` — current bounded batch, now consuming the canonical model/Color Conversion domains.
+7. `export` — final focused duplicate-root migration after this batch validates, with its child module, visibility boundary, and source-scanning guards handled explicitly.
