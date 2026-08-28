@@ -11,12 +11,17 @@ use windows_shade_editor::conversion_presets::{
     PresetCompatibility, PresetOrigin, SeparationPresetDefinition,
 };
 
+use super::characterization_intake::{
+    CharacterizationIntakeUiState, render_characterization_intake,
+};
+
 #[derive(Clone, Default)]
 pub(crate) struct ConversionPresetUiState {
     initialized: bool,
     controller: Option<PresetRuntimeController>,
     load_error: Option<String>,
     rename_buffers: BTreeMap<String, String>,
+    characterization_intake: CharacterizationIntakeUiState,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +67,14 @@ pub(crate) fn render_conversion_preset_manager(
     custom_optimizer_production_authorized: bool,
     actions: &mut Vec<ConversionPresetUiAction>,
 ) {
+    egui::CollapsingHeader::new("Measured characterization package builder")
+        .id_salt("color-conversion-characterization-intake")
+        .default_open(false)
+        .show(ui, |ui| {
+            render_characterization_intake(ui, &mut state.characterization_intake);
+        });
+    ui.separator();
+
     state.ensure_loaded();
 
     if let Some(error) = state.load_error.as_deref() {
@@ -492,5 +505,14 @@ mod tests {
         assert!(!runtime.contains("save_current_recipe_as_user("));
         assert!(runtime.contains("unified_strategy_preset_availability"));
         assert!(runtime.contains("add_enabled(false, egui::Button::new(\"Apply\"))"));
+    }
+
+    #[test]
+    fn measured_characterization_builder_stays_inside_the_existing_conversion_surface() {
+        let source = include_str!("conversion_presets.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("Measured characterization package builder"));
+        assert!(runtime.contains("render_characterization_intake"));
+        assert!(!runtime.contains("egui::Window::new"));
     }
 }

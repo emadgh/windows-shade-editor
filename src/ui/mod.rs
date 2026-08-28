@@ -1,5 +1,6 @@
 pub(crate) mod actions;
 pub(crate) mod adjustments;
+pub(crate) mod characterization_intake;
 pub(crate) mod color_conversion;
 pub(crate) mod conversion_audit;
 pub(crate) mod conversion_batch;
@@ -130,6 +131,7 @@ mod tests {
         let batch_source = include_str!("conversion_batch.rs");
         let candidate_source = include_str!("conversion_candidate_preview.rs");
         let preset_source = include_str!("conversion_presets.rs");
+        let intake_source = include_str!("characterization_intake.rs");
         let conversion = conversion_source.split("\n#[cfg(test)]").next().unwrap_or(conversion_source);
         let audit = audit_source.split("\n#[cfg(test)]").next().unwrap_or(audit_source);
         let migration = migration_source.split("\n#[cfg(test)]").next().unwrap_or(migration_source);
@@ -137,6 +139,7 @@ mod tests {
         let batch = batch_source.split("\n#[cfg(test)]").next().unwrap_or(batch_source);
         let candidate = candidate_source.split("\n#[cfg(test)]").next().unwrap_or(candidate_source);
         let presets = preset_source.split("\n#[cfg(test)]").next().unwrap_or(preset_source);
+        let intake = intake_source.split("\n#[cfg(test)]").next().unwrap_or(intake_source);
 
         assert!(status_bar.contains("ui_color_conversion_window"));
         assert!(status_bar.contains("ui_conversion_route_migration"));
@@ -182,6 +185,11 @@ mod tests {
         assert!(presets.contains("PresetRuntimeController"));
         assert!(presets.contains("unified_strategy_preset_availability"));
         assert!(!presets.contains("egui::Window::new"));
+
+        assert!(intake.contains("build_characterization_package_from_table"));
+        assert!(intake.contains("save_characterization_package"));
+        assert!(!intake.contains("egui::Window::new"));
+        assert!(!intake.contains("CharacterizationPackage::new"));
 
         assert!(audit.contains("project.conversion_audits"));
         assert!(audit.contains("validate_against_provenance"));
