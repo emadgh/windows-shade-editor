@@ -1,6 +1,6 @@
 use crate::model::{ChannelAdjustment, Levels};
 use crate::render;
-use crate::settings::TonalDisplayMode;
+use crate::settings::{self, TonalDisplayMode};
 use crate::tiff_io;
 use eframe::egui;
 use std::collections::BTreeMap;
@@ -302,6 +302,26 @@ fn histogram_display_height(histogram: &[u32; 256], index: usize, graph_height: 
     histogram_bin_density(histogram, index) / peak * graph_height
 }
 
+fn original_histogram_style(ui: &egui::Ui) -> (egui::Color32, f32) {
+    let (opacity, prominence) = settings::runtime_histogram_overlay_preferences();
+    let opacity_scale = if settings::DEFAULT_ORIGINAL_HISTOGRAM_OPACITY > f32::EPSILON {
+        opacity / settings::DEFAULT_ORIGINAL_HISTOGRAM_OPACITY
+    } else {
+        opacity
+    };
+    let prominence_scale = if settings::DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE > f32::EPSILON {
+        prominence / settings::DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE
+    } else {
+        prominence
+    };
+    (
+        ui.visuals()
+            .weak_text_color()
+            .gamma_multiply(opacity_scale.clamp(0.0, 4.0)),
+        prominence_scale.clamp(0.0, 2.0),
+    )
+}
+
 pub(crate) fn target_overlay_color(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         egui::Color32::from_rgb(255, 177, 66)
@@ -336,7 +356,7 @@ pub(crate) fn draw_histogram_with_target(
         egui::StrokeKind::Inside,
     );
 
-    let original_color = ui.visuals().weak_text_color();
+    let (original_color, original_stroke_width) = original_histogram_style(ui);
     let adjusted_color = accent.unwrap_or(ui.visuals().selection.stroke.color);
 
     for index in 0..256 {
@@ -345,11 +365,13 @@ pub(crate) fn draw_histogram_with_target(
             super::curve_editor::tonal_display_value(index as f32 / 255.0, display_mode),
         );
         if let Some(bins) = original {
-            let h = histogram_display_height(bins, index, rect.height());
-            painter.line_segment(
-                [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
-                egui::Stroke::new(1.0, original_color),
-            );
+            if original_stroke_width > 0.001 && original_color != egui::Color32::TRANSPARENT {
+                let h = histogram_display_height(bins, index, rect.height());
+                painter.line_segment(
+                    [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - h)],
+                    egui::Stroke::new(original_stroke_width, original_color),
+                );
+            }
         }
         if let Some(bins) = adjusted {
             let h = histogram_display_height(bins, index, rect.height());
