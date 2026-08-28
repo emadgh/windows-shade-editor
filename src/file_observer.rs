@@ -97,6 +97,7 @@ struct TrackedEntry {
     fingerprint: Option<FileFingerprint>,
     state: ExternalFileState,
     generation: u64,
+    change_pending: bool,
     last_error: Option<String>,
 }
 
@@ -172,6 +173,7 @@ impl FileObserver {
                     fingerprint,
                     state,
                     generation: 0,
+                    change_pending: false,
                     last_error,
                 };
                 let snapshot = entry.snapshot();
@@ -223,6 +225,7 @@ impl FileObserver {
         let (state, fingerprint, last_error) = baseline(read_fingerprint(&entry.path));
         entry.state = state;
         entry.fingerprint = fingerprint;
+        entry.change_pending = false;
         entry.last_error = last_error;
         Some(entry.snapshot())
     }
@@ -339,6 +342,13 @@ fn refresh_key(registry: &Arc<Mutex<Registry>>, key: &str) {
     apply_reading(entry, reading);
 }
 
+fn begin_change_episode(entry: &mut TrackedEntry) {
+    if !entry.change_pending {
+        entry.generation = entry.generation.wrapping_add(1).max(1);
+        entry.change_pending = true;
+    }
+}
+
 fn apply_reading(entry: &mut TrackedEntry, reading: FingerprintReading) {
     match reading {
         FingerprintReading::Present(current) => {
@@ -351,7 +361,7 @@ fn apply_reading(entry: &mut TrackedEntry, reading: FingerprintReading) {
                     }
                 }
                 Some(previous) => {
-                    entry.generation = entry.generation.wrapping_add(1).max(1);
+                    begin_change_episode(entry);
                     if previous.created_ns.is_some()
                         && current.created_ns.is_some()
                         && previous.created_ns != current.created_ns
@@ -362,7 +372,7 @@ fn apply_reading(entry: &mut TrackedEntry, reading: FingerprintReading) {
                     }
                 }
                 None if entry.state == ExternalFileState::Missing => {
-                    entry.generation = entry.generation.wrapping_add(1).max(1);
+                    begin_change_episode(entry);
                     ExternalFileState::Recreated
                 }
                 None => ExternalFileState::Available,
@@ -373,7 +383,7 @@ fn apply_reading(entry: &mut TrackedEntry, reading: FingerprintReading) {
         }
         FingerprintReading::Missing => {
             if entry.fingerprint.is_some() || entry.state != ExternalFileState::Missing {
-                entry.generation = entry.generation.wrapping_add(1).max(1);
+                begin_change_episode(entry);
             }
             entry.fingerprint = None;
             entry.state = ExternalFileState::Missing;
@@ -383,7 +393,7 @@ fn apply_reading(entry: &mut TrackedEntry, reading: FingerprintReading) {
             if entry.state != ExternalFileState::Unreadable
                 || entry.last_error.as_deref() != Some(error.as_str())
             {
-                entry.generation = entry.generation.wrapping_add(1).max(1);
+                begin_change_episode(entry);
             }
             entry.fingerprint = None;
             entry.state = ExternalFileState::Unreadable;
@@ -565,6 +575,27 @@ mod tests {
         file.sync_all().unwrap();
     }
 
+    fn fingerprint(size: u64, modified_ns: u128, created_ns: u128) -> FileFingerprint {
+        FileFingerprint {
+            size,
+            modified_ns: Some(modified_ns),
+            created_ns: Some(created_ns),
+        }
+    }
+
+    fn synthetic_entry(fingerprint: FileFingerprint) -> TrackedEntry {
+        TrackedEntry {
+            path: PathBuf::from("synthetic.tif"),
+            parent_key: "synthetic".to_owned(),
+            roles: BTreeSet::new(),
+            fingerprint: Some(fingerprint),
+            state: ExternalFileState::Available,
+            generation: 0,
+            change_pending: false,
+            last_error: None,
+        }
+    }
+
     #[test]
     fn duplicate_roles_share_one_path_and_release_is_reference_safe() {
         let temp = TempDir::new("dedup");
@@ -593,14 +624,83 @@ mod tests {
             ExternalFileState::Available
         );
         write(&path, b"different-length");
-        assert!(observer.rescan(&path).unwrap().is_changed());
-        assert!(observer.rescan(&path).unwrap().is_changed());
+        let changed = observer.rescan(&path).unwrap();
+        assert!(changed.is_changed());
+        assert_eq!(changed.generation, 1);
+        let unchanged_rescan = observer.rescan(&path).unwrap();
+        assert!(unchanged_rescan.is_changed());
+        assert_eq!(unchanged_rescan.generation, 1);
         observer.acknowledge(&path).unwrap();
         assert_eq!(observer.snapshot(&path).unwrap().state, ExternalFileState::Available);
         fs::remove_file(&path).unwrap();
-        assert!(observer.rescan(&path).unwrap().is_missing());
+        let missing = observer.rescan(&path).unwrap();
+        assert!(missing.is_missing());
+        assert_eq!(missing.generation, 2);
         write(&path, b"recreated");
-        assert_eq!(observer.rescan(&path).unwrap().state, ExternalFileState::Recreated);
+        let recreated = observer.rescan(&path).unwrap();
+        assert_eq!(recreated.state, ExternalFileState::Recreated);
+        assert_eq!(recreated.generation, 2);
+    }
+
+    #[test]
+    fn distinct_fingerprints_coalesce_to_one_generation_until_acknowledged() {
+        let mut entry = synthetic_entry(fingerprint(10, 10, 1));
+
+        apply_reading(&mut entry, FingerprintReading::Present(fingerprint(11, 11, 1)));
+        assert_eq!(entry.state, ExternalFileState::Modified);
+        assert_eq!(entry.generation, 1);
+        assert!(entry.change_pending);
+
+        apply_reading(&mut entry, FingerprintReading::Present(fingerprint(12, 12, 1)));
+        assert_eq!(entry.state, ExternalFileState::Modified);
+        assert_eq!(entry.generation, 1);
+        assert!(entry.change_pending);
+    }
+
+    #[test]
+    fn delete_recreate_and_replace_remain_one_generation_before_acknowledge() {
+        let mut entry = synthetic_entry(fingerprint(10, 10, 1));
+
+        apply_reading(&mut entry, FingerprintReading::Missing);
+        assert_eq!(entry.state, ExternalFileState::Missing);
+        assert_eq!(entry.generation, 1);
+
+        let recreated = fingerprint(20, 20, 2);
+        apply_reading(&mut entry, FingerprintReading::Present(recreated));
+        assert_eq!(entry.state, ExternalFileState::Recreated);
+        assert_eq!(entry.generation, 1);
+
+        let replaced = fingerprint(30, 30, 3);
+        apply_reading(&mut entry, FingerprintReading::Present(replaced));
+        assert_eq!(entry.state, ExternalFileState::Replaced);
+        assert_eq!(entry.generation, 1);
+        assert_eq!(entry.fingerprint, Some(replaced));
+    }
+
+    #[test]
+    fn acknowledge_allows_the_next_external_change_to_advance_generation() {
+        let temp = TempDir::new("ack-generation");
+        let path = temp.0.join("a.tif");
+        write(&path, b"one");
+        let observer = FileObserver::without_native_watches();
+        observer.observe(&path, ExternalFileRole::Face);
+
+        write(&path, b"first-change-longer");
+        let first = observer.rescan(&path).unwrap();
+        assert_eq!(first.generation, 1);
+
+        write(&path, b"second-change-even-longer");
+        let same_episode = observer.rescan(&path).unwrap();
+        assert_eq!(same_episode.generation, 1);
+
+        let acknowledged = observer.acknowledge(&path).unwrap();
+        assert_eq!(acknowledged.state, ExternalFileState::Available);
+        assert_eq!(acknowledged.generation, 1);
+
+        write(&path, b"third-change-even-longer-than-before");
+        let next = observer.rescan(&path).unwrap();
+        assert_eq!(next.generation, 2);
+        assert!(next.is_changed());
     }
 
     #[test]
@@ -612,7 +712,9 @@ mod tests {
             .observe(&path, ExternalFileRole::IccProfile)
             .is_missing());
         write(&path, b"profile");
-        assert_eq!(observer.rescan(&path).unwrap().state, ExternalFileState::Recreated);
+        let recreated = observer.rescan(&path).unwrap();
+        assert_eq!(recreated.state, ExternalFileState::Recreated);
+        assert_eq!(recreated.generation, 1);
     }
 
     #[test]
