@@ -161,8 +161,16 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::MutexGuard;
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
+    static TEST_BASELINE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial_guard() -> MutexGuard<'static, ()> {
+        TEST_BASELINE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn temp_project_path(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +197,7 @@ mod tests {
 
     #[test]
     fn tracked_external_change_blocks_same_path_save_boundary() {
+        let _serial = serial_guard();
         let path = temp_project_path("changed");
         cleanup(&path);
         fs::write(&path, b"baseline").unwrap();
@@ -203,6 +212,7 @@ mod tests {
 
     #[test]
     fn accepted_baseline_allows_save_boundary() {
+        let _serial = serial_guard();
         let path = temp_project_path("accepted");
         cleanup(&path);
         fs::write(&path, b"baseline").unwrap();
@@ -213,6 +223,7 @@ mod tests {
 
     #[test]
     fn changed_during_load_is_not_accepted_as_the_active_baseline() {
+        let _serial = serial_guard();
         let path = temp_project_path("load-race");
         cleanup(&path);
         fs::write(&path, b"version a").unwrap();
@@ -225,6 +236,7 @@ mod tests {
 
     #[test]
     fn untracked_existing_target_fails_closed() {
+        let _serial = serial_guard();
         let path = temp_project_path("untracked-existing");
         cleanup(&path);
         fs::write(&path, b"external project").unwrap();
@@ -235,6 +247,7 @@ mod tests {
 
     #[test]
     fn existing_different_save_as_target_is_not_silently_overwritten() {
+        let _serial = serial_guard();
         let active = temp_project_path("active");
         let other = temp_project_path("other");
         cleanup(&active);
@@ -250,6 +263,7 @@ mod tests {
 
     #[test]
     fn untracked_new_save_as_target_remains_allowed() {
+        let _serial = serial_guard();
         let path = temp_project_path("save-as-new");
         cleanup(&path);
         assert!(verify_active_source_project_save_baseline(&path).is_ok());
@@ -258,6 +272,7 @@ mod tests {
 
     #[test]
     fn successful_save_establishes_and_refreshes_baseline_for_next_save() {
+        let _serial = serial_guard();
         let path = temp_project_path("refresh");
         cleanup(&path);
         let mut project = ShadeProject::default();
@@ -274,6 +289,7 @@ mod tests {
 
     #[test]
     fn external_write_after_accepted_save_is_preserved_when_next_save_is_rejected() {
+        let _serial = serial_guard();
         let path = temp_project_path("preserve-external");
         cleanup(&path);
         let mut project = ShadeProject::default();
