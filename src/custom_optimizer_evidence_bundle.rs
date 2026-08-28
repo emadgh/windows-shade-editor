@@ -17,7 +17,7 @@ pub const MAX_CUSTOM_OPTIMIZER_EVIDENCE_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
 /// This bundle is deliberately not a production-authorization token. Loading it
 /// validates only the serialized recipe/evidence bindings. Candidate Preview and
 /// final conversion must still reopen every referenced artifact and independently
-/// mint `InverseLutProductionEligibility` through the production evidence gate.
+/// mint production eligibility through the existing evidence gate.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CustomOptimizerEvidenceBundle {
@@ -213,7 +213,8 @@ mod tests {
     fn bundle_loader_never_claims_production_authority() {
         let source = include_str!("custom_optimizer_evidence_bundle.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
-        assert!(!runtime.contains("InverseLutProductionEligibility"));
+        assert!(!runtime.contains("validate_inverse_lut_production_eligibility"));
+        assert!(!runtime.contains("load_and_authorize_custom_optimizer_evidence"));
         assert!(!runtime.contains("is_production_approved("));
         assert!(!runtime.contains("production_authorized: bool"));
         assert!(runtime.contains("self.evidence.validate()"));
