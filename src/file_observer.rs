@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -112,10 +112,16 @@ impl TrackedEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WatchRegistration {
+    token: u64,
+}
+
 #[derive(Default)]
 struct Registry {
     entries: HashMap<String, TrackedEntry>,
-    watched_dirs: HashSet<String>,
+    watched_dirs: HashMap<String, WatchRegistration>,
+    next_watch_token: u64,
 }
 
 #[derive(Clone)]
@@ -156,10 +162,9 @@ impl FileObserver {
             .unwrap_or_else(|| normalized.clone());
         let parent_key = path_key(&parent);
 
-        let mut start_watch = false;
-        let snapshot = {
+        let (snapshot, watch_token) = {
             let mut registry = lock_registry(&self.registry);
-            if let Some(entry) = registry.entries.get_mut(&key) {
+            let snapshot = if let Some(entry) = registry.entries.get_mut(&key) {
                 entry.roles.insert(role);
                 entry.snapshot()
             } else {
@@ -178,15 +183,27 @@ impl FileObserver {
                 };
                 let snapshot = entry.snapshot();
                 registry.entries.insert(key, entry);
-                if self.native_watches && registry.watched_dirs.insert(parent_key.clone()) {
-                    start_watch = true;
-                }
                 snapshot
-            }
+            };
+            let watch_token = if self.native_watches {
+                claim_watch(&mut registry, &parent_key)
+            } else {
+                None
+            };
+            (snapshot, watch_token)
         };
 
-        if start_watch {
-            spawn_directory_observer(self.registry.clone(), parent, parent_key);
+        if let Some(token) = watch_token {
+            if spawn_directory_observer(
+                self.registry.clone(),
+                parent,
+                parent_key.clone(),
+                token,
+            )
+            .is_err()
+            {
+                abandon_watch_claim(&self.registry, &parent_key, token);
+            }
         }
         snapshot
     }
@@ -417,21 +434,93 @@ fn refresh_directory(registry: &Arc<Mutex<Registry>>, parent_key: &str) {
     }
 }
 
-fn directory_needed(registry: &Arc<Mutex<Registry>>, parent_key: &str) -> bool {
-    lock_registry(registry)
+fn directory_needed_locked(registry: &Registry, parent_key: &str) -> bool {
+    registry
         .entries
         .values()
         .any(|entry| entry.parent_key == parent_key && !entry.roles.is_empty())
 }
 
-fn finish_watch(registry: &Arc<Mutex<Registry>>, parent_key: &str) {
+fn next_watch_token(registry: &mut Registry) -> u64 {
+    registry.next_watch_token = registry.next_watch_token.wrapping_add(1).max(1);
+    registry.next_watch_token
+}
+
+fn claim_watch(registry: &mut Registry, parent_key: &str) -> Option<u64> {
+    if registry.watched_dirs.contains_key(parent_key) {
+        return None;
+    }
+    let token = next_watch_token(registry);
+    registry
+        .watched_dirs
+        .insert(parent_key.to_owned(), WatchRegistration { token });
+    Some(token)
+}
+
+fn watch_should_run(registry: &Arc<Mutex<Registry>>, parent_key: &str, token: u64) -> bool {
+    let registry = lock_registry(registry);
+    registry
+        .watched_dirs
+        .get(parent_key)
+        .is_some_and(|watch| watch.token == token)
+        && directory_needed_locked(&registry, parent_key)
+}
+
+fn abandon_watch_claim(registry: &Arc<Mutex<Registry>>, parent_key: &str, token: u64) {
     let mut registry = lock_registry(registry);
-    if !registry
-        .entries
-        .values()
-        .any(|entry| entry.parent_key == parent_key && !entry.roles.is_empty())
+    if registry
+        .watched_dirs
+        .get(parent_key)
+        .is_some_and(|watch| watch.token == token)
     {
         registry.watched_dirs.remove(parent_key);
+    }
+}
+
+/// Relinquish one exact watcher generation. If a subscriber arrived after this worker
+/// decided to stop, atomically reserve a replacement generation before releasing the lock.
+/// This closes the teardown/re-observe window where a stale `watched` marker used to remain
+/// without a live thread.
+fn finish_watch(
+    registry: &Arc<Mutex<Registry>>,
+    parent_key: &str,
+    token: u64,
+) -> Option<u64> {
+    let mut registry = lock_registry(registry);
+    let is_owner = registry
+        .watched_dirs
+        .get(parent_key)
+        .is_some_and(|watch| watch.token == token);
+    if !is_owner {
+        return None;
+    }
+
+    registry.watched_dirs.remove(parent_key);
+    if directory_needed_locked(&registry, parent_key) {
+        claim_watch(&mut registry, parent_key)
+    } else {
+        None
+    }
+}
+
+fn finish_and_restart_watch(
+    registry: Arc<Mutex<Registry>>,
+    parent: PathBuf,
+    parent_key: String,
+    token: u64,
+) {
+    let Some(next_token) = finish_watch(&registry, &parent_key, token) else {
+        return;
+    };
+    if spawn_directory_observer(
+        registry.clone(),
+        parent,
+        parent_key.clone(),
+        next_token,
+    )
+    .is_err()
+    {
+        abandon_watch_claim(&registry, &parent_key, next_token);
     }
 }
 
@@ -439,10 +528,12 @@ fn spawn_directory_observer(
     registry: Arc<Mutex<Registry>>,
     parent: PathBuf,
     parent_key: String,
-) {
-    let _ = thread::Builder::new()
+    token: u64,
+) -> std::io::Result<()> {
+    thread::Builder::new()
         .name("shade-file-observer".to_owned())
-        .spawn(move || run_directory_observer(registry, parent, parent_key));
+        .spawn(move || run_directory_observer(registry, parent, parent_key, token))
+        .map(|_| ())
 }
 
 #[cfg(windows)]
@@ -450,6 +541,7 @@ fn run_directory_observer(
     registry: Arc<Mutex<Registry>>,
     parent: PathBuf,
     parent_key: String,
+    token: u64,
 ) {
     let mut wide = parent.as_os_str().encode_wide().collect::<Vec<_>>();
     wide.push(0);
@@ -459,56 +551,62 @@ fn run_directory_observer(
         | FILE_NOTIFY_CHANGE_CREATION;
     let handle = unsafe { FindFirstChangeNotificationW(wide.as_ptr(), 0, filter) };
     if handle == INVALID_HANDLE_VALUE {
-        poll_fallback(&registry, &parent_key);
-        finish_watch(&registry, &parent_key);
+        poll_fallback(&registry, &parent_key, token);
+        finish_and_restart_watch(registry, parent, parent_key, token);
         return;
     }
 
     let mut ticks = 0u32;
     loop {
-        if !directory_needed(&registry, &parent_key) {
+        if !watch_should_run(&registry, &parent_key, token) {
             break;
         }
         let wait = unsafe { WaitForSingleObject(handle, WAIT_SLICE_MS) };
         if wait == WAIT_OBJECT_0 {
             thread::sleep(EVENT_DEBOUNCE);
+            if !watch_should_run(&registry, &parent_key, token) {
+                break;
+            }
             refresh_directory(&registry, &parent_key);
             ticks = 0;
             if unsafe { FindNextChangeNotification(handle) } == 0 {
                 unsafe { FindCloseChangeNotification(handle) };
-                poll_fallback(&registry, &parent_key);
-                finish_watch(&registry, &parent_key);
+                poll_fallback(&registry, &parent_key, token);
+                finish_and_restart_watch(registry, parent, parent_key, token);
                 return;
             }
         } else if wait == WAIT_TIMEOUT {
             ticks = ticks.saturating_add(1);
             if ticks >= RESCAN_EVERY_TICKS {
-                refresh_directory(&registry, &parent_key);
+                if watch_should_run(&registry, &parent_key, token) {
+                    refresh_directory(&registry, &parent_key);
+                }
                 ticks = 0;
             }
         } else {
             unsafe { FindCloseChangeNotification(handle) };
-            poll_fallback(&registry, &parent_key);
-            finish_watch(&registry, &parent_key);
+            poll_fallback(&registry, &parent_key, token);
+            finish_and_restart_watch(registry, parent, parent_key, token);
             return;
         }
     }
     unsafe { FindCloseChangeNotification(handle) };
-    finish_watch(&registry, &parent_key);
+    finish_and_restart_watch(registry, parent, parent_key, token);
 }
 
 #[cfg(not(windows))]
 fn run_directory_observer(
     registry: Arc<Mutex<Registry>>,
-    _parent: PathBuf,
+    parent: PathBuf,
     parent_key: String,
+    token: u64,
 ) {
-    poll_fallback(&registry, &parent_key);
-    finish_watch(&registry, &parent_key);
+    poll_fallback(&registry, &parent_key, token);
+    finish_and_restart_watch(registry, parent, parent_key, token);
 }
 
-fn poll_fallback(registry: &Arc<Mutex<Registry>>, parent_key: &str) {
-    while directory_needed(registry, parent_key) {
+fn poll_fallback(registry: &Arc<Mutex<Registry>>, parent_key: &str, token: u64) {
+    while watch_should_run(registry, parent_key, token) {
         refresh_directory(registry, parent_key);
         thread::sleep(Duration::from_secs(1));
     }
@@ -596,6 +694,21 @@ mod tests {
         }
     }
 
+    fn tracked_entry(path: PathBuf, parent_key: String, role: ExternalFileRole) -> TrackedEntry {
+        let mut roles = BTreeSet::new();
+        roles.insert(role);
+        TrackedEntry {
+            path,
+            parent_key,
+            roles,
+            fingerprint: None,
+            state: ExternalFileState::Missing,
+            generation: 0,
+            change_pending: false,
+            last_error: None,
+        }
+    }
+
     #[test]
     fn duplicate_roles_share_one_path_and_release_is_reference_safe() {
         let temp = TempDir::new("dedup");
@@ -611,6 +724,65 @@ mod tests {
         assert_eq!(observer.subscriber_count(&path), 1);
         observer.release(&path, ExternalFileRole::Reference);
         assert_eq!(observer.tracked_path_count(), 0);
+    }
+
+    #[test]
+    fn teardown_reobserve_interleaving_reserves_a_replacement_watch() {
+        let temp = TempDir::new("watch-race");
+        let path = temp.0.join("a.tif");
+        let parent = normalized_storage_path(&temp.0);
+        let parent_key = path_key(&parent);
+        let key = path_key(&normalized_storage_path(&path));
+        let registry = Arc::new(Mutex::new(Registry::default()));
+
+        let old_token = {
+            let mut state = lock_registry(&registry);
+            claim_watch(&mut state, &parent_key).unwrap()
+        };
+        assert!(!directory_needed_locked(&lock_registry(&registry), &parent_key));
+
+        // Exact problematic interleaving: the old worker already decided to stop,
+        // then a new subscriber arrives before the old worker runs finish_watch().
+        {
+            let mut state = lock_registry(&registry);
+            state.entries.insert(
+                key,
+                tracked_entry(path, parent_key.clone(), ExternalFileRole::Face),
+            );
+        }
+
+        let replacement = finish_watch(&registry, &parent_key, old_token)
+            .expect("new subscriber must reserve a replacement watcher generation");
+        assert_ne!(replacement, old_token);
+        let state = lock_registry(&registry);
+        assert_eq!(
+            state.watched_dirs.get(&parent_key).map(|watch| watch.token),
+            Some(replacement)
+        );
+        assert!(directory_needed_locked(&state, &parent_key));
+    }
+
+    #[test]
+    fn stale_watcher_cannot_clear_a_newer_registration() {
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let parent_key = "parent".to_owned();
+        let old_token = {
+            let mut state = lock_registry(&registry);
+            claim_watch(&mut state, &parent_key).unwrap()
+        };
+        let new_token = {
+            let mut state = lock_registry(&registry);
+            state.watched_dirs.remove(&parent_key);
+            claim_watch(&mut state, &parent_key).unwrap()
+        };
+        assert_ne!(old_token, new_token);
+
+        assert_eq!(finish_watch(&registry, &parent_key, old_token), None);
+        let state = lock_registry(&registry);
+        assert_eq!(
+            state.watched_dirs.get(&parent_key).map(|watch| watch.token),
+            Some(new_token)
+        );
     }
 
     #[test]
