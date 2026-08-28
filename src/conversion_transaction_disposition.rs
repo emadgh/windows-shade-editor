@@ -11,7 +11,8 @@ use crate::model::ShadeProject;
 use crate::production_replacement::prepare_production_replacement_plan;
 use crate::reconversion_policy::analyze_replacement_risk;
 use crate::production_project_compat::{
-    AppendConvertedFaceSpec, append_converted_face_to_production_project_at_path,
+    AppendConvertedFaceSpec, append_converted_face_with_audit_to_production_project_at_path,
+    replace_conversion_audit_for_provenance,
     validate_existing_production_project_for_append_at_path,
 };
 use crate::production_project_disposition::ProductionProjectDisposition;
@@ -250,9 +251,10 @@ where
             } => {
                 if generated_project.faces.len() != 1
                     || generated_project.production_provenance.len() != 1
+                    || generated_project.conversion_audits.len() != 1
                 {
                     return Err(
-                        "Append transaction expected exactly one newly converted Face/provenance pair."
+                        "Append transaction expected exactly one newly converted Face/provenance/audit set."
                             .to_owned(),
                     );
                 }
@@ -268,6 +270,7 @@ where
                 }
 
                 let incoming = generated_project.production_provenance[0].clone();
+                let incoming_audit = generated_project.conversion_audits[0].clone();
                 let compatibility = validate_existing_production_project_for_append_at_path(
                     &loaded.project,
                     path,
@@ -282,7 +285,7 @@ where
                 }
 
                 let mut appended = loaded.project;
-                append_converted_face_to_production_project_at_path(
+                append_converted_face_with_audit_to_production_project_at_path(
                     &mut appended,
                     path,
                     AppendConvertedFaceSpec {
@@ -290,6 +293,7 @@ where
                         output_face_label: &generated_project.faces[0].label,
                         provenance: incoming,
                     },
+                    incoming_audit,
                 )?;
                 self.appended_project = Some(appended.clone());
                 self.inner.save_existing_production_project(
@@ -305,9 +309,10 @@ where
             } => {
                 if generated_project.faces.len() != 1
                     || generated_project.production_provenance.len() != 1
+                    || generated_project.conversion_audits.len() != 1
                 {
                     return Err(
-                        "Existing-route update expected exactly one converted Face/provenance pair."
+                        "Existing-route update expected exactly one converted Face/provenance/audit set."
                             .to_owned(),
                     );
                 }
@@ -316,6 +321,7 @@ where
                 })?;
                 let mut updated = loaded.project;
                 let incoming = generated_project.production_provenance[0].clone();
+                let incoming_audit = generated_project.conversion_audits[0].clone();
                 if let Some(index) = self.prepared_replace_index.take() {
                     let previous = updated
                         .production_provenance
@@ -334,10 +340,16 @@ where
                                 .to_owned()
                         }));
                     }
+                    replace_conversion_audit_for_provenance(
+                        &mut updated,
+                        &previous,
+                        &incoming,
+                        incoming_audit,
+                    )?;
                     updated.faces[index] = generated_project.faces[0].clone();
                     updated.production_provenance[index] = incoming;
                 } else {
-                    append_converted_face_to_production_project_at_path(
+                    append_converted_face_with_audit_to_production_project_at_path(
                         &mut updated,
                         path,
                         AppendConvertedFaceSpec {
@@ -345,6 +357,7 @@ where
                             output_face_label: &generated_project.faces[0].label,
                             provenance: incoming,
                         },
+                        incoming_audit,
                     )?;
                 }
                 self.appended_project = Some(updated.clone());
@@ -647,6 +660,7 @@ mod tests {
             panic!("create-new transaction should complete");
         };
         assert_eq!(completed.production_project.faces.len(), 1);
+        assert_eq!(completed.production_project.conversion_audits.len(), 1);
         assert_eq!(backend.create_save_calls, 1);
         assert_eq!(backend.existing_save_calls, 0);
     }
@@ -668,8 +682,13 @@ mod tests {
         assert_eq!(backend.create_save_calls, 0);
         assert_eq!(backend.existing_save_calls, 1);
         assert_eq!(backend.existing.faces.len(), 2);
+        assert_eq!(backend.existing.conversion_audits.len(), 1);
         assert_eq!(completed.production_project.faces.len(), 2);
+        assert_eq!(completed.production_project.conversion_audits.len(), 1);
         assert!(completed.production_project.faces[1].path.ends_with("Face-2.tif"));
+        completed.production_project.conversion_audits[0]
+            .validate_against_provenance(&completed.production_project.production_provenance[1])
+            .unwrap();
     }
 
     #[test]
@@ -724,6 +743,7 @@ mod tests {
         };
         assert!(error.contains("simulated existing project save failure"));
         assert_eq!(recovery_project.faces.len(), 2);
+        assert_eq!(recovery_project.conversion_audits.len(), 1);
         assert_eq!(backend.existing.faces.len(), 1);
         assert_eq!(backend.existing_save_calls, 1);
     }

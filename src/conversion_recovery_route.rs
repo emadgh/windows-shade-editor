@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::color_conversion::ProjectRole;
+use crate::color_conversion::{ProductionProvenance, ProjectRole};
+use crate::conversion_audit::ConversionAuditRecord;
 use crate::conversion_batch::batch_recipe_policy_sha256;
 use crate::conversion_transaction::{
     CommittedConversionOutput, CompletedConversionTransaction, ConversionJobCapture,
@@ -11,6 +12,9 @@ use crate::icc_conversion_worker::sha256_file;
 use crate::model::ShadeProject;
 use crate::production_project_compat::{
     AppendConvertedFaceSpec, append_converted_face_to_production_project_at_path,
+    append_converted_face_with_audit_to_production_project_at_path,
+    replace_conversion_audit_for_provenance,
+    validate_existing_conversion_audits,
     validate_existing_production_project_baseline_at_path,
     validate_existing_production_project_for_append_at_path,
 };
@@ -143,6 +147,7 @@ fn validate_recovery_project(
                 .to_owned(),
         );
     }
+    validate_existing_conversion_audits(project)?;
     recovery_committed_index(project, recovery)?;
     Ok(())
 }
@@ -173,6 +178,39 @@ fn recovery_committed_index(
         ),
         _ => Err(
             "Recovery Production project contains ambiguous duplicate provenance for the committed TIFF."
+                .to_owned(),
+        ),
+    }
+}
+
+fn recovery_audit_for_provenance(
+    project: &ShadeProject,
+    provenance: &ProductionProvenance,
+) -> Result<Option<ConversionAuditRecord>, String> {
+    let matches = project
+        .conversion_audits
+        .iter()
+        .filter(|audit| {
+            audit
+                .output
+                .path
+                .trim()
+                .eq_ignore_ascii_case(provenance.output_path.trim())
+                && audit
+                    .output
+                    .sha256
+                    .trim()
+                    .eq_ignore_ascii_case(provenance.output_sha256.trim())
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [audit] => {
+            audit.validate_against_provenance(provenance)?;
+            Ok(Some((*audit).clone()))
+        }
+        [] => Ok(None),
+        _ => Err(
+            "Recovery Production project contains duplicate audits for the committed TIFF."
                 .to_owned(),
         ),
     }
@@ -220,6 +258,7 @@ fn recover_append_existing_project(
 
     let incoming_index = recovery_committed_index(recovery_project, recovery)?;
     let incoming = recovery_project.production_provenance[incoming_index].clone();
+    let incoming_audit = recovery_audit_for_provenance(recovery_project, &incoming)?;
     let compatibility = validate_existing_production_project_for_append_at_path(
         &current,
         path,
@@ -234,15 +273,23 @@ fn recover_append_existing_project(
     }
 
     let mut reconstructed = current;
-    append_converted_face_to_production_project_at_path(
-        &mut reconstructed,
-        path,
-        AppendConvertedFaceSpec {
-            source_project_path: &capture.source_project_path,
-            output_face_label: &recovery_project.faces[incoming_index].label,
-            provenance: incoming,
-        },
-    )?;
+    let spec = AppendConvertedFaceSpec {
+        source_project_path: &capture.source_project_path,
+        output_face_label: &recovery_project.faces[incoming_index].label,
+        provenance: incoming,
+    };
+    if let Some(audit) = incoming_audit {
+        append_converted_face_with_audit_to_production_project_at_path(
+            &mut reconstructed,
+            path,
+            spec,
+            audit,
+        )?;
+    } else {
+        // Preserve recoverability for pre-#111 pending records that legitimately
+        // have no producer audit. New transactions always carry an audit.
+        append_converted_face_to_production_project_at_path(&mut reconstructed, path, spec)?;
+    }
     if !projects_equivalent_at_path(&reconstructed, recovery_project, path)? {
         return Err(
             "Persisted recovery state does not match a deterministic append of the captured conversion."
@@ -294,6 +341,7 @@ fn recover_update_existing_route_project(
 
     let incoming_index = recovery_committed_index(recovery_project, recovery)?;
     let incoming = recovery_project.production_provenance[incoming_index].clone();
+    let incoming_audit = recovery_audit_for_provenance(recovery_project, &incoming)?;
     let incoming_policy = batch_recipe_policy_sha256(&incoming.recipe)?;
     if !incoming_policy.eq_ignore_ascii_case(route_policy_sha256.trim()) {
         return Err(
@@ -340,18 +388,32 @@ fn recover_update_existing_route_project(
                     .to_owned(),
             );
         }
+        if let Some(audit) = incoming_audit {
+            replace_conversion_audit_for_provenance(
+                &mut reconstructed,
+                previous,
+                &incoming,
+                audit,
+            )?;
+        }
         reconstructed.faces[index] = recovery_project.faces[incoming_index].clone();
         reconstructed.production_provenance[index] = incoming;
     } else {
-        append_converted_face_to_production_project_at_path(
-            &mut reconstructed,
-            path,
-            AppendConvertedFaceSpec {
-                source_project_path: &capture.source_project_path,
-                output_face_label: &recovery_project.faces[incoming_index].label,
-                provenance: incoming,
-            },
-        )?;
+        let spec = AppendConvertedFaceSpec {
+            source_project_path: &capture.source_project_path,
+            output_face_label: &recovery_project.faces[incoming_index].label,
+            provenance: incoming,
+        };
+        if let Some(audit) = incoming_audit {
+            append_converted_face_with_audit_to_production_project_at_path(
+                &mut reconstructed,
+                path,
+                spec,
+                audit,
+            )?;
+        } else {
+            append_converted_face_to_production_project_at_path(&mut reconstructed, path, spec)?;
+        }
     }
 
     if !projects_equivalent_at_path(&reconstructed, recovery_project, path)? {
