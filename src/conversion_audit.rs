@@ -9,7 +9,9 @@ use crate::color_conversion::{
     },
 };
 use crate::conversion_analytics::{ConversionUsageReport, analyze_conversion_tiff};
-use crate::conversion_transaction::{CommittedConversionOutput, ConversionJobCapture};
+use crate::conversion_transaction::{
+    CapturedSourceRasterFacts, CommittedConversionOutput, ConversionJobCapture,
+};
 
 pub const CONVERSION_AUDIT_SCHEMA_VERSION: u32 = 1;
 
@@ -21,6 +23,11 @@ pub struct ConversionAuditSource {
     pub snapshot_id: Option<u64>,
     pub source_file_sha256: String,
     pub source_profile_sha256: String,
+    /// Exact format-neutral raster facts frozen at queue capture. Audit records
+    /// written before this field existed deserialize it as `None` and must be
+    /// reported as legacy/unknown rather than inferred from the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster: Option<CapturedSourceRasterFacts>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +145,7 @@ impl ConversionAuditRecord {
                     .source_profile_identity
                     .sha256
                     .clone(),
+                raster: capture.source_raster,
             },
             target: ConversionAuditTarget {
                 engine_mode: capture.conversion_recipe.engine_mode,
@@ -197,6 +205,9 @@ impl ConversionAuditRecord {
         }
         if self.source.project_path.trim().is_empty() || self.source.face_path.trim().is_empty() {
             return Err("Conversion audit requires Source project and Face paths.".to_owned());
+        }
+        if let Some(raster) = self.source.raster {
+            raster.validate()?;
         }
         if self.target.target_name.trim().is_empty() || self.target.channel_names.is_empty() {
             return Err("Conversion audit requires a named target and channel topology.".to_owned());
@@ -521,7 +532,10 @@ mod tests {
         SeparationStrategy, TargetChannelDefinition,
     };
     use crate::conversion_analytics::{ChannelUsageStats, CoveragePercentiles};
-    use crate::conversion_transaction::{CapturedOutputPolicy, CapturedSourceProfile};
+    use crate::conversion_transaction::{
+        CapturedOutputPolicy, CapturedSourceColorModel, CapturedSourceFormat,
+        CapturedSourceProfile, CapturedSourceRasterFacts,
+    };
     use crate::model::{IccProfileIdentity, ShadeProject};
 
     fn hash(character: char) -> String {
@@ -583,6 +597,13 @@ mod tests {
             "Production".to_owned(),
             "Face CMYK".to_owned(),
         )
+        .unwrap()
+        .with_source_raster_facts(CapturedSourceRasterFacts::new(
+            CapturedSourceFormat::Tiff,
+            CapturedSourceColorModel::Rgb,
+            16,
+            3,
+        ))
         .unwrap()
     }
 
@@ -678,6 +699,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(audit.source.snapshot_id, Some(7));
+        assert_eq!(audit.source.raster, capture.source_raster);
         assert_eq!(audit.target.channel_names, ["Cyan", "Magenta", "Yellow", "Black"]);
         assert_eq!(audit.recipe_sha256, capture.conversion_recipe_sha256);
         assert_eq!(audit.output.sha256, hash('e'));
@@ -752,6 +774,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_audit_without_raster_facts_remains_readable() {
+        let capture = capture();
+        let output = committed(&capture);
+        let audit = ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new()).unwrap();
+        let mut value = serde_json::to_value(audit).unwrap();
+        value
+            .get_mut("source")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("raster");
+        let restored: ConversionAuditRecord = serde_json::from_value(value).unwrap();
+        assert!(restored.source.raster.is_none());
+        restored.validate().unwrap();
+    }
+
+    #[test]
     fn custom_optimizer_audit_requires_exact_authority_evidence() {
         let capture = capture();
         let output = committed(&capture);
@@ -787,5 +825,6 @@ mod tests {
         assert!(portable.contains(&audit.recipe_sha256));
         assert!(portable.contains(&audit.output.sha256));
         assert!(portable.contains("mean_total_ink"));
+        assert!(portable.contains("\"raster\""));
     }
 }
