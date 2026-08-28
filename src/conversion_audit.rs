@@ -8,6 +8,7 @@ use crate::color_conversion::{
         validate_production_provenance,
     },
 };
+use crate::conversion_analytics::{ConversionUsageReport, analyze_conversion_tiff};
 use crate::conversion_transaction::{CommittedConversionOutput, ConversionJobCapture};
 
 pub const CONVERSION_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -47,7 +48,7 @@ pub struct ConversionAuditFinding {
     pub acknowledged: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConversionAuditRecord {
     pub schema_version: u32,
     pub app_version: String,
@@ -58,6 +59,11 @@ pub struct ConversionAuditRecord {
     /// production conversion. ICC/DeviceLink records must not carry this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_optimizer: Option<CustomOptimizerProductionProvenance>,
+    /// Bounded-memory statistics derived from the exact committed TIFF under
+    /// the immutable conversion recipe. Legacy/mock records may omit this;
+    /// operator surfaces must never reconstruct it from current UI state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ConversionUsageReport>,
     pub output: ConversionAuditOutput,
     /// Findings must come from the actual preflight/transaction path. The audit
     /// model never reconstructs warnings from current UI or project state.
@@ -100,6 +106,23 @@ impl ConversionAuditRecord {
                 )
             })?;
 
+        // The production backend guarantees that a returned committed output is
+        // durable. When the exact file is available here, bind real TIFF
+        // analytics into the immutable audit. Unit/mock backends intentionally
+        // use non-existent destinations and therefore do not fabricate usage.
+        let usage = if committed_output.path.is_file() {
+            Some(
+                analyze_conversion_tiff(&committed_output.path, &capture.conversion_recipe)
+                    .map_err(|error| {
+                        format!(
+                            "Cannot analyze committed conversion TIFF for audit evidence: {error}"
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
         let target = &capture.conversion_recipe.target;
         let record = Self {
             schema_version: CONVERSION_AUDIT_SCHEMA_VERSION,
@@ -137,6 +160,7 @@ impl ConversionAuditRecord {
             },
             recipe_sha256: capture.conversion_recipe_sha256.clone(),
             custom_optimizer,
+            usage,
             output: ConversionAuditOutput {
                 path: committed_output.path.to_string_lossy().into_owned(),
                 sha256: committed_output.sha256.clone(),
@@ -182,6 +206,9 @@ impl ConversionAuditRecord {
         }
         if self.output.path.trim().is_empty() || self.output.converted_at_unix_ms <= 0 {
             return Err("Conversion audit requires committed output identity and timestamp.".to_owned());
+        }
+        if let Some(usage) = self.usage.as_ref() {
+            validate_usage_report(usage, &self.target.channel_names)?;
         }
 
         match (self.target.engine_mode, self.custom_optimizer.as_ref()) {
@@ -336,6 +363,115 @@ fn recipe_sha256(recipe: &crate::color_conversion::ConversionRecipe) -> Result<S
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn validate_usage_report(
+    usage: &ConversionUsageReport,
+    target_channels: &[String],
+) -> Result<(), String> {
+    if usage.pixel_count == 0 {
+        return Err("Conversion audit usage requires at least one committed output pixel.".to_owned());
+    }
+    if usage.channels.len() != target_channels.len() {
+        return Err("Conversion audit usage channel count does not match target topology.".to_owned());
+    }
+
+    for (channel, expected_name) in usage.channels.iter().zip(target_channels.iter()) {
+        if channel.name != *expected_name {
+            return Err("Conversion audit usage channel order does not match target topology.".to_owned());
+        }
+        for (label, value) in [
+            ("mean coverage", channel.mean_coverage),
+            ("peak coverage", channel.peak_coverage),
+            ("p50 coverage", channel.percentiles.p50),
+            ("p95 coverage", channel.percentiles.p95),
+            ("p99 coverage", channel.percentiles.p99),
+        ] {
+            if !unit_interval(value) {
+                return Err(format!(
+                    "Conversion audit usage {label} for '{}' must be finite in 0..=1.",
+                    channel.name
+                ));
+            }
+        }
+        if channel.percentiles.p50 > channel.percentiles.p95
+            || channel.percentiles.p95 > channel.percentiles.p99
+            || channel.percentiles.p99 > channel.peak_coverage + 1.0e-4
+        {
+            return Err(format!(
+                "Conversion audit usage percentiles for '{}' are not monotonic/bounded by peak coverage.",
+                channel.name
+            ));
+        }
+        if !percentage(channel.nonzero_percent) {
+            return Err(format!(
+                "Conversion audit non-zero coverage for '{}' must be finite in 0..=100.",
+                channel.name
+            ));
+        }
+        if channel.limit_hit_percent.is_some_and(|value| !percentage(value)) {
+            return Err(format!(
+                "Conversion audit channel-limit hits for '{}' must be finite in 0..=100.",
+                channel.name
+            ));
+        }
+        if !channel.integrated_coverage.is_finite() || channel.integrated_coverage < 0.0 {
+            return Err(format!(
+                "Conversion audit integrated coverage for '{}' must be finite and non-negative.",
+                channel.name
+            ));
+        }
+    }
+
+    let max_total = target_channels.len() as f32;
+    for (label, value) in [
+        ("mean total ink", usage.mean_total_ink),
+        ("peak total ink", usage.peak_total_ink),
+        ("p50 total ink", usage.total_ink_percentiles.p50),
+        ("p95 total ink", usage.total_ink_percentiles.p95),
+        ("p99 total ink", usage.total_ink_percentiles.p99),
+    ] {
+        if !value.is_finite() || !(0.0..=max_total).contains(&value) {
+            return Err(format!(
+                "Conversion audit usage {label} must be finite in 0..={max_total}."
+            ));
+        }
+    }
+    if usage.total_ink_percentiles.p50 > usage.total_ink_percentiles.p95
+        || usage.total_ink_percentiles.p95 > usage.total_ink_percentiles.p99
+        || usage.total_ink_percentiles.p99 > usage.peak_total_ink + 1.0e-4
+    {
+        return Err(
+            "Conversion audit total-ink percentiles are not monotonic/bounded by peak total ink."
+                .to_owned(),
+        );
+    }
+    if usage
+        .total_ink_limit_hit_percent
+        .is_some_and(|value| !percentage(value))
+    {
+        return Err(
+            "Conversion audit total-ink-limit hits must be finite in 0..=100.".to_owned(),
+        );
+    }
+    if usage
+        .neutral_black_share
+        .is_some_and(|value| !unit_interval(value))
+    {
+        return Err(
+            "Conversion audit neutral Black share must be finite in 0..=1 when available."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn unit_interval(value: f32) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+fn percentage(value: f32) -> bool {
+    value.is_finite() && (0.0..=100.0).contains(&value)
+}
+
 fn validate_findings(findings: &[ConversionAuditFinding]) -> Result<(), String> {
     for finding in findings {
         if finding.code.trim().is_empty() || finding.message.trim().is_empty() {
@@ -384,6 +520,7 @@ mod tests {
         ConversionRenderingIntent, ConversionSourceRef, ConversionTargetDefinition,
         SeparationStrategy, TargetChannelDefinition,
     };
+    use crate::conversion_analytics::{ChannelUsageStats, CoveragePercentiles};
     use crate::conversion_transaction::{CapturedOutputPolicy, CapturedSourceProfile};
     use crate::model::{IccProfileIdentity, ShadeProject};
 
@@ -476,6 +613,38 @@ mod tests {
         }
     }
 
+    fn usage() -> ConversionUsageReport {
+        ConversionUsageReport {
+            pixel_count: 10,
+            channels: ["Cyan", "Magenta", "Yellow", "Black"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| ChannelUsageStats {
+                    name: name.to_owned(),
+                    mean_coverage: 0.1 + index as f32 * 0.05,
+                    peak_coverage: 0.8,
+                    percentiles: CoveragePercentiles {
+                        p50: 0.1,
+                        p95: 0.5,
+                        p99: 0.7,
+                    },
+                    nonzero_percent: 80.0,
+                    limit_hit_percent: None,
+                    integrated_coverage: 1.0 + index as f64,
+                })
+                .collect(),
+            mean_total_ink: 0.7,
+            peak_total_ink: 2.5,
+            total_ink_percentiles: CoveragePercentiles {
+                p50: 0.6,
+                p95: 1.8,
+                p99: 2.3,
+            },
+            total_ink_limit_hit_percent: Some(2.0),
+            neutral_black_share: None,
+        }
+    }
+
     fn custom_optimizer_provenance(recipe_sha256: String) -> CustomOptimizerProductionProvenance {
         CustomOptimizerProductionProvenance {
             schema_version:
@@ -513,6 +682,7 @@ mod tests {
         assert_eq!(audit.recipe_sha256, capture.conversion_recipe_sha256);
         assert_eq!(audit.output.sha256, hash('e'));
         assert!(audit.custom_optimizer.is_none());
+        assert!(audit.usage.is_none());
         assert!(audit.findings[0].acknowledged);
         assert!(audit.to_pretty_json().unwrap().contains("Press CMYK"));
     }
@@ -566,6 +736,22 @@ mod tests {
     }
 
     #[test]
+    fn usage_must_match_exact_target_topology_and_ranges() {
+        let capture = capture();
+        let output = committed(&capture);
+        let mut audit = ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new()).unwrap();
+        audit.usage = Some(usage());
+        audit.validate().unwrap();
+
+        audit.usage.as_mut().unwrap().channels.swap(0, 1);
+        assert!(audit.validate().unwrap_err().contains("channel order"));
+
+        audit.usage = Some(usage());
+        audit.usage.as_mut().unwrap().total_ink_limit_hit_percent = Some(101.0);
+        assert!(audit.validate().unwrap_err().contains("total-ink-limit hits"));
+    }
+
+    #[test]
     fn custom_optimizer_audit_requires_exact_authority_evidence() {
         let capture = capture();
         let output = committed(&capture);
@@ -589,7 +775,8 @@ mod tests {
     fn portable_export_redacts_absolute_paths_but_preserves_authority_ids() {
         let capture = capture();
         let output = committed(&capture);
-        let audit = ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new()).unwrap();
+        let mut audit = ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new()).unwrap();
+        audit.usage = Some(usage());
         let portable = audit.to_portable_pretty_json().unwrap();
 
         assert!(!portable.contains(r"C:\Design"));
@@ -599,5 +786,6 @@ mod tests {
         assert!(portable.contains("<production-output>/Face-CMYK.tif"));
         assert!(portable.contains(&audit.recipe_sha256));
         assert!(portable.contains(&audit.output.sha256));
+        assert!(portable.contains("mean_total_ink"));
     }
 }
