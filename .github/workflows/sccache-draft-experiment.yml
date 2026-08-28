@@ -86,11 +86,12 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          $stats = sccache --show-stats 2>&1
           "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "### sccache statistics" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          "```text" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          (sccache --show-stats 2>&1) | ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append }
-          "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          $stats | ForEach-Object { "$_" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append }
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
       - name: Start Cargo dependency cache save timer
         if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
         shell: pwsh
