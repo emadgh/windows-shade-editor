@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use windows_shade_editor::file_observer::{self, ExternalFileRole};
 use windows_shade_editor::queue_core::{
     PersistedQueueEnvelope, QueueLifecycle, QueueRuntime, load_persisted_queue,
     sanitize_progress, write_persisted_queue,
@@ -1000,8 +1001,7 @@ impl ExportQueue {
                         )
                     }
                 };
-                export_result
-                .and_then(|_| {
+                export_result.and_then(|_| {
                     if spec.validate_after_export {
                         let _ = tx.send(ExportQueueEvent::Progress {
                             id,
@@ -1082,14 +1082,39 @@ fn validate_tiff_export_source(source: &Path) -> Result<(), String> {
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff")
         });
-    if is_tiff {
-        Ok(())
-    } else {
-        Err(format!(
+    if !is_tiff {
+        return Err(format!(
             "Shade Editor Export currently accepts TIFF source Faces only. PNG/JPEG remain available for preview and Color Conversion preflight: {}",
             source.display()
-        ))
+        ));
     }
+
+    // A Face preview is an accepted view of specific source bytes. If the shared
+    // observer has a sticky unacknowledged change for this path, establishing a new
+    // queue fingerprint from the new disk bytes would silently detach export from the
+    // preview/histograms the operator actually edited against. Fail closed until the
+    // Face reload/relink path verifies and acknowledges those bytes.
+    if let Some(snapshot) = file_observer::rescan(source) {
+        if snapshot.is_changed() {
+            return Err(format!(
+                "Source TIFF changed outside Shade Editor. Reload/verify the Face before exporting: {}",
+                source.display()
+            ));
+        }
+        if !snapshot.is_available() {
+            let detail = snapshot
+                .last_error
+                .as_deref()
+                .map(|error| format!(" ({error})"))
+                .unwrap_or_default();
+            return Err(format!(
+                "Source TIFF is not available for export{detail}: {}",
+                source.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_destination(destination: &Path, sources: &[PathBuf]) -> Result<(), String> {
@@ -1196,10 +1221,7 @@ mod tests {
         let mut value = serde_json::to_value(spec("out.tif")).unwrap();
         value.as_object_mut().unwrap().remove("operation");
         let restored: ExportQueueSpec = serde_json::from_value(value).unwrap();
-        assert!(matches!(
-            restored.operation,
-            ExportQueueOperation::Standard
-        ));
+        assert!(matches!(restored.operation, ExportQueueOperation::Standard));
     }
 
     #[test]
@@ -1237,8 +1259,7 @@ mod tests {
 
         assert_eq!(queue.items()[0].status, ExportQueueStatus::Done);
         assert_eq!(queue.items()[0].destination, folder.join("stack.tif"));
-        let decoded = windows_shade_editor::tiff_io::decode_full(&folder.join("stack.tif"))
-            .unwrap();
+        let decoded = windows_shade_editor::tiff_io::decode_full(&folder.join("stack.tif")).unwrap();
         assert_eq!(decoded.metadata.width, 2);
         assert_eq!(decoded.metadata.height, 2);
         let _ = std::fs::remove_dir_all(folder);
@@ -1389,37 +1410,11 @@ mod tests {
         let mut queue = ExportQueue::new();
         let failed = queue.enqueue(spec("failed.tif"));
         let cancelled = queue.enqueue(spec("cancelled.tif"));
-        queue
-            .items
-            .iter_mut()
-            .find(|item| item.id == failed)
-            .unwrap()
-            .status = ExportQueueStatus::Failed;
-        queue
-            .items
-            .iter_mut()
-            .find(|item| item.id == cancelled)
-            .unwrap()
-            .status = ExportQueueStatus::Cancelled;
+        queue.items.iter_mut().find(|item| item.id == failed).unwrap().status = ExportQueueStatus::Failed;
+        queue.items.iter_mut().find(|item| item.id == cancelled).unwrap().status = ExportQueueStatus::Cancelled;
         assert_eq!(queue.retry_all_failed(), 1);
-        assert_eq!(
-            queue
-                .items
-                .iter()
-                .find(|item| item.id == failed)
-                .unwrap()
-                .status,
-            ExportQueueStatus::Waiting
-        );
-        assert_eq!(
-            queue
-                .items
-                .iter()
-                .find(|item| item.id == cancelled)
-                .unwrap()
-                .status,
-            ExportQueueStatus::Cancelled
-        );
+        assert_eq!(queue.items.iter().find(|item| item.id == failed).unwrap().status, ExportQueueStatus::Waiting);
+        assert_eq!(queue.items.iter().find(|item| item.id == cancelled).unwrap().status, ExportQueueStatus::Cancelled);
     }
 
     #[test]
@@ -1431,6 +1426,26 @@ mod tests {
                 .expect_err("non-TIFF export source must fail closed");
             assert!(error.contains("TIFF source Faces only"), "{error}");
         }
+    }
+
+    #[test]
+    fn externally_changed_observed_face_is_rejected_until_acknowledged() {
+        let folder = temp_folder("external-change-guard");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = folder.join("face.tif");
+        std::fs::write(&source, b"preview baseline").unwrap();
+        file_observer::observe(&source, ExternalFileRole::Face);
+
+        std::fs::write(&source, b"externally changed source bytes").unwrap();
+        let error = validate_tiff_export_source(&source)
+            .expect_err("unacknowledged changed Face must fail closed");
+        assert!(error.contains("changed outside Shade Editor"), "{error}");
+
+        file_observer::acknowledge(&source).unwrap();
+        assert!(validate_tiff_export_source(&source).is_ok());
+
+        file_observer::release(&source, ExternalFileRole::Face);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]
