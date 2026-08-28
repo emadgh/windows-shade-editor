@@ -1,17 +1,22 @@
 use std::path::{Path, PathBuf};
 
 use crate::model::ShadeProject;
-use windows_shade_editor::file_observer;
+use windows_shade_editor::file_observer::{self, ExternalFileRole};
 
-/// Verify that a tracked active Source project still matches the baseline accepted by
-/// the File Observer. This is deliberately a persistence-boundary check rather than a
-/// UI-only warning: every same-path Save path that reaches `save_active_source_project`
-/// must fail closed after an unacknowledged external change.
+/// Verify that an existing Source `.shade` file still matches the filesystem
+/// baseline accepted by Shade Editor.
+///
+/// Existing-but-untracked targets fail closed. This intentionally makes a narrow
+/// Open/Save race safe and prevents a recovered/unknown project path from being
+/// overwritten without an accepted baseline. New Save As targets are still allowed.
 pub fn verify_active_source_project_save_baseline(path: &Path) -> Result<(), String> {
     let Some(snapshot) = file_observer::rescan(path) else {
-        // The open-project lifecycle establishes the observer baseline. Keep this
-        // function backward-compatible for untracked Save As targets; the caller that
-        // owns the active path is responsible for registering that baseline on open.
+        if path.exists() {
+            return Err(format!(
+                "Project overwrite blocked because Shade Editor has no accepted baseline for the existing file. Reopen/inspect it or use Save As with a new filename: {}",
+                path.display()
+            ));
+        }
         return Ok(());
     };
 
@@ -49,9 +54,11 @@ pub fn save_active_source_project(
     verify_active_source_project_save_baseline(path)?;
     project.save(path, resolved_face_paths)?;
 
-    // A successful app-owned write becomes the new accepted baseline. A pending
-    // native filesystem notification then converges to the same fingerprint instead
-    // of being mistaken for an external conflict on the next Ctrl+S.
+    // A successful app-owned write becomes an accepted baseline immediately,
+    // including first Save / Save As targets that were not observed before the
+    // write. This also closes the same-frame Save-after-Save window before the
+    // Recent Projects UI gets a chance to observe the new path.
+    file_observer::observe(path, ExternalFileRole::Project);
     let _ = file_observer::acknowledge(path);
     Ok(())
 }
@@ -61,7 +68,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use windows_shade_editor::file_observer::ExternalFileRole;
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -102,8 +108,18 @@ mod tests {
     }
 
     #[test]
-    fn untracked_save_as_target_remains_allowed_by_baseline_guard() {
-        let path = temp_project_path("save-as");
+    fn untracked_existing_target_fails_closed() {
+        let path = temp_project_path("untracked-existing");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"external project").unwrap();
+        let error = verify_active_source_project_save_baseline(&path).unwrap_err();
+        assert!(error.contains("no accepted baseline"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn untracked_new_save_as_target_remains_allowed() {
+        let path = temp_project_path("save-as-new");
         let _ = fs::remove_file(&path);
         assert!(verify_active_source_project_save_baseline(&path).is_ok());
     }
