@@ -5,6 +5,7 @@ pub(crate) mod conversion_audit;
 pub(crate) mod conversion_batch;
 pub(crate) mod conversion_candidate_preview;
 pub(crate) mod conversion_plan;
+pub(crate) mod conversion_presets;
 pub(crate) mod conversion_route_migration;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
@@ -128,12 +129,14 @@ mod tests {
         let plan_source = include_str!("conversion_plan.rs");
         let batch_source = include_str!("conversion_batch.rs");
         let candidate_source = include_str!("conversion_candidate_preview.rs");
+        let preset_source = include_str!("conversion_presets.rs");
         let conversion = conversion_source.split("\n#[cfg(test)]").next().unwrap_or(conversion_source);
         let audit = audit_source.split("\n#[cfg(test)]").next().unwrap_or(audit_source);
         let migration = migration_source.split("\n#[cfg(test)]").next().unwrap_or(migration_source);
         let plan = plan_source.split("\n#[cfg(test)]").next().unwrap_or(plan_source);
         let batch = batch_source.split("\n#[cfg(test)]").next().unwrap_or(batch_source);
         let candidate = candidate_source.split("\n#[cfg(test)]").next().unwrap_or(candidate_source);
+        let presets = preset_source.split("\n#[cfg(test)]").next().unwrap_or(preset_source);
 
         assert!(status_bar.contains("ui_color_conversion_window"));
         assert!(status_bar.contains("ui_conversion_route_migration"));
@@ -175,6 +178,10 @@ mod tests {
         assert!(candidate.contains("sync_conversion_candidate"));
         assert!(!candidate.contains("CandidateConfig"));
         assert!(!candidate.contains("egui::Window::new"));
+
+        assert!(presets.contains("PresetRuntimeController"));
+        assert!(presets.contains("unified_strategy_preset_availability"));
+        assert!(!presets.contains("egui::Window::new"));
 
         assert!(audit.contains("project.conversion_audits"));
         assert!(audit.contains("validate_against_provenance"));
