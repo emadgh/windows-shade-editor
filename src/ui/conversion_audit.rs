@@ -4,6 +4,7 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use windows_shade_editor::color_conversion::{ProductionProvenance, ProjectRole};
 use windows_shade_editor::conversion_audit::ConversionAuditRecord;
+use windows_shade_editor::conversion_analytics::ConversionUsageReport;
 
 #[derive(Clone)]
 struct AuditUiRow {
@@ -226,6 +227,17 @@ impl ShadeApp {
                             row.audit.source.project_file_sha256
                         ));
                         ui.small(format!("Face: {}", row.audit.source.face_path));
+                        if let Some(raster) = row.audit.source.raster {
+                            ui.small(format!(
+                                "Raster: {} · {} · {}-bit · {} channel(s)",
+                                raster.format.label(),
+                                raster.color_model.label(),
+                                raster.bit_depth,
+                                raster.channel_count
+                            ));
+                        } else {
+                            ui.small("Raster: unavailable in this legacy audit record");
+                        }
                         ui.small(format!(
                             "Source file SHA-256: {}",
                             row.audit.source.source_file_sha256
@@ -243,6 +255,16 @@ impl ShadeApp {
                         ui.small(format!("Path: {}", row.audit.output.path));
                         ui.small(format!("SHA-256: {}", row.audit.output.sha256));
                         ui.small(format!("Converted: {timestamp}"));
+
+                        ui.add_space(4.0);
+                        ui.strong("Committed ink usage / constraints");
+                        if let Some(usage) = row.audit.usage.as_ref() {
+                            draw_persisted_usage(ui, usage);
+                        } else {
+                            ui.small(
+                                "Committed usage analytics are unavailable in this legacy audit record.",
+                            );
+                        }
 
                         if let Some(custom) = row.audit.custom_optimizer.as_ref() {
                             ui.add_space(4.0);
@@ -272,6 +294,9 @@ impl ShadeApp {
                                 custom.pcs_compatibility_content_id
                             ));
                         }
+                        ui.small(
+                            "Measured ΔE00: unavailable until approved measured PCS/characterization evidence is present.",
+                        );
 
                         ui.add_space(4.0);
                         ui.strong(format!("Findings ({})", row.audit.findings.len()));
@@ -327,6 +352,43 @@ impl ShadeApp {
                 Err(error) => self.report_error(format!("Cannot export conversion audit: {error}")),
             }
         }
+    }
+}
+
+fn draw_persisted_usage(ui: &mut egui::Ui, usage: &ConversionUsageReport) {
+    ui.small(format!("Pixels analyzed: {}", usage.pixel_count));
+    ui.small(format!(
+        "Total ink · mean {:.1}% · p50 {:.1}% · p95 {:.1}% · p99 {:.1}% · peak {:.1}%",
+        usage.mean_total_ink * 100.0,
+        usage.total_ink_percentiles.p50 * 100.0,
+        usage.total_ink_percentiles.p95 * 100.0,
+        usage.total_ink_percentiles.p99 * 100.0,
+        usage.peak_total_ink * 100.0,
+    ));
+    if let Some(hit_percent) = usage.total_ink_limit_hit_percent {
+        ui.small(format!("Total-ink limit hits: {hit_percent:.2}%"));
+    } else {
+        ui.small("Total-ink limit hits: no total-ink limit configured");
+    }
+    for channel in &usage.channels {
+        ui.small(format!(
+            "{} · mean {:.1}% · p95 {:.1}% · p99 {:.1}% · peak {:.1}% · non-zero {:.2}%{}",
+            channel.name,
+            channel.mean_coverage * 100.0,
+            channel.percentiles.p95 * 100.0,
+            channel.percentiles.p99 * 100.0,
+            channel.peak_coverage * 100.0,
+            channel.nonzero_percent,
+            channel
+                .limit_hit_percent
+                .map(|value| format!(" · limit hits {value:.2}%"))
+                .unwrap_or_else(|| " · no channel limit".to_owned())
+        ));
+    }
+    if let Some(share) = usage.neutral_black_share {
+        ui.small(format!("Neutral Black share: {:.1}%", share * 100.0));
+    } else {
+        ui.small("Neutral Black share: unavailable without measured neutral classification");
     }
 }
 
@@ -495,5 +557,16 @@ mod tests {
         assert_eq!(effective_total_ink_limit(Some(1.8), None), Some(1.8));
         assert_eq!(effective_total_ink_limit(None, Some(2.1)), Some(2.1));
         assert_eq!(effective_total_ink_limit(None, None), None);
+    }
+
+    #[test]
+    fn audit_ui_uses_only_persisted_raster_and_usage_evidence() {
+        let source = include_str!("conversion_audit.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("row.audit.source.raster"));
+        assert!(runtime.contains("row.audit.usage"));
+        assert!(runtime.contains("draw_persisted_usage"));
+        assert!(!runtime.contains("analyze_conversion_tiff"));
+        assert!(!runtime.contains("ConversionUsageAccumulator"));
     }
 }
