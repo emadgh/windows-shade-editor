@@ -71,6 +71,22 @@ fn tonal_working_value(value: f32, mode: TonalDisplayMode) -> f32 {
     tonal_display_value(value, mode)
 }
 
+fn curve_display_scalar(value: f32, unit: settings::CurveValueDisplayUnit) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    match unit {
+        settings::CurveValueDisplayUnit::Byte255 => value * 255.0,
+        settings::CurveValueDisplayUnit::Percent => value * 100.0,
+    }
+}
+
+fn curve_normalized_scalar(value: f32, unit: settings::CurveValueDisplayUnit) -> f32 {
+    match unit {
+        settings::CurveValueDisplayUnit::Byte255 => value / 255.0,
+        settings::CurveValueDisplayUnit::Percent => value / 100.0,
+    }
+    .clamp(0.0, 1.0)
+}
+
 fn curve_histogram_height(histogram: &[u32; 256], index: usize, graph_height: f32) -> f32 {
     let peak = histogram.iter().copied().max().unwrap_or(0).max(1) as f32;
     histogram[index] as f32 / peak * graph_height
@@ -335,13 +351,22 @@ fn curve_editor_graph(
     );
     if histogram_before.is_some() || histogram_after.is_some() {
         let (before_base, after_base) = curve_histogram_colors(ui, accent, neutral_histogram);
-        let before_color = before_base.gamma_multiply(0.32);
+        let (before_opacity, before_prominence) = settings::runtime_histogram_overlay_preferences();
+        let before_color = before_base.gamma_multiply(before_opacity);
+        let before_width = if settings::DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE > f32::EPSILON {
+            (before_prominence / settings::DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE).clamp(0.0, 2.0)
+        } else {
+            before_prominence
+        };
         let after_color = after_base.gamma_multiply(0.56);
-        for (bins, color) in [
-            (histogram_before, before_color),
-            (histogram_after, after_color),
+        for (bins, color, width) in [
+            (histogram_before, before_color, before_width),
+            (histogram_after, after_color, 1.0),
         ] {
             if let Some(bins) = bins {
+                if width <= 0.001 || color == egui::Color32::TRANSPARENT {
+                    continue;
+                }
                 for (index, _) in bins.iter().enumerate() {
                     let x = egui::lerp(
                         rect.x_range(),
@@ -353,7 +378,7 @@ fn curve_editor_graph(
                             egui::pos2(x, rect.bottom()),
                             egui::pos2(x, rect.bottom() - h),
                         ],
-                        egui::Stroke::new(1.0, color),
+                        egui::Stroke::new(width, color),
                     );
                 }
             }
@@ -408,35 +433,82 @@ fn curve_point_fields(
     display_mode: TonalDisplayMode,
 ) -> bool {
     let (input, output) = curve_point_xy(*curve, selected);
-    let mut input_value = (tonal_display_value(input, display_mode) * 255.0).round() as i32;
-    let mut output_value = (tonal_display_value(output, display_mode) * 255.0).round() as i32;
+    let input_display = tonal_display_value(input, display_mode);
+    let output_display = tonal_display_value(output, display_mode);
+    let unit = settings::runtime_curve_value_display_unit();
     ui.strong(selected.label());
-    let mut input_changed = false;
-    let mut output_changed = false;
-    ui.columns(2, |columns| {
-        columns[0].small("Input");
-        input_changed = columns[0]
-            .add(
-                egui::DragValue::new(&mut input_value)
-                    .range(0..=255)
-                    .speed(1),
+
+    let (input_changed, output_changed, next_input, next_output) = match unit {
+        settings::CurveValueDisplayUnit::Byte255 => {
+            let mut input_value = curve_display_scalar(input_display, unit).round() as i32;
+            let mut output_value = curve_display_scalar(output_display, unit).round() as i32;
+            let mut input_changed = false;
+            let mut output_changed = false;
+            ui.columns(2, |columns| {
+                columns[0].small("Input");
+                input_changed = columns[0]
+                    .add(
+                        egui::DragValue::new(&mut input_value)
+                            .range(0..=255)
+                            .speed(1),
+                    )
+                    .changed();
+                columns[1].small("Output");
+                output_changed = columns[1]
+                    .add(
+                        egui::DragValue::new(&mut output_value)
+                            .range(0..=255)
+                            .speed(1),
+                    )
+                    .changed();
+            });
+            (
+                input_changed,
+                output_changed,
+                curve_normalized_scalar(input_value as f32, unit),
+                curve_normalized_scalar(output_value as f32, unit),
             )
-            .changed();
-        columns[1].small("Output");
-        output_changed = columns[1]
-            .add(
-                egui::DragValue::new(&mut output_value)
-                    .range(0..=255)
-                    .speed(1),
+        }
+        settings::CurveValueDisplayUnit::Percent => {
+            let mut input_value = curve_display_scalar(input_display, unit);
+            let mut output_value = curve_display_scalar(output_display, unit);
+            let mut input_changed = false;
+            let mut output_changed = false;
+            ui.columns(2, |columns| {
+                columns[0].small("Input");
+                input_changed = columns[0]
+                    .add(
+                        egui::DragValue::new(&mut input_value)
+                            .range(0.0..=100.0)
+                            .speed(0.1)
+                            .suffix("%"),
+                    )
+                    .changed();
+                columns[1].small("Output");
+                output_changed = columns[1]
+                    .add(
+                        egui::DragValue::new(&mut output_value)
+                            .range(0.0..=100.0)
+                            .speed(0.1)
+                            .suffix("%"),
+                    )
+                    .changed();
+            });
+            (
+                input_changed,
+                output_changed,
+                curve_normalized_scalar(input_value, unit),
+                curve_normalized_scalar(output_value, unit),
             )
-            .changed();
-    });
+        }
+    };
+
     if input_changed || output_changed {
         set_curve_point(
             curve,
             selected,
-            tonal_working_value(input_value as f32 / 255.0, display_mode),
-            tonal_working_value(output_value as f32 / 255.0, display_mode),
+            tonal_working_value(next_input, display_mode),
+            tonal_working_value(next_output, display_mode),
         );
         true
     } else {
@@ -457,12 +529,13 @@ pub(crate) fn curves_ui(
     with_accent(ui, accent, |ui| {
         if histogram_before.is_some() || histogram_after.is_some() {
             let (before_color, after_color) = curve_histogram_colors(ui, accent, neutral_histogram);
+            let (before_opacity, _) = settings::runtime_histogram_overlay_preferences();
             ui.horizontal(|ui| {
                 ui.strong("Histogram");
                 ui.small(format!("Mode: {}", display_mode.label()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     curve_legend_dot(ui, after_color, "After");
-                    curve_legend_dot(ui, before_color, "Before");
+                    curve_legend_dot(ui, before_color.gamma_multiply(before_opacity), "Before");
                 });
             });
         }
@@ -528,6 +601,29 @@ mod curve_qol_tests {
         assert_eq!((curve.input_black, curve.black), (0.0, 0.0));
         reset_selected_curve_point(&mut curve, CurvePointKind::White);
         assert_eq!((curve.input_white, curve.white), (1.0, 1.0));
+    }
+
+    #[test]
+    fn display_unit_conversion_covers_boundaries_midpoint_and_round_trip() {
+        for unit in [
+            settings::CurveValueDisplayUnit::Byte255,
+            settings::CurveValueDisplayUnit::Percent,
+        ] {
+            assert_eq!(curve_display_scalar(0.0, unit), 0.0);
+            let max = curve_display_scalar(1.0, unit);
+            assert_eq!(
+                max,
+                match unit {
+                    settings::CurveValueDisplayUnit::Byte255 => 255.0,
+                    settings::CurveValueDisplayUnit::Percent => 100.0,
+                }
+            );
+            let midpoint = curve_display_scalar(0.5, unit);
+            let round_trip = curve_normalized_scalar(midpoint, unit);
+            assert!((round_trip - 0.5).abs() < 1e-6);
+        }
+        assert!((curve_display_scalar(0.5, settings::CurveValueDisplayUnit::Byte255) - 127.5).abs() < 1e-6);
+        assert!((curve_display_scalar(0.5, settings::CurveValueDisplayUnit::Percent) - 50.0).abs() < 1e-6);
     }
 }
 
