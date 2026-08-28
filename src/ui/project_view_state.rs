@@ -1,6 +1,6 @@
 use crate::*;
 use eframe::egui;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use windows_shade_editor::file_observer::{self, ExternalFileRole};
 
 pub(crate) struct ProjectViewState {
@@ -13,6 +13,9 @@ pub(crate) struct ProjectViewState {
     pub(crate) texture: Option<egui::TextureHandle>,
     pub(crate) list_textures: BTreeMap<String, egui::TextureHandle>,
     pub(crate) list_texture_lru: VecDeque<String>,
+    recent_observed_paths: BTreeSet<String>,
+    view_observed_paths: BTreeSet<String>,
+    registered_project_observers: BTreeSet<String>,
 }
 
 impl Default for ProjectViewState {
@@ -27,6 +30,9 @@ impl Default for ProjectViewState {
             texture: None,
             list_textures: BTreeMap::new(),
             list_texture_lru: VecDeque::new(),
+            recent_observed_paths: BTreeSet::new(),
+            view_observed_paths: BTreeSet::new(),
+            registered_project_observers: BTreeSet::new(),
         }
     }
 }
@@ -44,6 +50,52 @@ impl ProjectViewState {
         self.selected.as_deref() != Some(path)
     }
 
+    pub(crate) fn reconcile_recent_observers<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.recent_observed_paths = paths.into_iter().collect();
+        self.reconcile_project_observers();
+    }
+
+    pub(crate) fn reconcile_view_observers<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.view_observed_paths = paths.into_iter().collect();
+        self.reconcile_project_observers();
+    }
+
+    pub(crate) fn clear_view_observers(&mut self) {
+        if self.view_observed_paths.is_empty() {
+            return;
+        }
+        self.view_observed_paths.clear();
+        self.reconcile_project_observers();
+    }
+
+    pub(crate) fn forget_observed_path(&mut self, path: &str) {
+        self.recent_observed_paths.remove(path);
+        self.view_observed_paths.remove(path);
+        self.reconcile_project_observers();
+    }
+
+    fn reconcile_project_observers(&mut self) {
+        let desired = self
+            .recent_observed_paths
+            .union(&self.view_observed_paths)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        for path in desired.difference(&self.registered_project_observers) {
+            file_observer::observe(Path::new(path), ExternalFileRole::Project);
+        }
+        for path in self.registered_project_observers.difference(&desired) {
+            file_observer::release(Path::new(path), ExternalFileRole::Project);
+        }
+        self.registered_project_observers = desired;
+    }
+
     pub(crate) fn clear_selection(&mut self) {
         self.selected = None;
         self.preview = None;
@@ -54,8 +106,17 @@ impl ProjectViewState {
     pub(crate) fn forget_path(&mut self, path: &str) {
         self.list_textures.remove(path);
         self.list_texture_lru.retain(|item| item != path);
+        self.forget_observed_path(path);
         if self.selected.as_deref() == Some(path) {
             self.clear_selection();
+        }
+    }
+}
+
+impl Drop for ProjectViewState {
+    fn drop(&mut self) {
+        for path in std::mem::take(&mut self.registered_project_observers) {
+            file_observer::release(Path::new(&path), ExternalFileRole::Project);
         }
     }
 }
@@ -76,6 +137,9 @@ mod tests {
         assert!(state.texture.is_none());
         assert!(state.list_textures.is_empty());
         assert!(state.list_texture_lru.is_empty());
+        assert!(state.recent_observed_paths.is_empty());
+        assert!(state.view_observed_paths.is_empty());
+        assert!(state.registered_project_observers.is_empty());
     }
 
     #[test]
@@ -90,12 +154,35 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_selected_path_clears_selection_and_lru_metadata() {
+    fn recent_and_view_scopes_share_one_project_role_until_both_release() {
+        let mut state = ProjectViewState::default();
+        state.reconcile_recent_observers(["shared.shade".to_owned(), "recent.shade".to_owned()]);
+        state.reconcile_view_observers(["shared.shade".to_owned(), "view.shade".to_owned()]);
+        assert_eq!(state.registered_project_observers.len(), 3);
+        assert_eq!(
+            file_observer::subscriber_count(Path::new("shared.shade")),
+            1,
+            "the shared Project role is owned once by ProjectViewState"
+        );
+
+        state.reconcile_recent_observers(std::iter::empty::<String>());
+        assert!(state.registered_project_observers.contains("shared.shade"));
+        assert!(!state.registered_project_observers.contains("recent.shade"));
+        assert_eq!(file_observer::subscriber_count(Path::new("shared.shade")), 1);
+
+        state.clear_view_observers();
+        assert!(state.registered_project_observers.is_empty());
+        assert_eq!(file_observer::subscriber_count(Path::new("shared.shade")), 0);
+    }
+
+    #[test]
+    fn forgetting_selected_path_clears_selection_lru_and_observer_ownership() {
         let mut state = ProjectViewState::default();
         state.selected = Some("a.shade".to_owned());
         state.preview_error = Some("old preview".to_owned());
         state.list_texture_lru.push_back("a.shade".to_owned());
         state.list_texture_lru.push_back("b.shade".to_owned());
+        state.reconcile_view_observers(["a.shade".to_owned()]);
         state.forget_path("a.shade");
         assert!(state.selected.is_none());
         assert!(state.preview_error.is_none());
@@ -104,5 +191,6 @@ mod tests {
             state.list_texture_lru.front().map(String::as_str),
             Some("b.shade")
         );
+        assert!(!state.registered_project_observers.contains("a.shade"));
     }
 }
