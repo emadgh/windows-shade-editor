@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 use crate::color_conversion::{
     ConversionEngineMode, ConversionRecipe, ConversionSourceRef, ProductionProvenance, ProjectRole,
 };
+use crate::conversion_audit::{ConversionAuditFinding, ConversionAuditRecord};
 use crate::conversion_output::validate_conversion_output_path;
 use crate::conversion_recipe::recipe_sha256;
 use crate::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;
 use crate::export_recipe::ExportRecipe;
 use crate::model::ShadeProject;
-use crate::production_project::{ProductionProjectSpec, build_production_project};
+use crate::production_project::{
+    ProductionProjectSpec, build_production_project_with_audit,
+};
 use crate::tiff_output;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +99,11 @@ pub struct ConversionJobCapture {
     pub conversion_recipe_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_optimizer_evidence: Option<CapturedCustomOptimizerEvidence>,
+    /// Non-blocking findings frozen at queue-capture time. Legacy persisted jobs
+    /// deserialize this as empty; new unified conversion jobs populate it from
+    /// the typed production preflight report rather than current UI state.
+    #[serde(default)]
+    pub audit_findings: Vec<ConversionAuditFinding>,
     pub output_policy: CapturedOutputPolicy,
     pub output_tiff_path: PathBuf,
     pub production_project_path: PathBuf,
@@ -132,6 +140,7 @@ impl ConversionJobCapture {
             conversion_recipe,
             conversion_recipe_sha256,
             custom_optimizer_evidence: None,
+            audit_findings: Vec::new(),
             output_policy,
             output_tiff_path,
             production_project_path,
@@ -172,6 +181,7 @@ impl ConversionJobCapture {
             conversion_recipe,
             conversion_recipe_sha256,
             custom_optimizer_evidence: Some(custom_optimizer_evidence),
+            audit_findings: Vec::new(),
             output_policy,
             output_tiff_path,
             production_project_path,
@@ -180,6 +190,15 @@ impl ConversionJobCapture {
         };
         capture.validate()?;
         Ok(capture)
+    }
+
+    pub fn with_audit_findings(
+        mut self,
+        findings: Vec<ConversionAuditFinding>,
+    ) -> Result<Self, String> {
+        self.audit_findings = findings;
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -236,6 +255,14 @@ impl ConversionJobCapture {
                 );
             }
             (_, None) => {}
+        }
+        for finding in &self.audit_findings {
+            if finding.code.trim().is_empty() || finding.message.trim().is_empty() {
+                return Err(
+                    "Captured conversion audit findings require non-empty code and message."
+                        .to_owned(),
+                );
+            }
         }
         validate_conversion_output_path(&self.source_face_path, &self.output_tiff_path)
             .map_err(|err| err.to_string())?;
@@ -438,13 +465,31 @@ where
         output_sha256: committed_output.sha256.clone(),
         converted_at_unix_ms: committed_output.converted_at_unix_ms,
     };
-    let production_project = match build_production_project(ProductionProjectSpec {
-        project_name: &capture.production_project_name,
-        source_project_path: &capture.source_project_path,
-        output_tiff_path: &committed_output.path,
-        output_face_label: &capture.output_face_label,
-        provenance,
-    }) {
+    let audit = match ConversionAuditRecord::from_committed_job(
+        capture,
+        &committed_output,
+        capture.audit_findings.clone(),
+    ) {
+        Ok(audit) => audit,
+        Err(error) => {
+            return ConversionTransactionOutcome::OutputCommittedNeedsRecovery {
+                committed_output,
+                production_project_path: capture.production_project_path.clone(),
+                production_project: None,
+                error: format!("Cannot build committed conversion audit record: {error}"),
+            };
+        }
+    };
+    let production_project = match build_production_project_with_audit(
+        ProductionProjectSpec {
+            project_name: &capture.production_project_name,
+            source_project_path: &capture.source_project_path,
+            output_tiff_path: &committed_output.path,
+            output_face_label: &capture.output_face_label,
+            provenance,
+        },
+        audit,
+    ) {
         Ok(project) => project,
         Err(error) => {
             return ConversionTransactionOutcome::OutputCommittedNeedsRecovery {
@@ -658,11 +703,19 @@ mod tests {
             "Job".to_owned(),
             "Face".to_owned(),
         )
+        .unwrap()
+        .with_audit_findings(vec![ConversionAuditFinding {
+            code: "jpeg_lossy_source".to_owned(),
+            message: "JPEG source is lossy.".to_owned(),
+            acknowledged: false,
+        }])
         .unwrap();
         source.adjustments.get_mut("Red").unwrap().levels.gamma = 0.8;
         let restored: ConversionJobCapture =
             serde_json::from_slice(&serde_json::to_vec(&captured).unwrap()).unwrap();
         assert_eq!(restored.source_recipe.adjustments["Red"].levels.gamma, 1.25);
+        assert_eq!(restored.audit_findings.len(), 1);
+        assert_eq!(restored.audit_findings[0].code, "jpeg_lossy_source");
         assert!(restored.validate().is_ok());
     }
 
@@ -703,10 +756,17 @@ mod tests {
 
     #[test]
     fn successful_commit_builds_and_saves_clean_production_project() {
+        let captured = capture()
+            .with_audit_findings(vec![ConversionAuditFinding {
+                code: "rgb_not_production_separated".to_owned(),
+                message: "RGB source requires production separation.".to_owned(),
+                acknowledged: false,
+            }])
+            .unwrap();
         let mut backend = MockBackend::success();
         let mut phases = Vec::new();
         let outcome = run_conversion_transaction(
-            &capture(),
+            &captured,
             &ConversionCancellation::default(),
             &mut backend,
             |progress| phases.push(progress.phase),
@@ -721,6 +781,15 @@ mod tests {
             ProjectRole::Production
         );
         assert!(completed.production_project.snapshots.is_empty());
+        assert_eq!(completed.production_project.conversion_audits.len(), 1);
+        assert_eq!(completed.production_project.conversion_audits[0].findings.len(), 1);
+        assert_eq!(
+            completed.production_project.conversion_audits[0].findings[0].code,
+            "rgb_not_production_separated"
+        );
+        completed.production_project.conversion_audits[0]
+            .validate_against_provenance(&completed.production_project.production_provenance[0])
+            .unwrap();
         assert_eq!(phases.last(), Some(&ConversionPhase::Complete));
         assert_eq!(
             production_link_for_completed(&completed).role,
@@ -765,7 +834,8 @@ mod tests {
             panic!("expected recoverable output");
         };
         assert!(error.contains("simulated"));
-        assert!(production_project.is_some());
+        let project = production_project.expect("recoverable Production project");
+        assert_eq!(project.conversion_audits.len(), 1);
         assert!(committed_output.path.ends_with("Face_CMYK.tif"));
     }
 

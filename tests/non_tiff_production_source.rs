@@ -102,6 +102,7 @@ fn capture(source: &Path, policy: Option<SourceTransparencyPolicy>) -> Conversio
         conversion_recipe: recipe(policy),
         conversion_recipe_sha256: "d".repeat(64),
         custom_optimizer_evidence: None,
+        audit_findings: Vec::new(),
         output_policy: CapturedOutputPolicy::MustNotExist,
         output_tiff_path: base.with_extension("tif"),
         production_project_path: base.with_extension("production.shade"),

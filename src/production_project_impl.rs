@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::color_conversion::production_provenance::validate_production_provenance;
 use crate::color_conversion::{LinkedProjectRef, ProductionProvenance, ProjectRole};
+use crate::conversion_audit::ConversionAuditRecord;
 use crate::model::{FaceRef, FaceStatus, ShadeProject};
 
 /// Immutable inputs needed after a converted TIFF has been validated and
@@ -17,7 +18,30 @@ pub struct ProductionProjectSpec<'a> {
 
 /// Build a new Production project without carrying source-domain adjustments,
 /// snapshots, preview ICC choices or test-code state into the target ink space.
+///
+/// This compatibility entry point intentionally creates no operator audit
+/// record. New conversion transactions use `build_production_project_with_audit`
+/// so legacy/test callers remain source-compatible while new production output
+/// persists producer context.
 pub fn build_production_project(spec: ProductionProjectSpec<'_>) -> Result<ShadeProject, String> {
+    build_production_project_inner(spec, None)
+}
+
+/// Build a new Production project and persist the exact audit record produced by
+/// the same committed transaction. The audit must independently bind to the
+/// supplied provenance before any project bytes are serialized.
+pub fn build_production_project_with_audit(
+    spec: ProductionProjectSpec<'_>,
+    audit: ConversionAuditRecord,
+) -> Result<ShadeProject, String> {
+    audit.validate_against_provenance(&spec.provenance)?;
+    build_production_project_inner(spec, Some(audit))
+}
+
+fn build_production_project_inner(
+    spec: ProductionProjectSpec<'_>,
+    audit: Option<ConversionAuditRecord>,
+) -> Result<ShadeProject, String> {
     validate_production_provenance(&spec.provenance)?;
     spec.provenance
         .recipe
@@ -59,6 +83,7 @@ pub fn build_production_project(spec: ProductionProjectSpec<'_>) -> Result<Shade
             path: spec.source_project_path.display().to_string(),
         }],
         production_provenance: vec![spec.provenance],
+        conversion_audits: audit.into_iter().collect(),
         faces: vec![FaceRef {
             path: spec.output_tiff_path.display().to_string(),
             label: spec.output_face_label.trim().to_owned(),
@@ -187,6 +212,7 @@ mod tests {
         assert_eq!(project.project_role, ProjectRole::Production);
         assert_eq!(project.faces.len(), 1);
         assert_eq!(project.production_provenance.len(), 1);
+        assert!(project.conversion_audits.is_empty());
         assert_eq!(project.linked_projects[0].role, ProjectRole::Source);
         assert_eq!(
             project.adjustments.keys().cloned().collect::<Vec<_>>(),
@@ -222,11 +248,13 @@ mod tests {
         object.remove("project_role");
         object.remove("linked_projects");
         object.remove("production_provenance");
+        object.remove("conversion_audits");
 
         let restored: ShadeProject = serde_json::from_value(value).unwrap();
         assert_eq!(restored.project_role, ProjectRole::Standalone);
         assert!(restored.linked_projects.is_empty());
         assert!(restored.production_provenance.is_empty());
+        assert!(restored.conversion_audits.is_empty());
     }
 
     #[test]

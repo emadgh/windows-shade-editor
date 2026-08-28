@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::color_conversion::{LinkedProjectRef, ProductionProvenance, ProjectRole};
+use crate::conversion_audit::ConversionAuditRecord;
 use crate::safe_fs;
 
 use crate::palette::ChannelPalette;
@@ -133,6 +134,12 @@ pub struct ShadeProject {
     /// entry per converted Face/version.
     #[serde(default)]
     pub production_provenance: Vec<ProductionProvenance>,
+    /// Optional full operator audit records captured from the exact committed
+    /// conversion transaction. Legacy schema-v9 projects deserialize this as
+    /// empty and remain usable; new Production conversions persist one record
+    /// for every output whose producer context is available.
+    #[serde(default)]
+    pub conversion_audits: Vec<ConversionAuditRecord>,
     /// Source-side persisted mirrors of linked Production conversion routes.
     /// Legacy schema-v9 projects deserialize this as empty; Production provenance remains
     /// authoritative for committed output history.
@@ -173,6 +180,7 @@ impl Default for ShadeProject {
             project_role: ProjectRole::Standalone,
             linked_projects: Vec::new(),
             production_provenance: Vec::new(),
+            conversion_audits: Vec::new(),
             conversion_routes: Vec::new(),
             faces: Vec::new(),
             adjustments: BTreeMap::new(),

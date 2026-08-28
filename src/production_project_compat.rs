@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::color_conversion::production_provenance::validate_production_provenance;
 use crate::color_conversion::{ConversionEngineMode, ProductionProvenance, ProjectRole};
+use crate::conversion_audit::ConversionAuditRecord;
 use crate::model::{FaceRef, FaceStatus, ShadeProject};
 
 /// Stable target-side identity required for multiple converted Faces to coexist
@@ -195,6 +196,15 @@ fn validate_existing_production_project_baseline_with_resolved_paths(
                 index + 1
             ));
         }
+        if project.production_provenance[..index]
+            .iter()
+            .any(|previous| paths_match_str(&previous.output_path, &provenance.output_path))
+        {
+            return Err(format!(
+                "Existing Production project contains duplicate output ownership at Face {}.",
+                index + 1
+            ));
+        }
         let key = ProductionCompatibilityKey::from_provenance(provenance)?;
         if key != canonical {
             return Err(format!(
@@ -204,6 +214,8 @@ fn validate_existing_production_project_baseline_with_resolved_paths(
             ));
         }
     }
+
+    validate_existing_conversion_audits(project)?;
 
     for channel in &canonical.channel_names {
         if !project.adjustments.contains_key(channel) {
@@ -247,7 +259,7 @@ fn validate_existing_production_project_for_append_with_resolved_paths(
         || project
             .production_provenance
             .iter()
-            .any(|provenance| paths_match(&provenance.output_path, Path::new(&incoming.output_path)))
+            .any(|provenance| paths_match_str(&provenance.output_path, &incoming.output_path))
     {
         return Err(
             "Incoming converted TIFF is already present in the Production project.".to_owned(),
@@ -255,6 +267,49 @@ fn validate_existing_production_project_for_append_with_resolved_paths(
     }
 
     Ok(canonical)
+}
+
+/// Validate every audit that is present without requiring legacy Production
+/// projects to have one. Audits are sparse by design for pre-#111 projects, but
+/// any stored audit must bind to exactly one immutable provenance record.
+pub fn validate_existing_conversion_audits(project: &ShadeProject) -> Result<(), String> {
+    for audit in &project.conversion_audits {
+        let matches = project
+            .production_provenance
+            .iter()
+            .filter(|provenance| audit_matches_provenance(audit, provenance))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [provenance] => audit.validate_against_provenance(provenance)?,
+            [] => {
+                return Err(
+                    "Production project contains an orphan conversion audit with no matching provenance."
+                        .to_owned(),
+                );
+            }
+            _ => {
+                return Err(
+                    "Production project contains ambiguous provenance for a conversion audit."
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    for provenance in &project.production_provenance {
+        let count = project
+            .conversion_audits
+            .iter()
+            .filter(|audit| audit_matches_provenance(audit, provenance))
+            .count();
+        if count > 1 {
+            return Err(
+                "Production project contains duplicate conversion audits for one output provenance."
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Append one already-committed converted TIFF and its immutable provenance.
@@ -289,6 +344,96 @@ pub fn append_converted_face_to_production_project_at_path(
     )?;
     push_converted_face(project, spec);
     Ok(())
+}
+
+/// Audited append used by new conversion transactions. The audit is validated
+/// before mutating the project so an invalid producer record cannot leave a
+/// Face/provenance pair partially appended.
+pub fn append_converted_face_with_audit_to_production_project_at_path(
+    project: &mut ShadeProject,
+    production_project_path: &Path,
+    spec: AppendConvertedFaceSpec<'_>,
+    audit: ConversionAuditRecord,
+) -> Result<(), String> {
+    validate_append_spec(&spec)?;
+    validate_existing_production_project_for_append_at_path(
+        project,
+        production_project_path,
+        spec.source_project_path,
+        &spec.provenance,
+    )?;
+    audit.validate_against_provenance(&spec.provenance)?;
+    if project
+        .conversion_audits
+        .iter()
+        .any(|existing| paths_match_str(&existing.output.path, &audit.output.path))
+    {
+        return Err(
+            "Incoming converted output path already has an audit in the Production project."
+                .to_owned(),
+        );
+    }
+    push_converted_face(project, spec);
+    project.conversion_audits.push(audit);
+    Ok(())
+}
+
+/// Update the sparse audit collection for a same-route replacement. Legacy
+/// provenance may have no audit; in that case the new committed conversion
+/// simply adds its first durable audit record. A matching old audit is removed
+/// only when both old output path and hash bind it to the replaced provenance.
+pub fn replace_conversion_audit_for_provenance(
+    project: &mut ShadeProject,
+    previous: &ProductionProvenance,
+    incoming: &ProductionProvenance,
+    audit: ConversionAuditRecord,
+) -> Result<(), String> {
+    validate_existing_conversion_audits(project)?;
+    audit.validate_against_provenance(incoming)?;
+
+    let previous_matches = project
+        .conversion_audits
+        .iter()
+        .enumerate()
+        .filter(|(_, existing)| audit_matches_provenance(existing, previous))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if previous_matches.len() > 1 {
+        return Err(
+            "Same-route replacement found duplicate audits for the previous output."
+                .to_owned(),
+        );
+    }
+
+    for (index, existing) in project.conversion_audits.iter().enumerate() {
+        if previous_matches.first().copied() == Some(index) {
+            continue;
+        }
+        if paths_match_str(&existing.output.path, &audit.output.path) {
+            return Err(
+                "Replacement output path audit is already owned by another Production Face."
+                    .to_owned(),
+            );
+        }
+    }
+
+    if let Some(index) = previous_matches.first().copied() {
+        project.conversion_audits.remove(index);
+    }
+    project.conversion_audits.push(audit);
+    Ok(())
+}
+
+fn audit_matches_provenance(
+    audit: &ConversionAuditRecord,
+    provenance: &ProductionProvenance,
+) -> bool {
+    paths_match_str(&audit.output.path, &provenance.output_path)
+        && audit
+            .output
+            .sha256
+            .trim()
+            .eq_ignore_ascii_case(provenance.output_sha256.trim())
 }
 
 fn validate_append_spec(spec: &AppendConvertedFaceSpec<'_>) -> Result<(), String> {
@@ -346,9 +491,15 @@ fn describe_key_mismatch(
 }
 
 fn paths_match(recorded: &str, actual: &Path) -> bool {
-    recorded
-        .trim()
-        .eq_ignore_ascii_case(actual.to_string_lossy().as_ref())
+    paths_match_str(recorded, actual.to_string_lossy().as_ref())
+}
+
+fn paths_match_str(left: &str, right: &str) -> bool {
+    path_key(left) == path_key(right)
+}
+
+fn path_key(value: &str) -> String {
+    value.trim().replace('/', "\\").to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -373,7 +524,11 @@ mod tests {
         }
     }
 
-    fn provenance(output: &Path, source_face: &str, source_profile_hash: char) -> ProductionProvenance {
+    fn provenance(
+        output: &Path,
+        source_face: &str,
+        source_profile_hash: char,
+    ) -> ProductionProvenance {
         ProductionProvenance {
             source: ConversionSourceRef {
                 source_project_path: r"C:\Design\Source.shade".to_owned(),
@@ -466,7 +621,13 @@ mod tests {
         assert_eq!(project.adjustments.len(), adjustment_count);
         assert_eq!(project.snapshots.len(), snapshot_count);
         assert!(project.faces[1].path.ends_with("Face-2.tif"));
-        assert_eq!(project.production_provenance[1].recipe.source_profile_identity.sha256, hash('b'));
+        assert_eq!(
+            project.production_provenance[1]
+                .recipe
+                .source_profile_identity
+                .sha256,
+            hash('b')
+        );
     }
 
     #[test]
