@@ -8,12 +8,14 @@ use crate::conversion_presets::{PresetOrigin, SeparationPresetDefinition};
 use crate::safe_fs;
 
 pub const CONVERSION_PRESET_FILENAME: &str = "conversion-presets.json";
+const BUILT_IN_PRESET_ID_PREFIX: &str = "builtin:";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresetStoreError {
     Library(PresetLibraryError),
     Io(String),
     BuiltInPersisted(String),
+    ReservedBuiltInId(String),
     RuntimeEntryNotBuiltIn(String),
     UserIdConflictsWithBuiltIn(String),
 }
@@ -26,6 +28,10 @@ impl std::fmt::Display for PresetStoreError {
             Self::BuiltInPersisted(id) => write!(
                 formatter,
                 "Persisted user preset library cannot contain built-in preset '{id}'."
+            ),
+            Self::ReservedBuiltInId(id) => write!(
+                formatter,
+                "User preset id '{id}' uses the reserved built-in preset namespace."
             ),
             Self::RuntimeEntryNotBuiltIn(id) => write!(
                 formatter,
@@ -118,6 +124,15 @@ fn validate_user_only(library: &SeparationPresetLibrary) -> Result<(), PresetSto
         .find(|preset| preset.origin != PresetOrigin::User)
     {
         return Err(PresetStoreError::BuiltInPersisted(preset.id.clone()));
+    }
+    if let Some(preset) = library.presets.iter().find(|preset| {
+        preset
+            .id
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with(BUILT_IN_PRESET_ID_PREFIX)
+    }) {
+        return Err(PresetStoreError::ReservedBuiltInId(preset.id.clone()));
     }
     Ok(())
 }
@@ -251,14 +266,38 @@ mod tests {
     }
 
     #[test]
+    fn reserved_builtin_namespace_is_rejected_without_runtime_target() {
+        let path = temp_path(CONVERSION_PRESET_FILENAME);
+        let mut users = SeparationPresetLibrary::new();
+        users
+            .insert(user_preset("BuIlTiN:future:v1", "Imposter"))
+            .unwrap();
+
+        assert!(matches!(
+            save_user_preset_library(&path, &users),
+            Err(PresetStoreError::ReservedBuiltInId(id)) if id == "BuIlTiN:future:v1"
+        ));
+        assert!(!path.exists());
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, users.to_json_pretty().unwrap()).unwrap();
+        assert!(matches!(
+            load_user_preset_library(&path),
+            Err(PresetStoreError::ReservedBuiltInId(id)) if id == "BuIlTiN:future:v1"
+        ));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn runtime_composition_rejects_user_id_collision_with_built_in() {
-        let built_in = SeparationPresetDefinition::built_in_balanced(
+        let mut built_in = SeparationPresetDefinition::built_in_balanced(
             &target(),
             ConversionEngineMode::Icc,
         );
+        built_in.id = "runtime-owned:balanced:v1".to_owned();
         let mut users = SeparationPresetLibrary::new();
         users
-            .insert(user_preset("builtin:balanced:v1", "Imposter"))
+            .insert(user_preset("runtime-owned:balanced:v1", "Imposter"))
             .unwrap();
         assert!(matches!(
             compose_runtime_preset_library([built_in], &users),

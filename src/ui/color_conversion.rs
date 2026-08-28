@@ -19,6 +19,10 @@ use super::conversion_plan::{
     inspect_conversion_face, production_candidates, production_routes, restore_target_from_route,
     scope_indices,
 };
+use super::conversion_presets::{
+    ConversionPresetUiState, dispatch_conversion_preset_actions,
+    render_conversion_preset_manager,
+};
 
 const CONVERSION_WINDOW_ID: &str = "shade-editor-color-conversion-open";
 
@@ -38,6 +42,7 @@ pub(crate) struct ColorConversionUiState {
     pub(crate) destination_mode: UnifiedDestinationMode,
     pub(crate) selected_existing: Option<PathBuf>,
     pub(crate) allow_production_work_discard: bool,
+    pub(crate) presets: ConversionPresetUiState,
 }
 
 impl Default for ColorConversionUiState {
@@ -57,6 +62,7 @@ impl Default for ColorConversionUiState {
             destination_mode: UnifiedDestinationMode::CreateNew,
             selected_existing: None,
             allow_production_work_discard: false,
+            presets: ConversionPresetUiState::default(),
         }
     }
 }
@@ -188,6 +194,7 @@ impl ShadeApp {
         let mut requested_candidate_visibility: Option<bool> = None;
         let mut restore_route_requested: Option<PathBuf> = None;
         let mut queue_requested = false;
+        let mut preset_actions = Vec::new();
 
         egui::Window::new("Production Color Conversion")
             .id(egui::Id::new("production-color-conversion-window"))
@@ -440,6 +447,26 @@ impl ShadeApp {
                                         );
                                     }
                                 }
+                            });
+
+                        ui.add_space(6.0);
+                        let preset_recipe = build_conversion_recipe(
+                            &state.target,
+                            &current_inspection,
+                            current_policy,
+                        )
+                        .ok();
+                        egui::CollapsingHeader::new("2b. Conversion presets")
+                            .id_salt("unified-conversion-presets")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                render_conversion_preset_manager(
+                                    ui,
+                                    &mut state.presets,
+                                    preset_recipe.as_ref(),
+                                    false,
+                                    &mut preset_actions,
+                                );
                             });
 
                         ui.add_space(6.0);
@@ -813,6 +840,23 @@ impl ShadeApp {
             }
             if let Some(folder) = dialog.pick_folder() {
                 state.output_folder = Some(folder);
+            }
+        }
+
+        let preset_recipe_for_actions = build_conversion_recipe(
+            &state.target,
+            &current_inspection,
+            current_policy,
+        )
+        .ok();
+        for result in dispatch_conversion_preset_actions(
+            &mut state.presets,
+            std::mem::take(&mut preset_actions),
+            preset_recipe_for_actions.as_ref(),
+        ) {
+            match result {
+                Ok(message) => self.report_info(message),
+                Err(error) => self.report_error(error),
             }
         }
 
@@ -1286,11 +1330,13 @@ mod tests {
             "Current Face",
             "Selected Faces",
             "All Faces",
+            "Conversion presets",
             "Candidate Preview",
             "Destination folder",
             "Queue Production Conversion",
             "sync_conversion_candidate",
             "queue_unified_conversion_plan",
+            "dispatch_conversion_preset_actions",
         ] {
             assert!(runtime.contains(required), "missing unified conversion token: {required}");
         }
@@ -1303,6 +1349,7 @@ mod tests {
         let source = include_str!("color_conversion.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(runtime.contains("target: ConversionTargetState"));
+        assert!(runtime.contains("presets: ConversionPresetUiState"));
         assert!(!runtime.contains("CandidateConfig"));
         assert!(!runtime.contains("ConversionBatchUiConfig"));
     }
