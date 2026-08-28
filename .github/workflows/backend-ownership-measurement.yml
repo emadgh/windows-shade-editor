@@ -1,0 +1,59 @@
+name: Backend ownership build measurement
+
+on:
+  push:
+    branches:
+      - ci/issue-396-final-build-measurement
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout measurement/current source
+        uses: actions/checkout@v6
+        with:
+          path: current
+          fetch-depth: 1
+
+      - name: Checkout pre-396 baseline
+        uses: actions/checkout@v6
+        with:
+          ref: 44765389b8e91eca595b55279fd3c978e8566b89
+          path: baseline
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Record measurement identity
+        shell: pwsh
+        run: |
+          '## Measurement identity' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          '- Baseline: 44765389b8e91eca595b55279fd3c978e8566b89 (base of #399, before #396 migration)' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          '- Current: ${{ github.sha }} (final canonical ownership branch plus measurement-only files)' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          '- Runner: ${{ runner.os }} / ${{ runner.arch }}' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          rustc --version --verbose
+          cargo --version
+
+      - name: Measure clean and incremental command sequences
+        shell: pwsh
+        run: |
+          & ./current/scripts/measure-backend-ownership-builds.ps1 `
+            -BaselinePath ./baseline `
+            -CurrentPath ./current `
+            -OutputJson "$env:RUNNER_TEMP/backend-ownership-build-timings.json"
+
+      - name: Upload timing data
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-ownership-build-timings
+          path: ${{ runner.temp }}/backend-ownership-build-timings.json
+          if-no-files-found: error
+          retention-days: 14
