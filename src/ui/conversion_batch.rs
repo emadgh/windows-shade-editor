@@ -2,6 +2,7 @@ use crate::*;
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::path::Path;
+use windows_shade_editor::conversion_audit::ConversionAuditFinding;
 use windows_shade_editor::conversion_batch::{
     ConversionBatchCapture, ConversionBatchFaceCapture, ConversionBatchScope,
 };
@@ -9,6 +10,7 @@ use windows_shade_editor::conversion_batch_queue::{
     ConversionBatchQueue, ConversionBatchQueueCompletion, ConversionBatchQueueCompletionResult,
     ConversionBatchQueueItem, ConversionBatchQueueStatus,
 };
+use windows_shade_editor::conversion_preflight::{PreflightCode, PreflightSeverity};
 use windows_shade_editor::conversion_transaction::ConversionJobCapture;
 
 use super::conversion_plan::{ConversionFaceInspection, UnifiedConversionPlan};
@@ -45,6 +47,38 @@ enum BatchQueueUiAction {
     Retry(u64),
     Recover(u64),
     ClearFinished,
+}
+
+fn preflight_audit_findings(
+    inspection: &ConversionFaceInspection,
+) -> Vec<ConversionAuditFinding> {
+    inspection
+        .report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity != PreflightSeverity::Blocking)
+        .map(|finding| ConversionAuditFinding {
+            code: preflight_code_id(finding.code).to_owned(),
+            message: format!("{}: {}", finding.title, finding.detail),
+            // Queueing a conversion is not an explicit acknowledgement action.
+            // Preserve the warning truthfully unless a dedicated UI control says otherwise.
+            acknowledged: false,
+        })
+        .collect()
+}
+
+fn preflight_code_id(code: PreflightCode) -> &'static str {
+    match code {
+        PreflightCode::RgbNotProductionSeparated => "rgb_not_production_separated",
+        PreflightCode::JpegLossySource => "jpeg_lossy_source",
+        PreflightCode::MissingSourceProfile => "missing_source_profile",
+        PreflightCode::InvalidSourceProfile => "invalid_source_profile",
+        PreflightCode::UnsavedSourceProject => "unsaved_source_project",
+        PreflightCode::NoSourceFaces => "no_source_faces",
+        PreflightCode::UnresolvedTransparency => "unresolved_transparency",
+        PreflightCode::UnsupportedSourceColorModel => "unsupported_source_color_model",
+        PreflightCode::UnsupportedBitDepth => "unsupported_bit_depth",
+    }
 }
 
 impl ShadeApp {
@@ -207,6 +241,7 @@ impl ShadeApp {
                             inspection.label
                         )
                     })?;
+            let audit_findings = preflight_audit_findings(inspection);
             let capture = ConversionJobCapture::capture(
                 &captured_project,
                 source_project_path.clone(),
@@ -222,6 +257,7 @@ impl ShadeApp {
                 production_project_name.clone(),
                 inspection.label.clone(),
             )
+            .and_then(|capture| capture.with_audit_findings(audit_findings))
             .map_err(|error| {
                 format!(
                     "Face {} ('{}') capture failed: {error}",
@@ -558,6 +594,8 @@ fn paths_match(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn batch_runtime_contains_no_operator_target_config_or_window() {
         let source = include_str!("conversion_batch.rs");
@@ -568,5 +606,27 @@ mod tests {
         assert!(runtime.contains("ConversionBatchCapture::capture"));
         assert!(runtime.contains("ConversionBatchQueue::load_persistent"));
         assert!(runtime.contains("queue_unified_conversion_plan"));
+        assert!(runtime.contains("with_audit_findings"));
+    }
+
+    #[test]
+    fn preflight_audit_codes_are_stable_and_unique() {
+        let codes = [
+            PreflightCode::RgbNotProductionSeparated,
+            PreflightCode::JpegLossySource,
+            PreflightCode::MissingSourceProfile,
+            PreflightCode::InvalidSourceProfile,
+            PreflightCode::UnsavedSourceProject,
+            PreflightCode::NoSourceFaces,
+            PreflightCode::UnresolvedTransparency,
+            PreflightCode::UnsupportedSourceColorModel,
+            PreflightCode::UnsupportedBitDepth,
+        ];
+        let mut ids = std::collections::BTreeSet::new();
+        for code in codes {
+            let id = preflight_code_id(code);
+            assert!(!id.trim().is_empty());
+            assert!(ids.insert(id), "duplicate preflight audit code: {id}");
+        }
     }
 }
