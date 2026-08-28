@@ -14,6 +14,8 @@ use crate::palette::{
 };
 
 pub const DEFAULT_DPI: f64 = 220.0;
+pub const DEFAULT_ORIGINAL_HISTOGRAM_OPACITY: f32 = 0.32;
+pub const DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE: f32 = 0.72;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TonalDisplayMode {
@@ -45,6 +47,27 @@ impl TonalDisplayMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CurveValueDisplayUnit {
+    Byte255,
+    Percent,
+}
+
+impl Default for CurveValueDisplayUnit {
+    fn default() -> Self {
+        Self::Byte255
+    }
+}
+
+impl CurveValueDisplayUnit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Byte255 => "0–255",
+            Self::Percent => "0–100%",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -60,6 +83,9 @@ pub struct AppSettings {
     pub colorize_adjustments: bool,
     pub show_curve_histogram: bool,
     pub compact_curve_controls: bool,
+    pub original_histogram_opacity: f32,
+    pub original_histogram_prominence: f32,
+    pub curve_value_display_unit: CurveValueDisplayUnit,
     pub tonal_display_mode: TonalDisplayMode,
     pub validate_after_export: bool,
     pub export_all_test_code: bool,
@@ -93,6 +119,9 @@ impl Default for AppSettings {
             colorize_adjustments: true,
             show_curve_histogram: true,
             compact_curve_controls: false,
+            original_histogram_opacity: DEFAULT_ORIGINAL_HISTOGRAM_OPACITY,
+            original_histogram_prominence: DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE,
+            curve_value_display_unit: CurveValueDisplayUnit::Byte255,
             tonal_display_mode: TonalDisplayMode::Light,
             validate_after_export: false,
             export_all_test_code: false,
@@ -143,6 +172,14 @@ impl AppSettings {
         self.history_steps = self
             .history_steps
             .clamp(MIN_HISTORY_STEPS, MAX_SNAPSHOT_HISTORY_STATES);
+        if !self.original_histogram_opacity.is_finite() {
+            self.original_histogram_opacity = DEFAULT_ORIGINAL_HISTOGRAM_OPACITY;
+        }
+        self.original_histogram_opacity = self.original_histogram_opacity.clamp(0.0, 1.0);
+        if !self.original_histogram_prominence.is_finite() {
+            self.original_histogram_prominence = DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE;
+        }
+        self.original_histogram_prominence = self.original_histogram_prominence.clamp(0.0, 1.0);
         if self.export_all_template.trim().is_empty() {
             self.export_all_template = DEFAULT_EXPORT_TEMPLATE.to_owned();
         }
@@ -305,6 +342,48 @@ mod tests {
     #[test]
     fn compact_curve_controls_default_off() {
         assert!(!AppSettings::default().compact_curve_controls);
+    }
+
+    #[test]
+    fn histogram_overlay_defaults_match_current_appearance_and_sanitize() {
+        let settings = AppSettings::default();
+        assert_eq!(
+            settings.original_histogram_opacity,
+            DEFAULT_ORIGINAL_HISTOGRAM_OPACITY
+        );
+        assert_eq!(
+            settings.original_histogram_prominence,
+            DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE
+        );
+
+        let mut settings = AppSettings::default();
+        settings.original_histogram_opacity = 2.0;
+        settings.original_histogram_prominence = -1.0;
+        settings.sanitize();
+        assert_eq!(settings.original_histogram_opacity, 1.0);
+        assert_eq!(settings.original_histogram_prominence, 0.0);
+
+        settings.original_histogram_opacity = f32::NAN;
+        settings.original_histogram_prominence = f32::INFINITY;
+        settings.sanitize();
+        assert_eq!(
+            settings.original_histogram_opacity,
+            DEFAULT_ORIGINAL_HISTOGRAM_OPACITY
+        );
+        assert_eq!(
+            settings.original_histogram_prominence,
+            DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE
+        );
+    }
+
+    #[test]
+    fn curve_value_display_defaults_to_255_scale() {
+        assert_eq!(
+            AppSettings::default().curve_value_display_unit,
+            CurveValueDisplayUnit::Byte255
+        );
+        assert_eq!(CurveValueDisplayUnit::Byte255.label(), "0–255");
+        assert_eq!(CurveValueDisplayUnit::Percent.label(), "0–100%");
     }
 
     #[test]
