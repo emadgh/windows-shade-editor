@@ -8,6 +8,7 @@ pub mod conversion_audit;
 pub mod conversion_batch;
 pub mod conversion_batch_execution;
 pub mod conversion_batch_queue;
+#[path = "conversion_candidate_preview_runtime.rs"]
 pub mod conversion_candidate_preview;
 pub mod conversion_capabilities;
 pub mod conversion_output;
