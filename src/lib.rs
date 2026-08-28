@@ -11,6 +11,7 @@ pub mod conversion_batch_queue;
 #[path = "conversion_candidate_preview_runtime.rs"]
 pub mod conversion_candidate_preview;
 pub mod conversion_capabilities;
+pub mod conversion_job_authority;
 pub mod conversion_output;
 pub mod conversion_preflight;
 pub mod conversion_preset_library;
