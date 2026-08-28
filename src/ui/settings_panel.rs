@@ -222,6 +222,27 @@ fn settings_workspace_preview(app: &mut ShadeApp, ui: &mut egui::Ui, effects: &m
         ui.label("Curve / Histogram direction");
         effects.changed |= tonal_display_mode_selector(ui, &mut app.settings.tonal_display_mode);
     });
+    ui.horizontal(|ui| {
+        ui.label("Curve numeric values");
+        egui::ComboBox::from_id_salt("curve-value-display-unit")
+            .selected_text(app.settings.curve_value_display_unit.label())
+            .show_ui(ui, |ui| {
+                effects.changed |= ui
+                    .selectable_value(
+                        &mut app.settings.curve_value_display_unit,
+                        settings::CurveValueDisplayUnit::Byte255,
+                        settings::CurveValueDisplayUnit::Byte255.label(),
+                    )
+                    .changed();
+                effects.changed |= ui
+                    .selectable_value(
+                        &mut app.settings.curve_value_display_unit,
+                        settings::CurveValueDisplayUnit::Percent,
+                        settings::CurveValueDisplayUnit::Percent.label(),
+                    )
+                    .changed();
+            });
+    });
     effects.changed |= ui
         .checkbox(
             &mut app.settings.colorize_histograms,
@@ -240,6 +261,33 @@ fn settings_workspace_preview(app: &mut ShadeApp, ui: &mut egui::Ui, effects: &m
             "Show active histogram behind Curve",
         )
         .changed();
+
+    ui.add_space(8.0);
+    ui.strong("Original histogram overlay");
+    let opacity_changed = ui
+        .add(
+            egui::Slider::new(&mut app.settings.original_histogram_opacity, 0.0..=1.0)
+                .text("Opacity"),
+        )
+        .on_hover_text("Transparency of the gray pre-adjustment histogram. 0 hides the original overlay.")
+        .changed();
+    effects.changed |= opacity_changed;
+    ui.small(format!(
+        "Opacity: {:.0}%",
+        app.settings.original_histogram_opacity * 100.0
+    ));
+    let prominence_changed = ui
+        .add(
+            egui::Slider::new(&mut app.settings.original_histogram_prominence, 0.0..=1.0)
+                .text("Prominence"),
+        )
+        .on_hover_text("Visual strength of the gray original histogram before opacity is applied. Histogram bin data is unchanged.")
+        .changed();
+    effects.changed |= prominence_changed;
+    ui.small(format!(
+        "Prominence: {:.0}%",
+        app.settings.original_histogram_prominence * 100.0
+    ));
 }
 
 fn settings_history(app: &mut ShadeApp, ui: &mut egui::Ui, effects: &mut Effects) {
