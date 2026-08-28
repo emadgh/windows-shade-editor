@@ -1,0 +1,131 @@
+name: Draft sccache experiment
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, converted_to_draft]
+  workflow_dispatch:
+
+jobs:
+  sccache-draft:
+    name: Draft validation (sccache experiment)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.draft == true)
+    runs-on: windows-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Start CI timing
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          "CI_JOB_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "## sccache Draft experiment" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "| Stage | Seconds | Status |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "| --- | ---: | --- |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Start Cargo dependency cache restore timer
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          "CI_CACHE_RESTORE_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Restore Cargo dependency cache
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-msvc-deps-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msvc-deps-
+      - name: Record Cargo dependency cache restore timing
+        if: always()
+        shell: pwsh
+        run: |
+          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_RESTORE_STARTED_MS) / 1000.0
+          $seconds = [Math]::Round($elapsed, 2)
+          $outcome = "${{ steps.cargo-cache.outcome }}"
+          $cacheHit = "${{ steps.cargo-cache.outputs.cache-hit }}"
+          Write-Host "CI timing: Cargo dependency cache restore = ${seconds}s ($outcome), exact-key-hit=$cacheHit"
+          "| Cargo dependency cache restore | $seconds | $outcome |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Dependency cache exact-key hit: $cacheHit" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - name: Reset sccache statistics
+        shell: pwsh
+        run: sccache --zero-stats
+      - name: Test TIFF performance summarizer
+        shell: pwsh
+        run: .\scripts\test-summarize-tiff-perf.ps1
+      - name: Test TIFF performance comparison gate
+        shell: pwsh
+        run: .\scripts\test-compare-tiff-perf.ps1
+      - name: Test TIFF benchmark runner
+        shell: pwsh
+        run: .\scripts\test-run-tiff-perf-benchmark.ps1
+      - name: Test TIFF buffer benchmark plan
+        shell: pwsh
+        run: .\scripts\test-run-tiff-buffer-benchmark.ps1
+      - name: Test TIFF benchmark fixture inspector
+        shell: pwsh
+        run: .\scripts\measure-ci-command.ps1 -Name "TIFF benchmark fixture test" -Command "cargo test --locked --target x86_64-pc-windows-msvc --example tiff_benchmark_fixture"
+      - name: Check application targets
+        shell: pwsh
+        run: .\scripts\measure-ci-command.ps1 -Name "Cargo check" -Command "cargo check --locked --target x86_64-pc-windows-msvc"
+      - name: Test library
+        shell: pwsh
+        run: .\scripts\measure-ci-command.ps1 -Name "Library tests" -Command "cargo test --locked --target x86_64-pc-windows-msvc --lib"
+      - name: Record sccache statistics
+        if: always()
+        shell: pwsh
+        run: |
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "### sccache statistics" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "```text" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          (sccache --show-stats 2>&1) | ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append }
+          "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - name: Start Cargo dependency cache save timer
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          "CI_CACHE_SAVE_STARTED_MS=$started" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Save Cargo dependency cache
+        id: cargo-cache-save
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-msvc-deps-${{ hashFiles('Cargo.lock') }}
+      - name: Record Cargo dependency cache save timing
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_CACHE_SAVE_STARTED_MS) / 1000.0
+          $seconds = [Math]::Round($elapsed, 2)
+          $outcome = "${{ steps.cargo-cache-save.outcome }}"
+          Write-Host "CI timing: Cargo dependency cache save = ${seconds}s ($outcome)"
+          "| Cargo dependency cache save | $seconds | $outcome |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - name: Record Cargo dependency cache save exact-hit skip
+        if: success() && steps.cargo-cache.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "CI timing: Cargo dependency cache save skipped (exact-key hit)"
+          "| Cargo dependency cache save | 0 | skipped: exact-key hit |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+      - name: Record total CI timing
+        if: always()
+        shell: pwsh
+        run: |
+          $elapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$env:CI_JOB_STARTED_MS) / 1000.0
+          $seconds = [Math]::Round($elapsed, 2)
+          Write-Host "CI timing: sccache Draft experiment total = ${seconds}s (${{ job.status }})"
+          "| sccache Draft experiment total | $seconds | ${{ job.status }} |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
