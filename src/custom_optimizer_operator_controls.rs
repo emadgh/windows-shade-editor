@@ -19,6 +19,26 @@ pub struct CustomOptimizerOperatorControls {
     pub objective_weights: CustomOptimizerObjectiveWeights,
 }
 
+/// Recipe-bound capability for editing Custom Optimizer controls through the
+/// unified production UI.
+///
+/// This is deliberately *not* inverse-LUT production eligibility. Changing a
+/// strategy/objective field changes the recipe identity and therefore requires
+/// Candidate/LUT/evidence invalidation and revalidation. The token only proves
+/// that the caller evaluated the central UI availability policy for this exact
+/// pre-edit recipe; final production still reopens and authorizes exact measured
+/// evidence through `custom_optimizer_evidence` / #191.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomOptimizerOperatorControlCapability {
+    baseline_recipe_sha256: String,
+}
+
+impl CustomOptimizerOperatorControlCapability {
+    pub fn baseline_recipe_sha256(&self) -> &str {
+        &self.baseline_recipe_sha256
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedCustomOptimizerOperatorControls {
     pub recipe: ConversionRecipe,
@@ -29,6 +49,10 @@ pub struct AppliedCustomOptimizerOperatorControls {
 pub enum CustomOptimizerOperatorControlError {
     NotCustomOptimizerEngine(ConversionEngineMode),
     ApplicationUnavailable(PresetApplicationAvailability),
+    CapabilityRecipeMismatch {
+        expected: String,
+        actual: String,
+    },
     MissingSolverConfig,
     MissingObjectiveWeights,
     InvalidRecipe(Vec<String>),
@@ -47,6 +71,10 @@ impl std::fmt::Display for CustomOptimizerOperatorControlError {
                     .reason()
                     .unwrap_or("Custom Optimizer operator controls are unavailable."),
             ),
+            Self::CapabilityRecipeMismatch { expected, actual } => write!(
+                formatter,
+                "Custom Optimizer operator-control capability is stale: expected baseline recipe {expected}, found {actual}. Re-evaluate the exact current recipe before applying controls."
+            ),
             Self::MissingSolverConfig => formatter.write_str(
                 "Custom Optimizer operator controls require explicit persisted solver configuration.",
             ),
@@ -60,7 +88,7 @@ impl std::fmt::Display for CustomOptimizerOperatorControlError {
             ),
             Self::RecipeIdentity(error) => write!(
                 formatter,
-                "Cannot identify the Custom Optimizer recipe after applying operator controls: {error}"
+                "Cannot identify the Custom Optimizer recipe for operator controls: {error}"
             ),
         }
     }
@@ -69,8 +97,8 @@ impl std::fmt::Display for CustomOptimizerOperatorControlError {
 impl CustomOptimizerOperatorControls {
     /// Capture the exact persisted strategy/objective fields from an existing
     /// Custom Optimizer recipe. Production authorization is intentionally not
-    /// required merely to inspect/edit a draft; applying it to the executable
-    /// recipe remains guarded by `apply_to_recipe`.
+    /// required merely to inspect/edit a draft; applying it to the unified
+    /// production recipe requires a recipe-bound capability.
     pub fn from_recipe(
         recipe: &ConversionRecipe,
     ) -> Result<Self, CustomOptimizerOperatorControlError> {
@@ -95,16 +123,14 @@ impl CustomOptimizerOperatorControls {
         })
     }
 
-    /// Apply controls to the exact immutable recipe consumed by Candidate
-    /// Preview/final conversion. The same central availability gate used by
-    /// strategy presets is reused here so ICC/DeviceLink and an unapproved
-    /// Custom Optimizer can never receive pixel-affecting operator controls via
-    /// a parallel bypass.
-    pub fn apply_to_recipe(
-        &self,
+    /// Mint a capability only when the existing central Production Color
+    /// Conversion policy says strategy controls may be exposed. The token is
+    /// bound to the exact pre-edit recipe hash to prevent a stale UI action from
+    /// being replayed against a different target/recipe.
+    pub fn authorize_for_recipe(
         recipe: &ConversionRecipe,
         custom_optimizer_production_authorized: bool,
-    ) -> Result<AppliedCustomOptimizerOperatorControls, CustomOptimizerOperatorControlError> {
+    ) -> Result<CustomOptimizerOperatorControlCapability, CustomOptimizerOperatorControlError> {
         let availability = unified_strategy_preset_availability(
             recipe.engine_mode,
             custom_optimizer_production_authorized,
@@ -112,6 +138,40 @@ impl CustomOptimizerOperatorControls {
         if availability != PresetApplicationAvailability::Available {
             return Err(CustomOptimizerOperatorControlError::ApplicationUnavailable(
                 availability,
+            ));
+        }
+        recipe
+            .validate()
+            .map_err(CustomOptimizerOperatorControlError::InvalidRecipe)?;
+        let baseline_recipe_sha256 = recipe_sha256(recipe)
+            .map_err(CustomOptimizerOperatorControlError::RecipeIdentity)?;
+        Ok(CustomOptimizerOperatorControlCapability {
+            baseline_recipe_sha256,
+        })
+    }
+
+    /// Apply controls to the exact immutable recipe consumed by Candidate
+    /// Preview/final conversion. The capability is a UI/runtime guard only; the
+    /// changed recipe must invalidate any previous Candidate/LUT/evidence and
+    /// final conversion must independently authorize exact measured evidence.
+    pub fn apply_to_recipe(
+        &self,
+        recipe: &ConversionRecipe,
+        capability: &CustomOptimizerOperatorControlCapability,
+    ) -> Result<AppliedCustomOptimizerOperatorControls, CustomOptimizerOperatorControlError> {
+        let actual_baseline = recipe_sha256(recipe)
+            .map_err(CustomOptimizerOperatorControlError::RecipeIdentity)?;
+        if actual_baseline != capability.baseline_recipe_sha256 {
+            return Err(
+                CustomOptimizerOperatorControlError::CapabilityRecipeMismatch {
+                    expected: capability.baseline_recipe_sha256.clone(),
+                    actual: actual_baseline,
+                },
+            );
+        }
+        if recipe.engine_mode != ConversionEngineMode::CustomOptimizer {
+            return Err(CustomOptimizerOperatorControlError::NotCustomOptimizerEngine(
+                recipe.engine_mode,
             ));
         }
 
@@ -218,6 +278,10 @@ mod tests {
     fn authorized_controls_change_the_same_immutable_recipe_identity() {
         let recipe = custom_recipe();
         let original_sha = recipe_sha256(&recipe).unwrap();
+        let capability =
+            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap();
+        assert_eq!(capability.baseline_recipe_sha256(), original_sha);
+
         let mut controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
         controls.strategy.preset_name = "Black-focused operator".to_owned();
         controls.strategy.black_channel = Some("Black".to_owned());
@@ -230,7 +294,7 @@ mod tests {
         controls.objective_weights.neutral_black = 1.8;
         controls.objective_weights.ink_preference = 1.4;
 
-        let applied = controls.apply_to_recipe(&recipe, true).unwrap();
+        let applied = controls.apply_to_recipe(&recipe, &capability).unwrap();
         assert_eq!(recipe.strategy, SeparationStrategy::default());
         assert_eq!(recipe_sha256(&recipe).unwrap(), original_sha);
         assert_ne!(applied.recipe_sha256, original_sha);
@@ -250,8 +314,8 @@ mod tests {
     #[test]
     fn authorization_gate_remains_fail_closed_until_measured_approval_exists() {
         let recipe = custom_recipe();
-        let controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
-        let error = controls.apply_to_recipe(&recipe, false).unwrap_err();
+        let error =
+            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, false).unwrap_err();
         assert_eq!(
             error,
             CustomOptimizerOperatorControlError::ApplicationUnavailable(
@@ -261,8 +325,23 @@ mod tests {
     }
 
     #[test]
-    fn icc_and_devicelink_cannot_use_optimizer_controls_as_recipe_only_metadata() {
-        let controls = CustomOptimizerOperatorControls::from_recipe(&custom_recipe()).unwrap();
+    fn capability_is_bound_to_the_exact_pre_edit_recipe() {
+        let recipe = custom_recipe();
+        let capability =
+            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap();
+        let controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
+
+        let mut changed = recipe.clone();
+        changed.target.name.push_str(" changed");
+        let error = controls.apply_to_recipe(&changed, &capability).unwrap_err();
+        assert!(matches!(
+            error,
+            CustomOptimizerOperatorControlError::CapabilityRecipeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn icc_and_devicelink_cannot_mint_optimizer_control_capability() {
         for engine in [ConversionEngineMode::Icc, ConversionEngineMode::DeviceLink] {
             let mut recipe = custom_recipe();
             recipe.engine_mode = engine;
@@ -285,7 +364,8 @@ mod tests {
                 }
                 ConversionEngineMode::CustomOptimizer => unreachable!(),
             }
-            let error = controls.apply_to_recipe(&recipe, true).unwrap_err();
+            let error =
+                CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap_err();
             assert_eq!(
                 error,
                 CustomOptimizerOperatorControlError::ApplicationUnavailable(
@@ -296,8 +376,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_operator_state_never_mints_a_recipe_identity() {
+    fn invalid_operator_state_never_mints_a_changed_recipe_identity() {
         let recipe = custom_recipe();
+        let capability =
+            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap();
         let mut controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
         controls
             .strategy
@@ -305,7 +387,7 @@ mod tests {
             .insert("Not a target ink".to_owned(), 0.5);
         controls.objective_weights.color_error = f32::NAN;
         assert!(matches!(
-            controls.apply_to_recipe(&recipe, true),
+            controls.apply_to_recipe(&recipe, &capability),
             Err(CustomOptimizerOperatorControlError::InvalidRecipe(_))
         ));
     }
@@ -313,10 +395,12 @@ mod tests {
     #[test]
     fn applying_controls_preserves_non_control_recipe_identity_inputs() {
         let recipe = custom_recipe();
+        let capability =
+            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap();
         let mut controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
         controls.strategy.black_channel = Some("Black".to_owned());
         controls.strategy.black_generation_strength = 0.5;
-        let applied = controls.apply_to_recipe(&recipe, true).unwrap();
+        let applied = controls.apply_to_recipe(&recipe, &capability).unwrap();
 
         assert_eq!(applied.recipe.source_profile_identity, recipe.source_profile_identity);
         assert_eq!(applied.recipe.source_transparency_policy, recipe.source_transparency_policy);
