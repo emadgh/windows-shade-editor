@@ -1082,14 +1082,39 @@ fn validate_tiff_export_source(source: &Path) -> Result<(), String> {
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff")
         });
-    if is_tiff {
-        Ok(())
-    } else {
-        Err(format!(
+    if !is_tiff {
+        return Err(format!(
             "Shade Editor Export currently accepts TIFF source Faces only. PNG/JPEG remain available for preview and Color Conversion preflight: {}",
             source.display()
-        ))
+        ));
     }
+
+    // A Face preview is an accepted view of specific source bytes. If the shared
+    // observer has a sticky unacknowledged change for this path, establishing a new
+    // queue fingerprint from the new disk bytes would silently detach export from the
+    // preview/histograms the operator actually edited against. Fail closed until the
+    // Face reload/relink path verifies and acknowledges those bytes.
+    if let Some(snapshot) = crate::file_observer::rescan(source) {
+        if snapshot.is_changed() {
+            return Err(format!(
+                "Source TIFF changed outside Shade Editor. Reload/verify the Face before exporting: {}",
+                source.display()
+            ));
+        }
+        if !snapshot.is_available() {
+            let detail = snapshot
+                .last_error
+                .as_deref()
+                .map(|error| format!(" ({error})"))
+                .unwrap_or_default();
+            return Err(format!(
+                "Source TIFF is not available for export{detail}: {}",
+                source.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_destination(destination: &Path, sources: &[PathBuf]) -> Result<(), String> {
@@ -1106,6 +1131,7 @@ fn validate_destination(destination: &Path, sources: &[PathBuf]) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_observer::ExternalFileRole;
     use crate::model::ShadeProject;
     use std::fs::File;
     use tiff::encoder::{TiffEncoder, colortype};
@@ -1431,6 +1457,26 @@ mod tests {
                 .expect_err("non-TIFF export source must fail closed");
             assert!(error.contains("TIFF source Faces only"), "{error}");
         }
+    }
+
+    #[test]
+    fn externally_changed_observed_face_is_rejected_until_acknowledged() {
+        let folder = temp_folder("external-change-guard");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = folder.join("face.tif");
+        std::fs::write(&source, b"preview baseline").unwrap();
+        crate::file_observer::observe(&source, ExternalFileRole::Face);
+
+        std::fs::write(&source, b"externally changed source bytes").unwrap();
+        let error = validate_tiff_export_source(&source)
+            .expect_err("unacknowledged changed Face must fail closed");
+        assert!(error.contains("changed outside Shade Editor"), "{error}");
+
+        crate::file_observer::acknowledge(&source).unwrap();
+        assert!(validate_tiff_export_source(&source).is_ok());
+
+        crate::file_observer::release(&source, ExternalFileRole::Face);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]
