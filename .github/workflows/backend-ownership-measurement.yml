@@ -14,9 +14,16 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - name: Checkout measurement/current source
+      - name: Checkout measurement harness
         uses: actions/checkout@v6
         with:
+          path: harness
+          fetch-depth: 1
+
+      - name: Checkout post-396 canonical source
+        uses: actions/checkout@v6
+        with:
+          ref: 97f11dea84edaa589a2ec61e780ed7da84489e47
           path: current
           fetch-depth: 1
 
@@ -37,7 +44,8 @@ jobs:
         run: |
           '## Measurement identity' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           '- Baseline: 44765389b8e91eca595b55279fd3c978e8566b89 (base of #399, before #396 migration)' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          '- Current: ${{ github.sha }} (final canonical ownership branch plus measurement-only files)' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          '- Current: 97f11dea84edaa589a2ec61e780ed7da84489e47 (#407 merge, exact completed #396 architecture state)' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          '- Harness: ${{ github.sha }} (measurement-only workflow/script)' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           '- Runner: ${{ runner.os }} / ${{ runner.arch }}' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           rustc --version --verbose
           cargo --version
@@ -45,7 +53,7 @@ jobs:
       - name: Measure clean and incremental command sequences
         shell: pwsh
         run: |
-          & ./current/scripts/measure-backend-ownership-builds.ps1 `
+          & ./harness/scripts/measure-backend-ownership-builds.ps1 `
             -BaselinePath ./baseline `
             -CurrentPath ./current `
             -OutputJson "$env:RUNNER_TEMP/backend-ownership-build-timings.json"
