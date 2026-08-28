@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::color_conversion::{ConversionEngineMode, ProductionProvenance};
+use crate::color_conversion::{
+    ConversionEngineMode, ProductionProvenance,
+    production_provenance::{
+        CustomOptimizerProductionPcsMethod, CustomOptimizerProductionProvenance,
+        validate_production_provenance,
+    },
+};
 use crate::conversion_transaction::{CommittedConversionOutput, ConversionJobCapture};
 
 pub const CONVERSION_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -48,6 +54,10 @@ pub struct ConversionAuditRecord {
     pub source: ConversionAuditSource,
     pub target: ConversionAuditTarget,
     pub recipe_sha256: String,
+    /// Exact authority-bearing Custom Optimizer evidence used by the completed
+    /// production conversion. ICC/DeviceLink records must not carry this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_optimizer: Option<CustomOptimizerProductionProvenance>,
     pub output: ConversionAuditOutput,
     /// Findings must come from the actual preflight/transaction path. The audit
     /// model never reconstructs warnings from current UI or project state.
@@ -77,6 +87,18 @@ impl ConversionAuditRecord {
             return Err("Committed conversion output requires a valid conversion timestamp.".to_owned());
         }
         validate_findings(&findings)?;
+
+        let custom_optimizer = capture
+            .custom_optimizer_evidence
+            .as_ref()
+            .map(|evidence| evidence.production_provenance(&capture.conversion_recipe_sha256))
+            .transpose()
+            .map_err(|errors| {
+                format!(
+                    "Cannot build Custom Optimizer conversion audit evidence: {}",
+                    errors.join(" ")
+                )
+            })?;
 
         let target = &capture.conversion_recipe.target;
         let record = Self {
@@ -114,6 +136,7 @@ impl ConversionAuditRecord {
                 characterization_id: target.characterization_id.clone(),
             },
             recipe_sha256: capture.conversion_recipe_sha256.clone(),
+            custom_optimizer,
             output: ConversionAuditOutput {
                 path: committed_output.path.to_string_lossy().into_owned(),
                 sha256: committed_output.sha256.clone(),
@@ -160,6 +183,45 @@ impl ConversionAuditRecord {
         if self.output.path.trim().is_empty() || self.output.converted_at_unix_ms <= 0 {
             return Err("Conversion audit requires committed output identity and timestamp.".to_owned());
         }
+
+        match (self.target.engine_mode, self.custom_optimizer.as_ref()) {
+            (ConversionEngineMode::CustomOptimizer, Some(custom)) => {
+                custom.validate().map_err(|errors| {
+                    format!(
+                        "Invalid Custom Optimizer conversion audit evidence: {}",
+                        errors.join(" ")
+                    )
+                })?;
+                if !hashes_match(&custom.conversion_recipe_sha256, &self.recipe_sha256) {
+                    return Err(
+                        "Custom Optimizer conversion audit recipe SHA-256 does not match the audit recipe."
+                            .to_owned(),
+                    );
+                }
+                if self.target.characterization_id.as_deref()
+                    != Some(custom.characterization_id.as_str())
+                {
+                    return Err(
+                        "Custom Optimizer conversion audit characterization does not match the target."
+                            .to_owned(),
+                    );
+                }
+            }
+            (ConversionEngineMode::CustomOptimizer, None) => {
+                return Err(
+                    "Custom Optimizer conversion audit requires immutable LUT/validation/calibration evidence."
+                        .to_owned(),
+                );
+            }
+            (_, Some(_)) => {
+                return Err(
+                    "ICC/DeviceLink conversion audit cannot carry Custom Optimizer evidence."
+                        .to_owned(),
+                );
+            }
+            (_, None) => {}
+        }
+
         validate_findings(&self.findings)
     }
 
@@ -173,6 +235,7 @@ impl ConversionAuditRecord {
         provenance: &ProductionProvenance,
     ) -> Result<(), String> {
         self.validate()?;
+        validate_production_provenance(provenance)?;
 
         let recipe_sha256 = recipe_sha256(&provenance.recipe)?;
         let target = &provenance.recipe.target;
@@ -230,6 +293,12 @@ impl ConversionAuditRecord {
                 "Conversion audit target identity does not match Production provenance.".to_owned(),
             );
         }
+        if self.custom_optimizer != provenance.custom_optimizer {
+            return Err(
+                "Conversion audit Custom Optimizer evidence does not match Production provenance."
+                    .to_owned(),
+            );
+        }
         if !paths_match(&self.output.path, &provenance.output_path)
             || !hashes_match(&self.output.sha256, &provenance.output_sha256)
             || self.output.converted_at_unix_ms != provenance.converted_at_unix_ms
@@ -245,6 +314,19 @@ impl ConversionAuditRecord {
         self.validate()?;
         serde_json::to_string_pretty(self)
             .map_err(|error| format!("Cannot serialize conversion audit record: {error}"))
+    }
+
+    /// Export a portable copy without leaking absolute Source/Production paths.
+    /// Authority-bearing content identities are left byte-for-byte unchanged.
+    pub fn to_portable_pretty_json(&self) -> Result<String, String> {
+        self.validate()?;
+        let mut portable = self.clone();
+        portable.source.project_path = portable_path("source-project", &self.source.project_path);
+        portable.source.face_path = portable_path("source-face", &self.source.face_path);
+        portable.output.path = portable_path("production-output", &self.output.path);
+        serde_json::to_string_pretty(&portable).map_err(|error| {
+            format!("Cannot serialize portable conversion audit record: {error}")
+        })
     }
 }
 
@@ -284,6 +366,14 @@ fn paths_match(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
 
+fn portable_path(scope: &str, value: &str) -> String {
+    let leaf = value
+        .rsplit(|character| character == '/' || character == '\\')
+        .find(|segment| !segment.trim().is_empty())
+        .unwrap_or("redacted");
+    format!("<{scope}>/{leaf}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -299,6 +389,10 @@ mod tests {
 
     fn hash(character: char) -> String {
         character.to_string().repeat(64)
+    }
+
+    fn prefixed_hash(character: char) -> String {
+        format!("sha256:{}", hash(character))
     }
 
     fn capture() -> ConversionJobCapture {
@@ -382,6 +476,23 @@ mod tests {
         }
     }
 
+    fn custom_optimizer_provenance(recipe_sha256: String) -> CustomOptimizerProductionProvenance {
+        CustomOptimizerProductionProvenance {
+            schema_version:
+                crate::color_conversion::production_provenance::CUSTOM_OPTIMIZER_PRODUCTION_PROVENANCE_SCHEMA_VERSION,
+            lut_identity_content_id: prefixed_hash('1'),
+            lut_payload_sha256: hash('2'),
+            validation_report_content_id: prefixed_hash('3'),
+            characterization_id: prefixed_hash('4'),
+            threshold_set_content_id: prefixed_hash('5'),
+            calibration_manifest_content_id: prefixed_hash('6'),
+            calibration_approval_content_id: prefixed_hash('7'),
+            pcs_compatibility_method: CustomOptimizerProductionPcsMethod::IccPcsLabD50TwoDegreeV1,
+            pcs_compatibility_content_id: prefixed_hash('8'),
+            conversion_recipe_sha256: recipe_sha256,
+        }
+    }
+
     #[test]
     fn audit_is_derived_from_frozen_job_and_committed_output() {
         let capture = capture();
@@ -401,6 +512,7 @@ mod tests {
         assert_eq!(audit.target.channel_names, ["Cyan", "Magenta", "Yellow", "Black"]);
         assert_eq!(audit.recipe_sha256, capture.conversion_recipe_sha256);
         assert_eq!(audit.output.sha256, hash('e'));
+        assert!(audit.custom_optimizer.is_none());
         assert!(audit.findings[0].acknowledged);
         assert!(audit.to_pretty_json().unwrap().contains("Press CMYK"));
     }
@@ -451,5 +563,41 @@ mod tests {
         )
         .expect_err("anonymous findings must be rejected");
         assert!(error.contains("non-empty code"));
+    }
+
+    #[test]
+    fn custom_optimizer_audit_requires_exact_authority_evidence() {
+        let capture = capture();
+        let output = committed(&capture);
+        let mut audit =
+            ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new()).unwrap();
+        audit.target.engine_mode = ConversionEngineMode::CustomOptimizer;
+        audit.target.output_profile_sha256 = None;
+        audit.target.characterization_id = Some(prefixed_hash('4'));
+        audit.custom_optimizer = Some(custom_optimizer_provenance(audit.recipe_sha256.clone()));
+        audit.validate().unwrap();
+
+        audit
+            .custom_optimizer
+            .as_mut()
+            .unwrap()
+            .conversion_recipe_sha256 = hash('9');
+        assert!(audit.validate().unwrap_err().contains("recipe SHA-256"));
+    }
+
+    #[test]
+    fn portable_export_redacts_absolute_paths_but_preserves_authority_ids() {
+        let capture = capture();
+        let output = committed(&capture);
+        let audit = ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new()).unwrap();
+        let portable = audit.to_portable_pretty_json().unwrap();
+
+        assert!(!portable.contains(r"C:\Design"));
+        assert!(!portable.contains(r"C:\Production"));
+        assert!(portable.contains("<source-project>/Source.shade"));
+        assert!(portable.contains("<source-face>/Face.tif"));
+        assert!(portable.contains("<production-output>/Face-CMYK.tif"));
+        assert!(portable.contains(&audit.recipe_sha256));
+        assert!(portable.contains(&audit.output.sha256));
     }
 }
