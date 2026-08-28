@@ -11,7 +11,11 @@ use windows_shade_editor::conversion_batch_queue::{
     ConversionBatchQueueItem, ConversionBatchQueueStatus,
 };
 use windows_shade_editor::conversion_preflight::{PreflightCode, PreflightSeverity};
-use windows_shade_editor::conversion_transaction::ConversionJobCapture;
+use windows_shade_editor::conversion_transaction::{
+    CapturedSourceColorModel, CapturedSourceFormat, CapturedSourceRasterFacts,
+    ConversionJobCapture,
+};
+use windows_shade_editor::design_source::SourceImageFormat;
 
 use super::conversion_plan::{ConversionFaceInspection, UnifiedConversionPlan};
 
@@ -65,6 +69,28 @@ fn preflight_audit_findings(
             acknowledged: false,
         })
         .collect()
+}
+
+fn captured_source_raster_facts(
+    inspection: &ConversionFaceInspection,
+) -> CapturedSourceRasterFacts {
+    let format = match inspection.source_format {
+        SourceImageFormat::Tiff => CapturedSourceFormat::Tiff,
+        SourceImageFormat::Png => CapturedSourceFormat::Png,
+        SourceImageFormat::Jpeg => CapturedSourceFormat::Jpeg,
+    };
+    let color_model = match inspection.source_model {
+        RuntimeColorModel::Gray => CapturedSourceColorModel::Gray,
+        RuntimeColorModel::Rgb => CapturedSourceColorModel::Rgb,
+        RuntimeColorModel::Cmyk => CapturedSourceColorModel::Cmyk,
+        RuntimeColorModel::Other => CapturedSourceColorModel::Multichannel,
+    };
+    CapturedSourceRasterFacts::new(
+        format,
+        color_model,
+        inspection.bit_depth,
+        inspection.channel_count,
+    )
 }
 
 fn preflight_code_id(code: PreflightCode) -> &'static str {
@@ -242,6 +268,7 @@ impl ShadeApp {
                         )
                     })?;
             let audit_findings = preflight_audit_findings(inspection);
+            let source_raster = captured_source_raster_facts(inspection);
             let capture = ConversionJobCapture::capture(
                 &captured_project,
                 source_project_path.clone(),
@@ -257,6 +284,7 @@ impl ShadeApp {
                 production_project_name.clone(),
                 inspection.label.clone(),
             )
+            .and_then(|capture| capture.with_source_raster_facts(source_raster))
             .and_then(|capture| capture.with_audit_findings(audit_findings))
             .map_err(|error| {
                 format!(
@@ -606,6 +634,7 @@ mod tests {
         assert!(runtime.contains("ConversionBatchCapture::capture"));
         assert!(runtime.contains("ConversionBatchQueue::load_persistent"));
         assert!(runtime.contains("queue_unified_conversion_plan"));
+        assert!(runtime.contains("with_source_raster_facts"));
         assert!(runtime.contains("with_audit_findings"));
     }
 

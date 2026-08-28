@@ -14,7 +14,8 @@ use windows_shade_editor::color_conversion::{
     TargetChannelDefinition,
 };
 use windows_shade_editor::conversion_transaction::{
-    CapturedOutputPolicy, CapturedSourceProfile, ConversionCancellation, ConversionJobCapture,
+    CapturedOutputPolicy, CapturedSourceColorModel, CapturedSourceFormat, CapturedSourceProfile,
+    CapturedSourceRasterFacts, ConversionCancellation, ConversionJobCapture,
     ConversionTransactionBackend,
 };
 use windows_shade_editor::export_recipe::ExportRecipe;
@@ -88,7 +89,11 @@ fn recipe(policy: Option<SourceTransparencyPolicy>) -> ConversionRecipe {
     }
 }
 
-fn capture(source: &Path, policy: Option<SourceTransparencyPolicy>) -> ConversionJobCapture {
+fn capture(
+    source: &Path,
+    policy: Option<SourceTransparencyPolicy>,
+    source_raster: CapturedSourceRasterFacts,
+) -> ConversionJobCapture {
     let project = ShadeProject::default();
     let base = temp_path("capture", "tmp");
     ConversionJobCapture {
@@ -98,6 +103,7 @@ fn capture(source: &Path, policy: Option<SourceTransparencyPolicy>) -> Conversio
         source_snapshot_id: None,
         source_file_sha256: sha256_file(source).expect("source hash"),
         source_profile: CapturedSourceProfile::Embedded,
+        source_raster: Some(source_raster),
         source_recipe: ExportRecipe::from_project(&project),
         conversion_recipe: recipe(policy),
         conversion_recipe_sha256: "d".repeat(64),
@@ -126,8 +132,14 @@ fn backend_error(capture: &ConversionJobCapture) -> String {
 fn rgba16_png_file_reaches_production_source_adapter_and_requires_explicit_alpha_policy() {
     let path = temp_path("rgba16", "png");
     write_rgba16_png(&path);
+    let raster = CapturedSourceRasterFacts::new(
+        CapturedSourceFormat::Png,
+        CapturedSourceColorModel::Rgb,
+        16,
+        3,
+    );
 
-    let missing = backend_error(&capture(&path, None));
+    let missing = backend_error(&capture(&path, None, raster));
     assert!(
         missing.contains("no explicit flatten background policy"),
         "{missing}"
@@ -136,7 +148,7 @@ fn rgba16_png_file_reaches_production_source_adapter_and_requires_explicit_alpha
     let policy = SourceTransparencyPolicy::FlattenSolidRgb16 {
         background_rgb: [u16::MAX; 3],
     };
-    let after_policy = backend_error(&capture(&path, Some(policy)));
+    let after_policy = backend_error(&capture(&path, Some(policy), raster));
     assert!(
         after_policy.contains("decoded source has none"),
         "expected real PNG decode to pass alpha policy and reach embedded ICC verification, got: {after_policy}"
@@ -150,8 +162,14 @@ fn rgb_jpeg_file_reaches_production_source_adapter_before_embedded_icc_verificat
     let path = temp_path("rgb", "jpg");
     fs::write(&path, STANDARD.decode(RGB_BLACK_JPEG).expect("JPEG fixture"))
         .expect("write JPEG fixture");
+    let raster = CapturedSourceRasterFacts::new(
+        CapturedSourceFormat::Jpeg,
+        CapturedSourceColorModel::Rgb,
+        8,
+        3,
+    );
 
-    let error = backend_error(&capture(&path, None));
+    let error = backend_error(&capture(&path, None, raster));
     assert!(
         error.contains("decoded source has none"),
         "expected real JPEG decode to reach embedded ICC verification, got: {error}"

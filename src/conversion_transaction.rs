@@ -81,6 +81,92 @@ pub enum CapturedSourceProfile {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum CapturedSourceFormat {
+    Tiff,
+    Png,
+    Jpeg,
+}
+
+impl CapturedSourceFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tiff => "TIFF",
+            Self::Png => "PNG",
+            Self::Jpeg => "JPEG",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturedSourceColorModel {
+    Gray,
+    Rgb,
+    Cmyk,
+    Multichannel,
+}
+
+impl CapturedSourceColorModel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gray => "Gray",
+            Self::Rgb => "RGB",
+            Self::Cmyk => "CMYK",
+            Self::Multichannel => "Multichannel",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapturedSourceRasterFacts {
+    pub format: CapturedSourceFormat,
+    pub color_model: CapturedSourceColorModel,
+    pub bit_depth: u8,
+    pub channel_count: usize,
+}
+
+impl CapturedSourceRasterFacts {
+    pub fn new(
+        format: CapturedSourceFormat,
+        color_model: CapturedSourceColorModel,
+        bit_depth: u8,
+        channel_count: usize,
+    ) -> Self {
+        Self {
+            format,
+            color_model,
+            bit_depth,
+            channel_count,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        if self.bit_depth == 0 {
+            return Err("Captured source raster bit depth must be non-zero.".to_owned());
+        }
+        if self.channel_count == 0 {
+            return Err("Captured source raster channel count must be non-zero.".to_owned());
+        }
+        let expected_channels = match self.color_model {
+            CapturedSourceColorModel::Gray => Some(1),
+            CapturedSourceColorModel::Rgb => Some(3),
+            CapturedSourceColorModel::Cmyk => Some(4),
+            CapturedSourceColorModel::Multichannel => None,
+        };
+        if expected_channels.is_some_and(|expected| expected != self.channel_count) {
+            return Err(format!(
+                "Captured source raster {} model requires {} channel(s); found {}.",
+                self.color_model.label(),
+                expected_channels.unwrap(),
+                self.channel_count
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CapturedOutputPolicy {
     MustNotExist,
     TransactionalReplace,
@@ -94,6 +180,10 @@ pub struct ConversionJobCapture {
     pub source_snapshot_id: Option<u64>,
     pub source_file_sha256: String,
     pub source_profile: CapturedSourceProfile,
+    /// Format-neutral raster facts frozen from the exact Source descriptor at
+    /// queue-capture time. Legacy persisted jobs deserialize this as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_raster: Option<CapturedSourceRasterFacts>,
     pub source_recipe: ExportRecipe,
     pub conversion_recipe: ConversionRecipe,
     pub conversion_recipe_sha256: String,
@@ -136,6 +226,7 @@ impl ConversionJobCapture {
             source_snapshot_id,
             source_file_sha256,
             source_profile,
+            source_raster: None,
             source_recipe: ExportRecipe::from_project(source_project),
             conversion_recipe,
             conversion_recipe_sha256,
@@ -177,6 +268,7 @@ impl ConversionJobCapture {
             source_snapshot_id,
             source_file_sha256,
             source_profile,
+            source_raster: None,
             source_recipe: ExportRecipe::from_project(source_project),
             conversion_recipe,
             conversion_recipe_sha256,
@@ -190,6 +282,16 @@ impl ConversionJobCapture {
         };
         capture.validate()?;
         Ok(capture)
+    }
+
+    pub fn with_source_raster_facts(
+        mut self,
+        source_raster: CapturedSourceRasterFacts,
+    ) -> Result<Self, String> {
+        source_raster.validate()?;
+        self.source_raster = Some(source_raster);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn with_audit_findings(
@@ -220,6 +322,9 @@ impl ConversionJobCapture {
             CapturedSourceProfile::External { path } if path.as_os_str().is_empty()
         ) {
             return Err("Assigned production Source ICC path cannot be empty.".to_owned());
+        }
+        if let Some(source_raster) = self.source_raster {
+            source_raster.validate()?;
         }
         self.conversion_recipe.validate().map_err(|errors| {
             format!("Invalid captured conversion recipe: {}", errors.join(" "))
@@ -704,6 +809,13 @@ mod tests {
             "Face".to_owned(),
         )
         .unwrap()
+        .with_source_raster_facts(CapturedSourceRasterFacts::new(
+            CapturedSourceFormat::Tiff,
+            CapturedSourceColorModel::Rgb,
+            16,
+            3,
+        ))
+        .unwrap()
         .with_audit_findings(vec![ConversionAuditFinding {
             code: "jpeg_lossy_source".to_owned(),
             message: "JPEG source is lossy.".to_owned(),
@@ -714,9 +826,31 @@ mod tests {
         let restored: ConversionJobCapture =
             serde_json::from_slice(&serde_json::to_vec(&captured).unwrap()).unwrap();
         assert_eq!(restored.source_recipe.adjustments["Red"].levels.gamma, 1.25);
+        assert_eq!(
+            restored.source_raster,
+            Some(CapturedSourceRasterFacts::new(
+                CapturedSourceFormat::Tiff,
+                CapturedSourceColorModel::Rgb,
+                16,
+                3,
+            ))
+        );
         assert_eq!(restored.audit_findings.len(), 1);
         assert_eq!(restored.audit_findings[0].code, "jpeg_lossy_source");
         assert!(restored.validate().is_ok());
+    }
+
+    #[test]
+    fn source_raster_facts_fail_closed_on_impossible_topology() {
+        let error = capture()
+            .with_source_raster_facts(CapturedSourceRasterFacts::new(
+                CapturedSourceFormat::Png,
+                CapturedSourceColorModel::Rgb,
+                8,
+                4,
+            ))
+            .expect_err("RGB capture with four color channels must fail closed");
+        assert!(error.contains("RGB model requires 3 channel"));
     }
 
     #[test]
