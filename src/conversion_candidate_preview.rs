@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::color_conversion::{ConversionEngineMode, ConversionRecipe, TargetChannelDefinition};
+use crate::conversion_analytics::{
+    ConversionUsageAccumulator, ConversionUsageReport, NeutralClassification,
+};
 use crate::conversion_recipe::recipe_sha256;
 use crate::conversion_transaction::{CapturedSourceProfile, ConversionCancellation};
 use crate::devicelink_conversion::ProductionDeviceLinkTransform;
@@ -33,6 +36,10 @@ pub struct CandidatePreviewResult {
     pub channels: Vec<TargetChannelDefinition>,
     pub planes: Vec<Vec<u16>>,
     pub histograms: Vec<[u32; 256]>,
+    /// Coverage/limit diagnostics computed from these exact cached candidate
+    /// planes under the same immutable recipe. Neutrality remains unknown until
+    /// a valid PCS/characterization classifier is available.
+    pub usage: ConversionUsageReport,
 }
 
 impl CandidatePreviewResult {
@@ -98,14 +105,70 @@ pub fn render_candidate_preview(
             &input.recipe,
             cancellation,
         )?,
-        5 => transform_n::<5>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
-        6 => transform_n::<6>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
-        7 => transform_n::<7>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
-        8 => transform_n::<8>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
-        9 => transform_n::<9>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
-        10 => transform_n::<10>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
-        11 => transform_n::<11>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
-        12 => transform_n::<12>(input.source_model, &input.source_planes, &source_icc, &target_icc, &input.recipe, cancellation)?,
+        5 => transform_n::<5>(
+            input.source_model,
+            &input.source_planes,
+            &source_icc,
+            &target_icc,
+            &input.recipe,
+            cancellation,
+        )?,
+        6 => transform_n::<6>(
+            input.source_model,
+            &input.source_planes,
+            &source_icc,
+            &target_icc,
+            &input.recipe,
+            cancellation,
+        )?,
+        7 => transform_n::<7>(
+            input.source_model,
+            &input.source_planes,
+            &source_icc,
+            &target_icc,
+            &input.recipe,
+            cancellation,
+        )?,
+        8 => transform_n::<8>(
+            input.source_model,
+            &input.source_planes,
+            &source_icc,
+            &target_icc,
+            &input.recipe,
+            cancellation,
+        )?,
+        9 => transform_n::<9>(
+            input.source_model,
+            &input.source_planes,
+            &source_icc,
+            &target_icc,
+            &input.recipe,
+            cancellation,
+        )?,
+        10 => transform_n::<10>(
+            input.source_model,
+            &input.source_planes,
+            &source_icc,
+            &target_icc,
+            &input.recipe,
+            cancellation,
+        )?,
+        11 => transform_n::<11>(
+            input.source_model,
+            &input.source_planes,
+            &source_icc,
+            &target_icc,
+            &input.recipe,
+            cancellation,
+        )?,
+        12 => transform_n::<12>(
+            input.source_model,
+            &input.source_planes,
+            &source_icc,
+            &target_icc,
+            &input.recipe,
+            cancellation,
+        )?,
         channels => {
             return Err(format!(
                 "Candidate preview supports production target topology 4..=12 channels; found {channels}."
@@ -113,6 +176,7 @@ pub fn render_candidate_preview(
         }
     };
     let histograms = build_histograms(&planes);
+    let usage = build_usage_report(&input.recipe, &planes, cancellation)?;
     Ok(CandidatePreviewResult {
         width: input.width,
         height: input.height,
@@ -120,7 +184,42 @@ pub fn render_candidate_preview(
         channels: input.recipe.target.channels,
         planes,
         histograms,
+        usage,
     })
+}
+
+fn build_usage_report(
+    recipe: &ConversionRecipe,
+    planes: &[Vec<u16>],
+    cancellation: &ConversionCancellation,
+) -> Result<ConversionUsageReport, String> {
+    if planes.len() != recipe.target.channels.len() {
+        return Err(format!(
+            "Candidate analytics has {} planes for {} target channels.",
+            planes.len(),
+            recipe.target.channels.len()
+        ));
+    }
+    let pixels = planes
+        .first()
+        .map(Vec::len)
+        .ok_or_else(|| "Candidate analytics requires output planes.".to_owned())?;
+    if planes.iter().any(|plane| plane.len() != pixels) {
+        return Err("Candidate analytics output planes have inconsistent lengths.".to_owned());
+    }
+
+    let mut accumulator = ConversionUsageAccumulator::from_recipe(recipe)?;
+    let mut pixel = vec![0u16; planes.len()];
+    for index in 0..pixels {
+        if index % PREVIEW_CHUNK_PIXELS == 0 {
+            check_cancelled(cancellation)?;
+        }
+        for (channel, plane) in planes.iter().enumerate() {
+            pixel[channel] = plane[index];
+        }
+        accumulator.observe_u16(&pixel, NeutralClassification::Unknown)?;
+    }
+    Ok(accumulator.finish())
 }
 
 fn transform_4(
@@ -422,11 +521,12 @@ mod tests {
                 name: "CMYK Link".to_owned(),
                 channels: ["Cyan", "Magenta", "Yellow", "Black"]
                     .into_iter()
-                    .map(|name| TargetChannelDefinition {
+                    .enumerate()
+                    .map(|(index, name)| TargetChannelDefinition {
                         name: name.to_owned(),
                         display_rgb: None,
                         solidity: 1.0,
-                        max_coverage: None,
+                        max_coverage: (index == 0).then_some(0.5),
                     })
                     .collect(),
                 bit_depth: 16,
@@ -438,7 +538,7 @@ mod tests {
                 }),
                 device_link_path: Some(link_path.to_string_lossy().into_owned()),
                 characterization_id: None,
-                total_ink_limit: None,
+                total_ink_limit: Some(2.4),
             },
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: false,
@@ -464,6 +564,11 @@ mod tests {
         assert_eq!(result.planes[0][0], 0);
         assert_eq!(result.histograms[0].iter().sum::<u32>(), 2);
         assert_eq!(result.recipe_sha256.len(), 64);
+        assert_eq!(result.usage.pixel_count, 2);
+        assert_eq!(result.usage.channels.len(), 4);
+        assert!(result.usage.channels[0].limit_hit_percent.is_some());
+        assert!(result.usage.total_ink_limit_hit_percent.is_some());
+        assert!(result.usage.neutral_black_share.is_none());
         let _ = fs::remove_file(link_path);
     }
 
