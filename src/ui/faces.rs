@@ -17,12 +17,128 @@ fn duplicate_face_counts(faces: &[RuntimeFace]) -> BTreeMap<String, usize> {
     counts
 }
 
+fn verify_changed_face_metadata(
+    preview: &runtime_preview::RuntimePreview,
+    expected: Option<&model::FaceFileMetadata>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let mut bad = Vec::new();
+    let (width, height) = preview.source_dimensions();
+    if (width, height) != (expected.width, expected.height) {
+        bad.push(format!(
+            "dimensions expected {}x{}, got {}x{}",
+            expected.width, expected.height, width, height
+        ));
+    }
+    if preview.bit_depth() != expected.bit_depth {
+        bad.push(format!(
+            "bit depth expected {}, got {}",
+            expected.bit_depth,
+            preview.bit_depth()
+        ));
+    }
+    if preview.color_model().title() != expected.color_model {
+        bad.push(format!(
+            "color model expected {}, got {}",
+            expected.color_model,
+            preview.color_model().title()
+        ));
+    }
+    if preview.channel_count() != expected.channel_count
+        || preview.base_channel_count() != expected.base_channel_count
+    {
+        bad.push(format!(
+            "channel layout expected {}/{} base, got {}/{} base",
+            expected.channel_count,
+            expected.base_channel_count,
+            preview.channel_count(),
+            preview.base_channel_count()
+        ));
+    }
+    if preview.channel_names() != expected.channel_names.as_slice() {
+        bad.push(format!(
+            "channel names/order expected {:?}, got {:?}",
+            expected.channel_names,
+            preview.channel_names()
+        ));
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Changed source does not match the accepted Face metadata: {}",
+            bad.join("; ")
+        ))
+    }
+}
+
+fn reload_changed_current_face(app: &mut ShadeApp) {
+    if app.job.is_some() {
+        return;
+    }
+    let index = app.current_face;
+    let Some(face) = app.faces.get(index) else {
+        return;
+    };
+    let path = face.path.clone();
+    let observed = file_observer::rescan(&path)
+        .unwrap_or_else(|| file_observer::observe(&path, ExternalFileRole::Face));
+    if !observed.is_available() || !observed.is_changed() {
+        return;
+    }
+    let expected = app
+        .project
+        .file_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.faces.get(index))
+        .cloned();
+    let max_dimension = app.settings.max_preview_dimension;
+    let default_dpi = app.settings.default_dpi;
+    app.launch_job("Reloading changed Face", move |progress| {
+        ShadeApp::set_progress(
+            &progress,
+            Some(0.15),
+            "Reloading changed Face",
+            "Loading current source bytes",
+        );
+        let result = (|| -> Result<LoadedFace, String> {
+            let preview = runtime_preview::RuntimePreview::load(&path, max_dimension)
+                .map_err(|err| format!("Cannot reload changed source {}: {err}", path.display()))?;
+            verify_changed_face_metadata(&preview, expected.as_ref())?;
+            let item = LoadedFace {
+                dpi: dpi::read_dpi(&path, default_dpi),
+                path: path.clone(),
+                available: true,
+                preview,
+            };
+            // The job remains active until this result is applied, so acknowledging here
+            // cannot open an export window with the old preview still interactive.
+            file_observer::acknowledge(&path).ok_or_else(|| {
+                format!(
+                    "Changed Face was verified but its observer baseline disappeared before acceptance: {}",
+                    path.display()
+                )
+            })?;
+            Ok(item)
+        })();
+        ShadeApp::set_progress(
+            &progress,
+            Some(1.0),
+            "Reloading changed Face",
+            "Complete",
+        );
+        JobResult::RelinkFace { index, result }
+    });
+}
+
 pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
     let mut actions = Vec::new();
 
     // Availability is synchronized from the shared observer. Recreated/modified files are
     // intentionally not auto-reloaded: the current RuntimePreview remains authoritative until
-    // the existing relink/verification flow accepts new source bytes.
+    // an explicit verified reload/relink accepts new source bytes.
     for face in &mut app.faces {
         let observed = file_observer::observe(&face.path, ExternalFileRole::Face);
         if !observed.is_available() {
@@ -150,7 +266,7 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                         )
                     } else if externally_changed {
                         format!(
-                            "Source TIFF changed outside Shade Editor: {}. Cached preview is retained; verify/relink before treating the new bytes as authoritative.",
+                            "Source TIFF changed outside Shade Editor: {}. Cached preview remains authoritative until Reload changed file verifies and accepts the new bytes.",
                             face.path.display()
                         )
                     } else if duplicate_count > 1 {
@@ -201,16 +317,30 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                     actions.push(FaceUiAction::Select(index));
                 }
 
+                let active_observed = app.faces.get(app.current_face).map(|face| {
+                    file_observer::observe(&face.path, ExternalFileRole::Face)
+                });
                 let active_missing = app
                     .faces
                     .get(app.current_face)
                     .is_some_and(|face| !face.available);
+                let active_changed = active_observed
+                    .as_ref()
+                    .is_some_and(|observed| observed.is_available() && observed.is_changed());
                 let missing_count = app.faces.iter().filter(|face| !face.available).count();
                 let mut locate_file = false;
+                let mut reload_changed = false;
                 let mut locate_folder = false;
                 ui.horizontal_wrapped(|ui| {
                     if active_missing {
                         locate_file = ui.button("Locate file").clicked();
+                    } else if active_changed {
+                        reload_changed = ui
+                            .button("Reload changed file")
+                            .on_hover_text(
+                                "Verify dimensions, bit depth, color model and channel topology, then accept the new source bytes",
+                            )
+                            .clicked();
                     }
                     if missing_count > 0 {
                         locate_folder = ui
@@ -221,7 +351,9 @@ pub(crate) fn ui_faces(app: &mut ShadeApp, ui: &mut egui::Ui) {
                             .clicked();
                     }
                 });
-                if locate_file {
+                if reload_changed {
+                    reload_changed_current_face(app);
+                } else if locate_file {
                     actions.push(FaceUiAction::RelinkCurrent);
                 } else if locate_folder {
                     actions.push(FaceUiAction::RelinkMissingFolder);
