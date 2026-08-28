@@ -12,6 +12,7 @@ pub mod conversion_capabilities;
 pub mod conversion_output;
 pub mod conversion_preflight;
 pub mod conversion_preset_library;
+pub mod conversion_preset_runtime;
 pub mod conversion_preset_store;
 pub mod conversion_presets;
 pub mod conversion_queue;
