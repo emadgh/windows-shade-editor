@@ -7,6 +7,8 @@ use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use crate::conversion_recipe::recipe_sha256;
 use crate::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;
 use crate::inverse_lut_threshold_set::InverseLutThresholdCalibrationObservation;
+use crate::model::IccProfileIdentity;
+use crate::source_transparency::SourceTransparencyPolicy;
 
 pub const CUSTOM_OPTIMIZER_EVIDENCE_BUNDLE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CUSTOM_OPTIMIZER_EVIDENCE_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
@@ -119,6 +121,37 @@ impl CustomOptimizerEvidenceBundle {
         }
     }
 
+    /// Validate that this exact recipe/evidence bundle still belongs to the
+    /// current Source Face identity. This is a staleness check only; it does not
+    /// authorize production execution.
+    pub fn validate_source_binding(
+        &self,
+        source_profile_identity: &IccProfileIdentity,
+        source_transparency_policy: Option<SourceTransparencyPolicy>,
+    ) -> Result<(), Vec<String>> {
+        let mut errors = self.validate().err().unwrap_or_default();
+        if &self.recipe.source_profile_identity != source_profile_identity {
+            errors.push(format!(
+                "Custom Optimizer evidence bundle Source ICC '{}' ({}) does not match current Face Source ICC '{}' ({}).",
+                self.recipe.source_profile_identity.description,
+                self.recipe.source_profile_identity.sha256,
+                source_profile_identity.description,
+                source_profile_identity.sha256
+            ));
+        }
+        if self.recipe.source_transparency_policy != source_transparency_policy {
+            errors.push(
+                "Custom Optimizer evidence bundle transparency policy does not match the current Face recipe."
+                    .to_owned(),
+            );
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     pub fn to_pretty_json(&self) -> Result<String, String> {
         self.validate().map_err(|errors| errors.join("\n"))?;
         serde_json::to_string_pretty(self).map_err(|error| error.to_string())
@@ -219,5 +252,7 @@ mod tests {
         assert!(!runtime.contains("production_authorized: bool"));
         assert!(runtime.contains("self.evidence.validate()"));
         assert!(runtime.contains("recipe_sha256(&self.recipe)"));
+        assert!(runtime.contains("self.recipe.source_profile_identity !="));
+        assert!(runtime.contains("self.recipe.source_transparency_policy !="));
     }
 }
