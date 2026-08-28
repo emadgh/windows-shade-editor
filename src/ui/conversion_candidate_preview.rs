@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_shade_editor::color_conversion::ConversionRecipe;
+use windows_shade_editor::conversion_analytics::ConversionUsageReport;
 use windows_shade_editor::conversion_candidate_preview::{
     CandidatePreviewInput, CandidatePreviewResult, render_candidate_preview,
 };
@@ -204,6 +205,7 @@ impl ShadeApp {
 
         let channels = active.result.channels.clone();
         let histograms = active.result.histograms.clone();
+        let usage = active.result.usage.clone();
         let solo = active.solo_channel;
         let recipe_sha = active.result.recipe_sha256.clone();
         let mut requested_solo: Option<Option<usize>> = None;
@@ -240,6 +242,9 @@ impl ShadeApp {
         if solo.is_some() && ui.small_button("Return to converted composite").clicked() {
             requested_solo = Some(None);
         }
+
+        ui.separator();
+        draw_candidate_usage(ui, &usage);
 
         ui.separator();
         ui.horizontal(|ui| {
@@ -618,6 +623,48 @@ fn load_candidate_texture(
     )
 }
 
+fn draw_candidate_usage(ui: &mut egui::Ui, usage: &ConversionUsageReport) {
+    ui.strong("Ink usage / limits");
+    ui.small(format!(
+        "Total ink · mean {:.1}% · p50 {:.1}% · p95 {:.1}% · p99 {:.1}% · peak {:.1}%",
+        usage.mean_total_ink * 100.0,
+        usage.total_ink_percentiles.p50 * 100.0,
+        usage.total_ink_percentiles.p95 * 100.0,
+        usage.total_ink_percentiles.p99 * 100.0,
+        usage.peak_total_ink * 100.0,
+    ));
+    if let Some(hit_percent) = usage.total_ink_limit_hit_percent {
+        ui.small(format!("Total-ink limit hits: {hit_percent:.2}% of candidate pixels"));
+    } else {
+        ui.small("Total-ink limit hits: no total-ink limit configured");
+    }
+
+    for channel in &usage.channels {
+        ui.group(|ui| {
+            ui.strong(&channel.name);
+            ui.small(format!(
+                "Mean {:.1}% · p50 {:.1}% · p95 {:.1}% · p99 {:.1}% · peak {:.1}%",
+                channel.mean_coverage * 100.0,
+                channel.percentiles.p50 * 100.0,
+                channel.percentiles.p95 * 100.0,
+                channel.percentiles.p99 * 100.0,
+                channel.peak_coverage * 100.0,
+            ));
+            ui.small(format!("Non-zero coverage: {:.2}%", channel.nonzero_percent));
+            if let Some(hit_percent) = channel.limit_hit_percent {
+                ui.small(format!("Channel-limit hits: {hit_percent:.2}%"));
+            } else {
+                ui.small("Channel-limit hits: no channel limit configured");
+            }
+        });
+    }
+
+    ui.small(
+        "Neutral Black share: unavailable until PCS/characterization-based neutral classification exists.",
+    );
+    ui.small("ΔE00: unavailable until approved measured PCS/characterization evidence exists.");
+}
+
 fn draw_candidate_histogram(ui: &mut egui::Ui, histogram: &[u32; 256], color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width().max(120.0), 68.0),
@@ -646,6 +693,37 @@ fn short_hash(hash: &str) -> &str {
 mod tests {
     use super::*;
     use windows_shade_editor::color_conversion::TargetChannelDefinition;
+    use windows_shade_editor::conversion_analytics::{
+        ChannelUsageStats, ConversionUsageReport, CoveragePercentiles,
+    };
+
+    fn test_usage() -> ConversionUsageReport {
+        ConversionUsageReport {
+            pixel_count: 2,
+            channels: vec![ChannelUsageStats {
+                name: "Black".to_owned(),
+                mean_coverage: 0.5,
+                peak_coverage: 1.0,
+                percentiles: CoveragePercentiles {
+                    p50: 0.0,
+                    p95: 1.0,
+                    p99: 1.0,
+                },
+                nonzero_percent: 50.0,
+                limit_hit_percent: None,
+                integrated_coverage: 1.0,
+            }],
+            mean_total_ink: 0.5,
+            peak_total_ink: 1.0,
+            total_ink_percentiles: CoveragePercentiles {
+                p50: 0.0,
+                p95: 1.0,
+                p99: 1.0,
+            },
+            total_ink_limit_hit_percent: None,
+            neutral_black_share: None,
+        }
+    }
 
     #[test]
     fn solo_candidate_uses_direct_ink_coverage_polarity() {
@@ -661,6 +739,7 @@ mod tests {
             }],
             planes: vec![vec![0, u16::MAX]],
             histograms: vec![[0; 256]],
+            usage: test_usage(),
         };
         let rgba = candidate_rgba(&result, Some(0));
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
@@ -674,6 +753,10 @@ mod tests {
         assert!(!runtime.contains("struct CandidateConfig"));
         assert!(!runtime.contains("egui::Window::new"));
         assert!(!runtime.contains("Queue this exact conversion"));
+        assert!(!runtime.contains("ConversionUsageAccumulator"));
+        assert!(!runtime.contains("analyze_conversion_tiff"));
+        assert!(runtime.contains("active.result.usage"));
+        assert!(runtime.contains("draw_candidate_usage"));
         assert!(runtime.contains("sync_conversion_candidate"));
         assert!(runtime.contains("render_candidate_preview"));
     }
