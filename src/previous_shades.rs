@@ -8,6 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{FaceFileMetadata, ProjectThumbnail, ShadeProject};
+use crate::project_persistence;
 use crate::thumbnail;
 
 const SNAPSHOT_CACHE_VERSION: u32 = 4;
@@ -359,7 +360,16 @@ impl PreviousShadesStore {
         let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let display = normalized.to_string_lossy().into_owned();
         let now = unix_ms_now();
+        // Capture before re-reading the just-opened/saved project, then accept only
+        // if those bytes are unchanged after the parse. This establishes the exact
+        // active-project baseline used by Ctrl+S lost-update protection.
+        let baseline_candidate = project_persistence::begin_active_source_project_load(path).ok();
         let loaded_project = ShadeProject::load(path).ok();
+        if loaded_project.is_some() {
+            if let Some(candidate) = baseline_candidate {
+                let _ = project_persistence::accept_loaded_source_project(path, candidate);
+            }
+        }
         let saved_at = loaded_project
             .as_ref()
             .and_then(|project| {
