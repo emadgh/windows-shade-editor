@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::file_observer;
 use crate::model::ShadeProject;
+use windows_shade_editor::file_observer;
 
 /// Verify that a tracked active Source project still matches the baseline accepted by
 /// the File Observer. This is deliberately a persistence-boundary check rather than a
@@ -59,9 +59,9 @@ pub fn save_active_source_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_observer::ExternalFileRole;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use windows_shade_editor::file_observer::ExternalFileRole;
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
