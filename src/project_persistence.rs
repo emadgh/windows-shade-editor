@@ -79,6 +79,13 @@ mod tests {
         ))
     }
 
+    fn cleanup(path: &Path) {
+        file_observer::release(path, ExternalFileRole::Project);
+        let _ = fs::remove_file(path);
+        let backup = path.with_extension("shade.bak");
+        let _ = fs::remove_file(backup);
+    }
+
     #[test]
     fn tracked_external_change_blocks_same_path_save_boundary() {
         let path = temp_project_path("changed");
@@ -90,8 +97,7 @@ mod tests {
         let error = verify_active_source_project_save_baseline(&path).unwrap_err();
         assert!(error.contains("changed outside Shade Editor"));
 
-        file_observer::release(&path, ExternalFileRole::Project);
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -103,8 +109,7 @@ mod tests {
 
         assert!(verify_active_source_project_save_baseline(&path).is_ok());
 
-        file_observer::release(&path, ExternalFileRole::Project);
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -114,7 +119,7 @@ mod tests {
         fs::write(&path, b"external project").unwrap();
         let error = verify_active_source_project_save_baseline(&path).unwrap_err();
         assert!(error.contains("no accepted baseline"), "{error}");
-        let _ = fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
@@ -122,5 +127,40 @@ mod tests {
         let path = temp_project_path("save-as-new");
         let _ = fs::remove_file(&path);
         assert!(verify_active_source_project_save_baseline(&path).is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn successful_save_establishes_and_refreshes_baseline_for_next_save() {
+        let path = temp_project_path("refresh");
+        cleanup(&path);
+        let mut project = ShadeProject::default();
+        project.name = "first".to_owned();
+        save_active_source_project(&project, &path, &[]).unwrap();
+        assert!(verify_active_source_project_save_baseline(&path).is_ok());
+
+        project.name = "second".to_owned();
+        save_active_source_project(&project, &path, &[]).unwrap();
+        assert!(verify_active_source_project_save_baseline(&path).is_ok());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn external_write_after_accepted_save_is_preserved_when_next_save_is_rejected() {
+        let path = temp_project_path("preserve-external");
+        cleanup(&path);
+        let mut project = ShadeProject::default();
+        project.name = "accepted".to_owned();
+        save_active_source_project(&project, &path, &[]).unwrap();
+
+        let external_bytes = b"external writer owns these bytes";
+        fs::write(&path, external_bytes).unwrap();
+        project.name = "local unsaved edit".to_owned();
+        let error = save_active_source_project(&project, &path, &[]).unwrap_err();
+        assert!(error.contains("changed outside Shade Editor"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), external_bytes);
+
+        cleanup(&path);
     }
 }
