@@ -1,6 +1,7 @@
 pub(crate) mod actions;
 pub(crate) mod adjustments;
 pub(crate) mod color_conversion;
+pub(crate) mod conversion_audit;
 pub(crate) mod conversion_batch;
 pub(crate) mod conversion_candidate_preview;
 pub(crate) mod conversion_plan;
@@ -122,11 +123,13 @@ mod tests {
         let main = include_str!("../main.rs");
         let status_bar = include_str!("status_bar.rs");
         let conversion_source = include_str!("color_conversion.rs");
+        let audit_source = include_str!("conversion_audit.rs");
         let migration_source = include_str!("conversion_route_migration.rs");
         let plan_source = include_str!("conversion_plan.rs");
         let batch_source = include_str!("conversion_batch.rs");
         let candidate_source = include_str!("conversion_candidate_preview.rs");
         let conversion = conversion_source.split("\n#[cfg(test)]").next().unwrap_or(conversion_source);
+        let audit = audit_source.split("\n#[cfg(test)]").next().unwrap_or(audit_source);
         let migration = migration_source.split("\n#[cfg(test)]").next().unwrap_or(migration_source);
         let plan = plan_source.split("\n#[cfg(test)]").next().unwrap_or(plan_source);
         let batch = batch_source.split("\n#[cfg(test)]").next().unwrap_or(batch_source);
@@ -134,6 +137,7 @@ mod tests {
 
         assert!(status_bar.contains("ui_color_conversion_window"));
         assert!(status_bar.contains("ui_conversion_route_migration"));
+        assert!(status_bar.contains("ui_conversion_audit_menu"));
         assert!(status_bar.contains("poll_conversion_candidate_runtime"));
         assert!(status_bar.contains("poll_conversion_batch_runtime"));
         for removed in [
@@ -171,6 +175,12 @@ mod tests {
         assert!(candidate.contains("sync_conversion_candidate"));
         assert!(!candidate.contains("CandidateConfig"));
         assert!(!candidate.contains("egui::Window::new"));
+
+        assert!(audit.contains("project.conversion_audits"));
+        assert!(audit.contains("validate_against_provenance"));
+        assert!(audit.contains("to_portable_pretty_json"));
+        assert!(!audit.contains("ConversionAuditRecord::from_committed_job"));
+        assert!(!audit.contains("build_conversion_preflight"));
         assert!(main.contains("app_features::COLOR_CONVERSION_LABEL"));
     }
 }
