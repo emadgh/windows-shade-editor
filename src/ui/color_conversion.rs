@@ -1,18 +1,25 @@
 use crate::*;
 use eframe::egui;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use windows_shade_editor::color_conversion::{ConversionEngineMode, ConversionRenderingIntent};
+use std::path::{Path, PathBuf};
+use windows_shade_editor::color_conversion::{
+    ConversionEngineMode, ConversionRecipe, ConversionRenderingIntent,
+};
 use windows_shade_editor::conversion_batch::ConversionBatchScope;
 use windows_shade_editor::conversion_preflight::{PreflightCode, PreflightSeverity};
+use windows_shade_editor::conversion_recipe::recipe_sha256;
 use windows_shade_editor::icc_profile_registry::IccProfileRegistry;
 use windows_shade_editor::production_destination::ProductionDestinationAvailability;
 use windows_shade_editor::production_profile_catalog::{
     ProductionProfileCandidate, installed_production_profiles,
 };
-use windows_shade_editor::production_target::inspect_production_target_profile;
+use windows_shade_editor::production_target::{
+    inspect_production_target_profile, validate_target_channel_names,
+    verify_production_target_profile,
+};
 use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 
+use super::conversion_candidate_preview::CandidatePromotionSelection;
 use super::conversion_plan::{
     ConversionFaceInspection, ConversionTargetState, UnifiedDestinationMode,
     build_conversion_recipe, build_unified_plan, conversion_color_model, default_output_folder,
@@ -26,10 +33,33 @@ use super::conversion_presets::{
 
 const CONVERSION_WINDOW_ID: &str = "shade-editor-color-conversion-open";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromotedCandidateOrigin {
+    A,
+    B,
+}
+
+impl PromotedCandidateOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            Self::A => "Candidate A",
+            Self::B => "Candidate B",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PromotedCandidateTarget {
+    origin: PromotedCandidateOrigin,
+    selection: CandidatePromotionSelection,
+    target: ConversionTargetState,
+}
+
 #[derive(Clone)]
 pub(crate) struct ColorConversionUiState {
     project_key: String,
     pub(crate) target: ConversionTargetState,
+    promoted_target: Option<PromotedCandidateTarget>,
     installed_target_profiles: Vec<ProductionProfileCandidate>,
     installed_catalog_key: String,
     installed_profiles_error: Option<String>,
@@ -50,6 +80,7 @@ impl Default for ColorConversionUiState {
         Self {
             project_key: String::new(),
             target: ConversionTargetState::default(),
+            promoted_target: None,
             installed_target_profiles: Vec::new(),
             installed_catalog_key: String::new(),
             installed_profiles_error: None,
@@ -144,43 +175,52 @@ impl ShadeApp {
             .collect::<Vec<_>>();
         let candidates = production_candidates(self);
         let routes = production_routes(self);
+        let final_target_result = final_conversion_target(self, &state);
         if state.destination_mode == UnifiedDestinationMode::AppendExisting
             && state.selected_existing.is_none()
         {
-            if let (Some(folder), Ok(recipe)) = (
-                state.output_folder.as_deref(),
-                build_conversion_recipe(&state.target, &current_inspection, current_policy),
-            ) {
-                let matching = routes
-                    .iter()
-                    .filter(|route| {
-                        route.matches_recipe_policy(&recipe).unwrap_or(false)
-                            && route
-                                .output_folder()
-                                .to_string_lossy()
-                                .eq_ignore_ascii_case(&folder.to_string_lossy())
-                    })
-                    .take(2)
-                    .collect::<Vec<_>>();
-                if let [route] = matching.as_slice() {
-                    state.selected_existing = Some(route.production_project_path());
+            if let (Some(folder), Ok(final_target)) =
+                (state.output_folder.as_deref(), final_target_result.as_ref())
+            {
+                if let Ok(recipe) =
+                    build_conversion_recipe(final_target, &current_inspection, current_policy)
+                {
+                    let matching = routes
+                        .iter()
+                        .filter(|route| {
+                            route.matches_recipe_policy(&recipe).unwrap_or(false)
+                                && route
+                                    .output_folder()
+                                    .to_string_lossy()
+                                    .eq_ignore_ascii_case(&folder.to_string_lossy())
+                        })
+                        .take(2)
+                        .collect::<Vec<_>>();
+                    if let [route] = matching.as_slice() {
+                        state.selected_existing = Some(route.production_project_path());
+                    }
                 }
             }
         }
         let plan_preview = state.output_folder.as_deref().map(|folder| {
-            build_unified_plan(
-                self,
-                state.scope,
-                &inspections,
-                &state.transparency_policies,
-                &state.target,
-                folder,
-                state.destination_mode,
-                state.selected_existing.as_deref(),
-                &candidates,
-                &routes,
-                state.allow_production_work_discard,
-            )
+            final_target_result
+                .as_ref()
+                .map_err(|error| vec![format!("Final Candidate authority is stale: {error}")])
+                .and_then(|final_target| {
+                    build_unified_plan(
+                        self,
+                        state.scope,
+                        &inspections,
+                        &state.transparency_policies,
+                        final_target,
+                        folder,
+                        state.destination_mode,
+                        state.selected_existing.as_deref(),
+                        &candidates,
+                        &routes,
+                        state.allow_production_work_discard,
+                    )
+                })
         });
 
         let mut open = true;
@@ -192,6 +232,8 @@ impl ShadeApp {
         let mut clear_source_profile: Option<usize> = None;
         let mut force_candidate_refresh = false;
         let mut requested_candidate_visibility: Option<bool> = None;
+        let mut promote_candidate_requested: Option<PromotedCandidateOrigin> = None;
+        let mut clear_promoted_candidate = false;
         let mut restore_route_requested: Option<PathBuf> = None;
         let mut queue_requested = false;
         let mut preset_actions = Vec::new();
@@ -210,7 +252,7 @@ impl ShadeApp {
                     .show(ui, |ui| {
                         ui.heading("Production Color Conversion");
                         ui.label(
-                            "One target recipe drives Candidate Preview and Current / Selected / All Face conversion.",
+                            "The working target drives Candidate Preview. An explicitly promoted A/B Candidate can freeze the final Queue target while Preview remains editable.",
                         );
                         ui.small(
                             "Preview is non-destructive. TIFF/Production output is created only after the final Queue action.",
@@ -515,7 +557,7 @@ impl ShadeApp {
                                 }
                                 if state.target.target_profile.is_some() {
                                     ui.small(
-                                        "A valid target automatically renders on the main viewport. The Channels/Histogram panel switches to converted target samples while Converted Candidate is selected.",
+                                        "A valid working target automatically renders on the main viewport. The Channels/Histogram panel switches to converted target samples while Converted Candidate is selected.",
                                     );
                                 } else {
                                     ui.label(
@@ -525,6 +567,74 @@ impl ShadeApp {
                                         .color(egui::Color32::YELLOW),
                                     );
                                 }
+
+                                ui.add_space(5.0);
+                                ui.group(|ui| {
+                                    ui.strong("Final production authority");
+                                    match state.promoted_target.as_ref() {
+                                        Some(promoted) => {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Promoted {} · recipe {} · target '{}'",
+                                                    promoted.origin.label(),
+                                                    short_hash(promoted.selection.snapshot.recipe_sha256()),
+                                                    promoted.target.target_name,
+                                                ))
+                                                .color(egui::Color32::LIGHT_GREEN)
+                                                .strong(),
+                                            );
+                                            ui.small(
+                                                "Working target changes now affect Candidate Preview only. Queue keeps this promoted target while rebuilding and validating Source ICC/transparency per Face.",
+                                            );
+                                            if let Err(error) = final_target_result.as_ref() {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Promotion is stale: {error}"
+                                                    ))
+                                                    .color(egui::Color32::LIGHT_RED),
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            ui.small(
+                                                "Final Queue follows the current working target until Candidate A or B is explicitly promoted.",
+                                            );
+                                        }
+                                    }
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                status.pinned_recipe_sha256.is_some(),
+                                                egui::Button::new("Promote Candidate A to final"),
+                                            )
+                                            .on_hover_text(
+                                                "Freeze Candidate A's exact rendered target recipe as final Queue authority without copying its raster.",
+                                            )
+                                            .clicked()
+                                        {
+                                            promote_candidate_requested =
+                                                Some(PromotedCandidateOrigin::A);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                status.active,
+                                                egui::Button::new("Promote current B to final"),
+                                            )
+                                            .on_hover_text(
+                                                "Freeze the current Candidate B target as final Queue authority. Preview can continue exploring other recipes afterward.",
+                                            )
+                                            .clicked()
+                                        {
+                                            promote_candidate_requested =
+                                                Some(PromotedCandidateOrigin::B);
+                                        }
+                                        if state.promoted_target.is_some()
+                                            && ui.small_button("Clear final promotion").clicked()
+                                        {
+                                            clear_promoted_candidate = true;
+                                        }
+                                    });
+                                });
                             });
 
                         ui.add_space(6.0);
@@ -761,6 +871,36 @@ impl ShadeApp {
                     });
             });
 
+        if clear_promoted_candidate {
+            state.promoted_target = None;
+            self.report_info(
+                "Cleared promoted final Candidate; Production Queue follows the working target again."
+            );
+        }
+        if let Some(origin) = promote_candidate_requested {
+            let selection = match origin {
+                PromotedCandidateOrigin::A => self.conversion_candidate_a_promotion_selection(),
+                PromotedCandidateOrigin::B => self.conversion_candidate_b_promotion_selection(),
+            };
+            match selection.and_then(|selection| {
+                build_promoted_candidate_target(self, &state, origin, selection)
+            }) {
+                Ok(promoted) => {
+                    let hash = promoted.selection.snapshot.recipe_sha256().to_owned();
+                    state.promoted_target = Some(promoted);
+                    self.report_info(format!(
+                        "Promoted {} recipe {} to final Production authority. Working Candidate changes remain preview-only until promotion is cleared or replaced.",
+                        origin.label(),
+                        short_hash(&hash),
+                    ));
+                }
+                Err(error) => self.report_error(format!(
+                    "Cannot promote {} to final Production authority: {error}",
+                    origin.label()
+                )),
+            }
+        }
+
         if let Some(route_path) = restore_route_requested {
             if let Some(route) = routes.iter().find(|route| {
                 route
@@ -772,6 +912,7 @@ impl ShadeApp {
                     Ok(target) => match self.restore_source_bindings_from_route(route, &mut state) {
                         Ok(source_changed) => {
                             state.target = target;
+                            state.promoted_target = None;
                             state.output_folder = Some(route.output_folder());
                             state.destination_mode = UnifiedDestinationMode::AppendExisting;
                             state.selected_existing = Some(route.production_project_path());
@@ -825,7 +966,7 @@ impl ShadeApp {
                         state.target.accept_profile(profile);
                         state.selected_existing = None;
                         self.report_info(format!(
-                            "Selected production target '{description}' ({channels} channels); Candidate Preview scheduled."
+                            "Selected working production target '{description}' ({channels} channels); Candidate Preview scheduled."
                         ));
                     }
                     Err(error) => self.report_error(error),
@@ -914,24 +1055,28 @@ impl ShadeApp {
                 })
                 .collect::<Vec<_>>();
             let candidates = production_candidates(self);
-            let result = state
-                .output_folder
-                .as_deref()
-                .ok_or_else(|| vec!["Choose a Production destination folder.".to_owned()])
-                .and_then(|folder| {
-                    build_unified_plan(
-                        self,
-                        state.scope,
-                        &inspections,
-                        &state.transparency_policies,
-                        &state.target,
-                        folder,
-                        state.destination_mode,
-                        state.selected_existing.as_deref(),
-                        &candidates,
-                        &routes,
-                        state.allow_production_work_discard,
-                    )
+            let result = final_conversion_target(self, &state)
+                .map_err(|error| vec![format!("Final Candidate authority is stale: {error}")])
+                .and_then(|final_target| {
+                    state
+                        .output_folder
+                        .as_deref()
+                        .ok_or_else(|| vec!["Choose a Production destination folder.".to_owned()])
+                        .and_then(|folder| {
+                            build_unified_plan(
+                                self,
+                                state.scope,
+                                &inspections,
+                                &state.transparency_policies,
+                                &final_target,
+                                folder,
+                                state.destination_mode,
+                                state.selected_existing.as_deref(),
+                                &candidates,
+                                &routes,
+                                state.allow_production_work_discard,
+                            )
+                        })
                 });
             match result {
                 Ok(plan) => match self.queue_unified_conversion_plan(state.scope, &inspections, plan) {
@@ -1084,6 +1229,161 @@ impl ShadeApp {
             ));
         }
     }
+}
+
+fn build_promoted_candidate_target(
+    app: &ShadeApp,
+    state: &ColorConversionUiState,
+    origin: PromotedCandidateOrigin,
+    selection: CandidatePromotionSelection,
+) -> Result<PromotedCandidateTarget, String> {
+    let target = target_from_candidate_recipe(selection.snapshot.recipe(), app, &selection)?;
+    validate_promoted_candidate_selection(app, state, &selection, &target)?;
+    Ok(PromotedCandidateTarget {
+        origin,
+        selection,
+        target,
+    })
+}
+
+fn final_conversion_target(
+    app: &ShadeApp,
+    state: &ColorConversionUiState,
+) -> Result<ConversionTargetState, String> {
+    match state.promoted_target.as_ref() {
+        Some(promoted) => {
+            validate_promoted_candidate_selection(
+                app,
+                state,
+                &promoted.selection,
+                &promoted.target,
+            )?;
+            Ok(promoted.target.clone())
+        }
+        None => Ok(state.target.clone()),
+    }
+}
+
+fn validate_promoted_candidate_selection(
+    app: &ShadeApp,
+    state: &ColorConversionUiState,
+    selection: &CandidatePromotionSelection,
+    target: &ConversionTargetState,
+) -> Result<(), String> {
+    if selection.project_revision != app.project_revision {
+        return Err(
+            "Source project revision changed after the promoted Candidate was rendered. Re-render and promote again."
+                .to_owned(),
+        );
+    }
+    let runtime = app
+        .faces
+        .get(selection.face_index)
+        .ok_or_else(|| "Promoted Candidate Source Face no longer exists.".to_owned())?;
+    if source_path_key(&runtime.path) != source_path_key(&selection.source_path) {
+        return Err(
+            "Promoted Candidate Source path changed after rendering. Re-render and promote again."
+                .to_owned(),
+        );
+    }
+    let policy = state
+        .transparency_policies
+        .get(&selection.face_index)
+        .copied();
+    let inspection = inspect_conversion_face(app, selection.face_index, policy.as_ref());
+    let rebuilt = build_conversion_recipe(target, &inspection, policy)?;
+    let rebuilt_sha = recipe_sha256(&rebuilt)?;
+    if !rebuilt_sha.eq_ignore_ascii_case(selection.snapshot.recipe_sha256()) {
+        return Err(format!(
+            "Current Source ICC/transparency no longer reconstructs promoted recipe {} (now {}).",
+            short_hash(selection.snapshot.recipe_sha256()),
+            short_hash(&rebuilt_sha),
+        ));
+    }
+    Ok(())
+}
+
+fn target_from_candidate_recipe(
+    recipe: &ConversionRecipe,
+    app: &ShadeApp,
+    selection: &CandidatePromotionSelection,
+) -> Result<ConversionTargetState, String> {
+    recipe.validate().map_err(|errors| errors.join(" "))?;
+    let runtime = app
+        .faces
+        .get(selection.face_index)
+        .ok_or_else(|| "Promoted Candidate Source Face no longer exists.".to_owned())?;
+    if source_path_key(&runtime.path) != source_path_key(&selection.source_path) {
+        return Err("Promoted Candidate Source path no longer matches the rendered Face.".to_owned());
+    }
+    let source_model = runtime.preview.color_model();
+    let (path, expected_identity) = match recipe.engine_mode {
+        ConversionEngineMode::Icc => (
+            recipe
+                .target
+                .output_profile_path
+                .as_deref()
+                .ok_or_else(|| "Promoted ICC Candidate has no target profile path.".to_owned())?,
+            recipe
+                .target
+                .output_profile_identity
+                .as_ref()
+                .ok_or_else(|| "Promoted ICC Candidate has no target profile identity.".to_owned())?,
+        ),
+        ConversionEngineMode::DeviceLink => (
+            recipe
+                .target
+                .device_link_path
+                .as_deref()
+                .ok_or_else(|| "Promoted DeviceLink Candidate has no profile path.".to_owned())?,
+            recipe
+                .target
+                .device_link_identity
+                .as_ref()
+                .ok_or_else(|| "Promoted DeviceLink Candidate has no profile identity.".to_owned())?,
+        ),
+        ConversionEngineMode::CustomOptimizer => {
+            return Err(
+                "Custom Optimizer Candidate promotion is not enabled before measured production authorization."
+                    .to_owned(),
+            );
+        }
+    };
+    let verified = verify_production_target_profile(
+        Path::new(path),
+        expected_identity,
+        recipe.engine_mode,
+        conversion_color_model(source_model),
+    )?;
+    if verified.output_channel_count != recipe.target.channels.len() {
+        return Err(
+            "Promoted Candidate target topology no longer matches the verified external profile."
+                .to_owned(),
+        );
+    }
+    let channel_names = recipe
+        .target
+        .channels
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect::<Vec<_>>();
+    validate_target_channel_names(&channel_names, verified.output_channel_count)?;
+    Ok(ConversionTargetState {
+        engine_mode: recipe.engine_mode,
+        target_profile: Some(verified),
+        target_name: recipe.target.name.clone(),
+        channel_names,
+        channel_names_confirmed: true,
+        output_bit_depth: recipe.target.bit_depth,
+        rendering_intent: recipe.rendering_intent,
+        black_point_compensation: recipe.black_point_compensation,
+    })
+}
+
+fn source_path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 fn ensure_installed_profile_catalog(
@@ -1332,6 +1632,9 @@ mod tests {
             "All Faces",
             "Conversion presets",
             "Candidate Preview",
+            "Final production authority",
+            "Promote Candidate A to final",
+            "Promote current B to final",
             "Destination folder",
             "Queue Production Conversion",
             "sync_conversion_candidate",
@@ -1345,12 +1648,27 @@ mod tests {
     }
 
     #[test]
-    fn operator_state_contains_one_shared_target() {
+    fn operator_state_keeps_working_target_and_immutable_promoted_final_authority_separate() {
         let source = include_str!("color_conversion.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(runtime.contains("target: ConversionTargetState"));
+        assert!(runtime.contains("promoted_target: Option<PromotedCandidateTarget>"));
+        assert!(runtime.contains("final_conversion_target(self, &state)"));
+        assert!(runtime.contains("build_conversion_recipe(\n            &state.target"));
         assert!(runtime.contains("presets: ConversionPresetUiState"));
         assert!(!runtime.contains("CandidateConfig"));
         assert!(!runtime.contains("ConversionBatchUiConfig"));
+    }
+
+    #[test]
+    fn promoted_final_authority_is_exact_and_source_drift_fails_closed() {
+        let source = include_str!("color_conversion.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("selection.project_revision != app.project_revision"));
+        assert!(runtime.contains("source_path_key(&runtime.path)"));
+        assert!(runtime.contains("recipe_sha256(&rebuilt)"));
+        assert!(runtime.contains("selection.snapshot.recipe_sha256()"));
+        assert!(runtime.contains("verify_production_target_profile"));
+        assert!(runtime.contains("Custom Optimizer Candidate promotion is not enabled"));
     }
 }
