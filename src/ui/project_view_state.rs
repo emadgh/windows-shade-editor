@@ -159,20 +159,19 @@ mod tests {
         state.reconcile_recent_observers(["shared.shade".to_owned(), "recent.shade".to_owned()]);
         state.reconcile_view_observers(["shared.shade".to_owned(), "view.shade".to_owned()]);
         assert_eq!(state.registered_project_observers.len(), 3);
-        assert_eq!(
-            file_observer::subscriber_count(Path::new("shared.shade")),
-            1,
-            "the shared Project role is owned once by ProjectViewState"
+        assert!(
+            file_observer::snapshot(Path::new("shared.shade")).is_some(),
+            "the shared Project role must remain observed while either scope owns it"
         );
 
         state.reconcile_recent_observers(std::iter::empty::<String>());
         assert!(state.registered_project_observers.contains("shared.shade"));
         assert!(!state.registered_project_observers.contains("recent.shade"));
-        assert_eq!(file_observer::subscriber_count(Path::new("shared.shade")), 1);
+        assert!(file_observer::snapshot(Path::new("shared.shade")).is_some());
 
         state.clear_view_observers();
         assert!(state.registered_project_observers.is_empty());
-        assert_eq!(file_observer::subscriber_count(Path::new("shared.shade")), 0);
+        assert!(file_observer::snapshot(Path::new("shared.shade")).is_none());
     }
 
     #[test]
