@@ -39,11 +39,11 @@ impl Default for ProjectViewState {
 
 impl ProjectViewState {
     pub(crate) fn needs_preview_load(&self, path: &str) -> bool {
-        let observed = file_observer::observe(Path::new(path), ExternalFileRole::Project);
-        if observed.is_changed() {
+        if file_observer::rescan(Path::new(path)).is_some_and(|observed| observed.is_changed()) {
             // The caller immediately reloads inspection data when this returns true. Accept the
             // current filesystem fingerprint as that inspection attempt's baseline so a sticky
-            // change event cannot cause an endless reload loop.
+            // change event cannot cause an endless reload loop. Rescan deliberately does not
+            // create a Project subscription: ownership belongs to the reconciled UI scopes.
             file_observer::acknowledge(Path::new(path));
             return true;
         }
@@ -64,6 +64,20 @@ impl ProjectViewState {
     {
         self.view_observed_paths = paths.into_iter().collect();
         self.reconcile_project_observers();
+    }
+
+    /// Reconcile every Project path touched by this render frame before applying the
+    /// window-open lifecycle boundary. This matters on the exact frame the user closes
+    /// Project View: render-time `observe()` calls have already happened, so those paths
+    /// must first become owned before the View scope can release them deterministically.
+    pub(crate) fn finish_view_observer_frame<I>(&mut self, open: bool, paths: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.reconcile_view_observers(paths);
+        if !open {
+            self.clear_view_observers();
+        }
     }
 
     pub(crate) fn clear_view_observers(&mut self) {
@@ -124,6 +138,20 @@ impl Drop for ProjectViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PROJECT_PATH: AtomicU64 = AtomicU64::new(1);
+
+    fn unique_project_path(label: &str) -> String {
+        let id = NEXT_PROJECT_PATH.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "shade-project-view-{label}-{}-{id}.shade",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
 
     #[test]
     fn defaults_are_closed_and_unselected() {
@@ -145,12 +173,59 @@ mod tests {
     #[test]
     fn preview_load_is_only_needed_when_selection_changes_without_external_change() {
         let mut state = ProjectViewState::default();
-        assert!(state.needs_preview_load("a.shade"));
-        state.selected = Some("a.shade".to_owned());
-        assert!(!state.needs_preview_load("a.shade"));
-        assert!(state.needs_preview_load("b.shade"));
-        file_observer::release(Path::new("a.shade"), ExternalFileRole::Project);
-        file_observer::release(Path::new("b.shade"), ExternalFileRole::Project);
+        let a = unique_project_path("preview-a");
+        let b = unique_project_path("preview-b");
+        assert!(state.needs_preview_load(&a));
+        state.selected = Some(a.clone());
+        assert!(!state.needs_preview_load(&a));
+        assert!(state.needs_preview_load(&b));
+        assert!(file_observer::snapshot(Path::new(&a)).is_none());
+        assert!(file_observer::snapshot(Path::new(&b)).is_none());
+    }
+
+    #[test]
+    fn needs_preview_load_does_not_create_unowned_project_subscription() {
+        let state = ProjectViewState::default();
+        let path = unique_project_path("preview-unowned");
+        assert!(file_observer::snapshot(Path::new(&path)).is_none());
+        assert!(state.needs_preview_load(&path));
+        assert!(
+            file_observer::snapshot(Path::new(&path)).is_none(),
+            "preview reload checks must not create anonymous Project subscriptions"
+        );
+    }
+
+    #[test]
+    fn closing_frame_releases_project_first_observed_during_that_frame() {
+        let mut state = ProjectViewState::default();
+        let path = unique_project_path("close-frame");
+
+        // Simulate the direct render-time observation that occurs before egui reports
+        // that the window was closed in this same frame.
+        file_observer::observe(Path::new(&path), ExternalFileRole::Project);
+        assert!(file_observer::snapshot(Path::new(&path)).is_some());
+
+        state.finish_view_observer_frame(false, [path.clone()]);
+        assert!(
+            file_observer::snapshot(Path::new(&path)).is_none(),
+            "the closing frame must adopt and then release every View-only observation"
+        );
+    }
+
+    #[test]
+    fn closing_frame_preserves_path_still_owned_by_recent_projects() {
+        let mut state = ProjectViewState::default();
+        let path = unique_project_path("close-shared-recent");
+        state.reconcile_recent_observers([path.clone()]);
+
+        // The View renders the same path and then closes. The role is shared logically,
+        // so closing only the View scope must keep the Recent scope alive.
+        file_observer::observe(Path::new(&path), ExternalFileRole::Project);
+        state.finish_view_observer_frame(false, [path.clone()]);
+        assert!(file_observer::snapshot(Path::new(&path)).is_some());
+
+        state.reconcile_recent_observers(std::iter::empty::<String>());
+        assert!(file_observer::snapshot(Path::new(&path)).is_none());
     }
 
     #[test]
