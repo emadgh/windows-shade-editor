@@ -222,9 +222,10 @@ mod tests {
 
     #[test]
     fn frozen_promotion_does_not_match_a_different_source_state_or_recipe() {
-        let recipe = recipe(ConversionRenderingIntent::RelativeColorimetric);
-        let result = preview(&recipe, 0.4);
-        let frozen = CandidatePromotionSnapshot::from_preview("source-a", &recipe, &result).unwrap();
+        let baseline_recipe = recipe(ConversionRenderingIntent::RelativeColorimetric);
+        let result = preview(&baseline_recipe, 0.4);
+        let frozen = CandidatePromotionSnapshot::from_preview("source-a", &baseline_recipe, &result)
+            .unwrap();
         assert!(!frozen.matches_preview("source-b", &result).unwrap());
 
         let different = recipe(ConversionRenderingIntent::Perceptual);
