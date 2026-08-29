@@ -8,7 +8,12 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FileRenameInfoEx, SetFileInformationByHandle,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -141,14 +146,27 @@ pub(crate) fn accept_loaded_source_project(
     Ok(())
 }
 
-fn refresh_saved_source_project_baseline(path: &Path) -> Result<(), String> {
+/// Accept only the exact bytes staged by the successful Save. Re-reading the path and accepting
+/// whatever happens to be there would let an external writer race immediately after publication
+/// and accidentally become the new trusted baseline.
+fn accept_saved_source_project(
+    path: &Path,
+    committed: ActiveProjectBaselineCandidate,
+) -> Result<(), String> {
     let current = capture_project_fingerprint(path)?;
+    if !same_path(&committed.path, &current.path) || committed != current {
+        clear_active_source_project_baseline();
+        return Err(format!(
+            "Project was saved, but the file changed again outside Shade Editor before the saved bytes could be accepted. Local edits remain protected; reopen/inspect the project before saving again: {}",
+            path.display()
+        ));
+    }
     *active_project_baseline()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(current);
-    // Project View may also be observing this path. Since this write is app-owned,
-    // converge that optional UI observer to the same bytes rather than showing a
-    // false external-change warning after Save.
+    // Project View may also be observing this path. Since these exact bytes were app-owned and
+    // reverified, converge that optional UI observer rather than showing a false external-change
+    // warning after Save.
     let _ = file_observer::acknowledge(path);
     Ok(())
 }
@@ -166,9 +184,10 @@ fn expected_active_source_project_save_baseline(
         // accepted project owned this exact path, external deletion is a lost-update event and
         // Ctrl+S must fail closed rather than silently recreating the file. A different absent
         // path remains a legitimate new Save As / Quick Save destination.
-        if baseline.as_ref().is_some_and(|accepted| {
-            same_path(&accepted.path, &normalize_identity_path(path))
-        }) {
+        if baseline
+            .as_ref()
+            .is_some_and(|accepted| same_path(&accepted.path, &normalize_identity_path(path)))
+        {
             return Err(format!(
                 "Project file was deleted or moved outside Shade Editor. Use Save As with a new filename or reopen/relink the project before saving: {}",
                 path.display()
@@ -213,15 +232,46 @@ fn ensure_expected_project_baseline(
     Ok(())
 }
 
+fn stage_active_source_project(
+    project: &ShadeProject,
+    path: &Path,
+    resolved_face_paths: &[PathBuf],
+) -> Result<(PathBuf, ActiveProjectBaselineCandidate), String> {
+    let staged = crate::safe_fs::temp_path(path);
+    if staged.exists() {
+        std::fs::remove_file(&staged).map_err(|err| {
+            format!(
+                "Cannot remove stale project staging file {}: {err}",
+                staged.display()
+            )
+        })?;
+    }
+
+    if let Err(err) = project.save_new(&staged, resolved_face_paths) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(err);
+    }
+
+    let mut committed = match capture_project_fingerprint(&staged) {
+        Ok(candidate) => candidate,
+        Err(err) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(err);
+        }
+    };
+    committed.path = normalize_identity_path(path);
+    Ok((staged, committed))
+}
+
 #[cfg(windows)]
 fn open_existing_project_write_exclusion(path: &Path) -> Result<(PathBuf, File), String> {
     let normalized = normalize_existing_path(path);
     let file = OpenOptions::new()
         .read(true)
-        // Keep rename/delete sharing so Shade Editor can atomically replace the accepted file,
-        // but deliberately exclude FILE_SHARE_WRITE. Windows sharing checks are symmetric: an
-        // already-open writer prevents this guard from opening, and a new writer cannot open
-        // while this handle remains alive through the final MoveFileExW replacement.
+        // Keep rename/delete sharing so a POSIX-semantics rename can atomically publish our staged
+        // file, but deliberately exclude FILE_SHARE_WRITE. Windows sharing checks are symmetric:
+        // an already-open writer prevents this guard from opening, and a new writer cannot open
+        // this file object while the verified baseline remains guarded.
         .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
         .open(&normalized)
         .map_err(|err| {
@@ -233,41 +283,133 @@ fn open_existing_project_write_exclusion(path: &Path) -> Result<(PathBuf, File),
     Ok((normalized, file))
 }
 
+#[cfg(windows)]
+fn replace_staged_project_while_guarded(staged: &Path, destination: &Path) -> Result<(), String> {
+    // MoveFileExW cannot replace a destination while that destination remains open, even when the
+    // handle grants FILE_SHARE_DELETE. FileRenameInfoEx with POSIX semantics is the Windows 10+
+    // primitive specifically intended to replace a name while existing delete-sharing handles
+    // remain valid. The guard therefore stays live through the exact rename boundary.
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+    use std::os::windows::ffi::OsStrExt;
+
+    let destination = normalize_identity_path(destination);
+    let destination_name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let file_name_bytes = destination_name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| "Project destination path is too long to rename safely.".to_owned())?;
+    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let buffer_bytes = header_bytes
+        .checked_add(file_name_bytes)
+        .ok_or_else(|| "Project rename buffer size overflow.".to_owned())?;
+    let word_bytes = std::mem::size_of::<usize>();
+    let word_count = buffer_bytes.div_ceil(word_bytes);
+    let mut storage = vec![0usize; word_count];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+
+    unsafe {
+        (*info).Anonymous = FILE_RENAME_INFO_0 {
+            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        };
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = u32::try_from(file_name_bytes)
+            .map_err(|_| "Project destination path is too long to rename safely.".to_owned())?;
+        std::ptr::copy_nonoverlapping(
+            destination_name.as_ptr(),
+            (*info).FileName.as_mut_ptr(),
+            destination_name.len(),
+        );
+    }
+
+    let staged_file = OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(staged)
+        .map_err(|err| {
+            format!(
+                "Cannot open staged project for atomic publication {}: {err}",
+                staged.display()
+            )
+        })?;
+
+    let renamed = unsafe {
+        SetFileInformationByHandle(
+            staged_file.as_raw_handle() as _,
+            FileRenameInfoEx,
+            info.cast(),
+            u32::try_from(buffer_bytes)
+                .map_err(|_| "Project rename buffer is too large.".to_owned())?,
+        )
+    };
+    if renamed == 0 {
+        return Err(format!(
+            "Cannot atomically publish guarded .shade file {} from {}: {}",
+            destination.display(),
+            staged.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 fn persist_active_source_project(
     project: &ShadeProject,
     path: &Path,
     resolved_face_paths: &[PathBuf],
     expected: Option<ActiveProjectBaselineCandidate>,
-) -> Result<(), String> {
-    let Some(expected) = expected else {
+) -> Result<ActiveProjectBaselineCandidate, String> {
+    // Serialize once into a same-directory staged file, then identify those exact bytes. The
+    // returned candidate is the only identity that Save is allowed to accept after publication.
+    let (staged, committed) = stage_active_source_project(project, path, resolved_face_paths)?;
+
+    let publish_result = if let Some(expected) = expected {
+        #[cfg(windows)]
+        {
+            let result = (|| -> Result<(), String> {
+                let (normalized, mut guard) = open_existing_project_write_exclusion(path)?;
+                let current = capture_project_fingerprint_from_open_file(normalized, &mut guard)?;
+                ensure_expected_project_baseline(path, &expected, &current)?;
+
+                // Preserve the existing `.shade.bak` contract while the verified destination is
+                // still write-excluded. The backup therefore captures the same accepted bytes we
+                // just revalidated, never a later external write.
+                let backup = crate::safe_fs::backup_path(path);
+                crate::safe_fs::atomic_copy(path, &backup)?;
+
+                // Unlike MoveFileExW, FileRenameInfoEx + POSIX semantics can replace the visible
+                // name while `guard` remains open with FILE_SHARE_DELETE. This closes the final
+                // verify -> publication TOCTOU window without weakening writer exclusion.
+                replace_staged_project_while_guarded(&staged, path)?;
+                drop(guard);
+                Ok(())
+            })();
+            result
+        }
+
+        #[cfg(not(windows))]
+        {
+            let current = capture_project_fingerprint(path)?;
+            ensure_expected_project_baseline(path, &expected, &current)?;
+            let backup = crate::safe_fs::backup_path(path);
+            crate::safe_fs::atomic_copy(path, &backup)?;
+            crate::safe_fs::commit_staged_file(&staged, path)
+        }
+    } else {
         // This is intentionally no-replace publication. If another process creates the chosen
-        // Save As / Quick Save target after classification, atomic_write_if_absent fails closed.
-        return project.save_new(path, resolved_face_paths);
+        // Save As / Quick Save target after classification or while serialization is running,
+        // commit_staged_file_if_absent fails closed and preserves that external file.
+        crate::safe_fs::commit_staged_file_if_absent(&staged, path)
     };
 
-    #[cfg(windows)]
-    {
-        let (normalized, mut guard) = open_existing_project_write_exclusion(path)?;
-        let current = capture_project_fingerprint_from_open_file(normalized, &mut guard)?;
-        ensure_expected_project_baseline(path, &expected, &current)?;
-
-        // Keep `guard` alive for the entire serialization/staging/backup/replace sequence. Its
-        // share mode allows our atomic rename but prevents a concurrent writer from entering the
-        // final verified-baseline -> replacement boundary.
-        let result = project.save(path, resolved_face_paths);
-        drop(guard);
-        return result;
+    if let Err(err) = publish_result {
+        if staged.exists() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        return Err(err);
     }
-
-    #[cfg(not(windows))]
-    {
-        // Shade Editor ships on Windows. Keep non-Windows development/tests fail-closed against
-        // changes that happen after initial classification by revalidating immediately before the
-        // existing atomic replacement boundary.
-        let current = capture_project_fingerprint(path)?;
-        ensure_expected_project_baseline(path, &expected, &current)?;
-        project.save(path, resolved_face_paths)
-    }
+    Ok(committed)
 }
 
 /// Verify that an existing Source `.shade` file still exactly matches the bytes
@@ -288,8 +430,8 @@ pub fn save_active_source_project(
     resolved_face_paths: &[PathBuf],
 ) -> Result<(), String> {
     let expected = expected_active_source_project_save_baseline(path)?;
-    persist_active_source_project(project, path, resolved_face_paths, expected)?;
-    refresh_saved_source_project_baseline(path)
+    let committed = persist_active_source_project(project, path, resolved_face_paths, expected)?;
+    accept_saved_source_project(path, committed)
 }
 
 #[cfg(test)]
@@ -324,6 +466,7 @@ mod tests {
         let _ = fs::remove_file(path);
         let backup = path.with_extension("shade.bak");
         let _ = fs::remove_file(backup);
+        let _ = fs::remove_file(crate::safe_fs::temp_path(path));
         clear_active_source_project_baseline();
     }
 
@@ -391,7 +534,10 @@ mod tests {
         project.name = "must not recreate deleted active project".to_owned();
         let error = save_active_source_project(&project, &path, &[]).unwrap_err();
         assert!(error.contains("deleted or moved outside Shade Editor"), "{error}");
-        assert!(!path.exists(), "rejected Ctrl+S must not recreate the deleted project");
+        assert!(
+            !path.exists(),
+            "rejected Ctrl+S must not recreate the deleted project"
+        );
 
         cleanup(&path);
     }
@@ -458,7 +604,10 @@ mod tests {
         let mut project = ShadeProject::default();
         project.name = "local project".to_owned();
         let error = persist_active_source_project(&project, &path, &[], expected).unwrap_err();
-        assert!(error.contains("Cannot safely create new .shade file"), "{error}");
+        assert!(
+            error.contains("Cannot commit new destination"),
+            "unexpected error: {error}"
+        );
         assert_eq!(fs::read(&path).unwrap(), external_bytes);
 
         cleanup(&path);
@@ -481,6 +630,27 @@ mod tests {
         let error = persist_active_source_project(&project, &path, &[], expected).unwrap_err();
         assert!(error.contains("changed outside Shade Editor"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), external_bytes);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn bytes_changed_immediately_after_publication_are_not_accepted_as_saved_baseline() {
+        let _serial = serial_guard();
+        let path = temp_project_path("post-publication-race");
+        cleanup(&path);
+        let mut project = ShadeProject::default();
+        project.name = "committed local bytes".to_owned();
+        let expected = expected_active_source_project_save_baseline(&path).unwrap();
+        let committed = persist_active_source_project(&project, &path, &[], expected).unwrap();
+
+        let external_bytes = b"external writer changed the just-published project";
+        fs::write(&path, external_bytes).unwrap();
+        let error = accept_saved_source_project(&path, committed).unwrap_err();
+        assert!(error.contains("changed again outside Shade Editor"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), external_bytes);
+        let error = verify_active_source_project_save_baseline(&path).unwrap_err();
+        assert!(error.contains("no accepted baseline"), "{error}");
 
         cleanup(&path);
     }
@@ -520,6 +690,8 @@ mod tests {
         project.name = "second".to_owned();
         save_active_source_project(&project, &path, &[]).unwrap();
         assert!(verify_active_source_project_save_baseline(&path).is_ok());
+        let backup = ShadeProject::load(&crate::safe_fs::backup_path(&path)).unwrap();
+        assert_eq!(backup.name, "first");
 
         cleanup(&path);
     }
