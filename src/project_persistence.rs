@@ -1,7 +1,14 @@
 use std::fs::File;
-use std::io::Read;
+#[cfg(windows)]
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
 
 use sha2::{Digest, Sha256};
 
@@ -37,16 +44,19 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn capture_project_fingerprint(path: &Path) -> Result<ActiveProjectBaselineCandidate, String> {
-    let normalized = normalize_existing_path(path);
-    let metadata = std::fs::metadata(&normalized)
+fn capture_project_fingerprint_from_open_file(
+    normalized: PathBuf,
+    file: &mut File,
+) -> Result<ActiveProjectBaselineCandidate, String> {
+    let metadata = file
+        .metadata()
         .map_err(|err| format!("Cannot inspect project file {}: {err}", normalized.display()))?;
     if !metadata.is_file() {
         return Err(format!("Project path is not a file: {}", normalized.display()));
     }
 
-    let mut file = File::open(&normalized)
-        .map_err(|err| format!("Cannot open project file {}: {err}", normalized.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| format!("Cannot seek project file {}: {err}", normalized.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -64,6 +74,13 @@ fn capture_project_fingerprint(path: &Path) -> Result<ActiveProjectBaselineCandi
         size_bytes: metadata.len(),
         sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+fn capture_project_fingerprint(path: &Path) -> Result<ActiveProjectBaselineCandidate, String> {
+    let normalized = normalize_existing_path(path);
+    let mut file = File::open(&normalized)
+        .map_err(|err| format!("Cannot open project file {}: {err}", normalized.display()))?;
+    capture_project_fingerprint_from_open_file(normalized, &mut file)
 }
 
 /// Capture the exact `.shade` bytes about to be loaded. The caller must only accept
@@ -106,12 +123,14 @@ fn refresh_saved_source_project_baseline(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Verify that an existing Source `.shade` file still exactly matches the bytes
-/// accepted by the last successful Open or Save.
-pub fn verify_active_source_project_save_baseline(path: &Path) -> Result<(), String> {
+fn expected_active_source_project_save_baseline(
+    path: &Path,
+) -> Result<Option<ActiveProjectBaselineCandidate>, String> {
     if !path.exists() {
-        // A brand-new Save As target has no previous bytes to protect.
-        return Ok(());
+        // A brand-new Save As target has no previous bytes to protect. Publication must still
+        // use save_new()/no-replace semantics because another process can create the path after
+        // this classification but before the staged project is committed.
+        return Ok(None);
     }
 
     let current = capture_project_fingerprint(path)?;
@@ -137,7 +156,84 @@ pub fn verify_active_source_project_save_baseline(path: &Path) -> Result<(), Str
             path.display()
         ));
     }
+    Ok(Some(baseline))
+}
+
+fn ensure_expected_project_baseline(
+    path: &Path,
+    expected: &ActiveProjectBaselineCandidate,
+    current: &ActiveProjectBaselineCandidate,
+) -> Result<(), String> {
+    if !same_path(&expected.path, &current.path) || expected != current {
+        return Err(format!(
+            "Project changed outside Shade Editor before Save could be committed. Reload/inspect the external version or use Save As before overwriting: {}",
+            path.display()
+        ));
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_existing_project_write_exclusion(path: &Path) -> Result<(PathBuf, File), String> {
+    let normalized = normalize_existing_path(path);
+    let file = OpenOptions::new()
+        .read(true)
+        // Keep rename/delete sharing so Shade Editor can atomically replace the accepted file,
+        // but deliberately exclude FILE_SHARE_WRITE. Windows sharing checks are symmetric: an
+        // already-open writer prevents this guard from opening, and a new writer cannot open
+        // while this handle remains alive through the final MoveFileExW replacement.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(&normalized)
+        .map_err(|err| {
+            format!(
+                "Project overwrite blocked because the accepted file cannot be exclusively guarded against concurrent writers: {}: {err}",
+                path.display()
+            )
+        })?;
+    Ok((normalized, file))
+}
+
+fn persist_active_source_project(
+    project: &ShadeProject,
+    path: &Path,
+    resolved_face_paths: &[PathBuf],
+    expected: Option<ActiveProjectBaselineCandidate>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        // This is intentionally no-replace publication. If another process creates the chosen
+        // Save As / Quick Save target after classification, atomic_write_if_absent fails closed.
+        return project.save_new(path, resolved_face_paths);
+    };
+
+    #[cfg(windows)]
+    {
+        let (normalized, mut guard) = open_existing_project_write_exclusion(path)?;
+        let current = capture_project_fingerprint_from_open_file(normalized, &mut guard)?;
+        ensure_expected_project_baseline(path, &expected, &current)?;
+
+        // Keep `guard` alive for the entire serialization/staging/backup/replace sequence. Its
+        // share mode allows our atomic rename but prevents a concurrent writer from entering the
+        // final verified-baseline -> replacement boundary.
+        let result = project.save(path, resolved_face_paths);
+        drop(guard);
+        return result;
+    }
+
+    #[cfg(not(windows))]
+    {
+        // Shade Editor ships on Windows. Keep non-Windows development/tests fail-closed against
+        // changes that happen after initial classification by revalidating immediately before the
+        // existing atomic replacement boundary.
+        let current = capture_project_fingerprint(path)?;
+        ensure_expected_project_baseline(path, &expected, &current)?;
+        project.save(path, resolved_face_paths)
+    }
+}
+
+/// Verify that an existing Source `.shade` file still exactly matches the bytes
+/// accepted by the last successful Open or Save.
+pub fn verify_active_source_project_save_baseline(path: &Path) -> Result<(), String> {
+    expected_active_source_project_save_baseline(path).map(|_| ())
 }
 
 /// The only write boundary for the currently opened Source `.shade` project.
@@ -151,8 +247,8 @@ pub fn save_active_source_project(
     path: &Path,
     resolved_face_paths: &[PathBuf],
 ) -> Result<(), String> {
-    verify_active_source_project_save_baseline(path)?;
-    project.save(path, resolved_face_paths)?;
+    let expected = expected_active_source_project_save_baseline(path)?;
+    persist_active_source_project(project, path, resolved_face_paths, expected)?;
     refresh_saved_source_project_baseline(path)
 }
 
@@ -160,6 +256,10 @@ pub fn save_active_source_project(
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(windows)]
+    use std::fs::OpenOptions;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::MutexGuard;
 
@@ -267,6 +367,68 @@ mod tests {
         let path = temp_project_path("save-as-new");
         cleanup(&path);
         assert!(verify_active_source_project_save_baseline(&path).is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn target_created_after_new_save_classification_is_preserved_at_publication() {
+        let _serial = serial_guard();
+        let path = temp_project_path("new-target-race");
+        cleanup(&path);
+        let expected = expected_active_source_project_save_baseline(&path).unwrap();
+        assert!(expected.is_none());
+
+        let external_bytes = b"created by another process after Save As classification";
+        fs::write(&path, external_bytes).unwrap();
+        let mut project = ShadeProject::default();
+        project.name = "local project".to_owned();
+        let error = persist_active_source_project(&project, &path, &[], expected).unwrap_err();
+        assert!(error.contains("Cannot safely create new .shade file"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), external_bytes);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn accepted_target_changed_after_initial_classification_is_preserved_at_publication() {
+        let _serial = serial_guard();
+        let path = temp_project_path("existing-target-race");
+        cleanup(&path);
+        fs::write(&path, b"accepted bytes").unwrap();
+        accept_existing(&path);
+        let expected = expected_active_source_project_save_baseline(&path).unwrap();
+        assert!(expected.is_some());
+
+        let external_bytes = b"external bytes written after initial save classification";
+        fs::write(&path, external_bytes).unwrap();
+        let mut project = ShadeProject::default();
+        project.name = "local unsaved edit".to_owned();
+        let error = persist_active_source_project(&project, &path, &[], expected).unwrap_err();
+        assert!(error.contains("changed outside Shade Editor"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), external_bytes);
+
+        cleanup(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_target_guard_blocks_new_concurrent_writer() {
+        let _serial = serial_guard();
+        let path = temp_project_path("windows-write-exclusion");
+        cleanup(&path);
+        fs::write(&path, b"accepted bytes").unwrap();
+
+        let (_normalized, guard) = open_existing_project_write_exclusion(&path).unwrap();
+        let writer = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(&path);
+        assert!(
+            writer.is_err(),
+            "a writer must not enter while the final accepted-project guard is held"
+        );
+        drop(guard);
+
         cleanup(&path);
     }
 
