@@ -284,6 +284,38 @@ fn open_existing_project_write_exclusion(path: &Path) -> Result<(PathBuf, File),
 }
 
 #[cfg(windows)]
+fn windows_file_rename_destination_wide(destination: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC_PREFIX: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    let wide = normalize_identity_path(destination)
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
+    if let Some(rest) = wide.strip_prefix(VERBATIM_UNC_PREFIX) {
+        let mut dos_unc = Vec::with_capacity(rest.len() + 2);
+        dos_unc.extend_from_slice(&[b'\\' as u16, b'\\' as u16]);
+        dos_unc.extend_from_slice(rest);
+        dos_unc
+    } else if let Some(rest) = wide.strip_prefix(VERBATIM_PREFIX) {
+        rest.to_vec()
+    } else {
+        wide
+    }
+}
+
+#[cfg(windows)]
 fn replace_staged_project_while_guarded(staged: &Path, destination: &Path) -> Result<(), String> {
     // MoveFileExW cannot replace a destination while that destination remains open, even when the
     // handle grants FILE_SHARE_DELETE. FileRenameInfoEx with POSIX semantics is the Windows 10+
@@ -292,10 +324,7 @@ fn replace_staged_project_while_guarded(staged: &Path, destination: &Path) -> Re
     const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
     const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
 
-    use std::os::windows::ffi::OsStrExt;
-
-    let destination = normalize_identity_path(destination);
-    let destination_name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let destination_name = windows_file_rename_destination_wide(destination);
     let file_name_bytes = destination_name
         .len()
         .checked_mul(std::mem::size_of::<u16>())
@@ -653,6 +682,23 @@ mod tests {
         assert!(error.contains("no accepted baseline"), "{error}");
 
         cleanup(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_rename_info_uses_dos_or_unc_absolute_paths() {
+        use std::path::Path;
+
+        let drive = windows_file_rename_destination_wide(Path::new(r"\\?\C:\factory\project.shade"));
+        assert_eq!(String::from_utf16(&drive).unwrap(), r"C:\factory\project.shade");
+
+        let unc = windows_file_rename_destination_wide(Path::new(
+            r"\\?\UNC\server\share\project.shade",
+        ));
+        assert_eq!(
+            String::from_utf16(&unc).unwrap(),
+            r"\\server\share\project.shade"
+        );
     }
 
     #[cfg(windows)]
