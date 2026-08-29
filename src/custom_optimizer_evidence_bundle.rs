@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use crate::conversion_recipe::recipe_sha256;
@@ -152,6 +153,16 @@ impl CustomOptimizerEvidenceBundle {
         }
     }
 
+    /// Stable selection/cache identity for this exact serialized recipe/evidence
+    /// transport. This is deliberately not a production-authorization identity.
+    /// Execution must still reopen and independently authorize every artifact.
+    pub fn selection_sha256(&self) -> Result<String, String> {
+        self.validate().map_err(|errors| errors.join("\n"))?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| format!("Cannot serialize Custom Optimizer evidence bundle: {error}"))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
     pub fn to_pretty_json(&self) -> Result<String, String> {
         self.validate().map_err(|errors| errors.join("\n"))?;
         serde_json::to_string_pretty(self).map_err(|error| error.to_string())
@@ -254,5 +265,7 @@ mod tests {
         assert!(runtime.contains("recipe_sha256(&self.recipe)"));
         assert!(runtime.contains("self.recipe.source_profile_identity !="));
         assert!(runtime.contains("self.recipe.source_transparency_policy !="));
+        assert!(runtime.contains("pub fn selection_sha256(&self)"));
+        assert!(runtime.contains("Sha256::digest(bytes)"));
     }
 }
