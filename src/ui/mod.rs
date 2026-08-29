@@ -9,6 +9,7 @@ pub(crate) mod conversion_plan;
 pub(crate) mod conversion_presets;
 pub(crate) mod conversion_route_migration;
 pub(crate) mod curve_editor;
+pub(crate) mod custom_optimizer_plan_adapter;
 pub(crate) mod export_queue;
 pub(crate) mod faces;
 pub(crate) mod history_panel;
