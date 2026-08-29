@@ -7,6 +7,7 @@ use windows_shade_editor::color_conversion::{
     TargetChannelDefinition,
 };
 use windows_shade_editor::conversion_batch::ConversionBatchScope;
+use windows_shade_editor::conversion_job_authority::ConversionJobAuthority;
 use windows_shade_editor::conversion_output::{
     deterministic_converted_filename, validate_conversion_output_path,
 };
@@ -18,6 +19,7 @@ use windows_shade_editor::conversion_transaction::{CapturedOutputPolicy, Capture
 use windows_shade_editor::conversion_workflow::{
     ConversionSourceState, conversion_save_gate,
 };
+use windows_shade_editor::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;
 use windows_shade_editor::design_source::{
     DesignSourceColorModel, SourceImageFormat, TransparencyState,
 };
@@ -120,6 +122,7 @@ pub(crate) struct UnifiedConversionPlan {
     pub(crate) output_policy: CapturedOutputPolicy,
     pub(crate) output_paths: Vec<PathBuf>,
     pub(crate) recipes: Vec<ConversionRecipe>,
+    pub(crate) authorities: Vec<ConversionJobAuthority>,
 }
 
 pub(crate) fn scope_indices(
@@ -408,6 +411,37 @@ pub(crate) fn build_unified_plan(
     routes: &[ConversionRouteRecord],
     allow_production_work_discard: bool,
 ) -> Result<UnifiedConversionPlan, Vec<String>> {
+    let custom_optimizer_evidence = BTreeMap::new();
+    build_unified_plan_with_custom_optimizer_evidence(
+        app,
+        scope,
+        inspections,
+        transparency_policies,
+        &custom_optimizer_evidence,
+        target,
+        output_folder,
+        destination_mode,
+        selected_existing,
+        candidates,
+        routes,
+        allow_production_work_discard,
+    )
+}
+
+pub(crate) fn build_unified_plan_with_custom_optimizer_evidence(
+    app: &ShadeApp,
+    scope: ConversionBatchScope,
+    inspections: &[ConversionFaceInspection],
+    transparency_policies: &BTreeMap<usize, SourceTransparencyPolicy>,
+    custom_optimizer_evidence: &BTreeMap<usize, CapturedCustomOptimizerEvidence>,
+    target: &ConversionTargetState,
+    output_folder: &Path,
+    destination_mode: UnifiedDestinationMode,
+    selected_existing: Option<&Path>,
+    candidates: &[ProductionDestinationCandidate],
+    routes: &[ConversionRouteRecord],
+    allow_production_work_discard: bool,
+) -> Result<UnifiedConversionPlan, Vec<String>> {
     let mut errors = Vec::new();
     if inspections.is_empty() {
         return Err(vec!["Select at least one Source Face.".to_owned()]);
@@ -423,13 +457,27 @@ pub(crate) fn build_unified_plan(
     }
 
     let mut recipes = Vec::with_capacity(inspections.len());
+    let mut authorities = Vec::with_capacity(inspections.len());
     for inspection in inspections {
         match build_conversion_recipe(
             target,
             inspection,
             transparency_policies.get(&inspection.index).copied(),
         ) {
-            Ok(recipe) => recipes.push(recipe),
+            Ok(recipe) => {
+                let evidence = custom_optimizer_evidence.get(&inspection.index).cloned();
+                match ConversionJobAuthority::for_recipe(&recipe, evidence) {
+                    Ok(authority) => {
+                        recipes.push(recipe);
+                        authorities.push(authority);
+                    }
+                    Err(error) => errors.push(format!(
+                        "Face {} ('{}') final conversion authority: {error}",
+                        inspection.index + 1,
+                        inspection.label
+                    )),
+                }
+            }
             Err(error) => errors.push(format!(
                 "Face {} ('{}'): {error}",
                 inspection.index + 1,
@@ -437,7 +485,7 @@ pub(crate) fn build_unified_plan(
             )),
         }
     }
-    if recipes.len() != inspections.len() {
+    if recipes.len() != inspections.len() || authorities.len() != inspections.len() {
         return Err(errors);
     }
 
@@ -553,6 +601,7 @@ pub(crate) fn build_unified_plan(
         output_policy,
         output_paths,
         recipes,
+        authorities,
     })
 }
 
@@ -867,5 +916,15 @@ mod tests {
     fn target_display_color_is_shared_by_preview_and_recipe() {
         assert_eq!(target_channel_rgb("Cyan", 0), [0, 174, 239]);
         assert_eq!(target_channel_rgb("Black", 3), [28, 28, 28]);
+    }
+
+    #[test]
+    fn unified_plan_has_explicit_per_face_authority_sidecar() {
+        let source = include_str!("conversion_plan.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("authorities: Vec<ConversionJobAuthority>"));
+        assert!(runtime.contains("build_unified_plan_with_custom_optimizer_evidence"));
+        assert!(runtime.contains("custom_optimizer_evidence.get(&inspection.index).cloned()"));
+        assert!(runtime.contains("ConversionJobAuthority::for_recipe(&recipe, evidence)"));
     }
 }

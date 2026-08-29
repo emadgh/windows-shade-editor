@@ -10,9 +10,7 @@ use windows_shade_editor::conversion_batch_queue::{
     ConversionBatchQueue, ConversionBatchQueueCompletion, ConversionBatchQueueCompletionResult,
     ConversionBatchQueueItem, ConversionBatchQueueStatus,
 };
-use windows_shade_editor::conversion_job_authority::{
-    ConversionJobAuthority, capture_conversion_job_with_authority,
-};
+use windows_shade_editor::conversion_job_authority::capture_conversion_job_with_authority;
 use windows_shade_editor::conversion_preflight::{PreflightCode, PreflightSeverity};
 use windows_shade_editor::conversion_transaction::{
     CapturedSourceColorModel, CapturedSourceFormat, CapturedSourceRasterFacts,
@@ -226,7 +224,10 @@ impl ShadeApp {
         if inspections.iter().any(|inspection| !inspection.ready()) {
             return Err("Resolve blocking per-Face preflight findings before conversion.".to_owned());
         }
-        if plan.recipes.len() != inspections.len() || plan.output_paths.len() != inspections.len() {
+        if plan.recipes.len() != inspections.len()
+            || plan.authorities.len() != inspections.len()
+            || plan.output_paths.len() != inspections.len()
+        {
             return Err("Unified conversion plan Face cardinality changed before capture.".to_owned());
         }
         if let Some(parent) = plan.production_project_path.parent() {
@@ -255,9 +256,10 @@ impl ShadeApp {
         );
 
         let mut face_captures = Vec::with_capacity(inspections.len());
-        for ((inspection, recipe), output_path) in inspections
+        for (((inspection, recipe), authority), output_path) in inspections
             .iter()
             .zip(plan.recipes.iter())
+            .zip(plan.authorities.iter())
             .zip(plan.output_paths.iter())
         {
             let source_file_sha256 =
@@ -271,15 +273,8 @@ impl ShadeApp {
                     })?;
             let audit_findings = preflight_audit_findings(inspection);
             let source_raster = captured_source_raster_facts(inspection);
-            let authority = ConversionJobAuthority::for_recipe(recipe, None).map_err(|error| {
-                format!(
-                    "Face {} ('{}') final conversion authority failed: {error}",
-                    inspection.index + 1,
-                    inspection.label
-                )
-            })?;
             let capture = capture_conversion_job_with_authority(
-                authority,
+                authority.clone(),
                 &captured_project,
                 source_project_path.clone(),
                 source_project_sha_before.clone(),
@@ -645,7 +640,8 @@ mod tests {
         assert!(runtime.contains("ConversionBatchQueue::load_persistent"));
         assert!(runtime.contains("queue_unified_conversion_plan"));
         assert!(runtime.contains("capture_conversion_job_with_authority"));
-        assert!(runtime.contains("ConversionJobAuthority::for_recipe"));
+        assert!(runtime.contains("plan.authorities.iter()"));
+        assert!(!runtime.contains("ConversionJobAuthority::for_recipe(recipe, None)"));
         assert!(!runtime.contains("ConversionJobCapture::capture("));
         assert!(runtime.contains("with_source_raster_facts"));
         assert!(runtime.contains("with_audit_findings"));
