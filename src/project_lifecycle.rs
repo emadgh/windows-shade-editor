@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectTransition {
@@ -72,6 +72,7 @@ fn startup_project_argument() -> Option<PathBuf> {
 }
 
 fn prepare_transition_authority(transition: &ProjectTransition) {
+    #[cfg(not(test))]
     match transition {
         ProjectTransition::Open(path) => {
             // Failure is intentionally non-fatal for Open itself. Persistence records the failed
@@ -83,6 +84,12 @@ fn prepare_transition_authority(transition: &ProjectTransition) {
             crate::project_persistence::disarm_prepared_active_source_project_open();
         }
     }
+
+    // Persistence owns process-global authority state. Unit tests for this lifecycle controller run
+    // in parallel with persistence race tests, so keep this helper pure under cfg(test); the actual
+    // authority machinery is exercised directly by project_persistence's serialized tests.
+    #[cfg(test)]
+    let _ = transition;
 }
 
 impl Default for ProjectLifecycleController {
@@ -90,11 +97,11 @@ impl Default for ProjectLifecycleController {
         // Startup/double-click Open bypasses request() and calls open_project_path directly. Stage
         // its exact-byte evidence while the controller is constructed, before the background Open
         // worker can read the project. Normal in-app Open transitions are staged by request().
+        #[cfg(not(test))]
         if let Some(path) = startup_project_argument() {
             let _ = crate::project_persistence::prepare_active_source_project_open(&path);
-        } else {
-            crate::project_persistence::disarm_prepared_active_source_project_open();
         }
+
         Self {
             pending: None,
             after_save: None,
@@ -180,7 +187,9 @@ impl ProjectLifecycleController {
         // exact-byte baseline, then accepts a prepared Open candidate only if the file still has the
         // same SHA-256, path identity and filesystem generation captured before Open. New/Recovery
         // arrive with no prepared candidate and therefore remain deliberately unarmed.
+        #[cfg(not(test))]
         let _ = crate::project_persistence::rotate_active_source_project_session();
+
         self.session_id = self.session_id.wrapping_add(1).max(1);
         self.session_id
     }
@@ -199,6 +208,7 @@ pub fn requires_save_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn dirty_or_never_saved_face_project_is_protected() {
@@ -291,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_project_argument_only_accepts_shade_extension() {
+    fn startup_project_argument_only_accepts_shade_extension_shape() {
         assert!(Path::new("project.shade").extension().is_some());
         assert_eq!(
             Path::new("project.shade")
