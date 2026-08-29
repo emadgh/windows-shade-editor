@@ -302,7 +302,7 @@ impl ShadeApp {
                                         ui.selectable_value(
                                             &mut state.target.engine_mode,
                                             ConversionEngineMode::Icc,
-                                            "Standard Output ICC",
+                                            "Output ICC (CMYK / N-channel)",
                                         );
                                         ui.selectable_value(
                                             &mut state.target.engine_mode,
@@ -310,6 +310,15 @@ impl ShadeApp {
                                             "DeviceLink",
                                         );
                                     });
+                                ui.small(
+                                    "N-channel is an output topology, not a separate engine. Verified Output ICC and DeviceLink profiles can produce CMYK or multi-ink target planes.",
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Custom Optimizer is the measured strategy-capable N-ink path and remains unavailable until measured production authorization.",
+                                    )
+                                    .color(egui::Color32::YELLOW),
+                                );
                                 if previous_engine != state.target.engine_mode {
                                     state.target.clear_profile();
                                     state.clear_profile_catalog();
@@ -1564,7 +1573,7 @@ fn render_profile_consistency_warning(ui: &mut egui::Ui, inspections: &[Conversi
 
 fn engine_label(mode: ConversionEngineMode) -> &'static str {
     match mode {
-        ConversionEngineMode::Icc => "Standard Output ICC",
+        ConversionEngineMode::Icc => "Output ICC (CMYK / N-channel)",
         ConversionEngineMode::DeviceLink => "DeviceLink",
         ConversionEngineMode::CustomOptimizer => "Custom Optimizer",
     }
@@ -1627,6 +1636,9 @@ mod tests {
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         for required in [
             "Production Color Conversion",
+            "Output ICC (CMYK / N-channel)",
+            "N-channel is an output topology, not a separate engine",
+            "Custom Optimizer is the measured strategy-capable N-ink path",
             "Current Face",
             "Selected Faces",
             "All Faces",
