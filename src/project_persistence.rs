@@ -4,6 +4,8 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+#[cfg(not(windows))]
+use std::time::SystemTime;
 
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -11,8 +13,9 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FileRenameInfoEx, SetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_BASIC_INFO, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileRenameInfoEx,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, SetFileInformationByHandle,
 };
 
 use sha2::{Digest, Sha256};
@@ -27,19 +30,71 @@ pub(crate) struct ActiveProjectBaselineCandidate {
     sha256: String,
 }
 
+/// Evidence that the file object visible at Open-transition entry remained the same object and
+/// generation until the GUI accepted the loaded project session. SHA-256 proves the bytes; this
+/// generation token detects the otherwise-undetectable A -> B -> A race where the path ends with
+/// the original bytes after a different version was visible to the background Open worker.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenFileGeneration {
+    volume_serial_number: u32,
+    file_index: u64,
+    creation_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenFileGeneration {
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedOpenBaseline {
+    candidate: ActiveProjectBaselineCandidate,
+    generation: OpenFileGeneration,
+}
+
+#[derive(Clone, Debug)]
+struct OpenBaselineFailure {
+    path: PathBuf,
+    message: String,
+}
+
 static ACTIVE_PROJECT_BASELINE: OnceLock<Mutex<Option<ActiveProjectBaselineCandidate>>> =
     OnceLock::new();
+static PREPARED_OPEN_BASELINE: OnceLock<Mutex<Option<PreparedOpenBaseline>>> = OnceLock::new();
+static OPEN_BASELINE_FAILURE: OnceLock<Mutex<Option<OpenBaselineFailure>>> = OnceLock::new();
 
 fn active_project_baseline() -> &'static Mutex<Option<ActiveProjectBaselineCandidate>> {
     ACTIVE_PROJECT_BASELINE.get_or_init(|| Mutex::new(None))
 }
 
-/// Invalidate the accepted Source-project identity whenever the application changes project
-/// session (New/Open/Recovery). A successful Open or Save will establish a fresh exact-byte
-/// baseline afterwards. Keeping this explicit prevents a previous project's accepted path from
-/// authorizing an unrelated later Save As after the active project has changed.
+fn prepared_open_baseline() -> &'static Mutex<Option<PreparedOpenBaseline>> {
+    PREPARED_OPEN_BASELINE.get_or_init(|| Mutex::new(None))
+}
+
+fn open_baseline_failure() -> &'static Mutex<Option<OpenBaselineFailure>> {
+    OPEN_BASELINE_FAILURE.get_or_init(|| Mutex::new(None))
+}
+
+/// Invalidate only the accepted Source-project identity. Pending Open evidence has its own
+/// lifecycle because a successful Open calls the session bump before Project View/history work.
 pub(crate) fn clear_active_source_project_baseline() {
     *active_project_baseline()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// Disarm any not-yet-accepted Open evidence. New/Recovery/Exit use this so an earlier cancelled
+/// or failed Open can never authorize a later unrelated project session.
+pub(crate) fn disarm_prepared_active_source_project_open() {
+    *prepared_open_baseline()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    *open_baseline_failure()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
@@ -118,32 +173,162 @@ fn capture_project_fingerprint(path: &Path) -> Result<ActiveProjectBaselineCandi
     capture_project_fingerprint_from_open_file(normalized, &mut file)
 }
 
-/// Capture the exact `.shade` bytes about to be loaded. The caller must only accept
-/// this candidate after its project parse/validation succeeds.
-pub(crate) fn begin_active_source_project_load(
-    path: &Path,
-) -> Result<ActiveProjectBaselineCandidate, String> {
-    capture_project_fingerprint(path)
-}
-
-/// Accept a baseline only when the file still has the exact bytes captured before
-/// the successful load. This closes the load/fingerprint race without coupling the
-/// active project to Project View's observer subscription lifecycle.
-pub(crate) fn accept_loaded_source_project(
-    path: &Path,
-    candidate: ActiveProjectBaselineCandidate,
-) -> Result<(), String> {
-    let current = capture_project_fingerprint(path)?;
-    if !same_path(&candidate.path, &current.path) || candidate != current {
+#[cfg(windows)]
+fn capture_open_file_generation(file: &File, path: &Path) -> Result<OpenFileGeneration, String> {
+    let handle = file.as_raw_handle() as _;
+    let mut identity = BY_HANDLE_FILE_INFORMATION::default();
+    let identity_ok = unsafe { GetFileInformationByHandle(handle, &raw mut identity) };
+    if identity_ok == 0 {
         return Err(format!(
-            "Project changed while it was being loaded. Reopen it before editing or saving: {}",
-            path.display()
+            "Cannot identify project file generation {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
         ));
     }
-    *active_project_baseline()
+
+    let mut basic = FILE_BASIC_INFO::default();
+    let basic_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            std::ptr::addr_of_mut!(basic).cast(),
+            u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>())
+                .map_err(|_| "Project file generation buffer is too large.".to_owned())?,
+        )
+    };
+    if basic_ok == 0 {
+        return Err(format!(
+            "Cannot inspect project file generation {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(OpenFileGeneration {
+        volume_serial_number: identity.dwVolumeSerialNumber,
+        file_index: (u64::from(identity.nFileIndexHigh) << 32) | u64::from(identity.nFileIndexLow),
+        creation_time: basic.CreationTime,
+        last_write_time: basic.LastWriteTime,
+        change_time: basic.ChangeTime,
+    })
+}
+
+#[cfg(not(windows))]
+fn capture_open_file_generation(file: &File, path: &Path) -> Result<OpenFileGeneration, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("Cannot inspect project file generation {}: {err}", path.display()))?;
+    Ok(OpenFileGeneration {
+        created: metadata.created().ok(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn capture_prepared_open_baseline(path: &Path) -> Result<PreparedOpenBaseline, String> {
+    let normalized = normalize_existing_path(path);
+    let mut file = File::open(&normalized)
+        .map_err(|err| format!("Cannot open project file {}: {err}", normalized.display()))?;
+    let generation = capture_open_file_generation(&file, &normalized)?;
+    let candidate = capture_project_fingerprint_from_open_file(normalized, &mut file)?;
+    Ok(PreparedOpenBaseline {
+        candidate,
+        generation,
+    })
+}
+
+fn set_open_baseline_failure(path: PathBuf, message: String) {
+    *open_baseline_failure()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(current);
-    Ok(())
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(OpenBaselineFailure { path, message });
+}
+
+/// Capture immutable evidence before the Open worker reads the `.shade` project. Lifecycle owns
+/// this operation; Project View/history is deliberately excluded from this authority boundary.
+pub(crate) fn prepare_active_source_project_open(path: &Path) -> Result<(), String> {
+    match capture_prepared_open_baseline(path) {
+        Ok(prepared) => {
+            *prepared_open_baseline()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(prepared);
+            *open_baseline_failure()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            Ok(())
+        }
+        Err(err) => {
+            *prepared_open_baseline()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            set_open_baseline_failure(
+                normalize_identity_path(path),
+                format!(
+                    "Shade Editor could not establish exact-byte authority before opening this project. Same-path Save is blocked until the project is reopened or saved to a new filename: {err}"
+                ),
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Rotate project-session authority. New/Recovery call this with no prepared Open and therefore
+/// only disarm the previous baseline. A successful Open has a prepared candidate; it is accepted
+/// only if both exact bytes and the underlying file generation still match after the background
+/// Open/preview load completes.
+pub(crate) fn rotate_active_source_project_session() -> Result<(), String> {
+    clear_active_source_project_baseline();
+    let prepared = prepared_open_baseline()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+
+    let expected_path = prepared.candidate.path.clone();
+    match capture_prepared_open_baseline(&expected_path) {
+        Ok(current) if current == prepared => {
+            *active_project_baseline()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(current.candidate);
+            *open_baseline_failure()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            Ok(())
+        }
+        Ok(_) => {
+            let message = format!(
+                "Project changed while it was opening. The loaded editor state is not authorized to overwrite the current file; reopen it or use Save As: {}",
+                expected_path.display()
+            );
+            set_open_baseline_failure(expected_path, message.clone());
+            Err(message)
+        }
+        Err(err) => {
+            let message = format!(
+                "Project became unavailable while it was opening. The loaded editor state is not authorized to recreate or overwrite it; reopen it or use Save As: {} ({err})",
+                expected_path.display()
+            );
+            set_open_baseline_failure(expected_path, message.clone());
+            Err(message)
+        }
+    }
+}
+
+/// Legacy Project View hook retained until its cache code is simplified. Active project
+/// authority is lifecycle-owned now, so history/indexing is never allowed to mint a baseline.
+pub(crate) fn begin_active_source_project_load(
+    _path: &Path,
+) -> Result<ActiveProjectBaselineCandidate, String> {
+    Err("Active .shade Open baselines are lifecycle-owned; Project View/history cannot capture save authority.".to_owned())
+}
+
+/// Legacy Project View hook retained as a fail-closed compatibility shim. Only lifecycle Open and
+/// the explicit Save boundary can establish active same-path overwrite authority.
+pub(crate) fn accept_loaded_source_project(
+    _path: &Path,
+    _candidate: ActiveProjectBaselineCandidate,
+) -> Result<(), String> {
+    Err("Project View/history cannot establish active .shade save authority.".to_owned())
 }
 
 /// Accept only the exact bytes staged by the successful Save. Re-reading the path and accepting
@@ -164,11 +349,24 @@ fn accept_saved_source_project(
     *active_project_baseline()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(current);
+    *open_baseline_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     // Project View may also be observing this path. Since these exact bytes were app-owned and
     // reverified, converge that optional UI observer rather than showing a false external-change
     // warning after Save.
     let _ = file_observer::acknowledge(path);
     Ok(())
+}
+
+fn active_open_failure_for(path: &Path) -> Option<String> {
+    let identity = normalize_identity_path(path);
+    open_baseline_failure()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|failure| same_path(&failure.path, &identity))
+        .map(|failure| failure.message.clone())
 }
 
 fn expected_active_source_project_save_baseline(
@@ -178,8 +376,12 @@ fn expected_active_source_project_save_baseline(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let open_failure = active_open_failure_for(path);
 
     if !path.exists() {
+        if let Some(message) = open_failure {
+            return Err(message);
+        }
         // Missing is not automatically equivalent to a brand-new Save As target. If the active
         // accepted project owned this exact path, external deletion is a lost-update event and
         // Ctrl+S must fail closed rather than silently recreating the file. A different absent
@@ -198,6 +400,9 @@ fn expected_active_source_project_save_baseline(
 
     let current = capture_project_fingerprint(path)?;
     let Some(baseline) = baseline else {
+        if let Some(message) = open_failure {
+            return Err(message);
+        }
         return Err(format!(
             "Project overwrite blocked because Shade Editor has no accepted baseline for the existing file. Reopen/inspect it or use Save As with a new filename: {}",
             path.display()
@@ -396,7 +601,7 @@ fn persist_active_source_project(
     let publish_result = if let Some(expected) = expected {
         #[cfg(windows)]
         {
-            let result = (|| -> Result<(), String> {
+            (|| -> Result<(), String> {
                 let (normalized, mut guard) = open_existing_project_write_exclusion(path)?;
                 let current = capture_project_fingerprint_from_open_file(normalized, &mut guard)?;
                 ensure_expected_project_baseline(path, &expected, &current)?;
@@ -407,14 +612,13 @@ fn persist_active_source_project(
                 let backup = crate::safe_fs::backup_path(path);
                 crate::safe_fs::atomic_copy(path, &backup)?;
 
-                // Unlike MoveFileExW, FileRenameInfoEx + POSIX semantics can replace the visible
-                // name while `guard` remains open with FILE_SHARE_DELETE. This closes the final
-                // verify -> publication TOCTOU window without weakening writer exclusion.
+                // FileRenameInfoEx + POSIX semantics can replace the visible name while `guard`
+                // remains open with FILE_SHARE_DELETE. This closes the final verify -> publication
+                // TOCTOU window without weakening writer exclusion.
                 replace_staged_project_while_guarded(&staged, path)?;
                 drop(guard);
                 Ok(())
-            })();
-            result
+            })()
         }
 
         #[cfg(not(windows))]
@@ -442,7 +646,7 @@ fn persist_active_source_project(
 }
 
 /// Verify that an existing Source `.shade` file still exactly matches the bytes
-/// accepted by the last successful Open or Save.
+/// accepted by the last successful lifecycle Open or explicit Save.
 pub fn verify_active_source_project_save_baseline(path: &Path) -> Result<(), String> {
     expected_active_source_project_save_baseline(path).map(|_| ())
 }
@@ -471,8 +675,8 @@ mod tests {
     use std::fs::OpenOptions;
     #[cfg(windows)]
     use std::os::windows::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::MutexGuard;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
     static TEST_BASELINE_LOCK: Mutex<()> = Mutex::new(());
@@ -497,12 +701,12 @@ mod tests {
         let _ = fs::remove_file(backup);
         let _ = fs::remove_file(crate::safe_fs::temp_path(path));
         clear_active_source_project_baseline();
+        disarm_prepared_active_source_project_open();
     }
 
     fn accept_existing(path: &Path) {
-        let candidate = begin_active_source_project_load(path).unwrap();
-        let _ = fs::read(path).unwrap();
-        accept_loaded_source_project(path, candidate).unwrap();
+        prepare_active_source_project_open(path).unwrap();
+        rotate_active_source_project_session().unwrap();
     }
 
     #[test]
@@ -521,12 +725,14 @@ mod tests {
     }
 
     #[test]
-    fn accepted_baseline_allows_save_boundary() {
+    fn unchanged_lifecycle_open_accepts_exact_baseline() {
         let _serial = serial_guard();
-        let path = temp_project_path("accepted");
+        let path = temp_project_path("accepted-open");
         cleanup(&path);
         fs::write(&path, b"baseline").unwrap();
-        accept_existing(&path);
+        prepare_active_source_project_open(&path).unwrap();
+        let _loaded_bytes = fs::read(&path).unwrap();
+        rotate_active_source_project_session().unwrap();
         assert!(verify_active_source_project_save_baseline(&path).is_ok());
         cleanup(&path);
     }
@@ -572,15 +778,69 @@ mod tests {
     }
 
     #[test]
-    fn changed_during_load_is_not_accepted_as_the_active_baseline() {
+    fn changed_during_open_is_not_accepted_as_active_baseline() {
         let _serial = serial_guard();
-        let path = temp_project_path("load-race");
+        let path = temp_project_path("open-race");
         cleanup(&path);
         fs::write(&path, b"version a").unwrap();
-        let candidate = begin_active_source_project_load(&path).unwrap();
+        prepare_active_source_project_open(&path).unwrap();
+        let _loaded_a = fs::read(&path).unwrap();
         fs::write(&path, b"version b with different bytes").unwrap();
-        let error = accept_loaded_source_project(&path, candidate).unwrap_err();
-        assert!(error.contains("changed while it was being loaded"), "{error}");
+
+        let error = rotate_active_source_project_session().unwrap_err();
+        assert!(error.contains("changed while it was opening"), "{error}");
+        let save_error = verify_active_source_project_save_baseline(&path).unwrap_err();
+        assert!(save_error.contains("changed while it was opening"), "{save_error}");
+        cleanup(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_open_generation_detects_a_to_b_to_a_rewrite() {
+        let _serial = serial_guard();
+        let path = temp_project_path("open-generation-race");
+        cleanup(&path);
+        let a = b"version a exact bytes";
+        fs::write(&path, a).unwrap();
+        prepare_active_source_project_open(&path).unwrap();
+        let _loaded_a = fs::read(&path).unwrap();
+        fs::write(&path, b"temporary external version b").unwrap();
+        fs::write(&path, a).unwrap();
+
+        let error = rotate_active_source_project_session().unwrap_err();
+        assert!(error.contains("changed while it was opening"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), a);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn deletion_during_open_blocks_same_path_recreation() {
+        let _serial = serial_guard();
+        let path = temp_project_path("open-delete-race");
+        cleanup(&path);
+        fs::write(&path, b"version a").unwrap();
+        prepare_active_source_project_open(&path).unwrap();
+        let _loaded_a = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let error = rotate_active_source_project_session().unwrap_err();
+        assert!(error.contains("became unavailable while it was opening"), "{error}");
+
+        let project = ShadeProject::default();
+        let error = save_active_source_project(&project, &path, &[]).unwrap_err();
+        assert!(error.contains("not authorized to recreate"), "{error}");
+        assert!(!path.exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn project_view_history_hooks_cannot_arm_save_authority() {
+        let _serial = serial_guard();
+        let path = temp_project_path("history-no-authority");
+        cleanup(&path);
+        fs::write(&path, b"history bytes").unwrap();
+        assert!(begin_active_source_project_load(&path).is_err());
+        let error = verify_active_source_project_save_baseline(&path).unwrap_err();
+        assert!(error.contains("no accepted baseline"), "{error}");
         cleanup(&path);
     }
 
