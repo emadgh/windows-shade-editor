@@ -599,12 +599,8 @@ impl ShadeApp {
                 }
             });
 
-        if open {
-            self.project_view
-                .reconcile_view_observers(view_observer_paths.into_iter());
-        } else {
-            self.project_view.clear_view_observers();
-        }
+        self.project_view
+            .finish_view_observer_frame(open, view_observer_paths.into_iter());
         actions.push(ProjectViewUiAction::SetOpen(open));
         if let Some(path) = requested_select {
             actions.push(ProjectViewUiAction::Select(path));
