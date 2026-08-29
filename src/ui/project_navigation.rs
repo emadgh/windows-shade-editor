@@ -9,15 +9,15 @@ impl ShadeApp {
         let mut dismiss_error = false;
         let mut inspect_requested = false;
         let mut queue_requested = false;
-        let recent_projects = self
-            .previous_shades
-            .recent(8)
+        let recent_entries = self.previous_shades.recent(8);
+        self.project_view
+            .reconcile_recent_observers(recent_entries.iter().map(|entry| entry.path.clone()));
+        let recent_projects = recent_entries
             .into_iter()
             .map(|entry| {
-                let observed = file_observer::observe(
-                    Path::new(&entry.path),
-                    ExternalFileRole::Project,
-                );
+                let observed = file_observer::rescan(Path::new(&entry.path)).unwrap_or_else(|| {
+                    file_observer::observe(Path::new(&entry.path), ExternalFileRole::Project)
+                });
                 (
                     entry.display_name(),
                     entry.path.clone(),
@@ -135,6 +135,7 @@ impl ShadeApp {
 
     pub(crate) fn ui_previous_shades_window(&mut self, ctx: &egui::Context) {
         if !self.project_view.open {
+            self.project_view.clear_view_observers();
             return;
         }
         let mut actions = Vec::new();
@@ -145,6 +146,7 @@ impl ShadeApp {
         let mut requested_reveal: Option<String> = None;
         let mut requested_remove: Option<String> = None;
         let mut requested_relink: Option<String> = None;
+        let mut view_observer_paths = Vec::<String>::new();
 
         egui::Window::new("Project View")
             .open(&mut open)
@@ -253,6 +255,7 @@ impl ShadeApp {
                         .clone()
                         .or_else(|| self.project_view.selected.clone())
                         .filter(|path| {
+                            view_observer_paths.push(path.clone());
                             file_observer::observe(Path::new(path), ExternalFileRole::Project)
                                 .is_available()
                         });
@@ -263,6 +266,9 @@ impl ShadeApp {
                 let selected_path = requested_select
                     .clone()
                     .or_else(|| self.project_view.selected.clone());
+                if let Some(path) = selected_path.as_ref() {
+                    view_observer_paths.push(path.clone());
+                }
                 let selected_project_state = selected_path.as_deref().map(|path| {
                     file_observer::observe(Path::new(path), ExternalFileRole::Project)
                 });
@@ -519,6 +525,7 @@ impl ShadeApp {
                         .show_rows(ui, 88.0, indices.len(), |ui, range| {
                             for row in range {
                                 let entry = self.previous_shades.entries()[indices[row]].clone();
+                                view_observer_paths.push(entry.path.clone());
                                 self.ensure_previous_shade_list_texture(ctx, &entry);
                                 let display_name = entry.display_name();
                                 let observed = file_observer::observe(
@@ -592,6 +599,12 @@ impl ShadeApp {
                 }
             });
 
+        if open {
+            self.project_view
+                .reconcile_view_observers(view_observer_paths.into_iter());
+        } else {
+            self.project_view.clear_view_observers();
+        }
         actions.push(ProjectViewUiAction::SetOpen(open));
         if let Some(path) = requested_select {
             actions.push(ProjectViewUiAction::Select(path));
@@ -603,7 +616,6 @@ impl ShadeApp {
             actions.push(ProjectViewUiAction::Relink(path));
         }
         if let Some(path) = requested_remove {
-            file_observer::release(Path::new(&path), ExternalFileRole::Project);
             actions.push(ProjectViewUiAction::Remove(path));
         }
         if let Some(path) = requested_open {
