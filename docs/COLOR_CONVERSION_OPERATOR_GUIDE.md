@@ -63,9 +63,13 @@ Changing or clearing an explicit production Source ICC assignment marks the Sour
 
 ## 5. Production target engines
 
-### Standard Output ICC
+N-channel is an output topology, not a separate conversion engine mode. The active production engines are Output ICC, DeviceLink and the measured Custom Optimizer path. A verified ICC or DeviceLink can therefore produce CMYK or a supported multi-ink target topology without introducing a fourth `N-channel` engine authority.
+
+### Output ICC (CMYK / N-channel)
 
 Use an Output/printer ICC when the target profile itself defines the separation behavior.
+
+When a verified Output ICC exposes a supported 5–12 channel output space, Shade Editor uses the typed N-channel ICC transform and preserves the exact channel topology in the resulting TIFF/BigTIFF. The same ICC engine also handles normal CMYK targets.
 
 Applicable operator controls include target profile, output precision, rendering intent and Black Point Compensation where supported.
 
@@ -74,6 +78,8 @@ Black-generation or ink-priority controls are **not** applied on top of an Outpu
 ### DeviceLink
 
 Use a DeviceLink when the device-to-device transform and separation strategy are already encoded in the Link-class profile.
+
+A verified DeviceLink may likewise target a supported multi-channel output topology; the link itself owns the device-to-device separation semantics and exact output channel topology.
 
 Shade Editor verifies the DeviceLink identity and input/output topology. The exact DeviceLink identity is retained in provenance. A DeviceLink is not treated as an Output ICC characterization and is not embedded in the output TIFF as if it were one.
 
@@ -102,7 +108,7 @@ Shade Editor keeps two concepts separate:
 
 A compatible preset is not automatically applicable.
 
-For Standard ICC and DeviceLink, separation-strategy Apply/Save-current is intentionally unavailable when it would only change the recipe/provenance hash while leaving pixels unchanged.
+For Output ICC and DeviceLink, separation-strategy Apply/Save-current is intentionally unavailable when it would only change the recipe/provenance hash while leaving pixels unchanged.
 
 Built-in presets are immutable. User presets may be duplicated, renamed, deleted, imported and exported through the guarded preset lifecycle. Portable preset JSON contains definitions/identity hashes, not ICC/DeviceLink payload bytes or absolute profile paths.
 
@@ -186,7 +192,7 @@ The audit viewer is read-only. It consumes persisted evidence and does not rerun
 
 Do not compensate by multiplying Black after an ICC/DeviceLink conversion.
 
-For Standard ICC or DeviceLink, use a profile/link whose separation already has the required neutral construction. For Custom Optimizer, a Black-focused strategy may be used only after the measured target is production-authorized. Acceptance must prove that Black increases and competing chromatic ink decreases without violating approved color-error or laydown limits.
+For Output ICC or DeviceLink, use a profile/link whose separation already has the required neutral construction. For Custom Optimizer, a Black-focused strategy may be used only after the measured target is production-authorized. Acceptance must prove that Black increases and competing chromatic ink decreases without violating approved color-error or laydown limits.
 
 ### Avoid an unstable or expensive ink
 
