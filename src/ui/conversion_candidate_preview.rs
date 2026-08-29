@@ -271,9 +271,11 @@ impl ShadeApp {
                 ui.small(format!("A · recipe {}", short_hash(hash)));
                 match comparison.as_ref() {
                     Ok(Some(comparison)) => draw_candidate_comparison(ui, comparison),
-                    Ok(None) => ui.small(
-                        "Current Candidate B matches A. Change conversion recipe/preset to compare a distinct Candidate.",
-                    ),
+                    Ok(None) => {
+                        ui.small(
+                            "Current Candidate B matches A. Change conversion recipe/preset to compare a distinct Candidate.",
+                        );
+                    }
                     Err(error) => {
                         ui.label(egui::RichText::new(error).color(egui::Color32::YELLOW));
                     }
