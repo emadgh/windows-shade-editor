@@ -119,3 +119,30 @@ pub mod tiff_output;
 #[path = "tiff_io_impl.rs"]
 pub mod tiff_io;
 pub mod tiff_io_inspection;
+
+#[cfg(test)]
+pub(crate) mod color_conversion_test_support;
+#[cfg(test)]
+mod conversion_capture_compat_tests;
+#[cfg(test)]
+mod custom_optimizer_evidence_tests;
+#[cfg(test)]
+mod inverse_lut_artifact_tests;
+#[cfg(test)]
+mod inverse_lut_build_tests;
+#[cfg(test)]
+mod inverse_lut_continuity_field_tests;
+#[cfg(test)]
+mod inverse_lut_continuity_path_validation_tests;
+#[cfg(test)]
+mod inverse_lut_continuity_sensitivity_tests;
+#[cfg(test)]
+mod inverse_lut_production_eligibility_tests;
+#[cfg(test)]
+mod inverse_lut_runtime_tests;
+#[cfg(test)]
+mod inverse_lut_validation_tests;
+#[cfg(test)]
+mod test_stack_tests;
+#[cfg(test)]
+mod tiff_conformance_tests;
