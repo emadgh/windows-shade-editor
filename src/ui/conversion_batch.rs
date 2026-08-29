@@ -10,10 +10,12 @@ use windows_shade_editor::conversion_batch_queue::{
     ConversionBatchQueue, ConversionBatchQueueCompletion, ConversionBatchQueueCompletionResult,
     ConversionBatchQueueItem, ConversionBatchQueueStatus,
 };
+use windows_shade_editor::conversion_job_authority::{
+    ConversionJobAuthority, capture_conversion_job_with_authority,
+};
 use windows_shade_editor::conversion_preflight::{PreflightCode, PreflightSeverity};
 use windows_shade_editor::conversion_transaction::{
     CapturedSourceColorModel, CapturedSourceFormat, CapturedSourceRasterFacts,
-    ConversionJobCapture,
 };
 use windows_shade_editor::design_source::SourceImageFormat;
 
@@ -269,7 +271,15 @@ impl ShadeApp {
                     })?;
             let audit_findings = preflight_audit_findings(inspection);
             let source_raster = captured_source_raster_facts(inspection);
-            let capture = ConversionJobCapture::capture(
+            let authority = ConversionJobAuthority::for_recipe(recipe, None).map_err(|error| {
+                format!(
+                    "Face {} ('{}') final conversion authority failed: {error}",
+                    inspection.index + 1,
+                    inspection.label
+                )
+            })?;
+            let capture = capture_conversion_job_with_authority(
+                authority,
                 &captured_project,
                 source_project_path.clone(),
                 source_project_sha_before.clone(),
@@ -634,6 +644,9 @@ mod tests {
         assert!(runtime.contains("ConversionBatchCapture::capture"));
         assert!(runtime.contains("ConversionBatchQueue::load_persistent"));
         assert!(runtime.contains("queue_unified_conversion_plan"));
+        assert!(runtime.contains("capture_conversion_job_with_authority"));
+        assert!(runtime.contains("ConversionJobAuthority::for_recipe"));
+        assert!(!runtime.contains("ConversionJobCapture::capture("));
         assert!(runtime.contains("with_source_raster_facts"));
         assert!(runtime.contains("with_audit_findings"));
     }
