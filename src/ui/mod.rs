@@ -5,6 +5,7 @@ pub(crate) mod color_conversion;
 pub(crate) mod conversion_audit;
 pub(crate) mod conversion_batch;
 pub(crate) mod conversion_candidate_preview;
+pub(crate) mod custom_optimizer_plan_adapter;
 pub(crate) mod conversion_plan;
 pub(crate) mod conversion_presets;
 pub(crate) mod conversion_route_migration;
