@@ -102,6 +102,10 @@ pub struct CandidateComparison {
     pub p95_total_ink: f32,
     pub p99_total_ink: f32,
     pub peak_total_ink: f32,
+    /// Candidate B minus baseline A in deterministic relative ink units across
+    /// every target channel. This is image-integrated normalized coverage, not
+    /// printer/RIP volume, mass, drops, or monetary cost.
+    pub integrated_total_coverage: f64,
     /// Candidate B minus baseline A in percentage points when both recipes
     /// expose a comparable configured total-ink limit.
     pub total_ink_limit_hit_percent: Option<f32>,
@@ -169,6 +173,10 @@ pub fn compare_candidate_snapshots(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let integrated_total_coverage = channels
+        .iter()
+        .map(|channel| channel.integrated_coverage)
+        .sum();
 
     Ok(CandidateComparison {
         source_state_id: baseline.source_state_id.clone(),
@@ -180,6 +188,7 @@ pub fn compare_candidate_snapshots(
         p99_total_ink: candidate.usage.total_ink_percentiles.p99
             - baseline.usage.total_ink_percentiles.p99,
         peak_total_ink: candidate.usage.peak_total_ink - baseline.usage.peak_total_ink,
+        integrated_total_coverage,
         total_ink_limit_hit_percent: option_delta(
             baseline.usage.total_ink_limit_hit_percent,
             candidate.usage.total_ink_limit_hit_percent,
@@ -267,6 +276,15 @@ mod tests {
         let comparison = compare_candidate_snapshots(&a, &b).unwrap();
         assert!((comparison.mean_total_ink - 0.15).abs() < 1e-6);
         assert!((comparison.channels[0].mean_coverage - 0.10).abs() < 1e-6);
+        assert!((comparison.integrated_total_coverage - 0.20).abs() < 1e-6);
+        assert_eq!(
+            comparison.integrated_total_coverage,
+            comparison
+                .channels
+                .iter()
+                .map(|channel| channel.integrated_coverage)
+                .sum::<f64>()
+        );
         assert_eq!(comparison.neutral_black_share, None);
 
         let source = include_str!("conversion_candidate_comparison.rs");
