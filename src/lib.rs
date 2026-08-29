@@ -38,6 +38,7 @@ pub mod conversion_workflow;
 #[path = "custom_optimizer_config_impl.rs"]
 pub mod custom_optimizer_config;
 pub mod custom_optimizer_evidence;
+pub mod custom_optimizer_evidence_binding;
 pub mod custom_optimizer_evidence_bundle;
 pub mod custom_optimizer_operator_binding;
 pub mod custom_optimizer_operator_controls;
