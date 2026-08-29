@@ -43,6 +43,26 @@ fn normalize_existing_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Produce a stable identity path even when the final file is currently missing. Canonicalizing
+/// the parent keeps an active baseline comparable after external deletion while still resolving
+/// normal existing files through the filesystem first.
+fn normalize_identity_path(path: &Path) -> PathBuf {
+    if let Ok(normalized) = std::fs::canonicalize(path) {
+        return normalized;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if let (Ok(parent), Some(name)) = (std::fs::canonicalize(parent), path.file_name()) {
+        return parent.join(name);
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -136,18 +156,28 @@ fn refresh_saved_source_project_baseline(path: &Path) -> Result<(), String> {
 fn expected_active_source_project_save_baseline(
     path: &Path,
 ) -> Result<Option<ActiveProjectBaselineCandidate>, String> {
-    if !path.exists() {
-        // A brand-new Save As target has no previous bytes to protect. Publication must still
-        // use save_new()/no-replace semantics because another process can create the path after
-        // this classification but before the staged project is committed.
-        return Ok(None);
-    }
-
-    let current = capture_project_fingerprint(path)?;
     let baseline = active_project_baseline()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+
+    if !path.exists() {
+        // Missing is not automatically equivalent to a brand-new Save As target. If the active
+        // accepted project owned this exact path, external deletion is a lost-update event and
+        // Ctrl+S must fail closed rather than silently recreating the file. A different absent
+        // path remains a legitimate new Save As / Quick Save destination.
+        if baseline.as_ref().is_some_and(|accepted| {
+            same_path(&accepted.path, &normalize_identity_path(path))
+        }) {
+            return Err(format!(
+                "Project file was deleted or moved outside Shade Editor. Use Save As with a new filename or reopen/relink the project before saving: {}",
+                path.display()
+            ));
+        }
+        return Ok(None);
+    }
+
+    let current = capture_project_fingerprint(path)?;
     let Some(baseline) = baseline else {
         return Err(format!(
             "Project overwrite blocked because Shade Editor has no accepted baseline for the existing file. Reopen/inspect it or use Save As with a new filename: {}",
@@ -341,6 +371,27 @@ mod tests {
         clear_active_source_project_baseline();
         let error = verify_active_source_project_save_baseline(&path).unwrap_err();
         assert!(error.contains("no accepted baseline"), "{error}");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn deleted_active_project_is_not_reclassified_as_a_new_save_target() {
+        let _serial = serial_guard();
+        let path = temp_project_path("deleted-active");
+        cleanup(&path);
+        fs::write(&path, b"accepted active project").unwrap();
+        accept_existing(&path);
+        fs::remove_file(&path).unwrap();
+
+        let error = verify_active_source_project_save_baseline(&path).unwrap_err();
+        assert!(error.contains("deleted or moved outside Shade Editor"), "{error}");
+
+        let mut project = ShadeProject::default();
+        project.name = "must not recreate deleted active project".to_owned();
+        let error = save_active_source_project(&project, &path, &[]).unwrap_err();
+        assert!(error.contains("deleted or moved outside Shade Editor"), "{error}");
+        assert!(!path.exists(), "rejected Ctrl+S must not recreate the deleted project");
 
         cleanup(&path);
     }
