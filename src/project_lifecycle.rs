@@ -124,6 +124,10 @@ impl ProjectLifecycleController {
     }
 
     pub fn bump_session(&mut self) -> u64 {
+        // New/Open/Recovery change the active project identity. Disarm any exact-byte baseline
+        // accepted by the previous session before the new session can issue Save/Save As. A
+        // successful Open or Save establishes a fresh baseline afterwards.
+        crate::project_persistence::clear_active_source_project_baseline();
         self.session_id = self.session_id.wrapping_add(1).max(1);
         self.session_id
     }
