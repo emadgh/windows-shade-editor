@@ -9,6 +9,7 @@ pub mod conversion_batch;
 pub mod conversion_batch_execution;
 pub mod conversion_batch_queue;
 pub mod conversion_candidate_comparison;
+pub mod conversion_candidate_promotion;
 #[path = "conversion_candidate_preview_runtime.rs"]
 pub mod conversion_candidate_preview;
 pub mod conversion_capabilities;
