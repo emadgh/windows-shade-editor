@@ -12,6 +12,7 @@ use windows_shade_editor::conversion_candidate_comparison::{
 use windows_shade_editor::conversion_candidate_preview::{
     CandidatePreviewInput, CandidatePreviewResult, render_candidate_preview,
 };
+use windows_shade_editor::conversion_candidate_promotion::CandidatePromotionSnapshot;
 use windows_shade_editor::conversion_recipe::recipe_sha256;
 use windows_shade_editor::conversion_transaction::{
     CapturedSourceProfile, ConversionCancellation,
@@ -25,6 +26,8 @@ const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(220);
 struct PendingCandidate {
     key: String,
     source_state_id: String,
+    source_path: PathBuf,
+    recipe: ConversionRecipe,
     generation: u64,
     cancellation: ConversionCancellation,
     rx: mpsc::Receiver<Result<CandidatePreviewResult, String>>,
@@ -33,6 +36,8 @@ struct PendingCandidate {
 struct ActiveCandidate {
     key: String,
     source_state_id: String,
+    source_path: PathBuf,
+    recipe: ConversionRecipe,
     face_index: usize,
     project_revision: u64,
     result: CandidatePreviewResult,
@@ -47,7 +52,7 @@ pub(crate) struct CandidatePreviewController {
     generation: u64,
     pending: Option<PendingCandidate>,
     active: Option<ActiveCandidate>,
-    pinned: Option<CandidateComparisonSnapshot>,
+    pinned: Option<CandidatePromotionSnapshot>,
     error: Option<String>,
     show_converted: bool,
 }
@@ -85,8 +90,17 @@ pub(crate) struct CandidateStatusSnapshot {
     pub(crate) pending: bool,
     pub(crate) show_converted: bool,
     pub(crate) recipe_sha256: Option<String>,
+    pub(crate) pinned_recipe_sha256: Option<String>,
     pub(crate) channel_count: usize,
     pub(crate) error: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CandidatePromotionSelection {
+    pub(crate) snapshot: CandidatePromotionSnapshot,
+    pub(crate) face_index: usize,
+    pub(crate) project_revision: u64,
+    pub(crate) source_path: PathBuf,
 }
 
 impl ShadeApp {
@@ -127,7 +141,7 @@ impl ShadeApp {
             .conversion_candidate
             .pinned
             .as_ref()
-            .is_some_and(|pinned| pinned.source_state_id != source_state_id)
+            .is_some_and(|pinned| pinned.source_state_id() != source_state_id)
         {
             self.conversion_candidate.pinned = None;
         }
@@ -186,6 +200,11 @@ impl ShadeApp {
             pending: self.conversion_candidate.pending.is_some(),
             show_converted: self.conversion_candidate.show_converted,
             recipe_sha256: active.map(|active| active.result.recipe_sha256.clone()),
+            pinned_recipe_sha256: self
+                .conversion_candidate
+                .pinned
+                .as_ref()
+                .map(|pinned| pinned.recipe_sha256().to_owned()),
             channel_count: active.map(|active| active.result.channel_count()).unwrap_or(0),
             error: self.conversion_candidate.error.clone(),
         }
@@ -204,6 +223,65 @@ impl ShadeApp {
                     && active.project_revision == self.project_revision
                     && active.result.recipe_sha256 == expected
             })
+    }
+
+    pub(crate) fn conversion_candidate_a_promotion_selection(
+        &self,
+    ) -> Result<CandidatePromotionSelection, String> {
+        let pinned = self
+            .conversion_candidate
+            .pinned
+            .as_ref()
+            .ok_or_else(|| "Pin a Candidate as A before promoting A to final production.".to_owned())?;
+        let active = self
+            .conversion_candidate
+            .active
+            .as_ref()
+            .filter(|active| {
+                active.face_index == self.current_face
+                    && active.project_revision == self.project_revision
+            })
+            .ok_or_else(|| {
+                "A current Production Candidate is required to revalidate Candidate A Source state."
+                    .to_owned()
+            })?;
+        if pinned.source_state_id() != active.source_state_id {
+            return Err(
+                "Candidate A no longer belongs to the current exact Source state; pin A again."
+                    .to_owned(),
+            );
+        }
+        Ok(CandidatePromotionSelection {
+            snapshot: pinned.clone(),
+            face_index: active.face_index,
+            project_revision: active.project_revision,
+            source_path: active.source_path.clone(),
+        })
+    }
+
+    pub(crate) fn conversion_candidate_b_promotion_selection(
+        &self,
+    ) -> Result<CandidatePromotionSelection, String> {
+        let active = self
+            .conversion_candidate
+            .active
+            .as_ref()
+            .filter(|active| {
+                active.face_index == self.current_face
+                    && active.project_revision == self.project_revision
+            })
+            .ok_or_else(|| "No current Production Candidate B is ready to promote.".to_owned())?;
+        let snapshot = CandidatePromotionSnapshot::from_preview(
+            active.source_state_id.clone(),
+            &active.recipe,
+            &active.result,
+        )?;
+        Ok(CandidatePromotionSelection {
+            snapshot,
+            face_index: active.face_index,
+            project_revision: active.project_revision,
+            source_path: active.source_path.clone(),
+        })
     }
 
     /// Replace the ordinary Source channel/histogram panel while the converted candidate is
@@ -232,7 +310,7 @@ impl ShadeApp {
             .conversion_candidate
             .pinned
             .as_ref()
-            .map(|pinned| pinned.recipe_sha256.clone());
+            .map(|pinned| pinned.recipe_sha256().to_owned());
         let comparison = self.current_candidate_comparison();
         let mut requested_solo: Option<Option<usize>> = None;
         let mut pin_current = false;
@@ -257,7 +335,7 @@ impl ShadeApp {
                         "Pin current as A"
                     })
                     .on_hover_text(
-                        "Pins only bounded Candidate analytics and identities. Candidate raster planes are not duplicated.",
+                        "Pins the exact rendered recipe plus bounded Candidate analytics/identity. Candidate raster planes are not duplicated.",
                     )
                     .clicked()
                 {
@@ -390,11 +468,12 @@ impl ShadeApp {
                     && active.project_revision == self.project_revision
             })
             .ok_or_else(|| "No current Production Candidate is ready to pin as A.".to_owned())?;
-        let snapshot = CandidateComparisonSnapshot::from_preview(
+        let snapshot = CandidatePromotionSnapshot::from_preview(
             active.source_state_id.clone(),
+            &active.recipe,
             &active.result,
         )?;
-        let recipe_sha256 = snapshot.recipe_sha256.clone();
+        let recipe_sha256 = snapshot.recipe_sha256().to_owned();
         self.conversion_candidate.pinned = Some(snapshot);
         Ok(recipe_sha256)
     }
@@ -416,10 +495,10 @@ impl ShadeApp {
             active.source_state_id.clone(),
             &active.result,
         )?;
-        if baseline.recipe_sha256 == candidate.recipe_sha256 {
+        if baseline.recipe_sha256() == candidate.recipe_sha256 {
             return Ok(None);
         }
-        compare_candidate_snapshots(baseline, &candidate).map(Some)
+        compare_candidate_snapshots(baseline.comparison(), &candidate).map(Some)
     }
 
     fn observe_candidate(
@@ -498,6 +577,8 @@ impl ShadeApp {
             self.project_revision,
             &source.source_path,
         );
+        let source_path = source.source_path.clone();
+        let rendered_recipe = recipe.clone();
         let adjusted_planes = match self.faces.get(source.face_index) {
             Some(face) => render::adjusted_planes(face.preview.as_ref(), &self.project),
             None => {
@@ -527,6 +608,8 @@ impl ShadeApp {
         self.conversion_candidate.pending = Some(PendingCandidate {
             key,
             source_state_id,
+            source_path,
+            recipe: rendered_recipe,
             generation,
             cancellation,
             rx,
@@ -570,7 +653,14 @@ impl ShadeApp {
         enum PollResult {
             Empty,
             Disconnected,
-            Ready(String, String, u64, Result<CandidatePreviewResult, String>),
+            Ready(
+                String,
+                String,
+                PathBuf,
+                ConversionRecipe,
+                u64,
+                Result<CandidatePreviewResult, String>,
+            ),
         }
         let poll = match self.conversion_candidate.pending.as_ref() {
             None => PollResult::Empty,
@@ -578,6 +668,8 @@ impl ShadeApp {
                 Ok(result) => PollResult::Ready(
                     pending.key.clone(),
                     pending.source_state_id.clone(),
+                    pending.source_path.clone(),
+                    pending.recipe.clone(),
                     pending.generation,
                     result,
                 ),
@@ -596,7 +688,7 @@ impl ShadeApp {
                 self.conversion_candidate.error =
                     Some("Candidate preview worker disconnected.".to_owned());
             }
-            PollResult::Ready(key, source_state_id, generation, result) => {
+            PollResult::Ready(key, source_state_id, source_path, recipe, generation, result) => {
                 self.conversion_candidate.pending = None;
                 if self.conversion_candidate.desired_key.as_deref() != Some(key.as_str()) {
                     return;
@@ -609,6 +701,8 @@ impl ShadeApp {
                         self.conversion_candidate.active = Some(ActiveCandidate {
                             key,
                             source_state_id,
+                            source_path,
+                            recipe,
                             face_index: self.current_face,
                             project_revision: self.project_revision,
                             result,
@@ -950,7 +1044,11 @@ mod tests {
         assert!(!runtime.contains("Queue this exact conversion"));
         assert!(!runtime.contains("ConversionUsageAccumulator"));
         assert!(!runtime.contains("analyze_conversion_tiff"));
-        assert!(runtime.contains("CandidateComparisonSnapshot"));
+        assert!(runtime.contains("CandidatePromotionSnapshot"));
+        assert!(runtime.contains("pinned: Option<CandidatePromotionSnapshot>"));
+        assert!(runtime.contains("conversion_candidate_a_promotion_selection"));
+        assert!(runtime.contains("conversion_candidate_b_promotion_selection"));
+        assert!(runtime.contains("recipe: ConversionRecipe"));
         assert!(runtime.contains("compare_candidate_snapshots"));
         assert!(runtime.contains("Pin current as A"));
         assert!(runtime.contains("active.result.usage"));
