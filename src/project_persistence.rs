@@ -29,6 +29,16 @@ fn active_project_baseline() -> &'static Mutex<Option<ActiveProjectBaselineCandi
     ACTIVE_PROJECT_BASELINE.get_or_init(|| Mutex::new(None))
 }
 
+/// Invalidate the accepted Source-project identity whenever the application changes project
+/// session (New/Open/Recovery). A successful Open or Save will establish a fresh exact-byte
+/// baseline afterwards. Keeping this explicit prevents a previous project's accepted path from
+/// authorizing an unrelated later Save As after the active project has changed.
+pub(crate) fn clear_active_source_project_baseline() {
+    *active_project_baseline()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
 fn normalize_existing_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -284,9 +294,7 @@ mod tests {
         let _ = fs::remove_file(path);
         let backup = path.with_extension("shade.bak");
         let _ = fs::remove_file(backup);
-        *active_project_baseline()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        clear_active_source_project_baseline();
     }
 
     fn accept_existing(path: &Path) {
@@ -318,6 +326,22 @@ mod tests {
         fs::write(&path, b"baseline").unwrap();
         accept_existing(&path);
         assert!(verify_active_source_project_save_baseline(&path).is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn clearing_project_session_baseline_disarms_previous_existing_path() {
+        let _serial = serial_guard();
+        let path = temp_project_path("clear-session");
+        cleanup(&path);
+        fs::write(&path, b"accepted previous project").unwrap();
+        accept_existing(&path);
+        assert!(verify_active_source_project_save_baseline(&path).is_ok());
+
+        clear_active_source_project_baseline();
+        let error = verify_active_source_project_save_baseline(&path).unwrap_err();
+        assert!(error.contains("no accepted baseline"), "{error}");
+
         cleanup(&path);
     }
 
