@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,14 @@ use crate::palette::{
 };
 
 pub const DEFAULT_DPI: f64 = 220.0;
+pub const DEFAULT_ORIGINAL_HISTOGRAM_OPACITY: f32 = 0.32;
+pub const DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE: f32 = 0.72;
+
+static RUNTIME_ORIGINAL_HISTOGRAM_OPACITY_BITS: AtomicU32 =
+    AtomicU32::new(DEFAULT_ORIGINAL_HISTOGRAM_OPACITY.to_bits());
+static RUNTIME_ORIGINAL_HISTOGRAM_PROMINENCE_BITS: AtomicU32 =
+    AtomicU32::new(DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE.to_bits());
+static RUNTIME_CURVE_VALUE_DISPLAY_UNIT: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TonalDisplayMode {
@@ -45,6 +54,57 @@ impl TonalDisplayMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CurveValueDisplayUnit {
+    Byte255,
+    Percent,
+}
+
+impl Default for CurveValueDisplayUnit {
+    fn default() -> Self {
+        Self::Byte255
+    }
+}
+
+impl CurveValueDisplayUnit {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Byte255 => "0–255",
+            Self::Percent => "0–100%",
+        }
+    }
+
+    fn runtime_code(self) -> u8 {
+        match self {
+            Self::Byte255 => 0,
+            Self::Percent => 1,
+        }
+    }
+
+    fn from_runtime_code(value: u8) -> Self {
+        if value == 1 {
+            Self::Percent
+        } else {
+            Self::Byte255
+        }
+    }
+}
+
+pub fn runtime_histogram_overlay_preferences() -> (f32, f32) {
+    (
+        f32::from_bits(RUNTIME_ORIGINAL_HISTOGRAM_OPACITY_BITS.load(Ordering::Relaxed))
+            .clamp(0.0, 1.0),
+        f32::from_bits(RUNTIME_ORIGINAL_HISTOGRAM_PROMINENCE_BITS.load(Ordering::Relaxed))
+            .clamp(0.0, 1.0),
+    )
+}
+
+pub fn runtime_curve_value_display_unit() -> CurveValueDisplayUnit {
+    CurveValueDisplayUnit::from_runtime_code(
+        RUNTIME_CURVE_VALUE_DISPLAY_UNIT.load(Ordering::Relaxed),
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -60,6 +120,9 @@ pub struct AppSettings {
     pub colorize_adjustments: bool,
     pub show_curve_histogram: bool,
     pub compact_curve_controls: bool,
+    pub original_histogram_opacity: f32,
+    pub original_histogram_prominence: f32,
+    pub curve_value_display_unit: CurveValueDisplayUnit,
     pub tonal_display_mode: TonalDisplayMode,
     pub validate_after_export: bool,
     pub export_all_test_code: bool,
@@ -93,6 +156,9 @@ impl Default for AppSettings {
             colorize_adjustments: true,
             show_curve_histogram: true,
             compact_curve_controls: false,
+            original_histogram_opacity: DEFAULT_ORIGINAL_HISTOGRAM_OPACITY,
+            original_histogram_prominence: DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE,
+            curve_value_display_unit: CurveValueDisplayUnit::Byte255,
             tonal_display_mode: TonalDisplayMode::Light,
             validate_after_export: false,
             export_all_test_code: false,
@@ -116,15 +182,17 @@ impl Default for AppSettings {
 impl AppSettings {
     pub fn load() -> Self {
         let path = settings_path();
-        let Ok(text) = fs::read_to_string(path) else {
-            return Self::default();
+        let mut settings = match fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Self::default(),
         };
-        let mut settings: Self = serde_json::from_str(&text).unwrap_or_default();
         settings.sanitize();
+        settings.sync_runtime_display_preferences();
         settings
     }
 
     pub fn save(&self) -> Result<(), String> {
+        self.sync_runtime_display_preferences();
         let path = settings_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -135,6 +203,21 @@ impl AppSettings {
         fs::write(path, text).map_err(|err| format!("Cannot save settings: {err}"))
     }
 
+    fn sync_runtime_display_preferences(&self) {
+        RUNTIME_ORIGINAL_HISTOGRAM_OPACITY_BITS.store(
+            self.original_histogram_opacity.clamp(0.0, 1.0).to_bits(),
+            Ordering::Relaxed,
+        );
+        RUNTIME_ORIGINAL_HISTOGRAM_PROMINENCE_BITS.store(
+            self.original_histogram_prominence.clamp(0.0, 1.0).to_bits(),
+            Ordering::Relaxed,
+        );
+        RUNTIME_CURVE_VALUE_DISPLAY_UNIT.store(
+            self.curve_value_display_unit.runtime_code(),
+            Ordering::Relaxed,
+        );
+    }
+
     pub fn sanitize(&mut self) {
         if !self.default_dpi.is_finite() {
             self.default_dpi = DEFAULT_DPI;
@@ -143,6 +226,14 @@ impl AppSettings {
         self.history_steps = self
             .history_steps
             .clamp(MIN_HISTORY_STEPS, MAX_SNAPSHOT_HISTORY_STATES);
+        if !self.original_histogram_opacity.is_finite() {
+            self.original_histogram_opacity = DEFAULT_ORIGINAL_HISTOGRAM_OPACITY;
+        }
+        self.original_histogram_opacity = self.original_histogram_opacity.clamp(0.0, 1.0);
+        if !self.original_histogram_prominence.is_finite() {
+            self.original_histogram_prominence = DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE;
+        }
+        self.original_histogram_prominence = self.original_histogram_prominence.clamp(0.0, 1.0);
         if self.export_all_template.trim().is_empty() {
             self.export_all_template = DEFAULT_EXPORT_TEMPLATE.to_owned();
         }
@@ -305,6 +396,61 @@ mod tests {
     #[test]
     fn compact_curve_controls_default_off() {
         assert!(!AppSettings::default().compact_curve_controls);
+    }
+
+    #[test]
+    fn histogram_overlay_defaults_match_current_appearance_and_sanitize() {
+        let settings = AppSettings::default();
+        assert_eq!(
+            settings.original_histogram_opacity,
+            DEFAULT_ORIGINAL_HISTOGRAM_OPACITY
+        );
+        assert_eq!(
+            settings.original_histogram_prominence,
+            DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE
+        );
+
+        let mut settings = AppSettings::default();
+        settings.original_histogram_opacity = 2.0;
+        settings.original_histogram_prominence = -1.0;
+        settings.sanitize();
+        assert_eq!(settings.original_histogram_opacity, 1.0);
+        assert_eq!(settings.original_histogram_prominence, 0.0);
+
+        settings.original_histogram_opacity = f32::NAN;
+        settings.original_histogram_prominence = f32::INFINITY;
+        settings.sanitize();
+        assert_eq!(
+            settings.original_histogram_opacity,
+            DEFAULT_ORIGINAL_HISTOGRAM_OPACITY
+        );
+        assert_eq!(
+            settings.original_histogram_prominence,
+            DEFAULT_ORIGINAL_HISTOGRAM_PROMINENCE
+        );
+    }
+
+    #[test]
+    fn curve_value_display_defaults_to_255_scale() {
+        assert_eq!(
+            AppSettings::default().curve_value_display_unit,
+            CurveValueDisplayUnit::Byte255
+        );
+        assert_eq!(CurveValueDisplayUnit::Byte255.label(), "0–255");
+        assert_eq!(CurveValueDisplayUnit::Percent.label(), "0–100%");
+    }
+
+    #[test]
+    fn runtime_display_preferences_follow_saved_settings() {
+        let mut settings = AppSettings::default();
+        settings.original_histogram_opacity = 0.81;
+        settings.original_histogram_prominence = 0.44;
+        settings.curve_value_display_unit = CurveValueDisplayUnit::Percent;
+        settings.sync_runtime_display_preferences();
+        let (opacity, prominence) = runtime_histogram_overlay_preferences();
+        assert!((opacity - 0.81).abs() < 1e-6);
+        assert!((prominence - 0.44).abs() < 1e-6);
+        assert_eq!(runtime_curve_value_display_unit(), CurveValueDisplayUnit::Percent);
     }
 
     #[test]
