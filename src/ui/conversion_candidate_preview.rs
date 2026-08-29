@@ -6,6 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use windows_shade_editor::color_conversion::ConversionRecipe;
 use windows_shade_editor::conversion_analytics::ConversionUsageReport;
+use windows_shade_editor::conversion_candidate_comparison::{
+    CandidateComparison, CandidateComparisonSnapshot, compare_candidate_snapshots,
+};
 use windows_shade_editor::conversion_candidate_preview::{
     CandidatePreviewInput, CandidatePreviewResult, render_candidate_preview,
 };
@@ -21,6 +24,7 @@ const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(220);
 
 struct PendingCandidate {
     key: String,
+    source_state_id: String,
     generation: u64,
     cancellation: ConversionCancellation,
     rx: mpsc::Receiver<Result<CandidatePreviewResult, String>>,
@@ -28,6 +32,7 @@ struct PendingCandidate {
 
 struct ActiveCandidate {
     key: String,
+    source_state_id: String,
     face_index: usize,
     project_revision: u64,
     result: CandidatePreviewResult,
@@ -42,6 +47,7 @@ pub(crate) struct CandidatePreviewController {
     generation: u64,
     pending: Option<PendingCandidate>,
     active: Option<ActiveCandidate>,
+    pinned: Option<CandidateComparisonSnapshot>,
     error: Option<String>,
     show_converted: bool,
 }
@@ -55,6 +61,7 @@ impl Default for CandidatePreviewController {
             generation: 0,
             pending: None,
             active: None,
+            pinned: None,
             error: None,
             show_converted: true,
         }
@@ -110,6 +117,19 @@ impl ShadeApp {
             );
             self.invalidate_conversion_candidate_render_only();
             return;
+        }
+        let source_state_id = candidate_source_state_id(
+            inspection.index,
+            self.project_revision,
+            &inspection.source_path,
+        );
+        if self
+            .conversion_candidate
+            .pinned
+            .as_ref()
+            .is_some_and(|pinned| pinned.source_state_id != source_state_id)
+        {
+            self.conversion_candidate.pinned = None;
         }
         let key = candidate_key(
             inspection.index,
@@ -208,7 +228,15 @@ impl ShadeApp {
         let usage = active.result.usage.clone();
         let solo = active.solo_channel;
         let recipe_sha = active.result.recipe_sha256.clone();
+        let pinned_recipe_sha = self
+            .conversion_candidate
+            .pinned
+            .as_ref()
+            .map(|pinned| pinned.recipe_sha256.clone());
+        let comparison = self.current_candidate_comparison();
         let mut requested_solo: Option<Option<usize>> = None;
+        let mut pin_current = false;
+        let mut clear_pin = false;
 
         ui.horizontal(|ui| {
             ui.heading("Production Candidate");
@@ -218,6 +246,45 @@ impl ShadeApp {
             );
         });
         ui.small(format!("Converted target samples · recipe {}", short_hash(&recipe_sha)));
+
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("A/B comparison");
+                if ui
+                    .button(if pinned_recipe_sha.is_some() {
+                        "Replace A with current"
+                    } else {
+                        "Pin current as A"
+                    })
+                    .on_hover_text(
+                        "Pins only bounded Candidate analytics and identities. Candidate raster planes are not duplicated.",
+                    )
+                    .clicked()
+                {
+                    pin_current = true;
+                }
+                if pinned_recipe_sha.is_some() && ui.small_button("Clear A").clicked() {
+                    clear_pin = true;
+                }
+            });
+            if let Some(hash) = pinned_recipe_sha.as_deref() {
+                ui.small(format!("A · recipe {}", short_hash(hash)));
+                match comparison.as_ref() {
+                    Ok(Some(comparison)) => draw_candidate_comparison(ui, comparison),
+                    Ok(None) => ui.small(
+                        "Current Candidate B matches A. Change conversion recipe/preset to compare a distinct Candidate.",
+                    ),
+                    Err(error) => {
+                        ui.label(egui::RichText::new(error).color(egui::Color32::YELLOW));
+                    }
+                }
+            } else {
+                ui.small(
+                    "Pin the current converted Candidate as A, then change recipe/preset to compare the next real Candidate as B.",
+                );
+            }
+        });
+
         if ui
             .selectable_label(solo.is_none(), "Composite converted preview")
             .clicked()
@@ -292,10 +359,65 @@ impl ShadeApp {
             }
         }
 
+        if clear_pin {
+            self.conversion_candidate.pinned = None;
+            self.report_info("Cleared Candidate A comparison baseline");
+        }
+        if pin_current {
+            match self.pin_current_conversion_candidate() {
+                Ok(hash) => self.report_info(format!(
+                    "Pinned Candidate A from recipe {}",
+                    short_hash(&hash)
+                )),
+                Err(error) => self.report_error(error),
+            }
+        }
         if let Some(solo) = requested_solo {
             self.set_candidate_solo(solo, ui.ctx());
         }
         true
+    }
+
+    fn pin_current_conversion_candidate(&mut self) -> Result<String, String> {
+        let active = self
+            .conversion_candidate
+            .active
+            .as_ref()
+            .filter(|active| {
+                active.face_index == self.current_face
+                    && active.project_revision == self.project_revision
+            })
+            .ok_or_else(|| "No current Production Candidate is ready to pin as A.".to_owned())?;
+        let snapshot = CandidateComparisonSnapshot::from_preview(
+            active.source_state_id.clone(),
+            &active.result,
+        )?;
+        let recipe_sha256 = snapshot.recipe_sha256.clone();
+        self.conversion_candidate.pinned = Some(snapshot);
+        Ok(recipe_sha256)
+    }
+
+    fn current_candidate_comparison(&self) -> Result<Option<CandidateComparison>, String> {
+        let Some(baseline) = self.conversion_candidate.pinned.as_ref() else {
+            return Ok(None);
+        };
+        let active = self
+            .conversion_candidate
+            .active
+            .as_ref()
+            .filter(|active| {
+                active.face_index == self.current_face
+                    && active.project_revision == self.project_revision
+            })
+            .ok_or_else(|| "Candidate B is not ready for comparison.".to_owned())?;
+        let candidate = CandidateComparisonSnapshot::from_preview(
+            active.source_state_id.clone(),
+            &active.result,
+        )?;
+        if baseline.recipe_sha256 == candidate.recipe_sha256 {
+            return Ok(None);
+        }
+        compare_candidate_snapshots(baseline, &candidate).map(Some)
     }
 
     fn observe_candidate(
@@ -369,6 +491,11 @@ impl ShadeApp {
                 return;
             }
         };
+        let source_state_id = candidate_source_state_id(
+            source.face_index,
+            self.project_revision,
+            &source.source_path,
+        );
         let adjusted_planes = match self.faces.get(source.face_index) {
             Some(face) => render::adjusted_planes(face.preview.as_ref(), &self.project),
             None => {
@@ -397,6 +524,7 @@ impl ShadeApp {
         });
         self.conversion_candidate.pending = Some(PendingCandidate {
             key,
+            source_state_id,
             generation,
             cancellation,
             rx,
@@ -440,12 +568,17 @@ impl ShadeApp {
         enum PollResult {
             Empty,
             Disconnected,
-            Ready(String, u64, Result<CandidatePreviewResult, String>),
+            Ready(String, String, u64, Result<CandidatePreviewResult, String>),
         }
         let poll = match self.conversion_candidate.pending.as_ref() {
             None => PollResult::Empty,
             Some(pending) => match pending.rx.try_recv() {
-                Ok(result) => PollResult::Ready(pending.key.clone(), pending.generation, result),
+                Ok(result) => PollResult::Ready(
+                    pending.key.clone(),
+                    pending.source_state_id.clone(),
+                    pending.generation,
+                    result,
+                ),
                 Err(mpsc::TryRecvError::Empty) => PollResult::Empty,
                 Err(mpsc::TryRecvError::Disconnected) => PollResult::Disconnected,
             },
@@ -461,7 +594,7 @@ impl ShadeApp {
                 self.conversion_candidate.error =
                     Some("Candidate preview worker disconnected.".to_owned());
             }
-            PollResult::Ready(key, generation, result) => {
+            PollResult::Ready(key, source_state_id, generation, result) => {
                 self.conversion_candidate.pending = None;
                 if self.conversion_candidate.desired_key.as_deref() != Some(key.as_str()) {
                     return;
@@ -473,6 +606,7 @@ impl ShadeApp {
                         self.conversion_candidate.error = None;
                         self.conversion_candidate.active = Some(ActiveCandidate {
                             key,
+                            source_state_id,
                             face_index: self.current_face,
                             project_revision: self.project_revision,
                             result,
@@ -557,6 +691,17 @@ impl ShadeApp {
     }
 }
 
+fn candidate_source_state_id(
+    face_index: usize,
+    project_revision: u64,
+    source_path: &std::path::Path,
+) -> String {
+    format!(
+        "{face_index}|{project_revision}|{}",
+        source_path.to_string_lossy().to_ascii_lowercase()
+    )
+}
+
 fn candidate_key(
     face_index: usize,
     project_revision: u64,
@@ -564,8 +709,8 @@ fn candidate_key(
     recipe: &ConversionRecipe,
 ) -> String {
     format!(
-        "{face_index}|{project_revision}|{}|{}",
-        source_path.to_string_lossy().to_ascii_lowercase(),
+        "{}|{}",
+        candidate_source_state_id(face_index, project_revision, source_path),
         recipe_sha256(recipe).unwrap_or_default()
     )
 }
@@ -621,6 +766,45 @@ fn load_candidate_texture(
         image,
         egui::TextureOptions::LINEAR,
     )
+}
+
+fn draw_candidate_comparison(ui: &mut egui::Ui, comparison: &CandidateComparison) {
+    ui.label(
+        egui::RichText::new(format!(
+            "B − A · recipe {} → {}",
+            short_hash(&comparison.baseline_recipe_sha256),
+            short_hash(&comparison.candidate_recipe_sha256)
+        ))
+        .strong(),
+    );
+    ui.small(format!(
+        "Total ink Δ · mean {:+.1} pp · p95 {:+.1} pp · p99 {:+.1} pp · peak {:+.1} pp",
+        comparison.mean_total_ink * 100.0,
+        comparison.p95_total_ink * 100.0,
+        comparison.p99_total_ink * 100.0,
+        comparison.peak_total_ink * 100.0,
+    ));
+    if let Some(delta) = comparison.total_ink_limit_hit_percent {
+        ui.small(format!("Total-ink limit-hit Δ: {delta:+.2} percentage points"));
+    }
+    for channel in &comparison.channels {
+        ui.small(format!(
+            "{} · mean {:+.1} pp · p95 {:+.1} pp · peak {:+.1} pp · integrated {:+.3} relative ink units",
+            channel.name,
+            channel.mean_coverage * 100.0,
+            channel.p95_coverage * 100.0,
+            channel.peak_coverage * 100.0,
+            channel.integrated_coverage,
+        ));
+    }
+    if let Some(delta) = comparison.neutral_black_share {
+        ui.small(format!("Measured Neutral Black-share Δ: {:+.1} pp", delta * 100.0));
+    } else {
+        ui.small(
+            "Measured Neutral Black-share Δ: unavailable until both A and B carry valid measured neutral classification.",
+        );
+    }
+    ui.small("ΔE00 A/B remains unavailable until approved measured PCS/characterization evidence exists.");
 }
 
 fn draw_candidate_usage(ui: &mut egui::Ui, usage: &ConversionUsageReport) {
@@ -747,6 +931,15 @@ mod tests {
     }
 
     #[test]
+    fn source_state_identity_changes_without_recipe_and_candidate_key_adds_recipe_identity() {
+        let path = std::path::Path::new("C:/Designs/Face-01.tif");
+        let source_a = candidate_source_state_id(0, 7, path);
+        let source_b = candidate_source_state_id(0, 8, path);
+        assert_ne!(source_a, source_b);
+        assert_eq!(source_a, "0|7|c:/designs/face-01.tif");
+    }
+
+    #[test]
     fn candidate_controller_contains_no_independent_target_config_or_window() {
         let source = include_str!("conversion_candidate_preview.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
@@ -755,6 +948,9 @@ mod tests {
         assert!(!runtime.contains("Queue this exact conversion"));
         assert!(!runtime.contains("ConversionUsageAccumulator"));
         assert!(!runtime.contains("analyze_conversion_tiff"));
+        assert!(runtime.contains("CandidateComparisonSnapshot"));
+        assert!(runtime.contains("compare_candidate_snapshots"));
+        assert!(runtime.contains("Pin current as A"));
         assert!(runtime.contains("active.result.usage"));
         assert!(runtime.contains("draw_candidate_usage"));
         assert!(runtime.contains("sync_conversion_candidate"));
