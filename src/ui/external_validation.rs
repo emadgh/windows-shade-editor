@@ -1,14 +1,19 @@
 use crate::*;
 use eframe::egui;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use windows_shade_editor::color_conversion::{ProductionProvenance, ProjectRole};
 use windows_shade_editor::conversion_audit::ConversionAuditRecord;
-use windows_shade_editor::external_validation_evidence::ExternalValidationPacket;
+use windows_shade_editor::external_validation_evidence::{
+    ExternalValidationPacket, ExternalValidationStatus,
+};
+
+const MAX_EXTERNAL_VALIDATION_PACKET_BYTES: usize = 2 * 1024 * 1024;
 
 impl ShadeApp {
-    /// Export-only bridge from durable Production conversion audits to the
-    /// manual Photoshop/RIP evidence contract. This surface never fabricates
-    /// observations and every generated consumer section starts Pending.
+    /// Export/import bridge from durable Production conversion audits to the
+    /// manual Photoshop/RIP evidence contract. Generated packets always start
+    /// Pending; returned packets are accepted only after exact audit binding.
     pub(crate) fn ui_external_validation_packet_menu(&mut self, ui: &mut egui::Ui) {
         if self.project.project_role != ProjectRole::Production
             || self.project.conversion_audits.is_empty()
@@ -19,13 +24,14 @@ impl ShadeApp {
         let audits = self.project.conversion_audits.clone();
         let provenances = self.project.production_provenance.clone();
         let mut export_request: Option<(String, String)> = None;
+        let mut validate_request: Option<ConversionAuditRecord> = None;
         let mut export_error: Option<String> = None;
 
         ui.menu_button("External validation", |ui| {
-            ui.set_min_width(520.0);
+            ui.set_min_width(560.0);
             ui.strong("Photoshop / ceramic RIP validation packets");
             ui.small(
-                "Each packet is audit-bound and starts Pending. Exporting a packet is not external approval.",
+                "Export starts Pending. Re-import validates manual evidence against the exact persisted Production conversion audit.",
             );
             ui.separator();
 
@@ -49,25 +55,32 @@ impl ShadeApp {
                             ui.small(
                                 "Photoshop: Pending · Ceramic RIP: Pending · manual evidence required",
                             );
-                            if ui.button("Export validation packet...").clicked() {
-                                match packet.to_pretty_json() {
-                                    Ok(json) => {
-                                        export_request = Some((
-                                            format!(
-                                                "{}-external-validation.json",
-                                                safe_filename_component(&packet.fixture.output_file)
-                                            ),
-                                            json,
-                                        ));
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Export validation packet...").clicked() {
+                                    match packet.to_pretty_json() {
+                                        Ok(json) => {
+                                            export_request = Some((
+                                                format!(
+                                                    "{}-external-validation.json",
+                                                    safe_filename_component(
+                                                        &packet.fixture.output_file
+                                                    )
+                                                ),
+                                                json,
+                                            ));
+                                        }
+                                        Err(error) => export_error = Some(error),
                                     }
-                                    Err(error) => export_error = Some(error),
                                 }
-                            }
+                                if ui.button("Validate completed packet...").clicked() {
+                                    validate_request = Some(audit.clone());
+                                }
+                            });
                         }
                         Err(error) => {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Cannot export: audit is not bound to exactly one Production provenance record ({error})"
+                                    "Cannot use external validation: audit is not bound to exactly one Production provenance record ({error})"
                                 ))
                                 .color(egui::Color32::LIGHT_RED),
                             );
@@ -95,6 +108,27 @@ impl ShadeApp {
                 )),
             }
         }
+        if let Some(audit) = validate_request {
+            match select_and_validate_completed_packet(&audit) {
+                Ok(Some(packet)) => {
+                    let photoshop = status_label(packet.photoshop.status);
+                    let rip = status_label(packet.ceramic_rip.status);
+                    if packet.externally_accepted() {
+                        self.report_info(format!(
+                            "External validation packet is exactly audit-bound and complete: Photoshop {photoshop}, Ceramic RIP {rip}."
+                        ));
+                    } else {
+                        self.report_info(format!(
+                            "External validation packet is exactly audit-bound but not fully accepted: Photoshop {photoshop}, Ceramic RIP {rip}."
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.report_error(format!(
+                    "External validation packet rejected: {error}"
+                )),
+            }
+        }
     }
 }
 
@@ -117,6 +151,52 @@ fn packet_for_bound_audit(
     }
 }
 
+fn select_and_validate_completed_packet(
+    audit: &ConversionAuditRecord,
+) -> Result<Option<ExternalValidationPacket>, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("External validation JSON", &["json"])
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+    let packet = load_validation_packet(&path)?;
+    packet.validate_against_conversion_audit(audit)?;
+    Ok(Some(packet))
+}
+
+fn load_validation_packet(path: &Path) -> Result<ExternalValidationPacket, String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "Cannot open external validation packet '{}': {error}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_EXTERNAL_VALIDATION_PACKET_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "Cannot read external validation packet '{}': {error}",
+                path.display()
+            )
+        })?;
+    validate_packet_size(bytes.len())?;
+    let json = String::from_utf8(bytes)
+        .map_err(|error| format!("External validation packet is not UTF-8 JSON: {error}"))?;
+    ExternalValidationPacket::from_json(&json)
+}
+
+fn validate_packet_size(size: usize) -> Result<(), String> {
+    if size > MAX_EXTERNAL_VALIDATION_PACKET_BYTES {
+        return Err(format!(
+            "External validation packet exceeds the {} byte safety limit.",
+            MAX_EXTERNAL_VALIDATION_PACKET_BYTES
+        ));
+    }
+    Ok(())
+}
+
 fn save_validation_packet_json(
     default_name: &str,
     json: &str,
@@ -130,6 +210,14 @@ fn save_validation_packet_json(
     };
     windows_shade_editor::safe_fs::atomic_write(&path, json.as_bytes(), None)?;
     Ok(Some(path))
+}
+
+fn status_label(status: ExternalValidationStatus) -> &'static str {
+    match status {
+        ExternalValidationStatus::Pending => "Pending",
+        ExternalValidationStatus::Passed => "Passed",
+        ExternalValidationStatus::Failed => "Failed",
+    }
 }
 
 fn short_hash(value: &str) -> String {
@@ -170,11 +258,19 @@ mod tests {
     }
 
     #[test]
-    fn external_validation_surface_never_claims_generated_packet_is_approval() {
+    fn completed_packet_import_is_strictly_size_bounded() {
+        assert!(validate_packet_size(MAX_EXTERNAL_VALIDATION_PACKET_BYTES).is_ok());
+        assert!(validate_packet_size(MAX_EXTERNAL_VALIDATION_PACKET_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn external_validation_surface_requires_exact_binding_before_reporting_returned_evidence() {
         let source = include_str!("external_validation.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(runtime.contains("starts Pending"));
-        assert!(runtime.contains("is not external approval"));
-        assert!(!runtime.contains("externally_accepted()"));
+        assert!(runtime.contains("Validate completed packet..."));
+        assert!(runtime.contains("ExternalValidationPacket::from_json"));
+        assert!(runtime.contains("packet.validate_against_conversion_audit(audit)?"));
+        assert!(runtime.contains("file.take((MAX_EXTERNAL_VALIDATION_PACKET_BYTES + 1) as u64)"));
     }
 }
