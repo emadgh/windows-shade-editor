@@ -82,7 +82,7 @@ impl IccDeviceForwardModel {
 
         Ok(Self {
             identity: CharacterizationIdentity {
-                id: expected_sha256.trim().to_ascii_lowercase(),
+                id: canonical_output_icc_model_id(expected_sha256)?,
                 channel_names,
             },
             transform,
@@ -208,7 +208,7 @@ fn create_transform(
 
 fn validate_profile_hash(profile_bytes: &[u8], expected_sha256: &str) -> Result<(), String> {
     let expected = expected_sha256.trim();
-    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_bare_sha256(expected) {
         return Err("Target Output ICC identity must be a full SHA-256 hash.".to_owned());
     }
     let actual = format!("{:x}", Sha256::digest(profile_bytes));
@@ -260,9 +260,27 @@ fn quantize_coverages(coverages: &[f32]) -> Result<Vec<u16>, String> {
         .collect()
 }
 
+pub fn canonical_output_icc_model_id(profile_sha256: &str) -> Result<String, String> {
+    let hash = profile_sha256.trim();
+    if !is_bare_sha256(hash) {
+        return Err("Output ICC forward-model identity requires a full SHA-256 hash.".to_owned());
+    }
+    Ok(format!("sha256:{}", hash.to_ascii_lowercase()))
+}
+
+fn model_id_matches_output_hash(model_id: &str, profile_sha256: &str) -> bool {
+    canonical_output_icc_model_id(profile_sha256)
+        .is_ok_and(|expected| expected.eq_ignore_ascii_case(model_id.trim()))
+}
+
+fn is_bare_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// A target may authorize the inverse solver from either its measured
-/// characterization identity or the exact SHA-256 of its Output ICC forward
-/// model. Measured characterization remains valid and takes no semantic hit.
+/// characterization identity or the canonical content identity of its exact
+/// Output ICC forward model. Measured characterization remains valid and takes
+/// no semantic hit.
 pub fn target_accepts_forward_model_identity(
     target: &ConversionTargetDefinition,
     model_id: &str,
@@ -274,7 +292,7 @@ pub fn target_accepts_forward_model_identity(
         .is_some_and(|id| !id.trim().is_empty() && id.trim() == model_id)
         || target.output_profile_identity.as_ref().is_some_and(|identity| {
             !identity.sha256.trim().is_empty()
-                && identity.sha256.trim().eq_ignore_ascii_case(model_id)
+                && model_id_matches_output_hash(model_id, &identity.sha256)
         })
 }
 
@@ -292,7 +310,9 @@ pub fn target_forward_model_authorities(target: &ConversionTargetDefinition) -> 
         .as_ref()
         .filter(|identity| !identity.sha256.trim().is_empty())
     {
-        authorities.push(identity.sha256.trim().to_ascii_lowercase());
+        if let Ok(id) = canonical_output_icc_model_id(&identity.sha256) {
+            authorities.push(id);
+        }
     }
     authorities
 }
@@ -330,8 +350,23 @@ mod tests {
 
     #[test]
     fn profile_identity_can_authorize_forward_model_without_measurement_id() {
-        assert!(target_accepts_forward_model_identity(&target(), &"A".repeat(64)));
-        assert!(!target_accepts_forward_model_identity(&target(), &"b".repeat(64)));
+        assert!(target_accepts_forward_model_identity(
+            &target(),
+            &format!("sha256:{}", "A".repeat(64))
+        ));
+        assert!(!target_accepts_forward_model_identity(
+            &target(),
+            &format!("sha256:{}", "b".repeat(64))
+        ));
+    }
+
+    #[test]
+    fn output_icc_model_identity_is_canonical_prefixed_sha256() {
+        assert_eq!(
+            canonical_output_icc_model_id(&"A".repeat(64)).unwrap(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert!(canonical_output_icc_model_id("short").is_err());
     }
 
     #[test]
