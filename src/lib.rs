@@ -65,6 +65,7 @@ pub mod gradient_continuity;
 pub mod gradient_validation;
 pub mod icc_conversion;
 pub mod icc_conversion_worker;
+pub mod icc_device_forward_model;
 #[path = "icc_profile_registry.rs"]
 mod icc_profile_registry_raw;
 #[path = "icc_profile_registry_observed.rs"]
