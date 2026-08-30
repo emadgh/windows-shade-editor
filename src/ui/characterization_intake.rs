@@ -2,6 +2,9 @@ use eframe::egui;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use windows_shade_editor::characterization_acquisition::{
+    acquisition_plan_measurement_table, build_characterization_acquisition_plan,
+};
 use windows_shade_editor::characterization_intake::{
     CharacterizationIntakeMetadata, CharacterizationIntakeResult, MeasurementCoverageUnit,
     MeasurementTableDelimiter, build_characterization_package_from_table,
@@ -218,6 +221,14 @@ pub(crate) fn render_characterization_intake(
 
     ui.add_space(6.0);
     render_channel_editor(ui, state, &mut invalidate);
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Export acquisition template...").clicked() {
+            export_acquisition_template_dialog(state);
+        }
+        ui.small(
+            "Generates only bounded coverage patches with blank L/a/b cells. Real measurement and target-specific sampling are still required for #205/#106/#115.",
+        );
+    });
 
     ui.add_space(6.0);
     egui::CollapsingHeader::new("Production context")
@@ -488,6 +499,101 @@ fn collect_metadata(
     })
 }
 
+fn collect_acquisition_inputs(
+    state: &CharacterizationIntakeUiState,
+) -> Result<(Vec<String>, Vec<f32>, f32), Vec<String>> {
+    let mut errors = Vec::new();
+    let channel_limits = state
+        .channel_limits
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            parse_f32_field(
+                value,
+                &format!("Measured maximum for channel {}", index + 1),
+                &mut errors,
+            )
+        })
+        .collect::<Vec<_>>();
+    let total_ink_limit = parse_f32_field(
+        &state.total_ink_limit,
+        "Measured total-ink limit",
+        &mut errors,
+    );
+    let channel_names = state
+        .channel_names
+        .iter()
+        .map(|value| value.trim().to_owned())
+        .collect::<Vec<_>>();
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok((channel_names, channel_limits, total_ink_limit))
+}
+
+fn export_acquisition_template_dialog(state: &mut CharacterizationIntakeUiState) {
+    state.errors.clear();
+    state.status = None;
+
+    let (channel_names, channel_limits, total_ink_limit) = match collect_acquisition_inputs(state) {
+        Ok(inputs) => inputs,
+        Err(errors) => {
+            state.errors = errors;
+            return;
+        }
+    };
+    let plan = match build_characterization_acquisition_plan(
+        &channel_names,
+        &channel_limits,
+        total_ink_limit,
+    ) {
+        Ok(plan) => plan,
+        Err(errors) => {
+            state.errors = errors;
+            return;
+        }
+    };
+    let table = acquisition_plan_measurement_table(&plan, state.delimiter, state.coverage_unit);
+    let extension = match state.delimiter {
+        MeasurementTableDelimiter::Comma => "csv",
+        MeasurementTableDelimiter::Tab => "tsv",
+    };
+    let base = if state.revision.trim().is_empty() {
+        "measured-characterization-acquisition".to_owned()
+    } else {
+        format!(
+            "{}-acquisition",
+            safe_filename_component(state.revision.trim())
+        )
+    };
+    let file_name = format!("{base}.{extension}");
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Measurement acquisition table", &[extension])
+        .set_file_name(file_name)
+        .set_title("Export measured-characterization acquisition template")
+        .save_file()
+    else {
+        return;
+    };
+
+    match fs::write(&path, table.as_bytes()) {
+        Ok(()) => {
+            state.status = Some(format!(
+                "Saved {}-patch acquisition template: {}. L/a/b cells remain blank until real measurement.",
+                plan.patch_count(),
+                path.display()
+            ));
+        }
+        Err(error) => {
+            state.errors = vec![format!(
+                "Cannot save acquisition template {}: {error}",
+                path.display()
+            )];
+        }
+    }
+}
+
 fn load_table_dialog() -> Result<Option<(PathBuf, String)>, String> {
     let Some(path) = rfd::FileDialog::new()
         .add_filter("Measurement table", &["csv", "tsv", "txt"])
@@ -644,6 +750,36 @@ mod tests {
         assert!(runtime.contains("save_characterization_package"));
         assert!(!runtime.contains("CharacterizationPackage::new"));
         assert!(!runtime.contains("CharacterizationPayload {"));
+    }
+
+    #[test]
+    fn acquisition_export_delegates_generation_to_the_core_without_fabricating_lab() {
+        let source = include_str!("characterization_intake.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("build_characterization_acquisition_plan"));
+        assert!(runtime.contains("acquisition_plan_measurement_table"));
+        assert!(!runtime.contains("MeasuredLabColor"));
+        assert!(runtime.contains("L/a/b cells remain blank until real measurement"));
+    }
+
+    #[test]
+    fn acquisition_template_does_not_require_package_authority_metadata() {
+        let mut state = CharacterizationIntakeUiState::default();
+        state.channel_names = ["Blue", "Brown", "Beige", "Black"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        state.channel_limits = ["0.8", "0.8", "0.8", "0.7"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        state.total_ink_limit = "1.8".to_owned();
+        state.revision.clear();
+        state.instrument_model.clear();
+
+        let (names, limits, total) = collect_acquisition_inputs(&state).unwrap();
+        let plan = build_characterization_acquisition_plan(&names, &limits, total).unwrap();
+        assert!(plan.patch_count() > names.len());
     }
 
     #[test]
