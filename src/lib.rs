@@ -90,6 +90,7 @@ pub mod jpeg_source;
 #[path = "model_impl.rs"]
 pub mod model;
 pub mod nchannel_icc;
+pub mod output_icc_forward_model;
 #[path = "palette_impl.rs"]
 pub mod palette;
 pub mod png_source;
