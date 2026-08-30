@@ -109,6 +109,7 @@ pub mod production_project_disposition;
 pub mod production_replacement;
 pub mod production_staleness;
 pub mod production_target;
+pub mod profile_backed_inverse_lut_builder;
 pub mod project_link_navigation;
 pub mod queue_core;
 pub mod reconversion_policy;
