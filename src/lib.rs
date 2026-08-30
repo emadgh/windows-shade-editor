@@ -113,6 +113,7 @@ pub mod profile_backed_candidate_preview;
 pub mod profile_backed_inverse_lut_artifact;
 pub mod profile_backed_inverse_lut_builder;
 pub mod profile_backed_optimizer_authority;
+pub mod profile_backed_optimizer_execution_capture;
 pub mod profile_backed_optimizer_raster_transform;
 pub mod project_link_navigation;
 pub mod queue_core;
