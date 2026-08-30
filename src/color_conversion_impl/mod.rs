@@ -71,11 +71,13 @@ pub struct ConversionTargetDefinition {
     pub name: String,
     pub channels: Vec<TargetChannelDefinition>,
     pub bit_depth: u8,
-    /// ICC output profile used by the normal output-transform path.
+    /// ICC output profile used by the normal output-transform path and, when no
+    /// measured characterization is selected, as an identity-bound device→PCS
+    /// forward model for the Custom Optimizer.
     #[serde(default)]
     pub output_profile_identity: Option<IccProfileIdentity>,
-    /// External ICC path used by the worker. The payload remains outside the
-    /// recipe and is verified against `output_profile_identity` before use.
+    /// External ICC path used by workers. The payload remains outside the recipe
+    /// and is verified against `output_profile_identity` before any transform use.
     #[serde(default)]
     pub output_profile_path: Option<String>,
     /// DeviceLink profile used by a precomputed device-to-device separation path.
@@ -84,8 +86,9 @@ pub struct ConversionTargetDefinition {
     /// External DeviceLink path, identity-verified before conversion.
     #[serde(default)]
     pub device_link_path: Option<String>,
-    /// Versioned identifier for measured target characterization consumed by
-    /// Shade Editor's future custom N-ink optimizer.
+    /// Optional versioned identifier for measured target characterization. This
+    /// remains a supported higher-authority forward-model source, but existing
+    /// identity-verified Output ICCs may also back Custom Optimizer operation.
     #[serde(default)]
     pub characterization_id: Option<String>,
     /// Optional normalized aggregate channel-coverage limit. For N channels a
@@ -101,7 +104,7 @@ pub struct SeparationStrategy {
     /// Real target-channel name selected as the neutral/Black construction ink.
     pub black_channel: Option<String>,
     /// 0 = no extra Black preference; 1 = strongest allowed preference subject
-    /// to characterization, color-error and ink-limit constraints.
+    /// to forward-model, color-error and ink-limit constraints.
     pub black_generation_strength: f32,
     /// Normalized tone threshold where additional Black generation may begin.
     pub black_start: f32,
@@ -251,14 +254,26 @@ impl ConversionRecipe {
                 }
             }
             ConversionEngineMode::CustomOptimizer => {
-                if self
+                let has_measured_authority = self
                     .target
                     .characterization_id
                     .as_deref()
-                    .is_none_or(|value| value.trim().is_empty())
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_output_icc_authority =
+                    has_profile_hash(self.target.output_profile_identity.as_ref())
+                        && has_profile_path(self.target.output_profile_path.as_deref());
+                if !has_measured_authority && !has_output_icc_authority {
+                    errors.push(
+                        "Custom N-ink optimization requires either a versioned measured characterization or an identity-verified target Output ICC with an external path."
+                            .to_owned(),
+                    );
+                }
+                if !has_measured_authority
+                    && has_output_icc_authority
+                    && !(4..=12).contains(&self.target.channels.len())
                 {
                     errors.push(
-                        "Custom N-ink optimization requires a versioned target characterization."
+                        "Output-ICC-backed Custom Optimizer currently supports 4..=12 target channels."
                             .to_owned(),
                     );
                 }
@@ -473,6 +488,27 @@ mod tests {
     }
 
     #[test]
+    fn custom_optimizer_accepts_existing_output_icc_without_measurement_id() {
+        let mut target = seven_channel_target();
+        target.characterization_id = None;
+        target.output_profile_identity = Some(profile("Existing ceramic ICC", &"a".repeat(64)));
+        let recipe = ConversionRecipe {
+            source_transparency_policy: None,
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::CustomOptimizer,
+            source_profile_identity: profile("sRGB", "source-hash"),
+            target,
+            rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
+            black_point_compensation: true,
+            strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: Some(
+                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+            ),
+        };
+        assert!(recipe.validate().is_ok());
+    }
+
+    #[test]
     fn target_rejects_duplicate_channel_names() {
         let mut target = seven_channel_target();
         target.channels.push(TargetChannelDefinition {
@@ -548,9 +584,11 @@ mod tests {
     }
 
     #[test]
-    fn engine_mode_requires_matching_characterization_source() {
+    fn engine_mode_requires_forward_model_authority() {
         let mut target = seven_channel_target();
         target.characterization_id = None;
+        target.output_profile_identity = None;
+        target.output_profile_path = None;
         let recipe = ConversionRecipe {
             source_transparency_policy: None,
             schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
@@ -567,11 +605,30 @@ mod tests {
 
         let errors = recipe
             .validate()
-            .expect_err("custom optimizer without characterization must fail");
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("characterization"))
-        );
+            .expect_err("custom optimizer without any forward-model authority must fail");
+        assert!(errors.iter().any(|error| {
+            error.contains("measured characterization") && error.contains("Output ICC")
+        }));
+    }
+
+    #[test]
+    fn output_icc_optimizer_authority_requires_both_hash_and_path() {
+        let mut target = seven_channel_target();
+        target.characterization_id = None;
+        target.output_profile_path = None;
+        let recipe = ConversionRecipe {
+            source_transparency_policy: None,
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::CustomOptimizer,
+            source_profile_identity: profile("sRGB", "source-hash"),
+            target,
+            rendering_intent: ConversionRenderingIntent::Perceptual,
+            black_point_compensation: false,
+            strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: Some(
+                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+            ),
+        };
+        assert!(recipe.validate().is_err());
     }
 }
