@@ -6,6 +6,9 @@ use crate::custom_optimizer_config::{
     ContinuityDistanceMetric, ContinuityPreferenceConfig, CustomOptimizerSolverMethod,
 };
 use crate::device_characterization::{DeviceForwardModel, LabColor};
+use crate::optimizer_forward_model_authority::{
+    OptimizerForwardModelAuthorityError, optimizer_forward_model_identity,
+};
 use crate::separation_optimizer::{
     CandidateEvaluation, CandidateScoringWeights, SeparationCandidate, characterize_candidate,
     evaluate_candidate,
@@ -33,6 +36,7 @@ pub struct InverseSolveResult {
 pub enum InverseSolveError {
     InvalidConfiguration(Vec<String>),
     MissingTargetCharacterization,
+    InvalidForwardModelAuthority(String),
     CharacterizationIdentityMismatch {
         target: String,
         model: String,
@@ -294,14 +298,17 @@ fn validate_identity(
     target: &ConversionTargetDefinition,
     model: &dyn DeviceForwardModel,
 ) -> Result<(), InverseSolveError> {
-    let target_id = target
-        .characterization_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(InverseSolveError::MissingTargetCharacterization)?;
+    let target_id = optimizer_forward_model_identity(target).map_err(|error| match error {
+        OptimizerForwardModelAuthorityError::MissingAuthority => {
+            InverseSolveError::MissingTargetCharacterization
+        }
+        OptimizerForwardModelAuthorityError::InvalidOutputProfileIdentity(message) => {
+            InverseSolveError::InvalidForwardModelAuthority(message)
+        }
+    })?;
     if target_id != model.identity().id {
         return Err(InverseSolveError::CharacterizationIdentityMismatch {
-            target: target_id.to_owned(),
+            target: target_id,
             model: model.identity().id.clone(),
         });
     }
@@ -620,6 +627,7 @@ mod tests {
     use super::*;
     use crate::color_conversion::TargetChannelDefinition;
     use crate::device_characterization::CharacterizationIdentity;
+    use crate::model::IccProfileIdentity;
 
     struct DegenerateFourInkModel {
         identity: CharacterizationIdentity,
@@ -752,6 +760,33 @@ mod tests {
         assert!(first.candidate.delta_e00 <= 1.5);
         assert!(first.evaluation.total_ink <= 1.5);
         assert!(first.candidate.coverages.iter().all(|value| *value <= 0.8));
+    }
+
+    #[test]
+    fn solver_accepts_output_icc_identity_without_measurement() {
+        let mut target = target();
+        target.characterization_id = None;
+        target.output_profile_identity = Some(IccProfileIdentity {
+            description: "Existing ceramic Output ICC".to_owned(),
+            sha256: "a".repeat(64),
+        });
+        target.output_profile_path = Some("Ceramic.icc".to_owned());
+        let mut model = DegenerateFourInkModel::new(1.0);
+        model.identity.id = format!("output-icc-sha256:{}", "a".repeat(64));
+
+        let result = solve_inverse_separation(
+            &target,
+            &SeparationStrategy {
+                max_delta_e00: Some(1.5),
+                ..SeparationStrategy::default()
+            },
+            weights(0.2, 0.0, 0.0),
+            &model,
+            target_lab(),
+            config(),
+        )
+        .unwrap();
+        assert!(result.candidate.delta_e00 <= 1.5);
     }
 
     #[test]
