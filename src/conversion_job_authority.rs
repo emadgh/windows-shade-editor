@@ -6,21 +6,25 @@ use crate::conversion_transaction::{
 };
 use crate::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;
 use crate::model::ShadeProject;
+use crate::profile_backed_optimizer_execution_capture::CapturedProfileBackedOptimizerExecution;
 
 /// Authority payload attached to one exact immutable conversion recipe when a
 /// production job is captured.
 ///
 /// ICC and DeviceLink jobs must use `Standard`. Custom Optimizer jobs must carry
-/// the exact immutable evidence capture that will be reopened and independently
-/// authorized again by the filesystem worker. This enum is deliberately not a
-/// serialized production-eligibility token and does not itself grant execution.
+/// exactly one immutable authority: measured evidence or a profile-backed
+/// execution capture. The filesystem worker reopens and independently verifies
+/// either authority before rendering; this enum is not an execution token.
 #[derive(Clone, Debug)]
 pub enum ConversionJobAuthority {
     Standard,
     CustomOptimizer(CapturedCustomOptimizerEvidence),
+    ProfileBackedOptimizer(CapturedProfileBackedOptimizerExecution),
 }
 
 impl ConversionJobAuthority {
+    /// Backward-compatible measured-evidence router used by existing #191/#205
+    /// call sites. Profile-backed callers must use `for_profile_backed_recipe`.
     pub fn for_recipe(
         recipe: &ConversionRecipe,
         custom_optimizer_evidence: Option<CapturedCustomOptimizerEvidence>,
@@ -30,6 +34,22 @@ impl ConversionJobAuthority {
             Some(evidence) => Ok(Self::CustomOptimizer(evidence)),
             None => Ok(Self::Standard),
         }
+    }
+
+    pub fn for_profile_backed_recipe(
+        recipe: &ConversionRecipe,
+        execution: CapturedProfileBackedOptimizerExecution,
+    ) -> Result<Self, String> {
+        if recipe.engine_mode != ConversionEngineMode::CustomOptimizer {
+            return Err(
+                "ICC/DeviceLink final conversion cannot carry profile-backed Custom Optimizer authority."
+                    .to_owned(),
+            );
+        }
+        execution
+            .validate_for_recipe(recipe)
+            .map_err(|errors| errors.join(" "))?;
+        Ok(Self::ProfileBackedOptimizer(execution))
     }
 }
 
@@ -53,11 +73,10 @@ pub fn validate_authority_binding(
 
 /// Capture one final production job through the authority-correct constructor.
 ///
-/// The Custom Optimizer branch always delegates to
-/// `ConversionJobCapture::capture_custom_optimizer`; the standard branch always
-/// delegates to `ConversionJobCapture::capture`. No caller can accidentally
-/// capture a Custom Optimizer recipe through the standard constructor or attach
-/// optimizer evidence to ICC/DeviceLink work.
+/// Measured and profile-backed Custom Optimizer jobs delegate to distinct
+/// `ConversionJobCapture` constructors. Standard ICC/DeviceLink jobs retain the
+/// original constructor. No branch can silently reinterpret one authority as the
+/// other.
 #[allow(clippy::too_many_arguments)]
 pub fn capture_conversion_job_with_authority(
     authority: ConversionJobAuthority,
@@ -94,8 +113,27 @@ pub fn capture_conversion_job_with_authority(
                 output_face_label,
             )
         }
+        (
+            ConversionEngineMode::CustomOptimizer,
+            ConversionJobAuthority::ProfileBackedOptimizer(execution),
+        ) => ConversionJobCapture::capture_profile_backed_optimizer(
+            source_project,
+            source_project_path,
+            source_project_file_sha256,
+            source_face_path,
+            source_snapshot_id,
+            source_file_sha256,
+            source_profile,
+            conversion_recipe,
+            execution,
+            output_policy,
+            output_tiff_path,
+            production_project_path,
+            production_project_name,
+            output_face_label,
+        ),
         (ConversionEngineMode::CustomOptimizer, ConversionJobAuthority::Standard) => Err(
-            "Custom Optimizer final conversion cannot be captured without immutable production evidence."
+            "Custom Optimizer final conversion cannot be captured without immutable measured or profile-backed authority."
                 .to_owned(),
         ),
         (
@@ -118,9 +156,10 @@ pub fn capture_conversion_job_with_authority(
         ),
         (
             ConversionEngineMode::Icc | ConversionEngineMode::DeviceLink,
-            ConversionJobAuthority::CustomOptimizer(_),
+            ConversionJobAuthority::CustomOptimizer(_)
+            | ConversionJobAuthority::ProfileBackedOptimizer(_),
         ) => Err(
-            "ICC/DeviceLink final conversion cannot be captured with Custom Optimizer production evidence."
+            "ICC/DeviceLink final conversion cannot be captured with Custom Optimizer production authority."
                 .to_owned(),
         ),
     }
@@ -131,7 +170,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn custom_optimizer_requires_evidence_at_final_job_capture_boundary() {
+    fn custom_optimizer_requires_evidence_at_legacy_measured_boundary() {
         assert!(validate_authority_binding(ConversionEngineMode::CustomOptimizer, true).is_ok());
         let error = validate_authority_binding(ConversionEngineMode::CustomOptimizer, false)
             .unwrap_err();
@@ -152,6 +191,7 @@ mod tests {
         let source = include_str!("conversion_job_authority.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(runtime.contains("ConversionJobCapture::capture_custom_optimizer"));
+        assert!(runtime.contains("ConversionJobCapture::capture_profile_backed_optimizer"));
         assert!(runtime.contains("ConversionJobCapture::capture("));
         assert!(!runtime.contains("InverseLutProductionEligibility"));
         assert!(!runtime.contains("production_authorized: bool"));
