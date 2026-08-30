@@ -269,8 +269,12 @@ pub fn canonical_output_icc_model_id(profile_sha256: &str) -> Result<String, Str
 }
 
 fn model_id_matches_output_hash(model_id: &str, profile_sha256: &str) -> bool {
-    canonical_output_icc_model_id(profile_sha256)
-        .is_ok_and(|expected| expected.eq_ignore_ascii_case(model_id.trim()))
+    let model_id = model_id.trim();
+    let bare_model_id = model_id.strip_prefix("sha256:").unwrap_or(model_id);
+    let profile_sha256 = profile_sha256.trim();
+    is_bare_sha256(bare_model_id)
+        && is_bare_sha256(profile_sha256)
+        && bare_model_id.eq_ignore_ascii_case(profile_sha256)
 }
 
 fn is_bare_sha256(value: &str) -> bool {
@@ -350,6 +354,7 @@ mod tests {
 
     #[test]
     fn profile_identity_can_authorize_forward_model_without_measurement_id() {
+        assert!(target_accepts_forward_model_identity(&target(), &"A".repeat(64)));
         assert!(target_accepts_forward_model_identity(
             &target(),
             &format!("sha256:{}", "A".repeat(64))
