@@ -8,7 +8,7 @@ use windows_shade_editor::conversion_candidate_preview::CandidatePreviewResult;
 use windows_shade_editor::conversion_recipe::recipe_sha256;
 use windows_shade_editor::conversion_transaction::ConversionCancellation;
 
-use lcms2::{Flags, Intent, PixelFormat, Profile, Transform};
+use lcms2::{ColorSpaceSignatureExt, Flags, Intent, PixelFormat, Profile, Transform};
 
 use super::conversion_plan::target_channel_rgb;
 
@@ -270,9 +270,7 @@ mod tests {
         CONVERSION_RECIPE_SCHEMA_VERSION, ConversionTargetDefinition, SeparationStrategy,
         TargetChannelDefinition,
     };
-    use windows_shade_editor::conversion_analytics::{
-        ChannelUsageStats, ConversionUsageReport, CoveragePercentiles,
-    };
+    use windows_shade_editor::conversion_analytics::{ConversionUsageReport, CoveragePercentiles};
     use windows_shade_editor::model::IccProfileIdentity;
 
     fn usage() -> ConversionUsageReport {
@@ -281,7 +279,11 @@ mod tests {
             channels: vec![],
             mean_total_ink: 0.0,
             peak_total_ink: 0.0,
-            total_ink_percentiles: CoveragePercentiles::default(),
+            total_ink_percentiles: CoveragePercentiles {
+                p50: 0.0,
+                p95: 0.0,
+                p99: 0.0,
+            },
             total_ink_limit_hit_percent: None,
             neutral_black_share: None,
         }
