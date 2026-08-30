@@ -40,8 +40,10 @@ Every row moved out of `Pending` must be backed by a reproducible evidence recor
 
 Production/fired approval additionally records printer/RIP configuration, physical ink set, substrate/body, firing conditions and the measurement/fired-result reference. Approval evidence must identify the exact fixture and profile bytes; filename-only or visually similar replacements are not equivalent evidence.
 
+`src/external_validation_evidence.rs` provides the typed Photoshop/RIP packet used to prepare this manual evidence from one validated `ConversionAuditRecord`. The packet copies only audit-bound fixture identities/topology, starts both consumers as `pending`, and rejects an asserted `passed` state unless exact consumer/version, observed bit depth, exact channel order/names, required semantic checks, evidence reference and reviewer/timestamp are present. The packet is an evidence-capture aid only: generating it does not move either external row out of `Pending`.
+
 ## Approval rule
 
-External rows must stay `Pending` until evidence from the named consumer is attached to the corresponding validation work. Internal unit/integration tests must never be used as a substitute for external Photoshop/RIP/production approval.
+External rows must stay `Pending` until evidence from the named consumer is attached to the corresponding validation work. Internal unit/integration tests or an uncompleted generated validation packet must never be used as a substitute for external Photoshop/RIP/production approval.
 
-Related milestone work: #91 and #96.
+Related milestone work: #91, #96 and #472.

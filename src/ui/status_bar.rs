@@ -27,6 +27,7 @@ impl ShadeApp {
             ui.label(format!("{}{}", self.status_message, dirty));
             self.ui_linked_project_navigation(ui);
             self.ui_conversion_audit_menu(ui);
+            self.ui_external_validation_packet_menu(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(path) = &self.project_path {
                     ui.label(path.display().to_string());

@@ -13,6 +13,7 @@ pub(crate) mod conversion_presets;
 pub(crate) mod conversion_route_migration;
 pub(crate) mod curve_editor;
 pub(crate) mod export_queue;
+pub(crate) mod external_validation;
 pub(crate) mod faces;
 pub(crate) mod history_panel;
 pub(crate) mod input_router;
@@ -129,6 +130,7 @@ mod tests {
         let status_bar = include_str!("status_bar.rs");
         let conversion_source = include_str!("color_conversion.rs");
         let audit_source = include_str!("conversion_audit.rs");
+        let external_validation_source = include_str!("external_validation.rs");
         let migration_source = include_str!("conversion_route_migration.rs");
         let plan_source = include_str!("conversion_plan.rs");
         let batch_source = include_str!("conversion_batch.rs");
@@ -137,6 +139,10 @@ mod tests {
         let intake_source = include_str!("characterization_intake.rs");
         let conversion = conversion_source.split("\n#[cfg(test)]").next().unwrap_or(conversion_source);
         let audit = audit_source.split("\n#[cfg(test)]").next().unwrap_or(audit_source);
+        let external_validation = external_validation_source
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(external_validation_source);
         let migration = migration_source.split("\n#[cfg(test)]").next().unwrap_or(migration_source);
         let plan = plan_source.split("\n#[cfg(test)]").next().unwrap_or(plan_source);
         let batch = batch_source.split("\n#[cfg(test)]").next().unwrap_or(batch_source);
@@ -147,6 +153,7 @@ mod tests {
         assert!(status_bar.contains("ui_color_conversion_window"));
         assert!(status_bar.contains("ui_conversion_route_migration"));
         assert!(status_bar.contains("ui_conversion_audit_menu"));
+        assert!(status_bar.contains("ui_external_validation_packet_menu"));
         assert!(status_bar.contains("poll_conversion_candidate_runtime"));
         assert!(status_bar.contains("poll_conversion_batch_runtime"));
         for removed in [
@@ -199,6 +206,9 @@ mod tests {
         assert!(audit.contains("to_portable_pretty_json"));
         assert!(!audit.contains("ConversionAuditRecord::from_committed_job"));
         assert!(!audit.contains("build_conversion_preflight"));
+        assert!(external_validation.contains("ExternalValidationPacket::from_conversion_audit"));
+        assert!(external_validation.contains("validate_against_provenance"));
+        assert!(!external_validation.contains("externally_accepted()"));
         assert!(main.contains("app_features::COLOR_CONVERSION_LABEL"));
     }
 }
