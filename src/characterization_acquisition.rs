@@ -70,7 +70,6 @@ pub fn build_characterization_acquisition_plan(
                 let mut vector = vec![0.0; channel_count];
                 vector[left] = channel_max_coverage[left] * fraction;
                 vector[right] = channel_max_coverage[right] * fraction;
-                scale_to_total_limit(&mut vector, total_ink_limit);
                 push_unique(&mut vectors, &mut seen, vector, total_ink_limit);
             }
         }
@@ -211,14 +210,17 @@ fn scale_to_total_limit(vector: &mut [f32], total_ink_limit: f32) {
 fn push_unique(
     vectors: &mut Vec<Vec<f32>>,
     seen: &mut BTreeSet<Vec<u32>>,
-    vector: Vec<f32>,
+    mut vector: Vec<f32>,
     total_ink_limit: f32,
 ) {
-    let mut quantized = vector
+    // Bound first, then quantize downward. This order guarantees the six-decimal
+    // serialized representation cannot round a boundary sample back above the
+    // declared total-ink limit.
+    scale_to_total_limit(&mut vector, total_ink_limit);
+    let quantized = vector
         .into_iter()
         .map(quantize_down)
         .collect::<Vec<_>>();
-    scale_to_total_limit(&mut quantized, total_ink_limit);
     let key = quantized
         .iter()
         .map(|value| ((*value as f64) * COVERAGE_QUANTIZATION).round() as u32)
@@ -272,6 +274,22 @@ mod tests {
         )
     }
 
+    fn populate_lab(table: &str, delimiter: char) -> String {
+        let suffix = delimiter.to_string().repeat(3);
+        let lab = format!("{delimiter}50{delimiter}0{delimiter}0");
+        let mut rows = table.lines();
+        let mut measured = String::new();
+        measured.push_str(rows.next().unwrap());
+        measured.push('\n');
+        for row in rows {
+            let coverage = row.strip_suffix(&suffix).unwrap();
+            measured.push_str(coverage);
+            measured.push_str(&lab);
+            measured.push('\n');
+        }
+        measured
+    }
+
     #[test]
     fn plan_is_deterministic_bounded_and_starts_with_substrate_baseline() {
         let (names, maxima, total) = four_channel_input();
@@ -281,7 +299,9 @@ mod tests {
         assert_eq!(first.coverage_vectors[0], vec![0.0; 4]);
         assert!(first.patch_count() <= 1 + 4 * 4 + 2 * 6 + 4);
 
-        let names = (0..12).map(|index| format!("Ink-{index}" )).collect::<Vec<_>>();
+        let names = (0..12)
+            .map(|index| format!("Ink-{index}"))
+            .collect::<Vec<_>>();
         let maxima = vec![0.8; 12];
         let large = build_characterization_acquisition_plan(&names, &maxima, 2.4).unwrap();
         assert!(large.patch_count() <= 185);
@@ -294,9 +314,13 @@ mod tests {
 
         for channel in 0..names.len() {
             assert!(
-                plan.coverage_vectors
-                    .iter()
-                    .any(|vector| vector[channel] > 0.0 && vector.iter().enumerate().all(|(index, value)| index == channel || *value == 0.0)),
+                plan.coverage_vectors.iter().any(|vector| {
+                    vector[channel] > 0.0
+                        && vector
+                            .iter()
+                            .enumerate()
+                            .all(|(index, value)| index == channel || *value == 0.0)
+                }),
                 "channel {channel} is missing a single-ink acquisition sample"
             );
         }
@@ -307,13 +331,18 @@ mod tests {
                 assert!(*coverage >= 0.0);
                 assert!(*coverage <= *maximum + 1.0e-6);
             }
-            assert!(vector.iter().sum::<f32>() <= total + 1.0e-6);
+            assert!(vector.iter().sum::<f32>() <= total);
         }
 
         let unique = plan
             .coverage_vectors
             .iter()
-            .map(|vector| vector.iter().map(|value| format!("{value:.6}")).collect::<Vec<_>>())
+            .map(|vector| {
+                vector
+                    .iter()
+                    .map(|value| format!("{value:.6}"))
+                    .collect::<Vec<_>>()
+            })
             .collect::<BTreeSet<_>>();
         assert_eq!(unique.len(), plan.coverage_vectors.len());
     }
@@ -330,12 +359,7 @@ mod tests {
         assert!(table.starts_with("Blue,Brown,Beige,Black,L,a,b\n"));
         assert!(table.lines().skip(1).all(|line| line.ends_with(",,,")));
 
-        let mut measured = String::from("Blue,Brown,Beige,Black,L,a,b\n");
-        for row in table.lines().skip(1) {
-            let coverage = row.strip_suffix(",,,").unwrap();
-            measured.push_str(coverage);
-            measured.push_str(",50,0,0\n");
-        }
+        let measured = populate_lab(&table, ',');
         let parsed = parse_measurement_table(
             &measured,
             MeasurementTableDelimiter::Comma,
@@ -344,10 +368,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.len(), plan.patch_count());
+        assert!(
+            parsed
+                .iter()
+                .all(|sample| sample.coverages.iter().sum::<f32>() <= total)
+        );
     }
 
     #[test]
-    fn percent_export_scales_coverages_but_never_fills_lab_values() {
+    fn percent_export_scales_coverages_and_round_trips_inside_limits() {
         let (names, maxima, total) = four_channel_input();
         let plan = build_characterization_acquisition_plan(&names, &maxima, total).unwrap();
         let table = acquisition_plan_measurement_table(
@@ -358,6 +387,21 @@ mod tests {
         assert!(table.starts_with("Blue\tBrown\tBeige\tBlack\tL\ta\tb\n"));
         assert!(table.lines().skip(1).all(|line| line.ends_with("\t\t\t")));
         assert!(table.contains("80"));
+
+        let measured = populate_lab(&table, '\t');
+        let parsed = parse_measurement_table(
+            &measured,
+            MeasurementTableDelimiter::Tab,
+            MeasurementCoverageUnit::Percent,
+            &names,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), plan.patch_count());
+        assert!(
+            parsed
+                .iter()
+                .all(|sample| sample.coverages.iter().sum::<f32>() <= total)
+        );
     }
 
     #[test]
