@@ -259,14 +259,28 @@ impl ConversionRecipe {
                     .characterization_id
                     .as_deref()
                     .is_some_and(|value| !value.trim().is_empty());
+                let has_output_profile_path =
+                    has_profile_path(self.target.output_profile_path.as_deref());
+                let has_output_profile_identity =
+                    has_profile_hash(self.target.output_profile_identity.as_ref());
+                let has_exact_output_profile_identity =
+                    has_canonical_profile_hash(self.target.output_profile_identity.as_ref());
                 let has_output_icc_authority =
-                    has_profile_hash(self.target.output_profile_identity.as_ref())
-                        && has_profile_path(self.target.output_profile_path.as_deref());
+                    has_exact_output_profile_identity && has_output_profile_path;
                 if !has_measured_authority && !has_output_icc_authority {
                     errors.push(
                         "Custom N-ink optimization requires either a versioned measured characterization or an identity-verified target Output ICC with an external path."
                             .to_owned(),
                     );
+                    if !has_measured_authority
+                        && has_output_profile_identity
+                        && !has_exact_output_profile_identity
+                    {
+                        errors.push(
+                            "Profile-backed Custom Optimizer requires the target Output ICC identity to be canonical lowercase 64-character SHA-256 hex."
+                                .to_owned(),
+                        );
+                    }
                 }
                 if !has_measured_authority
                     && has_output_icc_authority
@@ -403,6 +417,17 @@ fn has_profile_hash(identity: Option<&IccProfileIdentity>) -> bool {
     identity.is_some_and(|identity| !identity.sha256.trim().is_empty())
 }
 
+fn has_canonical_profile_hash(identity: Option<&IccProfileIdentity>) -> bool {
+    identity.is_some_and(|identity| is_canonical_bare_sha256(identity.sha256.trim()))
+}
+
+fn is_canonical_bare_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn has_profile_path(path: Option<&str>) -> bool {
     path.is_some_and(|path| !path.trim().is_empty())
 }
@@ -506,6 +531,28 @@ mod tests {
             ),
         };
         assert!(recipe.validate().is_ok());
+    }
+
+    #[test]
+    fn profile_backed_optimizer_rejects_non_sha256_profile_identity() {
+        let mut target = seven_channel_target();
+        target.characterization_id = None;
+        target.output_profile_identity = Some(profile("Existing ceramic ICC", "not-a-sha256"));
+        let recipe = ConversionRecipe {
+            source_transparency_policy: None,
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::CustomOptimizer,
+            source_profile_identity: profile("sRGB", "source-hash"),
+            target,
+            rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
+            black_point_compensation: true,
+            strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: Some(
+                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+            ),
+        };
+        let errors = recipe.validate().expect_err("malformed profile identity must fail");
+        assert!(errors.iter().any(|error| error.contains("64-character SHA-256")));
     }
 
     #[test]
@@ -615,6 +662,7 @@ mod tests {
     fn output_icc_optimizer_authority_requires_both_hash_and_path() {
         let mut target = seven_channel_target();
         target.characterization_id = None;
+        target.output_profile_identity = Some(profile("Existing ceramic ICC", &"a".repeat(64)));
         target.output_profile_path = None;
         let recipe = ConversionRecipe {
             source_transparency_policy: None,
