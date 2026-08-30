@@ -16,6 +16,20 @@ mod core {
         use super::*;
         include!("icc_conversion_worker/profile_backed.rs");
     }
+
+    pub(super) fn render_profile_backed(
+        backend: &mut FilesystemIccConversionBackend,
+        capture: &ConversionJobCapture,
+        cancellation: &ConversionCancellation,
+        report: &mut dyn FnMut(ConversionProgress),
+    ) -> Result<CommittedConversionOutput, String> {
+        profile_backed::render_convert_and_commit_profile_backed(
+            backend,
+            capture,
+            cancellation,
+            report,
+        )
+    }
 }
 
 pub use core::sha256_file;
@@ -43,12 +57,7 @@ impl ConversionTransactionBackend for FilesystemIccConversionBackend {
         report: &mut dyn FnMut(ConversionProgress),
     ) -> Result<CommittedConversionOutput, String> {
         if capture.profile_backed_optimizer_execution.is_some() {
-            core::profile_backed::render_convert_and_commit_profile_backed(
-                &mut self.core,
-                capture,
-                cancellation,
-                report,
-            )
+            core::render_profile_backed(&mut self.core, capture, cancellation, report)
         } else {
             ConversionTransactionBackend::render_convert_and_commit(
                 &mut self.core,
@@ -83,7 +92,7 @@ mod tests {
     fn profile_dispatch_contains_no_measured_authority_fallback() {
         let source = include_str!("icc_conversion_worker.rs");
         assert!(source.contains("profile_backed_optimizer_execution.is_some()"));
-        assert!(source.contains("render_convert_and_commit_profile_backed"));
+        assert!(source.contains("render_profile_backed"));
         assert!(!source.contains("load_and_authorize_custom_optimizer_evidence"));
     }
 }
