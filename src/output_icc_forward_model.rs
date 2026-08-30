@@ -329,8 +329,8 @@ mod tests {
 
     #[test]
     fn channel_names_are_bounded_explicit_and_unique() {
-        assert!(validate_channel_names(&["Black".to_owned(); 3]).is_err());
-        assert!(validate_channel_names(&["Black".to_owned(); 13]).is_err());
+        assert!(validate_channel_names(&vec![String::from("Black"); 3]).is_err());
+        assert!(validate_channel_names(&vec![String::from("Black"); 13]).is_err());
         assert!(validate_channel_names(&[
             "Blue".to_owned(),
             "Brown".to_owned(),
