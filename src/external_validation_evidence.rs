@@ -215,6 +215,13 @@ impl ExternalValidationPacket {
         Ok(packet)
     }
 
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let packet = serde_json::from_str::<Self>(json)
+            .map_err(|error| format!("Cannot decode external validation packet JSON: {error}"))?;
+        packet.validate()?;
+        Ok(packet)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != EXTERNAL_VALIDATION_PACKET_SCHEMA_VERSION {
             return Err(format!(
@@ -267,6 +274,26 @@ impl ExternalValidationPacket {
         )?;
         self.ceramic_rip
             .validate_for(ExternalValidationConsumerKind::CeramicRip, &self.fixture)?;
+        Ok(())
+    }
+
+    /// Prove that a returned, manually completed packet still refers to the
+    /// exact immutable Production conversion audit it was exported from. The
+    /// consumer observations may be edited; the authority-bearing fixture may
+    /// not drift without becoming a foreign packet.
+    pub fn validate_against_conversion_audit(
+        &self,
+        audit: &ConversionAuditRecord,
+    ) -> Result<(), String> {
+        self.validate()?;
+        audit.validate()?;
+        let expected = Self::from_conversion_audit(audit)?.fixture;
+        if self.fixture != expected {
+            return Err(
+                "External validation packet fixture identity does not match this Production conversion audit. Re-export a fresh packet instead of rewriting fixture identity fields."
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 
@@ -366,6 +393,16 @@ mod tests {
         evidence.reviewed_at_unix_ms = Some(1_788_100_000_000);
     }
 
+    fn assert_foreign_fixture_rejected(mutator: impl FnOnce(&mut ExternalValidationFixture)) {
+        let source_audit = audit();
+        let mut packet = ExternalValidationPacket::from_conversion_audit(&source_audit).unwrap();
+        mutator(&mut packet.fixture);
+        assert!(packet.validate().is_ok());
+        assert!(packet
+            .validate_against_conversion_audit(&source_audit)
+            .is_err());
+    }
+
     #[test]
     fn pending_packet_is_portable_and_not_external_acceptance() {
         let packet = ExternalValidationPacket::from_conversion_audit(&audit()).unwrap();
@@ -376,6 +413,23 @@ mod tests {
         let json = packet.to_pretty_json().unwrap();
         assert!(!json.contains(r"D:\production"));
         assert!(json.contains("face-separated.tif"));
+    }
+
+    #[test]
+    fn json_round_trip_binds_to_exact_source_audit() {
+        let source_audit = audit();
+        let packet = ExternalValidationPacket::from_conversion_audit(&source_audit).unwrap();
+        let json = packet.to_pretty_json().unwrap();
+        let decoded = ExternalValidationPacket::from_json(&json).unwrap();
+        assert_eq!(decoded, packet);
+        decoded
+            .validate_against_conversion_audit(&source_audit)
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_packet_json_is_rejected() {
+        assert!(ExternalValidationPacket::from_json("{not-json}").is_err());
     }
 
     #[test]
@@ -400,12 +454,37 @@ mod tests {
     }
 
     #[test]
-    fn complete_photoshop_and_rip_pass_is_accepted() {
-        let mut packet = ExternalValidationPacket::from_conversion_audit(&audit()).unwrap();
+    fn every_authority_bearing_fixture_field_is_audit_bound() {
+        assert_foreign_fixture_rejected(|fixture| fixture.app_version.push_str("-foreign"));
+        assert_foreign_fixture_rejected(|fixture| {
+            fixture.engine_mode = ConversionEngineMode::DeviceLink
+        });
+        assert_foreign_fixture_rejected(|fixture| fixture.target_name.push_str(" foreign"));
+        assert_foreign_fixture_rejected(|fixture| fixture.bit_depth = 8);
+        assert_foreign_fixture_rejected(|fixture| fixture.channel_names.swap(0, 1));
+        assert_foreign_fixture_rejected(|fixture| fixture.source_file_sha256 = hash('7'));
+        assert_foreign_fixture_rejected(|fixture| fixture.source_profile_sha256 = hash('8'));
+        assert_foreign_fixture_rejected(|fixture| fixture.recipe_sha256 = hash('9'));
+        assert_foreign_fixture_rejected(|fixture| fixture.output_file.push_str(".foreign"));
+        assert_foreign_fixture_rejected(|fixture| fixture.output_sha256 = hash('a'));
+        assert_foreign_fixture_rejected(|fixture| fixture.output_profile_sha256 = Some(hash('b')));
+        assert_foreign_fixture_rejected(|fixture| fixture.device_link_sha256 = Some(hash('c')));
+        assert_foreign_fixture_rejected(|fixture| {
+            fixture.characterization_id = Some("foreign-characterization".to_owned())
+        });
+    }
+
+    #[test]
+    fn complete_photoshop_and_rip_pass_is_accepted_only_for_bound_audit() {
+        let source_audit = audit();
+        let mut packet = ExternalValidationPacket::from_conversion_audit(&source_audit).unwrap();
         let fixture = packet.fixture.clone();
         complete_pass(&mut packet.photoshop, &fixture, "Adobe Photoshop");
         complete_pass(&mut packet.ceramic_rip, &fixture, "Ceramic RIP");
         assert!(packet.validate().is_ok());
+        packet
+            .validate_against_conversion_audit(&source_audit)
+            .unwrap();
         assert!(packet.externally_accepted());
     }
 }

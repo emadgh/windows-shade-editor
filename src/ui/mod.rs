@@ -208,7 +208,32 @@ mod tests {
         assert!(!audit.contains("build_conversion_preflight"));
         assert!(external_validation.contains("ExternalValidationPacket::from_conversion_audit"));
         assert!(external_validation.contains("validate_against_provenance"));
-        assert!(!external_validation.contains("externally_accepted()"));
+
+        let validation_ui = external_validation
+            .split("fn packet_for_bound_audit")
+            .next()
+            .unwrap_or(external_validation);
+        let import_call = validation_ui
+            .find("select_and_validate_completed_packet(&audit)")
+            .expect("external acceptance reporting must come from the validated import path");
+        let acceptance_call = validation_ui
+            .find("packet.externally_accepted()")
+            .expect("validated returned evidence must expose explicit complete acceptance status");
+        assert!(
+            import_call < acceptance_call,
+            "external acceptance status was checked before the exact-audit import path"
+        );
+
+        let import_helper = external_validation
+            .split("fn select_and_validate_completed_packet")
+            .nth(1)
+            .and_then(|tail| tail.split("fn load_validation_packet").next())
+            .expect("completed external-validation import helper must remain explicit");
+        assert!(
+            import_helper.contains("packet.validate_against_conversion_audit(audit)?"),
+            "completed external-validation evidence must bind to the exact persisted audit before it is returned"
+        );
+
         assert!(main.contains("app_features::COLOR_CONVERSION_LABEL"));
     }
 }
