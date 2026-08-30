@@ -58,6 +58,7 @@ pub mod dpi;
 pub mod export;
 #[path = "export_recipe_impl.rs"]
 pub mod export_recipe;
+pub mod external_validation_evidence;
 pub mod file_observer;
 pub mod gradient_continuity;
 pub mod gradient_validation;
