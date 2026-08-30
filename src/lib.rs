@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+pub mod characterization_acquisition;
 pub mod characterization_intake;
 #[path = "color_conversion_impl/mod.rs"]
 pub mod color_conversion;
