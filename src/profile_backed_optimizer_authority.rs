@@ -75,7 +75,7 @@ struct ProfileBackedLutBuildIdentity<'a> {
 impl ProfileBackedOptimizerAuthority {
     /// Capture an immutable authority for the profile-backed execution path.
     ///
-    /// This is intentionally disjoint from measured `InverseLutProductionEligibility`.
+    /// This is intentionally disjoint from measured production eligibility.
     /// If a measured characterization is present, capture fails so profile-backed
     /// evidence can never substitute for or downgrade the measured-qualified route.
     pub fn capture(
