@@ -1,8 +1,25 @@
 # Measured Characterization Intake
 
-Tracks: #421, #205, #106, #115, #191
+Tracks: #421, #478, #205, #106, #115, #191
 
 Shade Editor can build a typed measured-characterization package from a laboratory CSV/TSV table inside the existing **Production Color Conversion → measured characterization package builder** surface. This is qualification tooling inside the normal Shade Editor executable; it does not create or distribute a second application.
+
+## Start with an acquisition template
+
+If a laboratory measurement table does not exist yet, enter the exact production channel names/order, measured per-channel maximum coverages and measured total-ink limit, select the intended delimiter/coverage unit, then choose **Export acquisition template...**.
+
+The generated table is deterministic for identical topology/limits and contains:
+
+- one zero-ink substrate baseline;
+- four generic single-ink ramp points per production channel;
+- two bounded pairwise screening mixes for each channel pair;
+- four balanced samples across the declared total-ink envelope.
+
+Every generated coverage vector is bounded by the declared per-channel maximums and total-ink limit, duplicate vectors are removed deterministically, and the plan remains bounded to at most 185 patches for 12 channels. The exported header is the exact existing intake shape: `<authoritative channels...>,L,a,b` for CSV or the equivalent TSV form.
+
+The `L`, `a`, and `b` cells are intentionally empty. Shade Editor does not fabricate PCS measurements. Fill those cells only from the real measurement workflow, then load the completed table back into the builder.
+
+This generic acquisition template is a collection/screening aid, not a claim of a representative production corpus. #205 may still require target-specific density, mixed-ink regions, neutral/near-neutral paths, warm/cool grays, saturated/boundary regions and samples around relevant production constraints. #106 and #115 likewise retain their measured neutral/gradient/continuity requirements.
 
 ## What the builder accepts
 
@@ -20,17 +37,18 @@ Enter the measured per-channel maximum coverage, measured total-ink limit, outpu
 ## Build and save
 
 1. Open the measured characterization package builder from the existing Production Color Conversion/preset surface.
-2. Load the CSV/TSV table.
-3. Select delimiter and coverage unit explicitly.
-4. Enter the exact channel names/order and measured limits.
-5. Enter production context: machine, RIP/version, linearization/calibration identity, substrate and optional glaze/body/product family.
-6. Enter measurement context: instrument, illuminant, observer, measurement condition and optional operator/lab.
-7. Leave `Experimental` selected unless the package metadata is intentionally being declared otherwise. Changing the dropdown only changes declared metadata; it does not grant production approval.
-8. Choose **Validate & build package**.
-9. Review validation errors, content ID and qualification warnings.
-10. Save JSON only after validation succeeds.
+2. Optionally export an acquisition template from the exact channel topology/limits if measurement collection has not started yet.
+3. After real measurement, load the completed CSV/TSV table.
+4. Select delimiter and coverage unit explicitly.
+5. Enter the exact channel names/order and measured limits.
+6. Enter production context: machine, RIP/version, linearization/calibration identity, substrate and optional glaze/body/product family.
+7. Enter measurement context: instrument, illuminant, observer, measurement condition and optional operator/lab.
+8. Leave `Experimental` selected unless the package metadata is intentionally being declared otherwise. Changing the dropdown only changes declared metadata; it does not grant production approval.
+9. Choose **Validate & build package**.
+10. Review validation errors, content ID and qualification warnings.
+11. Save JSON only after validation succeeds.
 
-The UI delegates parsing, structural validation and canonical `sha256:<hex>` content identity to the same Rust characterization authority used by production code. Editing any input after a successful build invalidates the built result and requires validation again before saving.
+The UI delegates acquisition-plan generation to the dedicated characterization-acquisition core and delegates measurement parsing, structural validation and canonical `sha256:<hex>` content identity to the existing Rust characterization authority used by production code. Editing any package input after a successful build invalidates the built result and requires validation again before saving.
 
 ## What a successful package means
 
