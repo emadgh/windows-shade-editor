@@ -251,14 +251,17 @@ impl ConversionRecipe {
                 }
             }
             ConversionEngineMode::CustomOptimizer => {
-                if self
+                let has_measured_characterization = self
                     .target
                     .characterization_id
                     .as_deref()
-                    .is_none_or(|value| value.trim().is_empty())
-                {
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_output_icc_forward_model = has_exact_sha256_profile_hash(
+                    self.target.output_profile_identity.as_ref(),
+                ) && has_profile_path(self.target.output_profile_path.as_deref());
+                if !has_measured_characterization && !has_output_icc_forward_model {
                     errors.push(
-                        "Custom N-ink optimization requires a versioned target characterization."
+                        "Custom N-ink optimization requires either a versioned measured characterization or an identity-verified Output ICC forward model."
                             .to_owned(),
                     );
                 }
@@ -388,6 +391,13 @@ fn has_profile_hash(identity: Option<&IccProfileIdentity>) -> bool {
     identity.is_some_and(|identity| !identity.sha256.trim().is_empty())
 }
 
+fn has_exact_sha256_profile_hash(identity: Option<&IccProfileIdentity>) -> bool {
+    identity.is_some_and(|identity| {
+        let hash = identity.sha256.trim();
+        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
 fn has_profile_path(path: Option<&str>) -> bool {
     path.is_some_and(|path| !path.trim().is_empty())
 }
@@ -422,6 +432,22 @@ mod tests {
             device_link_path: None,
             characterization_id: Some("ceramic-7c-measurement-v1".to_owned()),
             total_ink_limit: Some(1.8),
+        }
+    }
+
+    fn custom_recipe(target: ConversionTargetDefinition) -> ConversionRecipe {
+        ConversionRecipe {
+            source_transparency_policy: None,
+            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
+            engine_mode: ConversionEngineMode::CustomOptimizer,
+            source_profile_identity: profile("sRGB", "source-hash"),
+            target,
+            rendering_intent: ConversionRenderingIntent::Perceptual,
+            black_point_compensation: false,
+            strategy: SeparationStrategy::default(),
+            custom_optimizer_solver: Some(
+                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
+            ),
         }
     }
 
@@ -548,30 +574,32 @@ mod tests {
     }
 
     #[test]
-    fn engine_mode_requires_matching_characterization_source() {
+    fn custom_optimizer_accepts_existing_output_icc_when_measurement_is_absent() {
         let mut target = seven_channel_target();
         target.characterization_id = None;
-        let recipe = ConversionRecipe {
-            source_transparency_policy: None,
-            schema_version: CONVERSION_RECIPE_SCHEMA_VERSION,
-            engine_mode: ConversionEngineMode::CustomOptimizer,
-            source_profile_identity: profile("sRGB", "source-hash"),
-            target,
-            rendering_intent: ConversionRenderingIntent::Perceptual,
-            black_point_compensation: false,
-            strategy: SeparationStrategy::default(),
-            custom_optimizer_solver: Some(
-                crate::custom_optimizer_config::CustomOptimizerSolverConfig::default(),
-            ),
-        };
+        target.output_profile_identity = Some(profile("Ceramic 7C", &"a".repeat(64)));
+        assert!(custom_recipe(target).validate().is_ok());
+    }
 
-        let errors = recipe
+    #[test]
+    fn custom_optimizer_rejects_missing_measured_and_output_icc_authority() {
+        let mut target = seven_channel_target();
+        target.characterization_id = None;
+        target.output_profile_identity = None;
+        target.output_profile_path = None;
+        let errors = custom_recipe(target)
             .validate()
-            .expect_err("custom optimizer without characterization must fail");
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("characterization"))
-        );
+            .expect_err("optimizer without any forward-model authority must fail");
+        assert!(errors.iter().any(|error| error.contains("Output ICC")));
+    }
+
+    #[test]
+    fn custom_optimizer_rejects_non_sha256_output_identity_without_measurement() {
+        let mut target = seven_channel_target();
+        target.characterization_id = None;
+        let errors = custom_recipe(target)
+            .validate()
+            .expect_err("profile-backed optimizer requires exact SHA-256 identity");
+        assert!(errors.iter().any(|error| error.contains("Output ICC")));
     }
 }
