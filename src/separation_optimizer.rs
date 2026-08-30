@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::color_conversion::{ConversionTargetDefinition, SeparationStrategy};
 use crate::device_characterization::{DeviceForwardModel, LabColor, evaluate_characterized_color};
+use crate::optimizer_forward_model_authority::{
+    OptimizerForwardModelAuthorityError, optimizer_forward_model_identity,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CandidateScoringWeights {
@@ -74,29 +77,31 @@ pub enum CharacterizedCandidateError {
     ForwardModel(String),
 }
 
-/// Build a separation candidate from an authoritative characterized forward
-/// model instead of accepting caller-supplied color error or neutrality data.
+/// Build a separation candidate from an authoritative forward model instead of
+/// accepting caller-supplied color error or neutrality data.
 ///
-/// The target characterization identity and exact channel order must match the
-/// model. This prevents a measured model for one ceramic ink set/RIP state from
-/// being silently reused for another topology. Neutral classification uses the
-/// requested PCS color's chroma, so an ink vector cannot make itself eligible
-/// for the neutral-Black reward.
+/// Measured characterization remains the preferred authority. When it is absent,
+/// the exact Output ICC SHA-256 may identify the forward model. Exact channel order
+/// must always match. Neutral classification uses the requested PCS color's chroma,
+/// so an ink vector cannot make itself eligible for the neutral-Black reward.
 pub fn characterize_candidate(
     target: &ConversionTargetDefinition,
     model: &dyn DeviceForwardModel,
     target_lab: LabColor,
     coverages: Vec<f32>,
 ) -> Result<SeparationCandidate, CharacterizedCandidateError> {
-    let target_characterization = target
-        .characterization_id
-        .as_deref()
-        .filter(|identity| !identity.trim().is_empty())
-        .ok_or(CharacterizedCandidateError::MissingTargetCharacterization)?;
+    let target_authority = optimizer_forward_model_identity(target).map_err(|error| match error {
+        OptimizerForwardModelAuthorityError::MissingAuthority => {
+            CharacterizedCandidateError::MissingTargetCharacterization
+        }
+        OptimizerForwardModelAuthorityError::InvalidOutputProfileIdentity(message) => {
+            CharacterizedCandidateError::ForwardModel(message)
+        }
+    })?;
 
-    if target_characterization != model.identity().id {
+    if target_authority != model.identity().id {
         return Err(CharacterizedCandidateError::CharacterizationIdentityMismatch {
-            target: target_characterization.to_owned(),
+            target: target_authority,
             model: model.identity().id.clone(),
         });
     }
@@ -122,7 +127,7 @@ pub fn characterize_candidate(
         .map_err(CharacterizedCandidateError::ForwardModel)?;
     if !evaluation.delta_e00.is_finite() || evaluation.delta_e00 > f64::from(f32::MAX) {
         return Err(CharacterizedCandidateError::ForwardModel(
-            "Characterization produced an invalid CIEDE2000 value.".to_owned(),
+            "Forward model produced an invalid CIEDE2000 value.".to_owned(),
         ));
     }
 
@@ -279,6 +284,7 @@ mod tests {
     use super::*;
     use crate::color_conversion::TargetChannelDefinition;
     use crate::device_characterization::CharacterizationIdentity;
+    use crate::model::IccProfileIdentity;
 
     fn target() -> ConversionTargetDefinition {
         ConversionTargetDefinition {
@@ -371,6 +377,32 @@ mod tests {
         assert!(candidate.delta_e00.is_finite());
         assert!(candidate.delta_e00 > 0.0);
         assert_eq!(candidate.chroma, 5.0);
+    }
+
+    #[test]
+    fn characterized_candidate_accepts_output_icc_authority_without_measurement() {
+        let mut target = target();
+        target.characterization_id = None;
+        target.output_profile_identity = Some(IccProfileIdentity {
+            description: "Existing ceramic Output ICC".to_owned(),
+            sha256: "a".repeat(64),
+        });
+        target.output_profile_path = Some("Ceramic.icc".to_owned());
+        let mut model = SyntheticModel::matching();
+        model.identity.id = format!("output-icc-sha256:{}", "a".repeat(64));
+
+        let candidate = characterize_candidate(
+            &target,
+            &model,
+            LabColor {
+                l: 60.0,
+                a: 0.0,
+                b: 0.0,
+            },
+            vec![0.1, 0.1, 0.1, 0.3],
+        )
+        .unwrap();
+        assert!(candidate.delta_e00.is_finite());
     }
 
     #[test]
