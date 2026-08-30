@@ -6,6 +6,9 @@ use crate::custom_optimizer_config::{
     ContinuityDistanceMetric, ContinuityPreferenceConfig, CustomOptimizerSolverMethod,
 };
 use crate::device_characterization::{DeviceForwardModel, LabColor};
+use crate::icc_device_forward_model::{
+    target_accepts_forward_model_identity, target_forward_model_authorities,
+};
 use crate::separation_optimizer::{
     CandidateEvaluation, CandidateScoringWeights, SeparationCandidate, characterize_candidate,
     evaluate_candidate,
@@ -32,7 +35,11 @@ pub struct InverseSolveResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InverseSolveError {
     InvalidConfiguration(Vec<String>),
+    /// Retained for API compatibility; now means no accepted target forward-model
+    /// identity exists (neither measured characterization nor Output ICC SHA).
     MissingTargetCharacterization,
+    /// Retained for API compatibility; `target` may list both accepted authority
+    /// identities when measured and profile-backed models coexist.
     CharacterizationIdentityMismatch {
         target: String,
         model: String,
@@ -69,9 +76,9 @@ struct RankedCandidate {
 /// candidate is evaluated through the authoritative `DeviceForwardModel` and the
 /// same production separation constraints used by `separation_optimizer`.
 ///
-/// Unsupported forward-model regions fail closed. The algorithm never edits a
-/// completed ICC/DeviceLink separation and never infers ink behavior from display
-/// colors.
+/// A model may be measured-characterization-backed or Output-ICC-backed. Unsupported
+/// forward-model regions fail closed. The algorithm never edits a completed
+/// ICC/DeviceLink separation and never infers ink behavior from display colors.
 pub fn solve_inverse_separation(
     target: &ConversionTargetDefinition,
     strategy: &SeparationStrategy,
@@ -294,14 +301,13 @@ fn validate_identity(
     target: &ConversionTargetDefinition,
     model: &dyn DeviceForwardModel,
 ) -> Result<(), InverseSolveError> {
-    let target_id = target
-        .characterization_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(InverseSolveError::MissingTargetCharacterization)?;
-    if target_id != model.identity().id {
+    let authorities = target_forward_model_authorities(target);
+    if authorities.is_empty() {
+        return Err(InverseSolveError::MissingTargetCharacterization);
+    }
+    if !target_accepts_forward_model_identity(target, &model.identity().id) {
         return Err(InverseSolveError::CharacterizationIdentityMismatch {
-            target: target_id.to_owned(),
+            target: authorities.join(" | "),
             model: model.identity().id.clone(),
         });
     }
@@ -620,6 +626,7 @@ mod tests {
     use super::*;
     use crate::color_conversion::TargetChannelDefinition;
     use crate::device_characterization::CharacterizationIdentity;
+    use crate::model::IccProfileIdentity;
 
     struct DegenerateFourInkModel {
         identity: CharacterizationIdentity,
@@ -752,6 +759,40 @@ mod tests {
         assert!(first.candidate.delta_e00 <= 1.5);
         assert!(first.evaluation.total_ink <= 1.5);
         assert!(first.candidate.coverages.iter().all(|value| *value <= 0.8));
+    }
+
+    #[test]
+    fn profile_backed_identity_can_drive_existing_inverse_solver() {
+        let mut profile_target = target();
+        profile_target.characterization_id = None;
+        profile_target.output_profile_identity = Some(IccProfileIdentity {
+            description: "Existing ceramic Output ICC".to_owned(),
+            sha256: "a".repeat(64),
+        });
+        profile_target.output_profile_path = Some("existing.icc".to_owned());
+        let model = DegenerateFourInkModel {
+            identity: CharacterizationIdentity {
+                id: "A".repeat(64),
+                channel_names: ["Blue", "Brown", "Beige", "Black"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            black_efficiency: 1.0,
+        };
+        let result = solve_inverse_separation(
+            &profile_target,
+            &SeparationStrategy {
+                max_delta_e00: Some(1.5),
+                ..SeparationStrategy::default()
+            },
+            weights(0.2, 0.0, 0.0),
+            &model,
+            target_lab(),
+            config(),
+        )
+        .unwrap();
+        assert!(result.candidate.delta_e00 <= 1.5);
     }
 
     #[test]
