@@ -4,6 +4,7 @@ pub(crate) mod characterization_intake;
 pub(crate) mod color_conversion;
 pub(crate) mod conversion_audit;
 pub(crate) mod conversion_batch;
+pub(crate) mod conversion_candidate_cache;
 pub(crate) mod conversion_candidate_preview;
 pub(crate) mod conversion_candidate_softproof;
 pub(crate) mod custom_optimizer_plan_adapter;
