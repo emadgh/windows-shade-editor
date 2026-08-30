@@ -19,9 +19,20 @@ use windows_shade_editor::conversion_transaction::{
 };
 use windows_shade_editor::icc_conversion::IccSourceModel;
 
+use super::conversion_candidate_cache::CandidateLru;
+use super::conversion_candidate_softproof::{
+    CandidateCompositeKind, CandidateCompositePreview, render_candidate_composite_preview,
+};
 use super::conversion_plan::{ConversionFaceInspection, target_channel_rgb};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(220);
+const CANDIDATE_CACHE_MAX_ENTRIES: usize = 6;
+const CANDIDATE_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
+
+struct RenderedCandidate {
+    result: CandidatePreviewResult,
+    composite: CandidateCompositePreview,
+}
 
 struct PendingCandidate {
     key: String,
@@ -30,7 +41,7 @@ struct PendingCandidate {
     recipe: ConversionRecipe,
     generation: u64,
     cancellation: ConversionCancellation,
-    rx: mpsc::Receiver<Result<CandidatePreviewResult, String>>,
+    rx: mpsc::Receiver<Result<RenderedCandidate, String>>,
 }
 
 struct ActiveCandidate {
@@ -41,8 +52,21 @@ struct ActiveCandidate {
     face_index: usize,
     project_revision: u64,
     result: CandidatePreviewResult,
+    composite: CandidateCompositePreview,
     solo_channel: Option<usize>,
+    composite_texture: egui::TextureHandle,
     texture: egui::TextureHandle,
+}
+
+struct CachedCandidate {
+    key: String,
+    source_state_id: String,
+    source_path: PathBuf,
+    recipe: ConversionRecipe,
+    face_index: usize,
+    project_revision: u64,
+    result: CandidatePreviewResult,
+    composite: CandidateCompositePreview,
 }
 
 pub(crate) struct CandidatePreviewController {
@@ -52,6 +76,7 @@ pub(crate) struct CandidatePreviewController {
     generation: u64,
     pending: Option<PendingCandidate>,
     active: Option<ActiveCandidate>,
+    cache: CandidateLru<CachedCandidate>,
     pinned: Option<CandidatePromotionSnapshot>,
     error: Option<String>,
     show_converted: bool,
@@ -66,6 +91,7 @@ impl Default for CandidatePreviewController {
             generation: 0,
             pending: None,
             active: None,
+            cache: CandidateLru::new(CANDIDATE_CACHE_MAX_ENTRIES, CANDIDATE_CACHE_MAX_BYTES),
             pinned: None,
             error: None,
             show_converted: true,
@@ -158,7 +184,7 @@ impl ShadeApp {
         if let Some(pending) = self.conversion_candidate.pending.take() {
             pending.cancellation.request();
         }
-        let removed = self.conversion_candidate.active.take().is_some();
+        let removed = self.cache_active_candidate(None);
         self.conversion_candidate.desired_key = None;
         self.conversion_candidate.desired_recipe = None;
         self.conversion_candidate.debounce_started = None;
@@ -305,6 +331,7 @@ impl ShadeApp {
         let histograms = active.result.histograms.clone();
         let usage = active.result.usage.clone();
         let solo = active.solo_channel;
+        let composite_kind = active.composite.kind;
         let recipe_sha = active.result.recipe_sha256.clone();
         let pinned_recipe_sha = self
             .conversion_candidate
@@ -324,6 +351,7 @@ impl ShadeApp {
             );
         });
         ui.small(format!("Converted target samples · recipe {}", short_hash(&recipe_sha)));
+        ui.small(composite_kind.label());
 
         ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
@@ -508,12 +536,29 @@ impl ShadeApp {
         force: bool,
         ctx: &egui::Context,
     ) {
+        if !force
+            && self
+                .conversion_candidate
+                .active
+                .as_ref()
+                .is_some_and(|active| active.key == key)
+        {
+            self.conversion_candidate.desired_key = Some(key);
+            self.conversion_candidate.desired_recipe = Some(recipe);
+            self.conversion_candidate.debounce_started = None;
+            self.apply_candidate_texture();
+            return;
+        }
+
         let changed = self.conversion_candidate.desired_key.as_deref() != Some(key.as_str());
         if changed || force {
             if let Some(pending) = self.conversion_candidate.pending.take() {
                 pending.cancellation.request();
             }
-            let removed = self.conversion_candidate.active.take().is_some();
+            let removed = self.cache_active_candidate(force.then_some(key.as_str()));
+            if force {
+                self.conversion_candidate.cache.remove(&key);
+            }
             self.conversion_candidate.desired_key = Some(key.clone());
             self.conversion_candidate.desired_recipe = Some(recipe.clone());
             self.conversion_candidate.debounce_started = Some(if force {
@@ -528,14 +573,12 @@ impl ShadeApp {
             }
         }
 
-        if self
-            .conversion_candidate
-            .active
-            .as_ref()
-            .is_some_and(|active| active.key == key)
-        {
+        if !force && self.restore_cached_candidate(&key, ctx) {
             self.conversion_candidate.debounce_started = None;
+            self.conversion_candidate.error = None;
+            self.conversion_candidate.show_converted = true;
             self.apply_candidate_texture();
+            self.report_info("Production candidate restored from cache");
             return;
         }
 
@@ -579,6 +622,7 @@ impl ShadeApp {
         );
         let source_path = source.source_path.clone();
         let rendered_recipe = recipe.clone();
+        let worker_recipe = recipe.clone();
         let adjusted_planes = match self.faces.get(source.face_index) {
             Some(face) => render::adjusted_planes(face.preview.as_ref(), &self.project),
             None => {
@@ -603,7 +647,12 @@ impl ShadeApp {
             self.conversion_candidate.generation.wrapping_add(1).max(1);
         let generation = self.conversion_candidate.generation;
         thread::spawn(move || {
-            let _ = tx.send(render_candidate_preview(input, &worker_cancel));
+            let rendered = render_candidate_preview(input, &worker_cancel).and_then(|result| {
+                let composite =
+                    render_candidate_composite_preview(&result, &worker_recipe, &worker_cancel)?;
+                Ok(RenderedCandidate { result, composite })
+            });
+            let _ = tx.send(rendered);
         });
         self.conversion_candidate.pending = Some(PendingCandidate {
             key,
@@ -659,7 +708,7 @@ impl ShadeApp {
                 PathBuf,
                 ConversionRecipe,
                 u64,
-                Result<CandidatePreviewResult, String>,
+                Result<RenderedCandidate, String>,
             ),
         }
         let poll = match self.conversion_candidate.pending.as_ref() {
@@ -694,9 +743,14 @@ impl ShadeApp {
                     return;
                 }
                 match result {
-                    Ok(result) => {
-                        let rgba = candidate_rgba(&result, None);
-                        let texture = load_candidate_texture(ctx, generation, None, &result, &rgba);
+                    Ok(rendered) => {
+                        let composite_texture = load_candidate_texture(
+                            ctx,
+                            generation,
+                            None,
+                            &rendered.result,
+                            &rendered.composite.rgba,
+                        );
                         self.conversion_candidate.error = None;
                         self.conversion_candidate.active = Some(ActiveCandidate {
                             key,
@@ -705,9 +759,11 @@ impl ShadeApp {
                             recipe,
                             face_index: self.current_face,
                             project_revision: self.project_revision,
-                            result,
+                            result: rendered.result,
+                            composite: rendered.composite,
                             solo_channel: None,
-                            texture,
+                            texture: composite_texture.clone(),
+                            composite_texture,
                         });
                         self.apply_candidate_texture();
                         self.report_info("Production candidate preview ready");
@@ -733,7 +789,7 @@ impl ShadeApp {
             return;
         };
         if face_index != self.current_face || revision != self.project_revision {
-            self.clear_conversion_candidate();
+            self.invalidate_conversion_candidate();
             return;
         }
         if let Some(face) = self.faces.get_mut(face_index) {
@@ -745,12 +801,76 @@ impl ShadeApp {
         let generation = self.conversion_candidate.generation;
         if let Some(active) = self.conversion_candidate.active.as_mut() {
             let solo = solo.filter(|index| *index < active.result.channel_count());
-            let rgba = candidate_rgba(&active.result, solo);
-            active.texture = load_candidate_texture(ctx, generation, solo, &active.result, &rgba);
+            if let Some(channel) = solo {
+                let rgba = candidate_solo_rgba(&active.result, channel);
+                active.texture =
+                    load_candidate_texture(ctx, generation, Some(channel), &active.result, &rgba);
+            } else {
+                active.texture = active.composite_texture.clone();
+            }
             active.solo_channel = solo;
         }
         self.conversion_candidate.show_converted = true;
         self.apply_candidate_texture();
+    }
+
+    fn cache_active_candidate(&mut self, discard_key: Option<&str>) -> bool {
+        let Some(active) = self.conversion_candidate.active.take() else {
+            return false;
+        };
+        if discard_key.is_some_and(|key| active.key == key) {
+            return true;
+        }
+        let bytes = candidate_cache_estimated_bytes(&active.result, &active.composite);
+        let key = active.key.clone();
+        let cached = CachedCandidate {
+            key: active.key,
+            source_state_id: active.source_state_id,
+            source_path: active.source_path,
+            recipe: active.recipe,
+            face_index: active.face_index,
+            project_revision: active.project_revision,
+            result: active.result,
+            composite: active.composite,
+        };
+        self.conversion_candidate.cache.insert(key, bytes, cached);
+        true
+    }
+
+    fn restore_cached_candidate(&mut self, key: &str, ctx: &egui::Context) -> bool {
+        let Some(cached) = self.conversion_candidate.cache.take(key) else {
+            return false;
+        };
+        if cached.key != key
+            || cached.face_index != self.current_face
+            || cached.project_revision != self.project_revision
+        {
+            return false;
+        }
+        self.conversion_candidate.generation =
+            self.conversion_candidate.generation.wrapping_add(1).max(1);
+        let generation = self.conversion_candidate.generation;
+        let composite_texture = load_candidate_texture(
+            ctx,
+            generation,
+            None,
+            &cached.result,
+            &cached.composite.rgba,
+        );
+        self.conversion_candidate.active = Some(ActiveCandidate {
+            key: cached.key,
+            source_state_id: cached.source_state_id,
+            source_path: cached.source_path,
+            recipe: cached.recipe,
+            face_index: cached.face_index,
+            project_revision: cached.project_revision,
+            result: cached.result,
+            composite: cached.composite,
+            solo_channel: None,
+            texture: composite_texture.clone(),
+            composite_texture,
+        });
+        true
     }
 
     fn invalidate_conversion_candidate(&mut self) {
@@ -758,6 +878,7 @@ impl ShadeApp {
             pending.cancellation.request();
         }
         let removed = self.conversion_candidate.active.take().is_some();
+        self.conversion_candidate.cache.clear();
         self.conversion_candidate.desired_key = None;
         self.conversion_candidate.desired_recipe = None;
         self.conversion_candidate.debounce_started = None;
@@ -771,6 +892,7 @@ impl ShadeApp {
             pending.cancellation.request();
         }
         let removed = self.conversion_candidate.active.take().is_some();
+        self.conversion_candidate.cache.clear();
         self.conversion_candidate.desired_key = None;
         self.conversion_candidate.desired_recipe = None;
         self.conversion_candidate.debounce_started = None;
@@ -811,40 +933,33 @@ fn candidate_key(
     )
 }
 
-fn candidate_rgba(result: &CandidatePreviewResult, solo: Option<usize>) -> Vec<u8> {
-    let pixels = result.width.saturating_mul(result.height);
-    let mut rgba = Vec::with_capacity(pixels.saturating_mul(4));
-    if let Some(channel) = solo.filter(|index| *index < result.planes.len()) {
-        for sample in &result.planes[channel] {
-            let gray = 255u8.saturating_sub((*sample >> 8) as u8);
-            rgba.extend_from_slice(&[gray, gray, gray, 255]);
-        }
-        return rgba;
-    }
-    for pixel in 0..pixels {
-        let mut rgb = [1.0f32; 3];
-        for (index, channel) in result.channels.iter().enumerate() {
-            let coverage = result.planes[index][pixel] as f32 / u16::MAX as f32;
-            let tint = channel
-                .display_rgb
-                .unwrap_or_else(|| target_channel_rgb(&channel.name, index));
-            let tint = [
-                tint[0] as f32 / 255.0,
-                tint[1] as f32 / 255.0,
-                tint[2] as f32 / 255.0,
-            ];
-            let strength = (coverage * channel.solidity).clamp(0.0, 1.0);
-            for component in 0..3 {
-                rgb[component] =
-                    rgb[component] * (1.0 - strength) + tint[component] * strength;
-            }
-        }
-        rgba.extend_from_slice(&[
-            (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-            255,
-        ]);
+fn candidate_cache_estimated_bytes(
+    result: &CandidatePreviewResult,
+    composite: &CandidateCompositePreview,
+) -> usize {
+    let planes = result
+        .planes
+        .iter()
+        .map(|plane| plane.len().saturating_mul(std::mem::size_of::<u16>()))
+        .sum::<usize>();
+    let histograms = result
+        .histograms
+        .len()
+        .saturating_mul(256)
+        .saturating_mul(std::mem::size_of::<u32>());
+    planes
+        .saturating_add(histograms)
+        .saturating_add(composite.rgba.len())
+}
+
+fn candidate_solo_rgba(result: &CandidatePreviewResult, channel: usize) -> Vec<u8> {
+    let Some(plane) = result.planes.get(channel) else {
+        return Vec::new();
+    };
+    let mut rgba = Vec::with_capacity(plane.len().saturating_mul(4));
+    for sample in plane {
+        let gray = 255u8.saturating_sub((*sample >> 8) as u8);
+        rgba.extend_from_slice(&[gray, gray, gray, 255]);
     }
     rgba
 }
@@ -879,6 +994,10 @@ fn draw_candidate_comparison(ui: &mut egui::Ui, comparison: &CandidateComparison
         comparison.p95_total_ink * 100.0,
         comparison.p99_total_ink * 100.0,
         comparison.peak_total_ink * 100.0,
+    ));
+    ui.small(format!(
+        "Total integrated relative ink Δ: {:+.3} units",
+        comparison.integrated_total_coverage,
     ));
     if let Some(delta) = comparison.total_ink_limit_hit_percent {
         ui.small(format!("Total-ink limit-hit Δ: {delta:+.2} percentage points"));
@@ -1021,7 +1140,7 @@ mod tests {
             histograms: vec![[0; 256]],
             usage: test_usage(),
         };
-        let rgba = candidate_rgba(&result, Some(0));
+        let rgba = candidate_solo_rgba(&result, 0);
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
         assert_eq!(&rgba[4..8], &[0, 0, 0, 255]);
     }
@@ -1055,5 +1174,9 @@ mod tests {
         assert!(runtime.contains("draw_candidate_usage"));
         assert!(runtime.contains("sync_conversion_candidate"));
         assert!(runtime.contains("render_candidate_preview"));
+        assert!(runtime.contains("render_candidate_composite_preview"));
+        assert!(runtime.contains("cache: CandidateLru<CachedCandidate>"));
+        assert!(runtime.contains("restore_cached_candidate"));
+        assert!(!runtime.contains("fn candidate_rgba"));
     }
 }
