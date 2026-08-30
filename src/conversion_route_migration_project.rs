@@ -223,7 +223,20 @@ fn replacement_provenance(
                 .production_provenance(&capture.conversion_recipe_sha256)
                 .map_err(|errors| {
                     format!(
-                        "Cannot persist migrated Custom Optimizer provenance: {}",
+                        "Cannot persist migrated measured Custom Optimizer provenance: {}",
+                        errors.join(" ")
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let profile_backed_optimizer = match capture.profile_backed_optimizer_execution.as_ref() {
+        Some(execution) => Some(
+            execution
+                .production_provenance(&capture.conversion_recipe_sha256)
+                .map_err(|errors| {
+                    format!(
+                        "Cannot persist migrated profile-backed Custom Optimizer provenance: {}",
                         errors.join(" ")
                     )
                 })?,
@@ -239,6 +252,7 @@ fn replacement_provenance(
         },
         recipe: capture.conversion_recipe.clone(),
         custom_optimizer,
+        profile_backed_optimizer,
         output_path: committed.final_path.display().to_string(),
         output_sha256: committed.new_sha256.clone(),
         converted_at_unix_ms: committed.converted_at_unix_ms,
@@ -563,6 +577,7 @@ mod tests {
             },
             recipe: old_recipe.clone(),
             custom_optimizer: None,
+            profile_backed_optimizer: None,
             output_path: output.display().to_string(),
             output_sha256: hash('o'),
             converted_at_unix_ms: 1,
