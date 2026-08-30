@@ -114,11 +114,12 @@ pub fn validate_production_provenance(provenance: &ProductionProvenance) -> Resu
     match (
         provenance.recipe.engine_mode,
         provenance.custom_optimizer.as_ref(),
+        provenance.profile_backed_optimizer.as_ref(),
     ) {
-        (ConversionEngineMode::CustomOptimizer, Some(custom)) => {
+        (ConversionEngineMode::CustomOptimizer, Some(custom), None) => {
             custom.validate().map_err(|errors| {
                 format!(
-                    "Invalid Custom Optimizer production provenance: {}",
+                    "Invalid measured Custom Optimizer production provenance: {}",
                     errors.join(" ")
                 )
             })?;
@@ -141,19 +142,85 @@ pub fn validate_production_provenance(provenance: &ProductionProvenance) -> Resu
                 ));
             }
         }
-        (ConversionEngineMode::CustomOptimizer, None) => {
+        (ConversionEngineMode::CustomOptimizer, None, Some(profile)) => {
+            profile.validate().map_err(|errors| {
+                format!(
+                    "Invalid profile-backed Custom Optimizer production provenance: {}",
+                    errors.join(" ")
+                )
+            })?;
+            if profile.conversion_recipe_sha256 != actual_recipe_sha {
+                return Err(format!(
+                    "Profile-backed Custom Optimizer production provenance recipe SHA-256 mismatch: recorded {}, actual {}.",
+                    profile.conversion_recipe_sha256, actual_recipe_sha
+                ));
+            }
+            if provenance
+                .recipe
+                .target
+                .characterization_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(
+                    "Profile-backed Custom Optimizer production provenance cannot authorize a measured-characterization recipe."
+                        .to_owned(),
+                );
+            }
+            let target = &provenance.recipe.target;
+            let output_identity = target.output_profile_identity.as_ref().ok_or_else(|| {
+                "Profile-backed Custom Optimizer production provenance requires Output ICC identity."
+                    .to_owned()
+            })?;
+            let output_path = target.output_profile_path.as_deref().ok_or_else(|| {
+                "Profile-backed Custom Optimizer production provenance requires Output ICC path."
+                    .to_owned()
+            })?;
+            if output_identity.sha256.trim() != profile.output_profile_sha256
+                || output_path != profile.output_profile_path
+            {
+                return Err(
+                    "Profile-backed Custom Optimizer Output ICC provenance does not match the exact recipe."
+                        .to_owned(),
+                );
+            }
+            let recipe_channels = target
+                .channels
+                .iter()
+                .map(|channel| channel.name.as_str())
+                .collect::<Vec<_>>();
+            if recipe_channels.len() != profile.channel_names.len()
+                || !recipe_channels
+                    .iter()
+                    .zip(profile.channel_names.iter())
+                    .all(|(left, right)| *left == right)
+                || target.bit_depth != profile.target_bit_depth
+            {
+                return Err(
+                    "Profile-backed Custom Optimizer topology/bit-depth provenance does not match the exact recipe."
+                        .to_owned(),
+                );
+            }
+        }
+        (ConversionEngineMode::CustomOptimizer, Some(_), Some(_)) => {
             return Err(
-                "Custom Optimizer Production provenance requires immutable LUT/validation evidence identities."
+                "Custom Optimizer Production provenance must carry exactly one authority: measured or profile-backed."
                     .to_owned(),
             );
         }
-        (_, Some(_)) => {
+        (ConversionEngineMode::CustomOptimizer, None, None) => {
             return Err(
-                "ICC/DeviceLink Production provenance cannot carry Custom Optimizer evidence identities."
+                "Custom Optimizer Production provenance requires immutable measured or profile-backed authority identities."
                     .to_owned(),
             );
         }
-        (_, None) => {}
+        (_, Some(_), _) | (_, _, Some(_)) => {
+            return Err(
+                "ICC/DeviceLink Production provenance cannot carry Custom Optimizer authority identities."
+                    .to_owned(),
+            );
+        }
+        (_, None, None) => {}
     }
     Ok(())
 }
@@ -251,6 +318,7 @@ mod tests {
                 pcs_compatibility_content_id: prefixed('a'),
                 conversion_recipe_sha256,
             }),
+            profile_backed_optimizer: None,
             output_path: output.display().to_string(),
             output_sha256: bare('b'),
             converted_at_unix_ms: 1234,
@@ -305,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_requires_evidence_and_non_optimizer_cannot_carry_it() {
+    fn optimizer_requires_one_authority_and_non_optimizer_cannot_carry_it() {
         let output = Path::new(r"C:\Production\Face_NInk.tif");
         let mut missing = custom_provenance(output);
         missing.custom_optimizer = None;
@@ -334,7 +402,9 @@ mod tests {
         validate_production_provenance(&icc).unwrap();
         let text = String::from_utf8(serde_json::to_vec(&icc).unwrap()).unwrap();
         assert!(!text.contains("custom_optimizer"));
+        assert!(!text.contains("profile_backed_optimizer"));
         let restored: ProductionProvenance = serde_json::from_str(&text).unwrap();
         assert!(restored.custom_optimizer.is_none());
+        assert!(restored.profile_backed_optimizer.is_none());
     }
 }
