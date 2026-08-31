@@ -76,6 +76,12 @@ impl PresetTargetBinding {
         target: &ConversionTargetDefinition,
         engine_mode: ConversionEngineMode,
     ) -> Self {
+        let measured_custom_optimizer = engine_mode == ConversionEngineMode::CustomOptimizer
+            && target
+                .characterization_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
         let transform_sha256 = match engine_mode {
             ConversionEngineMode::Icc => target
                 .output_profile_identity
@@ -85,7 +91,11 @@ impl PresetTargetBinding {
                 .device_link_identity
                 .as_ref()
                 .map(|identity| identity.sha256.trim().to_owned()),
-            ConversionEngineMode::CustomOptimizer => None,
+            ConversionEngineMode::CustomOptimizer if measured_custom_optimizer => None,
+            ConversionEngineMode::CustomOptimizer => target
+                .output_profile_identity
+                .as_ref()
+                .map(|identity| identity.sha256.trim().to_owned()),
         };
 
         let characterization_id = match engine_mode {
@@ -175,13 +185,32 @@ impl PresetTargetBinding {
                 }
             }
             ConversionEngineMode::CustomOptimizer => {
-                let current = target
+                let current_characterization = target
                     .characterization_id
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
-                if self.characterization_id.as_deref() != current {
-                    return PresetCompatibility::CharacterizationMismatch;
+                match current_characterization {
+                    Some(current) => {
+                        if self.characterization_id.as_deref() != Some(current) {
+                            return PresetCompatibility::CharacterizationMismatch;
+                        }
+                        if self.transform_sha256.is_some() {
+                            return PresetCompatibility::TransformIdentityMismatch;
+                        }
+                    }
+                    None => {
+                        if self.characterization_id.is_some() {
+                            return PresetCompatibility::CharacterizationMismatch;
+                        }
+                        let current = target
+                            .output_profile_identity
+                            .as_ref()
+                            .map(|identity| identity.sha256.trim());
+                        if self.transform_sha256.as_deref() != current {
+                            return PresetCompatibility::TransformIdentityMismatch;
+                        }
+                    }
                 }
             }
         }
@@ -306,7 +335,7 @@ impl SeparationPresetDefinition {
 mod tests {
     use super::*;
     use crate::color_conversion::{
-        ConversionRenderingIntent, TargetChannelDefinition, CONVERSION_RECIPE_SCHEMA_VERSION,
+        CONVERSION_RECIPE_SCHEMA_VERSION, ConversionRenderingIntent, TargetChannelDefinition,
     };
     use crate::conversion_recipe::recipe_sha256;
     use crate::model::IccProfileIdentity;
@@ -351,8 +380,16 @@ mod tests {
             black_point_compensation: false,
             strategy: SeparationStrategy::default(),
             custom_optimizer_solver: (engine_mode == ConversionEngineMode::CustomOptimizer)
-                                .then(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default),
+                .then(crate::custom_optimizer_config::CustomOptimizerSolverConfig::default),
         }
+    }
+
+    fn profile_backed_recipe() -> ConversionRecipe {
+        let mut recipe = recipe(ConversionEngineMode::CustomOptimizer);
+        recipe.target.characterization_id = None;
+        recipe.target.device_link_identity = None;
+        recipe.target.device_link_path = None;
+        recipe
     }
 
     #[test]
@@ -419,6 +456,62 @@ mod tests {
         changed.target.characterization_id = Some("measurement-v2".to_owned());
         assert_eq!(
             preset.compatibility_with_recipe(&changed),
+            PresetCompatibility::CharacterizationMismatch
+        );
+    }
+
+    #[test]
+    fn profile_backed_custom_optimizer_preset_is_bound_to_output_icc_hash() {
+        let base = profile_backed_recipe();
+        let preset = SeparationPresetDefinition::built_in_balanced(
+            &base.target,
+            ConversionEngineMode::CustomOptimizer,
+        );
+        assert_eq!(
+            preset.target.transform_sha256.as_deref(),
+            Some("icc-v1")
+        );
+        assert!(preset.target.characterization_id.is_none());
+
+        let mut replaced = base.clone();
+        replaced.target.output_profile_identity = Some(identity("icc-v2"));
+        assert_eq!(
+            preset.compatibility_with_recipe(&replaced),
+            PresetCompatibility::TransformIdentityMismatch
+        );
+
+        let mut moved = base;
+        moved.target.output_profile_path = Some(r"D:\Profiles\same-output.icc".to_owned());
+        assert_eq!(
+            preset.compatibility_with_recipe(&moved),
+            PresetCompatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn measured_and_profile_backed_optimizer_preset_authorities_do_not_cross() {
+        let measured = recipe(ConversionEngineMode::CustomOptimizer);
+        let measured_preset = SeparationPresetDefinition::built_in_balanced(
+            &measured.target,
+            ConversionEngineMode::CustomOptimizer,
+        );
+        assert!(measured_preset.target.transform_sha256.is_none());
+        assert_eq!(
+            measured_preset.target.characterization_id.as_deref(),
+            Some("measurement-v1")
+        );
+
+        let profile_backed = profile_backed_recipe();
+        assert_eq!(
+            measured_preset.compatibility_with_recipe(&profile_backed),
+            PresetCompatibility::CharacterizationMismatch
+        );
+        let profile_preset = SeparationPresetDefinition::built_in_balanced(
+            &profile_backed.target,
+            ConversionEngineMode::CustomOptimizer,
+        );
+        assert_eq!(
+            profile_preset.compatibility_with_recipe(&measured),
             PresetCompatibility::CharacterizationMismatch
         );
     }
