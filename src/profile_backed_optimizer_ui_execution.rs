@@ -2,9 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};
+use crate::conversion_candidate_preview::{CandidatePreviewInput, CandidatePreviewResult};
 use crate::conversion_recipe::recipe_sha256;
+use crate::conversion_transaction::ConversionCancellation;
 use crate::inverse_lut_identity::InverseLutBuildPolicy;
 use crate::output_icc_forward_model::OutputIccForwardModel;
+use crate::profile_backed_candidate_preview::render_profile_backed_candidate_preview;
 use crate::profile_backed_inverse_lut_artifact::{
     ProfileBackedInverseLutArtifact, load_profile_backed_inverse_lut_artifact,
     save_profile_backed_inverse_lut_artifact,
@@ -19,6 +22,13 @@ const PROFILE_BACKED_UI_LUT_EXTENSION: &str = "profile-backed-lut.json";
 
 #[derive(Clone, Debug)]
 pub struct PreparedProfileBackedOptimizerExecution {
+    pub capture: CapturedProfileBackedOptimizerExecution,
+    pub build_stats: ProfileBackedInverseLutBuildStats,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedProfileBackedCandidate {
+    pub result: CandidatePreviewResult,
     pub capture: CapturedProfileBackedOptimizerExecution,
     pub build_stats: ProfileBackedInverseLutBuildStats,
 }
@@ -98,6 +108,36 @@ pub fn prepare_profile_backed_optimizer_execution(
     Ok(PreparedProfileBackedOptimizerExecution {
         capture,
         build_stats: built.stats,
+    })
+}
+
+/// Prepare one exact profile-backed execution and immediately render Candidate Preview
+/// through that same persisted capture. The returned capture is the only authority the
+/// unified UI may retain/promote/queue for this rendered candidate; no second authority
+/// is minted after pixels are shown to the operator.
+pub fn prepare_and_render_profile_backed_candidate(
+    input: CandidatePreviewInput,
+    output_profile_bytes: &[u8],
+    build_policy: InverseLutBuildPolicy,
+    artifact_path: &Path,
+    cancellation: &ConversionCancellation,
+) -> Result<PreparedProfileBackedCandidate, String> {
+    let prepared = prepare_profile_backed_optimizer_execution(
+        &input.recipe,
+        output_profile_bytes,
+        build_policy,
+        artifact_path,
+    )?;
+    let result = render_profile_backed_candidate_preview(
+        input,
+        &prepared.capture.authority,
+        &prepared.capture.lut_artifact_path,
+        cancellation,
+    )?;
+    Ok(PreparedProfileBackedCandidate {
+        result,
+        capture: prepared.capture,
+        build_stats: prepared.build_stats,
     })
 }
 
@@ -221,5 +261,16 @@ mod tests {
         standard.engine_mode = ConversionEngineMode::Icc;
         standard.custom_optimizer_solver = None;
         assert!(validate_profile_backed_recipe(&standard).is_err());
+    }
+
+    #[test]
+    fn candidate_helper_retains_one_exact_execution_capture_contract() {
+        let source = include_str!("profile_backed_optimizer_ui_execution.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("prepare_profile_backed_optimizer_execution("));
+        assert!(runtime.contains("render_profile_backed_candidate_preview("));
+        assert!(runtime.contains("&prepared.capture.authority"));
+        assert!(runtime.contains("&prepared.capture.lut_artifact_path"));
+        assert!(runtime.contains("capture: prepared.capture"));
     }
 }
