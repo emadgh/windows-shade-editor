@@ -23,10 +23,6 @@ pub struct LoadedExistingProductionProject {
     pub file_sha256: String,
 }
 
-/// Storage operations specific to append-existing Production transactions.
-/// Keeping this separate from `ConversionTransactionBackend` preserves every
-/// existing create-new backend/mock while allowing append transactions to use
-/// optimistic concurrency around the existing `.shade` file.
 pub trait ExistingProductionProjectStore {
     fn load_existing_production_project(
         &mut self,
@@ -371,11 +367,6 @@ where
     }
 }
 
-/// Execute one conversion with explicit Production-project destination intent.
-///
-/// `CreateNew` is byte-for-byte the existing transaction behavior. Append mode
-/// reuses that same TIFF/provenance transaction and intercepts only the small
-/// Production-project save boundary after the output commit.
 pub fn run_conversion_transaction_with_disposition<B, F>(
     capture: &ConversionJobCapture,
     disposition: &ProductionProjectDisposition,
@@ -523,6 +514,7 @@ mod tests {
             },
             recipe: recipe(source_hash),
             custom_optimizer: None,
+            profile_backed_optimizer: None,
             output_path: output.display().to_string(),
             output_sha256: HASH_C.to_owned(),
             converted_at_unix_ms: 1000,
