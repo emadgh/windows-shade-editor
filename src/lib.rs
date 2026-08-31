@@ -116,6 +116,7 @@ pub mod profile_backed_optimizer_authority;
 pub mod profile_backed_optimizer_execution_capture;
 pub mod profile_backed_optimizer_raster_transform;
 pub mod profile_backed_optimizer_ui_contract;
+pub mod profile_backed_optimizer_ui_execution;
 pub mod project_link_navigation;
 pub mod queue_core;
 pub mod reconversion_policy;
