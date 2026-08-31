@@ -28,6 +28,9 @@ pub struct ReplacementRisk {
     pub warning: Option<String>,
 }
 
+/// Analyze whether replacing one prior Production output would discard or
+/// reinterpret production-side work. Replacement is never the default action;
+/// even a clean Face must be explicitly selected by the operator.
 pub fn analyze_replacement_risk(
     production_project: &ShadeProject,
     production_project_path: &Path,
@@ -86,6 +89,12 @@ pub fn safe_default_reconversion_mode() -> ReconversionMode {
     ReconversionMode::NewVersion
 }
 
+/// Production projects seed each target channel's mixer with an explicit
+/// identity matrix. Comparing those rows with `ChannelAdjustment::default()`
+/// would therefore classify a freshly-created, untouched Production project as
+/// modified. Compare the persisted adjustment state with the canonical target
+/// identity instead, while treating unknown rows/coefficients as production
+/// work that replacement must not silently discard.
 fn production_adjustments_are_modified(
     project: &ShadeProject,
     provenance: &ProductionProvenance,
