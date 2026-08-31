@@ -18,6 +18,7 @@ use crate::profile_backed_inverse_lut_artifact::{
     save_profile_backed_inverse_lut_artifact,
 };
 use crate::profile_backed_inverse_lut_builder::{
+    BuiltProfileBackedInverseLutPayload, ProfileBackedForwardModelMethod,
     ProfileBackedInverseLutBuildStats, build_output_icc_inverse_lut_payload,
 };
 use crate::profile_backed_optimizer_authority::ProfileBackedOptimizerAuthority;
@@ -92,10 +93,10 @@ pub fn profile_backed_optimizer_artifact_path(
     Ok(root.join(format!("{recipe_sha}.{PROFILE_BACKED_UI_LUT_EXTENSION}")))
 }
 
-/// Prepare exact execution using the same frozen policy/cache contract consumed by
-/// unified Candidate Preview. This is also the final-queue preparation entry point for
-/// Faces that do not already carry a reusable Candidate capture.
-pub fn prepare_default_profile_backed_optimizer_execution(
+/// Reopen an already-published exact UI artifact without running the inverse solver.
+/// A content-addressed path that exists but no longer matches the exact recipe/policy
+/// is treated as corruption and fails closed rather than being silently overwritten.
+pub fn load_default_profile_backed_optimizer_execution(
     recipe: &ConversionRecipe,
 ) -> Result<PreparedProfileBackedOptimizerExecution, String> {
     validate_profile_backed_recipe(recipe)?;
@@ -106,19 +107,111 @@ pub fn prepare_default_profile_backed_optimizer_execution(
         .ok_or_else(|| "Profile-backed optimizer recipe has no Output ICC path.".to_owned())?;
     let output_profile_bytes = fs::read(output_path).map_err(|error| {
         format!(
-            "Cannot reopen profile-backed Output ICC {output_path} for LUT preparation: {error}"
+            "Cannot reopen profile-backed Output ICC {output_path} for LUT reuse: {error}"
         )
     })?;
     let artifact_path = profile_backed_optimizer_artifact_path(
         &default_profile_backed_optimizer_artifact_root(),
         recipe,
     )?;
+    load_profile_backed_optimizer_execution(
+        recipe,
+        &output_profile_bytes,
+        profile_backed_optimizer_ui_build_policy_v1(),
+        &artifact_path,
+    )
+}
+
+/// Prepare exact execution using the same frozen policy/cache contract consumed by
+/// unified Candidate Preview. Exact existing artifacts are reopened and revalidated;
+/// only an absent content-addressed path causes a new bounded inverse-LUT build.
+pub fn prepare_default_profile_backed_optimizer_execution(
+    recipe: &ConversionRecipe,
+) -> Result<PreparedProfileBackedOptimizerExecution, String> {
+    validate_profile_backed_recipe(recipe)?;
+    let artifact_path = profile_backed_optimizer_artifact_path(
+        &default_profile_backed_optimizer_artifact_root(),
+        recipe,
+    )?;
+    if artifact_path.exists() {
+        return load_default_profile_backed_optimizer_execution(recipe);
+    }
+    let output_path = recipe
+        .target
+        .output_profile_path
+        .as_deref()
+        .ok_or_else(|| "Profile-backed optimizer recipe has no Output ICC path.".to_owned())?;
+    let output_profile_bytes = fs::read(output_path).map_err(|error| {
+        format!(
+            "Cannot reopen profile-backed Output ICC {output_path} for LUT preparation: {error}"
+        )
+    })?;
     prepare_profile_backed_optimizer_execution(
         recipe,
         &output_profile_bytes,
         profile_backed_optimizer_ui_build_policy_v1(),
         &artifact_path,
     )
+}
+
+fn load_profile_backed_optimizer_execution(
+    recipe: &ConversionRecipe,
+    output_profile_bytes: &[u8],
+    expected_policy: InverseLutBuildPolicy,
+    artifact_path: &Path,
+) -> Result<PreparedProfileBackedOptimizerExecution, String> {
+    expected_policy
+        .validate()
+        .map_err(|errors| errors.join(" "))?;
+    let artifact = load_profile_backed_inverse_lut_artifact(artifact_path)?;
+    let recipe_sha = recipe_sha256(recipe)?;
+    let output_identity = recipe
+        .target
+        .output_profile_identity
+        .as_ref()
+        .ok_or_else(|| "Profile-backed optimizer recipe has no Output ICC identity.".to_owned())?;
+    let channel_names = recipe
+        .target
+        .channels
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect::<Vec<_>>();
+
+    if artifact.identity.recipe_sha256 != recipe_sha
+        || artifact.identity.output_profile_sha256 != output_identity.sha256.trim()
+        || artifact.identity.channel_names != channel_names
+        || artifact.identity.target_bit_depth != recipe.target.bit_depth
+        || artifact.identity.build_policy != expected_policy
+    {
+        return Err(format!(
+            "Existing profile-backed LUT {} does not match the exact recipe, Output ICC, topology, bit depth or frozen UI build policy.",
+            artifact_path.display()
+        ));
+    }
+
+    let built = BuiltProfileBackedInverseLutPayload {
+        forward_model_method: ProfileBackedForwardModelMethod::OutputIccDeviceToPcsV1,
+        forward_model_id: artifact.identity.forward_model_id.clone(),
+        channel_names: artifact.identity.channel_names.clone(),
+        target_bit_depth: artifact.identity.target_bit_depth,
+        build_policy: artifact.identity.build_policy,
+        validity: artifact.validity.clone(),
+        coverages: artifact.coverages.clone(),
+        stats: ProfileBackedInverseLutBuildStats::default(),
+    };
+    let authority = ProfileBackedOptimizerAuthority::capture(recipe, output_profile_bytes, &built)
+        .map_err(|error| format!("Cannot recapture exact profile-backed optimizer authority: {error:?}"))?;
+    let capture = CapturedProfileBackedOptimizerExecution::from_verified(
+        artifact_path.to_path_buf(),
+        &artifact,
+        authority,
+        recipe,
+    )
+    .map_err(|errors| errors.join(" "))?;
+    Ok(PreparedProfileBackedOptimizerExecution {
+        capture,
+        build_stats: ProfileBackedInverseLutBuildStats::default(),
+    })
 }
 
 /// Build, publish, reopen and capture the exact profile-backed optimizer execution
@@ -198,12 +291,21 @@ pub fn prepare_and_render_profile_backed_candidate(
     artifact_path: &Path,
     cancellation: &ConversionCancellation,
 ) -> Result<PreparedProfileBackedCandidate, String> {
-    let prepared = prepare_profile_backed_optimizer_execution(
-        &input.recipe,
-        output_profile_bytes,
-        build_policy,
-        artifact_path,
-    )?;
+    let prepared = if artifact_path.exists() {
+        load_profile_backed_optimizer_execution(
+            &input.recipe,
+            output_profile_bytes,
+            build_policy,
+            artifact_path,
+        )?
+    } else {
+        prepare_profile_backed_optimizer_execution(
+            &input.recipe,
+            output_profile_bytes,
+            build_policy,
+            artifact_path,
+        )?
+    };
     let result = render_profile_backed_candidate_preview(
         input,
         &prepared.capture.authority,
@@ -217,36 +319,25 @@ pub fn prepare_and_render_profile_backed_candidate(
     })
 }
 
-/// Unified Candidate Preview entry point. It reopens the Output ICC, builds/publishes
-/// the exact content-addressed artifact using the frozen UI policy, renders through the
-/// persisted capture, and returns that same capture alongside the raster result.
+/// Unified Candidate Preview entry point. It prepares or reuses the exact persistent
+/// execution capture using the frozen policy, renders through that capture, and returns
+/// the same capture alongside the raster result.
 pub fn prepare_and_render_default_profile_backed_candidate(
     input: CandidatePreviewInput,
     cancellation: &ConversionCancellation,
 ) -> Result<PreparedProfileBackedCandidate, String> {
-    validate_profile_backed_recipe(&input.recipe)?;
-    let output_path = input
-        .recipe
-        .target
-        .output_profile_path
-        .as_deref()
-        .ok_or_else(|| "Profile-backed optimizer recipe has no Output ICC path.".to_owned())?;
-    let output_profile_bytes = fs::read(output_path).map_err(|error| {
-        format!(
-            "Cannot reopen profile-backed Output ICC {output_path} for Candidate Preview preparation: {error}"
-        )
-    })?;
-    let artifact_path = profile_backed_optimizer_artifact_path(
-        &default_profile_backed_optimizer_artifact_root(),
-        &input.recipe,
-    )?;
-    prepare_and_render_profile_backed_candidate(
+    let prepared = prepare_default_profile_backed_optimizer_execution(&input.recipe)?;
+    let result = render_profile_backed_candidate_preview(
         input,
-        &output_profile_bytes,
-        profile_backed_optimizer_ui_build_policy_v1(),
-        &artifact_path,
+        &prepared.capture.authority,
+        &prepared.capture.lut_artifact_path,
         cancellation,
-    )
+    )?;
+    Ok(PreparedProfileBackedCandidate {
+        result,
+        capture: prepared.capture,
+        build_stats: prepared.build_stats,
+    })
 }
 
 fn validate_profile_backed_recipe(recipe: &ConversionRecipe) -> Result<(), String> {
@@ -399,6 +490,7 @@ mod tests {
         let source = include_str!("profile_backed_optimizer_ui_execution.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(runtime.contains("prepare_profile_backed_optimizer_execution("));
+        assert!(runtime.contains("load_profile_backed_optimizer_execution("));
         assert!(runtime.contains("render_profile_backed_candidate_preview("));
         assert!(runtime.contains("&prepared.capture.authority"));
         assert!(runtime.contains("&prepared.capture.lut_artifact_path"));
