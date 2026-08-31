@@ -26,7 +26,8 @@ pub struct ProductionTargetProfileInspection {
     pub channel_names_authoritative: bool,
 }
 
-/// Inspect either an Output-class target profile or a DeviceLink.
+/// Inspect an Output-class target profile, profile-backed Custom Optimizer target,
+/// or a DeviceLink.
 ///
 /// Identity, role and declared input/output topology come from the canonical ICC
 /// registry. Production target inspection adds only channel-name/colorant-table policy.
@@ -35,13 +36,6 @@ pub fn inspect_production_target_profile(
     mode: ConversionEngineMode,
     source_model: ColorModel,
 ) -> Result<ProductionTargetProfileInspection, String> {
-    if mode == ConversionEngineMode::CustomOptimizer {
-        return Err(
-            "Custom optimizer targets require characterized target data, not an ICC/DeviceLink file."
-                .to_owned(),
-        );
-    }
-
     // Selection is an identity-bearing persistence boundary: bypass browse cache and
     // capture facts from a fresh byte read/hash.
     let record = inspect_profile_fresh(path)?;
@@ -55,12 +49,6 @@ pub fn verify_production_target_profile(
     mode: ConversionEngineMode,
     source_model: ColorModel,
 ) -> Result<ProductionTargetProfileInspection, String> {
-    if mode == ConversionEngineMode::CustomOptimizer {
-        return Err(
-            "Custom optimizer targets require characterized target data, not an ICC/DeviceLink file."
-                .to_owned(),
-        );
-    }
     let record = IccProfileRegistry.verify_identity(path, expected_identity)?;
     inspect_target_record(path, record, mode, source_model)
 }
@@ -118,10 +106,15 @@ fn profile_facts(
     source_model: ColorModel,
 ) -> Result<ProfileFacts, String> {
     match mode {
-        ConversionEngineMode::Icc => {
+        ConversionEngineMode::Icc | ConversionEngineMode::CustomOptimizer => {
             if record.role != IccProfileRole::Output {
+                let engine = if mode == ConversionEngineMode::CustomOptimizer {
+                    "Profile-backed Custom Optimizer"
+                } else {
+                    "Standard ICC"
+                };
                 return Err(format!(
-                    "Standard ICC target must be an Output/printer profile; selected profile is {}.",
+                    "{engine} target must be an Output/printer profile; selected profile is {}.",
                     record.role.label()
                 ));
             }
@@ -163,7 +156,6 @@ fn profile_facts(
                 output_channel_count,
             })
         }
-        ConversionEngineMode::CustomOptimizer => unreachable!("handled before profile inspection"),
     }
 }
 
@@ -200,8 +192,9 @@ fn target_channel_names(
 
     let primary_tag = match mode {
         ConversionEngineMode::DeviceLink => TagSignature::ColorantTableOutTag,
-        ConversionEngineMode::Icc => TagSignature::ColorantTableTag,
-        ConversionEngineMode::CustomOptimizer => unreachable!(),
+        ConversionEngineMode::Icc | ConversionEngineMode::CustomOptimizer => {
+            TagSignature::ColorantTableTag
+        }
     };
     for tag in [primary_tag, TagSignature::ColorantTableTag] {
         if let Tag::NamedColorList(list) = profile.read_tag(tag) {
@@ -284,6 +277,19 @@ mod tests {
     }
 
     #[test]
+    fn custom_optimizer_uses_output_colorant_table_semantics() {
+        let profile = Profile::new_srgb();
+        let (names, authoritative) = target_channel_names(
+            &profile,
+            ConversionEngineMode::CustomOptimizer,
+            "CMYK",
+            4,
+        );
+        assert!(authoritative);
+        assert_eq!(names, ["Cyan", "Magenta", "Yellow", "Black"]);
+    }
+
+    #[test]
     fn missing_nchannel_colorant_table_requires_operator_confirmation() {
         let profile = Profile::new_srgb();
         let (names, authoritative) =
@@ -316,6 +322,13 @@ mod tests {
         let error = profile_facts(&record, ConversionEngineMode::Icc, ColorModel::Rgb)
             .expect_err("sRGB display profile is not an output target");
         assert!(error.contains("Output/printer"));
+        let optimizer_error = profile_facts(
+            &record,
+            ConversionEngineMode::CustomOptimizer,
+            ColorModel::Rgb,
+        )
+        .expect_err("profile-backed optimizer also requires Output class");
+        assert!(optimizer_error.contains("Output/printer"));
         let _ = fs::remove_file(path);
     }
 

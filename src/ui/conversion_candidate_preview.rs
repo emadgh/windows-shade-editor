@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use windows_shade_editor::color_conversion::ConversionRecipe;
+use windows_shade_editor::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use windows_shade_editor::conversion_analytics::ConversionUsageReport;
 use windows_shade_editor::conversion_candidate_comparison::{
     CandidateComparison, CandidateComparisonSnapshot, compare_candidate_snapshots,
@@ -18,6 +18,8 @@ use windows_shade_editor::conversion_transaction::{
     CapturedSourceProfile, ConversionCancellation,
 };
 use windows_shade_editor::icc_conversion::IccSourceModel;
+use windows_shade_editor::profile_backed_optimizer_execution_capture::CapturedProfileBackedOptimizerExecution;
+use windows_shade_editor::profile_backed_optimizer_ui_execution::prepare_and_render_default_profile_backed_candidate;
 
 use super::conversion_candidate_cache::CandidateLru;
 use super::conversion_candidate_softproof::{
@@ -32,6 +34,7 @@ const CANDIDATE_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
 struct RenderedCandidate {
     result: CandidatePreviewResult,
     composite: CandidateCompositePreview,
+    profile_backed_execution: Option<CapturedProfileBackedOptimizerExecution>,
 }
 
 struct PendingCandidate {
@@ -53,6 +56,7 @@ struct ActiveCandidate {
     project_revision: u64,
     result: CandidatePreviewResult,
     composite: CandidateCompositePreview,
+    profile_backed_execution: Option<CapturedProfileBackedOptimizerExecution>,
     solo_channel: Option<usize>,
     composite_texture: egui::TextureHandle,
     texture: egui::TextureHandle,
@@ -67,6 +71,7 @@ struct CachedCandidate {
     project_revision: u64,
     result: CandidatePreviewResult,
     composite: CandidateCompositePreview,
+    profile_backed_execution: Option<CapturedProfileBackedOptimizerExecution>,
 }
 
 pub(crate) struct CandidatePreviewController {
@@ -78,6 +83,7 @@ pub(crate) struct CandidatePreviewController {
     active: Option<ActiveCandidate>,
     cache: CandidateLru<CachedCandidate>,
     pinned: Option<CandidatePromotionSnapshot>,
+    pinned_profile_backed_execution: Option<CapturedProfileBackedOptimizerExecution>,
     error: Option<String>,
     show_converted: bool,
 }
@@ -93,6 +99,7 @@ impl Default for CandidatePreviewController {
             active: None,
             cache: CandidateLru::new(CANDIDATE_CACHE_MAX_ENTRIES, CANDIDATE_CACHE_MAX_BYTES),
             pinned: None,
+            pinned_profile_backed_execution: None,
             error: None,
             show_converted: true,
         }
@@ -118,6 +125,7 @@ pub(crate) struct CandidateStatusSnapshot {
     pub(crate) recipe_sha256: Option<String>,
     pub(crate) pinned_recipe_sha256: Option<String>,
     pub(crate) channel_count: usize,
+    pub(crate) profile_backed_authority_ready: bool,
     pub(crate) error: Option<String>,
 }
 
@@ -127,6 +135,7 @@ pub(crate) struct CandidatePromotionSelection {
     pub(crate) face_index: usize,
     pub(crate) project_revision: u64,
     pub(crate) source_path: PathBuf,
+    pub(crate) profile_backed_execution: Option<CapturedProfileBackedOptimizerExecution>,
 }
 
 impl ShadeApp {
@@ -170,6 +179,7 @@ impl ShadeApp {
             .is_some_and(|pinned| pinned.source_state_id() != source_state_id)
         {
             self.conversion_candidate.pinned = None;
+            self.conversion_candidate.pinned_profile_backed_execution = None;
         }
         let key = candidate_key(
             inspection.index,
@@ -232,6 +242,9 @@ impl ShadeApp {
                 .as_ref()
                 .map(|pinned| pinned.recipe_sha256().to_owned()),
             channel_count: active.map(|active| active.result.channel_count()).unwrap_or(0),
+            profile_backed_authority_ready: active
+                .and_then(|active| active.profile_backed_execution.as_ref())
+                .is_some(),
             error: self.conversion_candidate.error.clone(),
         }
     }
@@ -249,6 +262,43 @@ impl ShadeApp {
                     && active.project_revision == self.project_revision
                     && active.result.recipe_sha256 == expected
             })
+    }
+
+    pub(crate) fn conversion_candidate_profile_backed_execution(
+        &self,
+        recipe: &ConversionRecipe,
+    ) -> Result<Option<CapturedProfileBackedOptimizerExecution>, String> {
+        if recipe.engine_mode != ConversionEngineMode::CustomOptimizer
+            || recipe
+                .target
+                .characterization_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        let expected = recipe_sha256(recipe)?;
+        let active = self
+            .conversion_candidate
+            .active
+            .as_ref()
+            .filter(|active| {
+                active.face_index == self.current_face
+                    && active.project_revision == self.project_revision
+                    && active.result.recipe_sha256 == expected
+            })
+            .ok_or_else(|| {
+                "Profile-backed final conversion requires the exact current Candidate to finish rendering first."
+                    .to_owned()
+            })?;
+        let execution = active.profile_backed_execution.as_ref().ok_or_else(|| {
+            "Current profile-backed Candidate has no retained execution authority; refresh the Candidate."
+                .to_owned()
+        })?;
+        execution
+            .validate_for_recipe(recipe)
+            .map_err(|errors| errors.join(" "))?;
+        Ok(Some(execution.clone()))
     }
 
     pub(crate) fn conversion_candidate_a_promotion_selection(
@@ -277,11 +327,24 @@ impl ShadeApp {
                     .to_owned(),
             );
         }
+        if let Some(execution) = self
+            .conversion_candidate
+            .pinned_profile_backed_execution
+            .as_ref()
+        {
+            execution
+                .validate_for_recipe(pinned.recipe())
+                .map_err(|errors| errors.join(" "))?;
+        }
         Ok(CandidatePromotionSelection {
             snapshot: pinned.clone(),
             face_index: active.face_index,
             project_revision: active.project_revision,
             source_path: active.source_path.clone(),
+            profile_backed_execution: self
+                .conversion_candidate
+                .pinned_profile_backed_execution
+                .clone(),
         })
     }
 
@@ -302,11 +365,17 @@ impl ShadeApp {
             &active.recipe,
             &active.result,
         )?;
+        if let Some(execution) = active.profile_backed_execution.as_ref() {
+            execution
+                .validate_for_recipe(&active.recipe)
+                .map_err(|errors| errors.join(" "))?;
+        }
         Ok(CandidatePromotionSelection {
             snapshot,
             face_index: active.face_index,
             project_revision: active.project_revision,
             source_path: active.source_path.clone(),
+            profile_backed_execution: active.profile_backed_execution.clone(),
         })
     }
 
@@ -352,6 +421,9 @@ impl ShadeApp {
         });
         ui.small(format!("Converted target samples · recipe {}", short_hash(&recipe_sha)));
         ui.small(composite_kind.label());
+        if active.profile_backed_execution.is_some() {
+            ui.small("Profile-backed authority: exact Output ICC + inverse-LUT capture retained for final queue.");
+        }
 
         ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
@@ -469,6 +541,7 @@ impl ShadeApp {
 
         if clear_pin {
             self.conversion_candidate.pinned = None;
+            self.conversion_candidate.pinned_profile_backed_execution = None;
             self.report_info("Cleared Candidate A comparison baseline");
         }
         if pin_current {
@@ -501,7 +574,14 @@ impl ShadeApp {
             &active.recipe,
             &active.result,
         )?;
+        if let Some(execution) = active.profile_backed_execution.as_ref() {
+            execution
+                .validate_for_recipe(&active.recipe)
+                .map_err(|errors| errors.join(" "))?;
+        }
         let recipe_sha256 = snapshot.recipe_sha256().to_owned();
+        self.conversion_candidate.pinned_profile_backed_execution =
+            active.profile_backed_execution.clone();
         self.conversion_candidate.pinned = Some(snapshot);
         Ok(recipe_sha256)
     }
@@ -647,11 +727,41 @@ impl ShadeApp {
             self.conversion_candidate.generation.wrapping_add(1).max(1);
         let generation = self.conversion_candidate.generation;
         thread::spawn(move || {
-            let rendered = render_candidate_preview(input, &worker_cancel).and_then(|result| {
-                let composite =
-                    render_candidate_composite_preview(&result, &worker_recipe, &worker_cancel)?;
-                Ok(RenderedCandidate { result, composite })
-            });
+            let profile_backed = worker_recipe.engine_mode == ConversionEngineMode::CustomOptimizer
+                && worker_recipe
+                    .target
+                    .characterization_id
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty());
+            let rendered = if profile_backed {
+                prepare_and_render_default_profile_backed_candidate(input, &worker_cancel)
+                    .and_then(|prepared| {
+                        prepared
+                            .capture
+                            .validate_for_recipe(&worker_recipe)
+                            .map_err(|errors| errors.join(" "))?;
+                        let composite = render_candidate_composite_preview(
+                            &prepared.result,
+                            &worker_recipe,
+                            &worker_cancel,
+                        )?;
+                        Ok(RenderedCandidate {
+                            result: prepared.result,
+                            composite,
+                            profile_backed_execution: Some(prepared.capture),
+                        })
+                    })
+            } else {
+                render_candidate_preview(input, &worker_cancel).and_then(|result| {
+                    let composite =
+                        render_candidate_composite_preview(&result, &worker_recipe, &worker_cancel)?;
+                    Ok(RenderedCandidate {
+                        result,
+                        composite,
+                        profile_backed_execution: None,
+                    })
+                })
+            };
             let _ = tx.send(rendered);
         });
         self.conversion_candidate.pending = Some(PendingCandidate {
@@ -761,6 +871,7 @@ impl ShadeApp {
                             project_revision: self.project_revision,
                             result: rendered.result,
                             composite: rendered.composite,
+                            profile_backed_execution: rendered.profile_backed_execution,
                             solo_channel: None,
                             texture: composite_texture.clone(),
                             composite_texture,
@@ -832,6 +943,7 @@ impl ShadeApp {
             project_revision: active.project_revision,
             result: active.result,
             composite: active.composite,
+            profile_backed_execution: active.profile_backed_execution,
         };
         self.conversion_candidate.cache.insert(key, bytes, cached);
         true
@@ -866,6 +978,7 @@ impl ShadeApp {
             project_revision: cached.project_revision,
             result: cached.result,
             composite: cached.composite,
+            profile_backed_execution: cached.profile_backed_execution,
             solo_channel: None,
             texture: composite_texture.clone(),
             composite_texture,
@@ -1165,8 +1278,11 @@ mod tests {
         assert!(!runtime.contains("analyze_conversion_tiff"));
         assert!(runtime.contains("CandidatePromotionSnapshot"));
         assert!(runtime.contains("pinned: Option<CandidatePromotionSnapshot>"));
+        assert!(runtime.contains("pinned_profile_backed_execution"));
         assert!(runtime.contains("conversion_candidate_a_promotion_selection"));
         assert!(runtime.contains("conversion_candidate_b_promotion_selection"));
+        assert!(runtime.contains("profile_backed_execution"));
+        assert!(runtime.contains("conversion_candidate_profile_backed_execution"));
         assert!(runtime.contains("recipe: ConversionRecipe"));
         assert!(runtime.contains("compare_candidate_snapshots"));
         assert!(runtime.contains("Pin current as A"));
@@ -1174,6 +1290,7 @@ mod tests {
         assert!(runtime.contains("draw_candidate_usage"));
         assert!(runtime.contains("sync_conversion_candidate"));
         assert!(runtime.contains("render_candidate_preview"));
+        assert!(runtime.contains("prepare_and_render_default_profile_backed_candidate"));
         assert!(runtime.contains("render_candidate_composite_preview"));
         assert!(runtime.contains("cache: CandidateLru<CachedCandidate>"));
         assert!(runtime.contains("restore_cached_candidate"));

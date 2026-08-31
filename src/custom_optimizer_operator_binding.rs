@@ -2,12 +2,15 @@ use crate::color_conversion::{
     ConversionEngineMode, ConversionRecipe, ConversionTargetDefinition,
 };
 use crate::conversion_preset_runtime::{
-    PresetApplicationAvailability, unified_strategy_preset_availability,
+    PresetApplicationAvailability, unified_strategy_preset_availability_for_recipe,
 };
 use crate::conversion_presets::{PresetApplyError, SeparationPresetDefinition};
 use crate::custom_optimizer_operator_controls::{
     AppliedCustomOptimizerOperatorControls, CustomOptimizerOperatorControlError,
     CustomOptimizerOperatorControls,
+};
+use crate::custom_optimizer_strategy_capability::{
+    CustomOptimizerStrategyAuthorityKind, CustomOptimizerStrategyCapability,
 };
 
 /// Operator controls captured against an exact Custom Optimizer production target.
@@ -15,8 +18,9 @@ use crate::custom_optimizer_operator_controls::{
 /// The binding intentionally excludes Source ICC/transparency identity so the same
 /// operator choice can be applied to Current / Selected / All Faces while each Face
 /// still gets its own immutable recipe and recipe SHA-256. Production-critical target
-/// identity stays exact: characterization, topology, per-ink limits, total-ink limit,
-/// bit depth and target name must all match before the controls can be replayed.
+/// identity stays exact: characterization/profile authority, topology, per-ink limits,
+/// total-ink limit, bit depth and target name must all match before the controls can be
+/// replayed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundCustomOptimizerOperatorControls {
     target: ConversionTargetDefinition,
@@ -45,7 +49,7 @@ impl std::fmt::Display for BoundCustomOptimizerOperatorControlError {
                     .unwrap_or("Custom Optimizer operator controls are unavailable."),
             ),
             Self::TargetMismatch => formatter.write_str(
-                "Custom Optimizer operator controls are stale because the exact production target identity changed. Re-evaluate the preset/controls for the current characterization and ink topology.",
+                "Custom Optimizer operator controls are stale because the exact production target identity changed. Re-evaluate the preset/controls for the current characterization/profile authority and ink topology.",
             ),
             Self::Preset(error) => write!(formatter, "Cannot apply conversion preset: {error:?}"),
             Self::Operator(error) => error.fmt(formatter),
@@ -63,6 +67,27 @@ impl From<CustomOptimizerOperatorControlError> for BoundCustomOptimizerOperatorC
     fn from(value: CustomOptimizerOperatorControlError) -> Self {
         Self::Operator(value)
     }
+}
+
+fn strategy_capability_for_recipe(
+    recipe: &ConversionRecipe,
+) -> Result<CustomOptimizerStrategyCapability, BoundCustomOptimizerOperatorControlError> {
+    let authority_kind = if recipe
+        .target
+        .characterization_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        CustomOptimizerStrategyAuthorityKind::MeasuredProduction
+    } else {
+        CustomOptimizerStrategyAuthorityKind::ProfileBackedOutputIcc
+    };
+
+    CustomOptimizerStrategyCapability::for_recipe(recipe, authority_kind).map_err(|error| {
+        BoundCustomOptimizerOperatorControlError::Operator(
+            CustomOptimizerOperatorControlError::StrategyCapability(error),
+        )
+    })
 }
 
 impl BoundCustomOptimizerOperatorControls {
@@ -93,13 +118,13 @@ impl BoundCustomOptimizerOperatorControls {
 
     /// Apply the bound controls to another Face recipe for the same exact target.
     ///
-    /// Authorization is re-evaluated for every concrete recipe. Passing `false`
-    /// remains fail-closed; callers must eventually derive `true` only from the
-    /// #191 production-authorization path backed by approved #205 measured evidence.
+    /// Strategy editing authority is derived from the concrete recipe shape and
+    /// minted as an exact recipe-bound capability for every Face. This is not final
+    /// raster authority: measured/profile-backed execution evidence is rebuilt and
+    /// independently revalidated after the recipe changes.
     pub fn apply_to_recipe(
         &self,
         recipe: &ConversionRecipe,
-        custom_optimizer_production_authorized: bool,
     ) -> Result<AppliedCustomOptimizerOperatorControls, BoundCustomOptimizerOperatorControlError>
     {
         if recipe.engine_mode != ConversionEngineMode::CustomOptimizer {
@@ -110,32 +135,30 @@ impl BoundCustomOptimizerOperatorControls {
         if recipe.target != self.target {
             return Err(BoundCustomOptimizerOperatorControlError::TargetMismatch);
         }
-        let capability = CustomOptimizerOperatorControls::authorize_for_recipe(
-            recipe,
-            custom_optimizer_production_authorized,
-        )?;
+        let strategy_capability = strategy_capability_for_recipe(recipe)?;
+        let capability =
+            CustomOptimizerOperatorControls::authorize_for_recipe(recipe, &strategy_capability)?;
         Ok(self.controls.apply_to_recipe(recipe, &capability)?)
     }
 
     /// Convert one compatible preset into the exact target-bound operator state
     /// that Candidate Preview and final conversion can share.
     ///
-    /// The central engine-semantics guard is evaluated before the preset is
-    /// allowed to alter a recipe. The preset owns strategy only; existing
-    /// versioned solver objective weights are deliberately preserved and captured
-    /// from the exact baseline recipe by `from_recipe`.
+    /// The central engine-semantics guard is evaluated against a typed capability
+    /// for the exact baseline recipe before the preset is allowed to alter it. The
+    /// preset owns strategy only; existing versioned solver objective weights are
+    /// deliberately preserved and captured from the exact baseline recipe by
+    /// `from_recipe`.
     pub fn from_preset(
         preset: &SeparationPresetDefinition,
         recipe: &ConversionRecipe,
-        custom_optimizer_production_authorized: bool,
     ) -> Result<
         (Self, AppliedCustomOptimizerOperatorControls),
         BoundCustomOptimizerOperatorControlError,
     > {
-        let availability = unified_strategy_preset_availability(
-            recipe.engine_mode,
-            custom_optimizer_production_authorized,
-        );
+        let strategy_capability = strategy_capability_for_recipe(recipe)?;
+        let availability =
+            unified_strategy_preset_availability_for_recipe(recipe, Some(&strategy_capability));
         if availability != PresetApplicationAvailability::Available {
             return Err(
                 BoundCustomOptimizerOperatorControlError::ApplicationUnavailable(availability),
@@ -144,7 +167,7 @@ impl BoundCustomOptimizerOperatorControls {
 
         let preset_recipe = preset.apply_to_recipe(recipe)?;
         let binding = Self::from_recipe(&preset_recipe)?;
-        let applied = binding.apply_to_recipe(recipe, custom_optimizer_production_authorized)?;
+        let applied = binding.apply_to_recipe(recipe)?;
 
         // The preset changes strategy only. Re-applying the target-bound controls
         // must therefore reconstruct the exact same immutable recipe, including
@@ -208,6 +231,18 @@ mod tests {
         }
     }
 
+    fn profile_backed_recipe(source_hash: char) -> ConversionRecipe {
+        let mut recipe = recipe(source_hash);
+        recipe.target.name = "Output ICC ceramic 4C".to_owned();
+        recipe.target.characterization_id = None;
+        recipe.target.output_profile_identity = Some(IccProfileIdentity {
+            description: "Output ICC".to_owned(),
+            sha256: hash('d'),
+        });
+        recipe.target.output_profile_path = Some(r"C:\Color\output.icc".to_owned());
+        recipe
+    }
+
     #[test]
     fn preset_becomes_exact_target_bound_operator_state() {
         let baseline = recipe('a');
@@ -220,7 +255,7 @@ mod tests {
         let baseline_sha = recipe_sha256(&baseline).unwrap();
 
         let (binding, applied) =
-            BoundCustomOptimizerOperatorControls::from_preset(&preset, &baseline, true).unwrap();
+            BoundCustomOptimizerOperatorControls::from_preset(&preset, &baseline).unwrap();
 
         assert_eq!(binding.target(), &baseline.target);
         assert_eq!(applied.recipe.strategy.preset_name, "Black-focused");
@@ -243,8 +278,8 @@ mod tests {
         )
         .unwrap();
         let (binding, first_applied) =
-            BoundCustomOptimizerOperatorControls::from_preset(&preset, &first, true).unwrap();
-        let second_applied = binding.apply_to_recipe(&second, true).unwrap();
+            BoundCustomOptimizerOperatorControls::from_preset(&preset, &first).unwrap();
+        let second_applied = binding.apply_to_recipe(&second).unwrap();
 
         assert_ne!(
             first_applied.recipe.source_profile_identity,
@@ -267,34 +302,56 @@ mod tests {
         let mut characterization_changed = recipe('b');
         characterization_changed.target.characterization_id = Some("different-measurement".to_owned());
         assert_eq!(
-            binding.apply_to_recipe(&characterization_changed, true).unwrap_err(),
+            binding.apply_to_recipe(&characterization_changed).unwrap_err(),
             BoundCustomOptimizerOperatorControlError::TargetMismatch
         );
 
         let mut topology_changed = recipe('b');
         topology_changed.target.channels.swap(0, 1);
         assert_eq!(
-            binding.apply_to_recipe(&topology_changed, true).unwrap_err(),
+            binding.apply_to_recipe(&topology_changed).unwrap_err(),
             BoundCustomOptimizerOperatorControlError::TargetMismatch
         );
     }
 
     #[test]
-    fn missing_production_authorization_remains_fail_closed() {
-        let baseline = recipe('a');
+    fn profile_backed_preset_editing_does_not_require_measured_authorization() {
+        let baseline = profile_backed_recipe('a');
         let preset = SeparationPresetDefinition::built_in_black_focused(
             &baseline.target,
             ConversionEngineMode::CustomOptimizer,
             "Black",
         )
         .unwrap();
+
+        let (_, applied) =
+            BoundCustomOptimizerOperatorControls::from_preset(&preset, &baseline).unwrap();
+        assert_eq!(applied.recipe.target.characterization_id, None);
         assert_eq!(
-            BoundCustomOptimizerOperatorControls::from_preset(&preset, &baseline, false)
-                .unwrap_err(),
-            BoundCustomOptimizerOperatorControlError::ApplicationUnavailable(
-                PresetApplicationAvailability::CustomOptimizerNotProductionAuthorized
-            )
+            applied.recipe.target.output_profile_identity,
+            baseline.target.output_profile_identity
         );
+        assert_eq!(applied.recipe.strategy.preset_name, "Black-focused");
+    }
+
+    #[test]
+    fn malformed_profile_backed_recipe_fails_closed() {
+        let mut baseline = profile_backed_recipe('a');
+        baseline.target.output_profile_identity = None;
+        baseline.target.output_profile_path = None;
+        let preset = SeparationPresetDefinition::built_in_black_focused(
+            &baseline.target,
+            ConversionEngineMode::CustomOptimizer,
+            "Black",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            BoundCustomOptimizerOperatorControls::from_preset(&preset, &baseline).unwrap_err(),
+            BoundCustomOptimizerOperatorControlError::Operator(
+                CustomOptimizerOperatorControlError::StrategyCapability(_)
+            )
+        ));
     }
 
     #[test]
@@ -312,7 +369,7 @@ mod tests {
         icc.custom_optimizer_solver = None;
 
         assert_eq!(
-            binding.apply_to_recipe(&icc, true).unwrap_err(),
+            binding.apply_to_recipe(&icc).unwrap_err(),
             BoundCustomOptimizerOperatorControlError::NotCustomOptimizerEngine(
                 ConversionEngineMode::Icc
             )

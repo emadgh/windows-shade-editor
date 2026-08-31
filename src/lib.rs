@@ -47,6 +47,7 @@ pub mod custom_optimizer_evidence_bundle;
 pub mod custom_optimizer_operator_binding;
 pub mod custom_optimizer_operator_controls;
 pub mod custom_optimizer_raster_transform;
+pub mod custom_optimizer_strategy_capability;
 pub mod design_source;
 pub mod design_source_preview;
 pub mod device_characterization;
@@ -57,9 +58,9 @@ pub mod devicelink_conversion;
 pub mod dpi;
 #[path = "export_impl.rs"]
 pub mod export;
+pub mod external_validation_evidence;
 #[path = "export_recipe_impl.rs"]
 pub mod export_recipe;
-pub mod external_validation_evidence;
 pub mod file_observer;
 pub mod gradient_continuity;
 pub mod gradient_validation;
@@ -115,6 +116,8 @@ pub mod profile_backed_inverse_lut_builder;
 pub mod profile_backed_optimizer_authority;
 pub mod profile_backed_optimizer_execution_capture;
 pub mod profile_backed_optimizer_raster_transform;
+pub mod profile_backed_optimizer_ui_contract;
+pub mod profile_backed_optimizer_ui_execution;
 pub mod project_link_navigation;
 pub mod queue_core;
 pub mod reconversion_policy;
@@ -133,6 +136,7 @@ pub mod tiff_output;
 #[path = "tiff_io_impl.rs"]
 pub mod tiff_io;
 pub mod tiff_io_inspection;
+pub mod unified_optimizer_job_authority;
 
 #[cfg(test)]
 pub(crate) mod color_conversion_test_support;

@@ -1,11 +1,9 @@
 use crate::color_conversion::{ConversionEngineMode, ConversionRecipe, SeparationStrategy};
-use crate::conversion_preset_runtime::{
-    PresetApplicationAvailability, unified_strategy_preset_availability,
-};
 use crate::conversion_recipe::recipe_sha256;
 use crate::custom_optimizer_config::{
     CustomOptimizerObjectiveWeights, CustomOptimizerSolverConfig,
 };
+use crate::custom_optimizer_strategy_capability::CustomOptimizerStrategyCapability;
 
 /// Exact operator-editable Custom Optimizer state that is persisted in the
 /// immutable conversion recipe.
@@ -24,10 +22,9 @@ pub struct CustomOptimizerOperatorControls {
 ///
 /// This is deliberately *not* inverse-LUT production eligibility. Changing a
 /// strategy/objective field changes the recipe identity and therefore requires
-/// Candidate/LUT/evidence invalidation and revalidation. The token only proves
-/// that the caller evaluated the central UI availability policy for this exact
-/// pre-edit recipe; final production still reopens and authorizes exact measured
-/// evidence through `custom_optimizer_evidence` / #191.
+/// Candidate/LUT/evidence invalidation and revalidation. The token proves only
+/// that an exact typed strategy capability was validated for the pre-edit recipe;
+/// final raster execution independently reopens measured or profile-backed authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomOptimizerOperatorControlCapability {
     baseline_recipe_sha256: String,
@@ -48,7 +45,7 @@ pub struct AppliedCustomOptimizerOperatorControls {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CustomOptimizerOperatorControlError {
     NotCustomOptimizerEngine(ConversionEngineMode),
-    ApplicationUnavailable(PresetApplicationAvailability),
+    StrategyCapability(String),
     CapabilityRecipeMismatch {
         expected: String,
         actual: String,
@@ -66,11 +63,7 @@ impl std::fmt::Display for CustomOptimizerOperatorControlError {
                 formatter,
                 "Custom Optimizer operator controls cannot be captured from {engine:?}."
             ),
-            Self::ApplicationUnavailable(availability) => formatter.write_str(
-                availability
-                    .reason()
-                    .unwrap_or("Custom Optimizer operator controls are unavailable."),
-            ),
+            Self::StrategyCapability(error) => formatter.write_str(error),
             Self::CapabilityRecipeMismatch { expected, actual } => write!(
                 formatter,
                 "Custom Optimizer operator-control capability is stale: expected baseline recipe {expected}, found {actual}. Re-evaluate the exact current recipe before applying controls."
@@ -98,7 +91,7 @@ impl CustomOptimizerOperatorControls {
     /// Capture the exact persisted strategy/objective fields from an existing
     /// Custom Optimizer recipe. Production authorization is intentionally not
     /// required merely to inspect/edit a draft; applying it to the unified
-    /// production recipe requires a recipe-bound capability.
+    /// production recipe requires a recipe-bound strategy capability.
     pub fn from_recipe(
         recipe: &ConversionRecipe,
     ) -> Result<Self, CustomOptimizerOperatorControlError> {
@@ -123,23 +116,20 @@ impl CustomOptimizerOperatorControls {
         })
     }
 
-    /// Mint a capability only when the existing central Production Color
-    /// Conversion policy says strategy controls may be exposed. The token is
-    /// bound to the exact pre-edit recipe hash to prevent a stale UI action from
-    /// being replayed against a different target/recipe.
+    /// Mint a control-edit capability only after validating the typed strategy
+    /// capability against this exact recipe. No boolean can grant editing authority.
     pub fn authorize_for_recipe(
         recipe: &ConversionRecipe,
-        custom_optimizer_production_authorized: bool,
+        strategy_capability: &CustomOptimizerStrategyCapability,
     ) -> Result<CustomOptimizerOperatorControlCapability, CustomOptimizerOperatorControlError> {
-        let availability = unified_strategy_preset_availability(
-            recipe.engine_mode,
-            custom_optimizer_production_authorized,
-        );
-        if availability != PresetApplicationAvailability::Available {
-            return Err(CustomOptimizerOperatorControlError::ApplicationUnavailable(
-                availability,
+        if recipe.engine_mode != ConversionEngineMode::CustomOptimizer {
+            return Err(CustomOptimizerOperatorControlError::NotCustomOptimizerEngine(
+                recipe.engine_mode,
             ));
         }
+        strategy_capability
+            .validate_for_recipe(recipe)
+            .map_err(CustomOptimizerOperatorControlError::StrategyCapability)?;
         recipe
             .validate()
             .map_err(CustomOptimizerOperatorControlError::InvalidRecipe)?;
@@ -151,9 +141,9 @@ impl CustomOptimizerOperatorControls {
     }
 
     /// Apply controls to the exact immutable recipe consumed by Candidate
-    /// Preview/final conversion. The capability is a UI/runtime guard only; the
-    /// changed recipe must invalidate any previous Candidate/LUT/evidence and
-    /// final conversion must independently authorize exact measured evidence.
+    /// Preview/final conversion. The capability is an editing guard only; the
+    /// changed recipe invalidates prior Candidate/LUT authority and final conversion
+    /// must independently authorize exact measured or profile-backed evidence.
     pub fn apply_to_recipe(
         &self,
         recipe: &ConversionRecipe,
@@ -193,9 +183,6 @@ impl CustomOptimizerOperatorControls {
         })
     }
 
-    /// Return the exact solver configuration that would be persisted after
-    /// applying these controls. This is useful to render UI fields without
-    /// inventing a second solver schema.
     pub fn solver_with_controls(
         &self,
         solver: &CustomOptimizerSolverConfig,
@@ -212,6 +199,9 @@ mod tests {
     use crate::color_conversion::{
         CONVERSION_RECIPE_SCHEMA_VERSION, ConversionRenderingIntent,
         ConversionTargetDefinition, TargetChannelDefinition,
+    };
+    use crate::custom_optimizer_strategy_capability::{
+        CustomOptimizerStrategyAuthorityKind, CustomOptimizerStrategyCapability,
     };
     use crate::model::IccProfileIdentity;
 
@@ -258,6 +248,14 @@ mod tests {
         }
     }
 
+    fn measured_capability(recipe: &ConversionRecipe) -> CustomOptimizerStrategyCapability {
+        CustomOptimizerStrategyCapability::for_recipe(
+            recipe,
+            CustomOptimizerStrategyAuthorityKind::MeasuredProduction,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn capture_reads_only_the_exact_persisted_control_fields() {
         let recipe = custom_recipe();
@@ -278,8 +276,12 @@ mod tests {
     fn authorized_controls_change_the_same_immutable_recipe_identity() {
         let recipe = custom_recipe();
         let original_sha = recipe_sha256(&recipe).unwrap();
-        let capability =
-            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap();
+        let strategy_capability = measured_capability(&recipe);
+        let capability = CustomOptimizerOperatorControls::authorize_for_recipe(
+            &recipe,
+            &strategy_capability,
+        )
+        .unwrap();
         assert_eq!(capability.baseline_recipe_sha256(), original_sha);
 
         let mut controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
@@ -312,23 +314,28 @@ mod tests {
     }
 
     #[test]
-    fn authorization_gate_remains_fail_closed_until_measured_approval_exists() {
+    fn stale_strategy_capability_fails_closed() {
         let recipe = custom_recipe();
-        let error =
-            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, false).unwrap_err();
-        assert_eq!(
-            error,
-            CustomOptimizerOperatorControlError::ApplicationUnavailable(
-                PresetApplicationAvailability::CustomOptimizerNotProductionAuthorized
-            )
-        );
+        let strategy_capability = measured_capability(&recipe);
+        let mut changed = recipe.clone();
+        changed.strategy.black_generation_strength = 0.7;
+        let error = CustomOptimizerOperatorControls::authorize_for_recipe(
+            &changed,
+            &strategy_capability,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CustomOptimizerOperatorControlError::StrategyCapability(_)));
     }
 
     #[test]
     fn capability_is_bound_to_the_exact_pre_edit_recipe() {
         let recipe = custom_recipe();
-        let capability =
-            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap();
+        let strategy_capability = measured_capability(&recipe);
+        let capability = CustomOptimizerOperatorControls::authorize_for_recipe(
+            &recipe,
+            &strategy_capability,
+        )
+        .unwrap();
         let controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
 
         let mut changed = recipe.clone();
@@ -364,22 +371,23 @@ mod tests {
                 }
                 ConversionEngineMode::CustomOptimizer => unreachable!(),
             }
-            let error =
-                CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap_err();
-            assert_eq!(
-                error,
-                CustomOptimizerOperatorControlError::ApplicationUnavailable(
-                    PresetApplicationAvailability::EngineDoesNotConsumeSeparationStrategy
-                )
+            let measured = CustomOptimizerStrategyCapability::for_recipe(
+                &recipe,
+                CustomOptimizerStrategyAuthorityKind::MeasuredProduction,
             );
+            assert!(measured.is_err());
         }
     }
 
     #[test]
     fn invalid_operator_state_never_mints_a_changed_recipe_identity() {
         let recipe = custom_recipe();
-        let capability =
-            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap();
+        let strategy_capability = measured_capability(&recipe);
+        let capability = CustomOptimizerOperatorControls::authorize_for_recipe(
+            &recipe,
+            &strategy_capability,
+        )
+        .unwrap();
         let mut controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
         controls
             .strategy
@@ -395,8 +403,12 @@ mod tests {
     #[test]
     fn applying_controls_preserves_non_control_recipe_identity_inputs() {
         let recipe = custom_recipe();
-        let capability =
-            CustomOptimizerOperatorControls::authorize_for_recipe(&recipe, true).unwrap();
+        let strategy_capability = measured_capability(&recipe);
+        let capability = CustomOptimizerOperatorControls::authorize_for_recipe(
+            &recipe,
+            &strategy_capability,
+        )
+        .unwrap();
         let mut controls = CustomOptimizerOperatorControls::from_recipe(&recipe).unwrap();
         controls.strategy.black_channel = Some("Black".to_owned());
         controls.strategy.black_generation_strength = 0.5;

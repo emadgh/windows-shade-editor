@@ -309,16 +309,23 @@ impl ShadeApp {
                                             ConversionEngineMode::DeviceLink,
                                             "DeviceLink",
                                         );
+                                        ui.selectable_value(
+                                            &mut state.target.engine_mode,
+                                            ConversionEngineMode::CustomOptimizer,
+                                            "Custom Optimizer (existing Output ICC)",
+                                        );
                                     });
                                 ui.small(
-                                    "N-channel is an output topology, not a separate engine. Verified Output ICC and DeviceLink profiles can produce CMYK or multi-ink target planes.",
+                                    "N-channel is an output topology, not a separate engine. Standard ICC and DeviceLink keep their own separation semantics; Custom Optimizer uses an existing Output ICC as its profile-predicted device model.",
                                 );
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Custom Optimizer is the measured strategy-capable N-ink path and remains unavailable until measured production authorization.",
-                                    )
-                                    .color(egui::Color32::YELLOW),
-                                );
+                                if state.target.engine_mode == ConversionEngineMode::CustomOptimizer {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Profile-backed Custom Optimizer changes Black/neutral/per-ink separation while constraining color against the selected ICC model. It does not claim measured fired-ceramic ΔE.",
+                                        )
+                                        .color(egui::Color32::LIGHT_BLUE),
+                                    );
+                                }
                                 if previous_engine != state.target.engine_mode {
                                     state.target.clear_profile();
                                     state.clear_profile_catalog();
@@ -330,7 +337,7 @@ impl ShadeApp {
                                         .button(match state.target.engine_mode {
                                             ConversionEngineMode::Icc => "Choose Output ICC file...",
                                             ConversionEngineMode::DeviceLink => "Choose DeviceLink file...",
-                                            ConversionEngineMode::CustomOptimizer => "Choose target...",
+                                            ConversionEngineMode::CustomOptimizer => "Choose existing Output ICC...",
                                         })
                                         .clicked()
                                     {
@@ -450,7 +457,10 @@ impl ShadeApp {
                                             ui.end_row();
                                         });
 
-                                    if state.target.engine_mode == ConversionEngineMode::Icc {
+                                    if matches!(
+                                        state.target.engine_mode,
+                                        ConversionEngineMode::Icc | ConversionEngineMode::CustomOptimizer
+                                    ) {
                                         egui::ComboBox::from_label("Rendering intent")
                                             .selected_text(intent_label(state.target.rendering_intent))
                                             .show_ui(ui, |ui| {
@@ -467,6 +477,8 @@ impl ShadeApp {
                                                     );
                                                 }
                                             });
+                                    }
+                                    if state.target.engine_mode == ConversionEngineMode::Icc {
                                         ui.checkbox(
                                             &mut state.target.black_point_compensation,
                                             "Black Point Compensation",
@@ -497,6 +509,13 @@ impl ShadeApp {
                                             "I confirm this production channel order",
                                         );
                                     }
+                                }
+
+                                if state.target.engine_mode == ConversionEngineMode::CustomOptimizer
+                                    && state.target.target_profile.is_some()
+                                {
+                                    ui.add_space(6.0);
+                                    render_profile_backed_optimizer_controls(ui, &mut state.target);
                                 }
                             });
 
@@ -959,7 +978,9 @@ impl ShadeApp {
                     .set_title(match state.target.engine_mode {
                         ConversionEngineMode::Icc => "Select Production Output ICC",
                         ConversionEngineMode::DeviceLink => "Select Production DeviceLink",
-                        ConversionEngineMode::CustomOptimizer => "Select production target",
+                        ConversionEngineMode::CustomOptimizer => {
+                            "Select Existing Output ICC for Custom Optimizer"
+                        }
                     })
                     .pick_file()
             };
@@ -1352,10 +1373,29 @@ fn target_from_candidate_recipe(
                 .ok_or_else(|| "Promoted DeviceLink Candidate has no profile identity.".to_owned())?,
         ),
         ConversionEngineMode::CustomOptimizer => {
-            return Err(
-                "Custom Optimizer Candidate promotion is not enabled before measured production authorization."
-                    .to_owned(),
-            );
+            if recipe
+                .target
+                .characterization_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(
+                    "Measured Custom Optimizer Candidate promotion remains on the separate measured qualification path."
+                        .to_owned(),
+                );
+            }
+            (
+                recipe
+                    .target
+                    .output_profile_path
+                    .as_deref()
+                    .ok_or_else(|| "Profile-backed Candidate has no Output ICC path.".to_owned())?,
+                recipe
+                    .target
+                    .output_profile_identity
+                    .as_ref()
+                    .ok_or_else(|| "Profile-backed Candidate has no Output ICC identity.".to_owned())?,
+            )
         }
     };
     let verified = verify_production_target_profile(
@@ -1386,7 +1426,157 @@ fn target_from_candidate_recipe(
         output_bit_depth: recipe.target.bit_depth,
         rendering_intent: recipe.rendering_intent,
         black_point_compensation: recipe.black_point_compensation,
+        optimizer_strategy: recipe.strategy.clone(),
+        optimizer_solver: recipe.custom_optimizer_solver.unwrap_or_default(),
     })
+}
+
+fn render_profile_backed_optimizer_controls(ui: &mut egui::Ui, target: &mut ConversionTargetState) {
+    ui.group(|ui| {
+        ui.strong("Custom Optimizer separation controls");
+        ui.small(
+            "These controls change the immutable optimizer recipe. Any change invalidates the previous profile-backed LUT/Candidate authority and requires a new Candidate build.",
+        );
+
+        let channel_names = target.channel_names.clone();
+        let previous_black = target.optimizer_strategy.black_channel.clone();
+        egui::ComboBox::from_label("Neutral / Black ink")
+            .selected_text(
+                target
+                    .optimizer_strategy
+                    .black_channel
+                    .as_deref()
+                    .unwrap_or("None"),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut target.optimizer_strategy.black_channel, None, "None");
+                for name in &channel_names {
+                    ui.selectable_value(
+                        &mut target.optimizer_strategy.black_channel,
+                        Some(name.clone()),
+                        name,
+                    );
+                }
+            });
+        let mut changed = previous_black != target.optimizer_strategy.black_channel;
+
+        changed |= ui
+            .add(
+                egui::Slider::new(
+                    &mut target.optimizer_strategy.black_generation_strength,
+                    0.0..=1.0,
+                )
+                .text("Black preference strength"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut target.optimizer_strategy.black_start, 0.0..=1.0)
+                    .text("Black start"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut target.optimizer_strategy.black_max, 0.0..=1.0)
+                    .text("Black maximum"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(
+                    &mut target.optimizer_strategy.neutral_chroma_threshold,
+                    0.0..=64.0,
+                )
+                .text("Neutral chroma threshold"),
+            )
+            .changed();
+
+        ui.add_space(4.0);
+        ui.strong("Per-ink preference");
+        ui.small("-1 avoids an ink; +1 prefers it. This is optimizer ranking, never post-transform channel multiplication.");
+        for name in &channel_names {
+            let value = target
+                .optimizer_strategy
+                .per_ink_bias
+                .entry(name.clone())
+                .or_insert(0.0);
+            changed |= ui
+                .add(egui::Slider::new(value, -1.0..=1.0).text(name))
+                .changed();
+        }
+
+        ui.add_space(4.0);
+        let mut use_total_limit = target.optimizer_strategy.total_ink_limit.is_some();
+        if ui.checkbox(&mut use_total_limit, "Strategy total-ink limit").changed() {
+            target.optimizer_strategy.total_ink_limit = use_total_limit.then_some(
+                target
+                    .optimizer_strategy
+                    .total_ink_limit
+                    .unwrap_or(channel_names.len() as f32),
+            );
+            changed = true;
+        }
+        if let Some(limit) = target.optimizer_strategy.total_ink_limit.as_mut() {
+            changed |= ui
+                .add(
+                    egui::Slider::new(limit, 0.0..=channel_names.len() as f32)
+                        .text("Normalized total laydown"),
+                )
+                .changed();
+        }
+
+        let mut use_delta_e = target.optimizer_strategy.max_delta_e00.is_some();
+        if ui
+            .checkbox(&mut use_delta_e, "Limit profile-predicted ICC-model ΔE00")
+            .changed()
+        {
+            target.optimizer_strategy.max_delta_e00 = use_delta_e.then_some(
+                target.optimizer_strategy.max_delta_e00.unwrap_or(2.0),
+            );
+            changed = true;
+        }
+        if let Some(max_delta_e) = target.optimizer_strategy.max_delta_e00.as_mut() {
+            changed |= ui
+                .add(egui::Slider::new(max_delta_e, 0.0..=10.0).text("ICC-model ΔE00 ceiling"))
+                .changed();
+        }
+
+        ui.add_space(4.0);
+        ui.strong("Optimizer objective weights");
+        if let Some(weights) = target.optimizer_solver.objective_weights.as_mut() {
+            changed |= ui
+                .add(egui::Slider::new(&mut weights.color_error, 0.0..=10.0).text("Color error"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut weights.ink_preference, 0.0..=10.0)
+                        .text("Ink preference"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut weights.neutral_black, 0.0..=10.0)
+                        .text("Neutral Black"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut weights.total_ink, 0.0..=10.0).text("Total ink"))
+                .changed();
+        } else {
+            ui.label(
+                egui::RichText::new("Optimizer objective provenance is missing; recipe validation will remain blocked.")
+                    .color(egui::Color32::LIGHT_RED),
+            );
+        }
+
+        if changed {
+            target.optimizer_strategy.preset_name = "Custom".to_owned();
+        }
+        if ui.small_button("Reset optimizer controls").clicked() {
+            target.optimizer_strategy = Default::default();
+            target.optimizer_solver = Default::default();
+        }
+    });
 }
 
 fn source_path_key(path: &Path) -> String {
@@ -1575,7 +1765,7 @@ fn engine_label(mode: ConversionEngineMode) -> &'static str {
     match mode {
         ConversionEngineMode::Icc => "Output ICC (CMYK / N-channel)",
         ConversionEngineMode::DeviceLink => "DeviceLink",
-        ConversionEngineMode::CustomOptimizer => "Custom Optimizer",
+        ConversionEngineMode::CustomOptimizer => "Custom Optimizer (existing Output ICC)",
     }
 }
 
@@ -1638,7 +1828,9 @@ mod tests {
             "Production Color Conversion",
             "Output ICC (CMYK / N-channel)",
             "N-channel is an output topology, not a separate engine",
-            "Custom Optimizer is the measured strategy-capable N-ink path",
+            "Custom Optimizer (existing Output ICC)",
+            "Custom Optimizer separation controls",
+            "profile-predicted ICC-model ΔE00",
             "Current Face",
             "Selected Faces",
             "All Faces",
@@ -1667,6 +1859,8 @@ mod tests {
         assert!(runtime.contains("promoted_target: Option<PromotedCandidateTarget>"));
         assert!(runtime.contains("final_conversion_target(self, &state)"));
         assert!(runtime.contains("build_conversion_recipe(\n            &state.target"));
+        assert!(runtime.contains("optimizer_strategy"));
+        assert!(runtime.contains("optimizer_solver"));
         assert!(runtime.contains("presets: ConversionPresetUiState"));
         assert!(!runtime.contains("CandidateConfig"));
         assert!(!runtime.contains("ConversionBatchUiConfig"));
@@ -1681,6 +1875,7 @@ mod tests {
         assert!(runtime.contains("recipe_sha256(&rebuilt)"));
         assert!(runtime.contains("selection.snapshot.recipe_sha256()"));
         assert!(runtime.contains("verify_production_target_profile"));
-        assert!(runtime.contains("Custom Optimizer Candidate promotion is not enabled"));
+        assert!(runtime.contains("Profile-backed Candidate has no Output ICC path"));
+        assert!(runtime.contains("Measured Custom Optimizer Candidate promotion remains"));
     }
 }

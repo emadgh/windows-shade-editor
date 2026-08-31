@@ -154,7 +154,10 @@ pub fn production_profile_rejection(
     source_model: ColorModel,
 ) -> Option<ProductionProfileRejection> {
     match mode {
-        ConversionEngineMode::Icc => {
+        ConversionEngineMode::Icc | ConversionEngineMode::CustomOptimizer => {
+            // Profile-backed Custom Optimizer uses the exact same Output-class
+            // target eligibility as Standard ICC. Its separation execution and
+            // final authority remain distinct later in the pipeline.
             if profile.role != IccProfileRole::Output {
                 return Some(ProductionProfileRejection::WrongRole);
             }
@@ -183,7 +186,6 @@ pub fn production_profile_rejection(
             }
             None
         }
-        ConversionEngineMode::CustomOptimizer => Some(ProductionProfileRejection::WrongRole),
     }
 }
 
@@ -390,19 +392,33 @@ mod tests {
     }
 
     #[test]
-    fn custom_optimizer_never_accepts_icc_catalog_entries() {
-        let path = temp_path("custom");
-        let mut profile = Profile::new_srgb();
-        profile.save_profile_to_file(&path).unwrap();
-        let record = IccProfileRegistry.inspect(&path).unwrap();
+    fn custom_optimizer_uses_output_profile_role_policy_not_devicelink_or_display() {
+        let display_path = temp_path("custom-display");
+        let mut display = Profile::new_srgb();
+        display.save_profile_to_file(&display_path).unwrap();
+        let display_record = IccProfileRegistry.inspect(&display_path).unwrap();
         assert_eq!(
             production_profile_rejection(
-                &record,
+                &display_record,
                 ConversionEngineMode::CustomOptimizer,
                 ColorModel::Rgb,
             ),
             Some(ProductionProfileRejection::WrongRole)
         );
-        let _ = fs::remove_file(path);
+
+        let mut link = Profile::ink_limiting(ColorSpaceSignature::CmykData, 240.0).unwrap();
+        let (link_path, link_record) = inspect_temp(&mut link, "custom-link");
+        assert_eq!(link_record.role, IccProfileRole::DeviceLink);
+        assert_eq!(
+            production_profile_rejection(
+                &link_record,
+                ConversionEngineMode::CustomOptimizer,
+                ColorModel::Cmyk,
+            ),
+            Some(ProductionProfileRejection::WrongRole)
+        );
+
+        let _ = fs::remove_file(display_path);
+        let _ = fs::remove_file(link_path);
     }
 }
