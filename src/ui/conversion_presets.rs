@@ -2,9 +2,7 @@ use eframe::egui;
 use std::collections::BTreeMap;
 use std::fs;
 
-use windows_shade_editor::color_conversion::{
-    ConversionEngineMode, ConversionRecipe, SeparationStrategy,
-};
+use windows_shade_editor::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use windows_shade_editor::conversion_preset_runtime::{
     PresetApplicationAvailability, PresetRuntimeController,
     unified_strategy_preset_availability_for_recipe,
@@ -34,7 +32,6 @@ pub(crate) struct ConversionPresetUiState {
 #[derive(Clone, Debug)]
 pub(crate) enum ConversionPresetUiAction {
     RetryLoad,
-    Apply { id: String },
     Duplicate { source_id: String },
     Rename { id: String, name: String },
     Delete { id: String },
@@ -72,6 +69,7 @@ pub(crate) fn render_conversion_preset_manager(
     ui: &mut egui::Ui,
     state: &mut ConversionPresetUiState,
     recipe: Option<&ConversionRecipe>,
+    _legacy_custom_optimizer_production_authorized: bool,
     actions: &mut Vec<ConversionPresetUiAction>,
 ) {
     if ENABLE_MEASURED_CHARACTERIZATION_TOOLS {
@@ -142,7 +140,7 @@ pub(crate) fn render_conversion_preset_manager(
         let save_reason = recipe
             .map(|recipe| {
                 preset_availability(recipe).reason().unwrap_or(
-                    "Apply/duplicate/import/export are available here. Capturing the current manual settings as a named user preset still requires an explicit naming surface.",
+                    "The current profile-backed recipe has exact strategy editing authority. A separate named-capture UI is still required before saving arbitrary manual settings as a new preset.",
                 )
             })
             .unwrap_or("Choose a valid Production target first.");
@@ -190,13 +188,6 @@ pub(crate) fn render_conversion_preset_manager(
                 ui.small(notes);
             }
 
-            let can_apply = matches!(
-                (compatibility.as_ref(), availability),
-                (
-                    Some(PresetCompatibility::Compatible),
-                    Some(PresetApplicationAvailability::Available)
-                )
-            );
             let apply_reason = match (compatibility.as_ref(), availability) {
                 (None, _) => "Choose a valid Production target first.".to_owned(),
                 (Some(value), _) if *value != PresetCompatibility::Compatible => {
@@ -206,17 +197,10 @@ pub(crate) fn render_conversion_preset_manager(
                     .reason()
                     .unwrap_or("Preset application is unavailable.")
                     .to_owned(),
-                _ => "Apply this strategy to the exact working recipe and refresh Candidate Preview. Final raster authority is revalidated independently.".to_owned(),
+                _ => "This preset is compatible with the exact recipe-bound editing authority. The unified UI still applies strategy through the direct optimizer controls until the named preset action surface is connected.".to_owned(),
             };
-            if ui
-                .add_enabled(can_apply, egui::Button::new("Apply"))
-                .on_hover_text(apply_reason)
-                .clicked()
-            {
-                actions.push(ConversionPresetUiAction::Apply {
-                    id: preset.id.clone(),
-                });
-            }
+            ui.add_enabled(false, egui::Button::new("Apply"))
+                .on_hover_text(apply_reason);
 
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Duplicate").clicked() {
@@ -269,7 +253,6 @@ pub(crate) fn dispatch_conversion_preset_actions(
     state: &mut ConversionPresetUiState,
     actions: Vec<ConversionPresetUiAction>,
     recipe: Option<&ConversionRecipe>,
-    strategy: &mut SeparationStrategy,
 ) -> Vec<Result<String, String>> {
     let built_ins = built_ins_for_recipe(recipe);
     let mut results = Vec::with_capacity(actions.len());
@@ -282,24 +265,6 @@ pub(crate) fn dispatch_conversion_preset_actions(
                     Some(error) => Err(format!("Preset library reload failed: {error}")),
                     None => Ok("Preset library reloaded.".to_owned()),
                 }
-            }
-            ConversionPresetUiAction::Apply { id } => {
-                let recipe = recipe
-                    .ok_or_else(|| "Choose a valid Production target first.".to_owned());
-                recipe.and_then(|recipe| {
-                    let availability = preset_availability(recipe);
-                    let controller = state
-                        .controller
-                        .as_ref()
-                        .ok_or_else(|| "Preset library is not loaded.".to_owned())?;
-                    let applied = controller
-                        .apply_to_recipe(&id, recipe, &built_ins, availability)
-                        .map_err(|error| error.to_string())?;
-                    *strategy = applied.strategy;
-                    Ok(format!(
-                        "Applied conversion preset '{id}' to the working Custom Optimizer recipe; Candidate Preview will refresh with new exact recipe authority."
-                    ))
-                })
             }
             ConversionPresetUiAction::Duplicate { source_id } => state
                 .controller
@@ -518,7 +483,7 @@ mod tests {
     use super::*;
     use windows_shade_editor::color_conversion::{
         CONVERSION_RECIPE_SCHEMA_VERSION, ConversionRenderingIntent, ConversionTargetDefinition,
-        TargetChannelDefinition,
+        SeparationStrategy, TargetChannelDefinition,
     };
     use windows_shade_editor::custom_optimizer_config::CustomOptimizerSolverConfig;
     use windows_shade_editor::model::IccProfileIdentity;
@@ -614,13 +579,12 @@ mod tests {
     }
 
     #[test]
-    fn management_surface_routes_apply_through_runtime_guard() {
+    fn management_surface_uses_typed_recipe_capability_not_ui_boolean() {
         let source = include_str!("conversion_presets.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
-        assert!(runtime.contains("apply_to_recipe(&id, recipe, &built_ins, availability)"));
         assert!(runtime.contains("unified_strategy_preset_availability_for_recipe"));
-        assert!(runtime.contains("ConversionPresetUiAction::Apply"));
-        assert!(!runtime.contains("custom_optimizer_production_authorized"));
+        assert!(runtime.contains("CustomOptimizerStrategyCapability::for_recipe"));
+        assert!(!runtime.contains("unified_strategy_preset_availability("));
     }
 
     #[test]
