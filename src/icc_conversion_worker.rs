@@ -91,8 +91,9 @@ mod tests {
     #[test]
     fn profile_dispatch_contains_no_measured_authority_fallback() {
         let source = include_str!("icc_conversion_worker.rs");
-        assert!(source.contains("profile_backed_optimizer_execution.is_some()"));
-        assert!(source.contains("render_profile_backed"));
-        assert!(!source.contains("load_and_authorize_custom_optimizer_evidence"));
+        let runtime = source.split("#[cfg(test)]").next().unwrap();
+        assert!(runtime.contains("profile_backed_optimizer_execution.is_some()"));
+        assert!(runtime.contains("render_profile_backed"));
+        assert!(!runtime.contains("load_and_authorize_custom_optimizer_evidence"));
     }
 }
