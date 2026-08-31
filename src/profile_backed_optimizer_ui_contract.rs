@@ -243,16 +243,16 @@ mod tests {
 
     #[test]
     fn verified_target_path_or_sha_drift_fails_before_recipe_identity() {
-        let input = input();
+        let sha_drift_input = input();
         let mut verified = verified_target();
         verified.identity.sha256 = hash('c');
-        let error = compose_profile_backed_unified_recipe(input, &verified).unwrap_err();
+        let error = compose_profile_backed_unified_recipe(sha_drift_input, &verified).unwrap_err();
         assert!(error.contains("identity does not match"));
 
-        let input = input();
+        let path_drift_input = input();
         let mut verified = verified_target();
         verified.path = PathBuf::from(r"C:\Color\Replacement.icc");
-        let error = compose_profile_backed_unified_recipe(input, &verified).unwrap_err();
+        let error = compose_profile_backed_unified_recipe(path_drift_input, &verified).unwrap_err();
         assert!(error.contains("path does not match"));
     }
 }
