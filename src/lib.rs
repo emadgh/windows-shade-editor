@@ -57,9 +57,9 @@ pub mod devicelink_conversion;
 pub mod dpi;
 #[path = "export_impl.rs"]
 pub mod export;
+pub mod external_validation_evidence;
 #[path = "export_recipe_impl.rs"]
 pub mod export_recipe;
-pub mod external_validation_evidence;
 pub mod file_observer;
 pub mod gradient_continuity;
 pub mod gradient_validation;
@@ -115,6 +115,7 @@ pub mod profile_backed_inverse_lut_builder;
 pub mod profile_backed_optimizer_authority;
 pub mod profile_backed_optimizer_execution_capture;
 pub mod profile_backed_optimizer_raster_transform;
+pub mod profile_backed_optimizer_ui_contract;
 pub mod project_link_navigation;
 pub mod queue_core;
 pub mod reconversion_policy;
