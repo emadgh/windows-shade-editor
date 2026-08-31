@@ -9,12 +9,13 @@ use crate::conversion_preset_store::{
 use crate::conversion_presets::{
     PresetApplyError, PresetCompatibility, PresetOrigin, SeparationPresetDefinition,
 };
+use crate::custom_optimizer_strategy_capability::CustomOptimizerStrategyCapability;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresetApplicationAvailability {
     Available,
     EngineDoesNotConsumeSeparationStrategy,
-    CustomOptimizerNotProductionAuthorized,
+    CustomOptimizerCapabilityUnavailable,
 }
 
 impl PresetApplicationAvailability {
@@ -24,8 +25,8 @@ impl PresetApplicationAvailability {
             Self::EngineDoesNotConsumeSeparationStrategy => Some(
                 "The selected ICC/DeviceLink engine does not consume Shade Editor separation-strategy controls. Applying this preset would change recipe/provenance without changing rendered pixels.",
             ),
-            Self::CustomOptimizerNotProductionAuthorized => Some(
-                "Custom Optimizer strategy presets remain unavailable until the production-authorized optimizer path is enabled with approved measured evidence.",
+            Self::CustomOptimizerCapabilityUnavailable => Some(
+                "Custom Optimizer strategy presets require an exact recipe-bound editing capability. Profile-backed Output ICC recipes can obtain this capability without measured characterization; final raster authority is still revalidated separately.",
             ),
         }
     }
@@ -33,23 +34,24 @@ impl PresetApplicationAvailability {
 
 /// Central fail-closed policy for the unified Production Color Conversion UI.
 ///
-/// ICC and DeviceLink transforms currently own their separation semantics, so
-/// Shade Editor strategy presets must not be presented as pixel-affecting
-/// controls for those engines. Custom Optimizer may consume the same persisted
-/// strategy only after the caller confirms that its production path is actually
-/// authorized/enabled.
-pub fn unified_strategy_preset_availability(
-    engine_mode: ConversionEngineMode,
-    custom_optimizer_production_authorized: bool,
+/// ICC and DeviceLink transforms own their separation semantics. Custom Optimizer
+/// preset editing is authorized by a capability bound to the exact immutable recipe,
+/// never by a UI boolean and never by measured-production eligibility. Final raster
+/// execution remains independently authorized by measured or profile-backed evidence.
+pub fn unified_strategy_preset_availability_for_recipe(
+    recipe: &ConversionRecipe,
+    capability: Option<&CustomOptimizerStrategyCapability>,
 ) -> PresetApplicationAvailability {
-    match engine_mode {
+    match recipe.engine_mode {
         ConversionEngineMode::Icc | ConversionEngineMode::DeviceLink => {
             PresetApplicationAvailability::EngineDoesNotConsumeSeparationStrategy
         }
-        ConversionEngineMode::CustomOptimizer if !custom_optimizer_production_authorized => {
-            PresetApplicationAvailability::CustomOptimizerNotProductionAuthorized
-        }
-        ConversionEngineMode::CustomOptimizer => PresetApplicationAvailability::Available,
+        ConversionEngineMode::CustomOptimizer => match capability {
+            Some(capability) if capability.validate_for_recipe(recipe).is_ok() => {
+                PresetApplicationAvailability::Available
+            }
+            _ => PresetApplicationAvailability::CustomOptimizerCapabilityUnavailable,
+        },
     }
 }
 
@@ -262,8 +264,6 @@ impl PresetRuntimeController {
         candidate: SeparationPresetLibrary,
         built_ins: &[SeparationPresetDefinition],
     ) -> Result<(), PresetRuntimeError> {
-        // Validate the exact runtime composition before touching disk so a user
-        // definition can never shadow or impersonate binary-owned built-ins.
         compose_runtime_preset_library(built_ins.iter().cloned(), &candidate)?;
         save_user_preset_library(&self.path, &candidate)?;
         self.user_library = candidate;
@@ -287,6 +287,10 @@ mod tests {
     use crate::color_conversion::{
         CONVERSION_RECIPE_SCHEMA_VERSION, ConversionRenderingIntent,
         ConversionTargetDefinition, SeparationStrategy, TargetChannelDefinition,
+    };
+    use crate::custom_optimizer_config::CustomOptimizerSolverConfig;
+    use crate::custom_optimizer_strategy_capability::{
+        CustomOptimizerStrategyAuthorityKind, CustomOptimizerStrategyCapability,
     };
     use crate::model::IccProfileIdentity;
     use std::fs;
@@ -338,6 +342,22 @@ mod tests {
         }
     }
 
+    fn profile_recipe() -> ConversionRecipe {
+        let mut recipe = recipe();
+        recipe.engine_mode = ConversionEngineMode::CustomOptimizer;
+        recipe.black_point_compensation = false;
+        recipe.custom_optimizer_solver = Some(CustomOptimizerSolverConfig::default());
+        recipe
+    }
+
+    fn profile_capability(recipe: &ConversionRecipe) -> CustomOptimizerStrategyCapability {
+        CustomOptimizerStrategyCapability::for_recipe(
+            recipe,
+            CustomOptimizerStrategyAuthorityKind::ProfileBackedOutputIcc,
+        )
+        .unwrap()
+    }
+
     fn built_ins() -> Vec<SeparationPresetDefinition> {
         vec![SeparationPresetDefinition::built_in_balanced(
             &target(),
@@ -358,20 +378,40 @@ mod tests {
     #[test]
     fn icc_and_devicelink_strategy_application_fail_closed() {
         for engine in [ConversionEngineMode::Icc, ConversionEngineMode::DeviceLink] {
-            let availability = unified_strategy_preset_availability(engine, false);
+            let mut recipe = recipe();
+            recipe.engine_mode = engine;
+            let availability = unified_strategy_preset_availability_for_recipe(&recipe, None);
             assert_eq!(
                 availability,
                 PresetApplicationAvailability::EngineDoesNotConsumeSeparationStrategy
             );
             assert!(availability.reason().unwrap().contains("rendered pixels"));
         }
+    }
+
+    #[test]
+    fn profile_backed_recipe_is_available_without_measurement_when_capability_is_exact() {
+        let recipe = profile_recipe();
+        let capability = profile_capability(&recipe);
         assert_eq!(
-            unified_strategy_preset_availability(ConversionEngineMode::CustomOptimizer, false),
-            PresetApplicationAvailability::CustomOptimizerNotProductionAuthorized
+            unified_strategy_preset_availability_for_recipe(&recipe, Some(&capability)),
+            PresetApplicationAvailability::Available
         );
         assert_eq!(
-            unified_strategy_preset_availability(ConversionEngineMode::CustomOptimizer, true),
-            PresetApplicationAvailability::Available
+            unified_strategy_preset_availability_for_recipe(&recipe, None),
+            PresetApplicationAvailability::CustomOptimizerCapabilityUnavailable
+        );
+    }
+
+    #[test]
+    fn stale_profile_backed_capability_cannot_enable_presets_after_recipe_change() {
+        let recipe = profile_recipe();
+        let capability = profile_capability(&recipe);
+        let mut changed = recipe;
+        changed.strategy.black_generation_strength = 0.7;
+        assert_eq!(
+            unified_strategy_preset_availability_for_recipe(&changed, Some(&capability)),
+            PresetApplicationAvailability::CustomOptimizerCapabilityUnavailable
         );
     }
 
@@ -461,7 +501,7 @@ mod tests {
             PresetCompatibility::Compatible
         );
         assert_eq!(
-            unified_strategy_preset_availability(ConversionEngineMode::Icc, false),
+            unified_strategy_preset_availability_for_recipe(&recipe(), None),
             PresetApplicationAvailability::EngineDoesNotConsumeSeparationStrategy
         );
     }
