@@ -47,6 +47,7 @@ pub mod custom_optimizer_evidence_bundle;
 pub mod custom_optimizer_operator_binding;
 pub mod custom_optimizer_operator_controls;
 pub mod custom_optimizer_raster_transform;
+pub mod custom_optimizer_strategy_capability;
 pub mod design_source;
 pub mod design_source_preview;
 pub mod device_characterization;
