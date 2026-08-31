@@ -5,7 +5,12 @@ use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use crate::conversion_candidate_preview::{CandidatePreviewInput, CandidatePreviewResult};
 use crate::conversion_recipe::recipe_sha256;
 use crate::conversion_transaction::ConversionCancellation;
-use crate::inverse_lut_identity::InverseLutBuildPolicy;
+use crate::inverse_lut_identity::{
+    INVERSE_LUT_BUILD_POLICY_SCHEMA_VERSION, InverseLutBuildPolicy,
+    InverseLutContinuityFieldMethod, InverseLutInterpolationMethod,
+    InverseLutNumericalPrecision, InverseLutOutputQuantization, InverseLutValidityEncoding,
+    LabGridSpec,
+};
 use crate::output_icc_forward_model::OutputIccForwardModel;
 use crate::profile_backed_candidate_preview::render_profile_backed_candidate_preview;
 use crate::profile_backed_inverse_lut_artifact::{
@@ -19,6 +24,8 @@ use crate::profile_backed_optimizer_authority::ProfileBackedOptimizerAuthority;
 use crate::profile_backed_optimizer_execution_capture::CapturedProfileBackedOptimizerExecution;
 
 const PROFILE_BACKED_UI_LUT_EXTENSION: &str = "profile-backed-lut.json";
+const PROFILE_BACKED_UI_CACHE_DIRECTORY: &str = "profile-backed-optimizer-v1";
+const PROFILE_BACKED_UI_AXIS_SAMPLES_V1: u16 = 17;
 
 #[derive(Clone, Debug)]
 pub struct PreparedProfileBackedOptimizerExecution {
@@ -33,6 +40,46 @@ pub struct PreparedProfileBackedCandidate {
     pub build_stats: ProfileBackedInverseLutBuildStats,
 }
 
+/// Versioned persistent cache root used by both unified Candidate Preview and final
+/// queue preparation. The queue/recovery worker may need to reopen the exact artifact
+/// after the UI operation that created it, so this deliberately does not use a random
+/// process-temporary path when LOCALAPPDATA is available.
+pub fn default_profile_backed_optimizer_artifact_root() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("ShadeEditor").join(PROFILE_BACKED_UI_CACHE_DIRECTORY)
+}
+
+/// Frozen v1 policy for the unified profile-backed workflow. Preview and final queue
+/// must call this same function so the inverse-LUT build identity cannot drift between
+/// what the operator inspected and what production consumes.
+///
+/// V1 uses a bounded 17^3 full D50-Lab lattice (4,913 nodes) with the already-versioned
+/// validity, interpolation, precision and quantization contracts. Unsupported nodes
+/// remain explicitly invalid; runtime interpolation never bridges them.
+pub fn profile_backed_optimizer_ui_build_policy_v1() -> InverseLutBuildPolicy {
+    InverseLutBuildPolicy {
+        schema_version: INVERSE_LUT_BUILD_POLICY_SCHEMA_VERSION,
+        grid: LabGridSpec {
+            l_min: 0.0,
+            l_max: 100.0,
+            l_samples: PROFILE_BACKED_UI_AXIS_SAMPLES_V1,
+            a_min: -128.0,
+            a_max: 127.0,
+            a_samples: PROFILE_BACKED_UI_AXIS_SAMPLES_V1,
+            b_min: -128.0,
+            b_max: 127.0,
+            b_samples: PROFILE_BACKED_UI_AXIS_SAMPLES_V1,
+        },
+        interpolation: InverseLutInterpolationMethod::TrilinearV1,
+        validity_encoding: InverseLutValidityEncoding::ExplicitNodeValidityMaskV1,
+        numerical_precision: InverseLutNumericalPrecision::NormalizedF32V1,
+        output_quantization: InverseLutOutputQuantization::ClampScaleRoundV1,
+        continuity_field: InverseLutContinuityFieldMethod::IndependentNodeSolvesV1,
+    }
+}
+
 /// Content-addressed destination for a profile-backed inverse LUT belonging to one
 /// exact immutable recipe. The caller owns the cache/root directory policy; this
 /// helper owns only recipe identity and filename stability.
@@ -43,6 +90,35 @@ pub fn profile_backed_optimizer_artifact_path(
     validate_profile_backed_recipe(recipe)?;
     let recipe_sha = recipe_sha256(recipe)?;
     Ok(root.join(format!("{recipe_sha}.{PROFILE_BACKED_UI_LUT_EXTENSION}")))
+}
+
+/// Prepare exact execution using the same frozen policy/cache contract consumed by
+/// unified Candidate Preview. This is also the final-queue preparation entry point for
+/// Faces that do not already carry a reusable Candidate capture.
+pub fn prepare_default_profile_backed_optimizer_execution(
+    recipe: &ConversionRecipe,
+) -> Result<PreparedProfileBackedOptimizerExecution, String> {
+    validate_profile_backed_recipe(recipe)?;
+    let output_path = recipe
+        .target
+        .output_profile_path
+        .as_deref()
+        .ok_or_else(|| "Profile-backed optimizer recipe has no Output ICC path.".to_owned())?;
+    let output_profile_bytes = fs::read(output_path).map_err(|error| {
+        format!(
+            "Cannot reopen profile-backed Output ICC {output_path} for LUT preparation: {error}"
+        )
+    })?;
+    let artifact_path = profile_backed_optimizer_artifact_path(
+        &default_profile_backed_optimizer_artifact_root(),
+        recipe,
+    )?;
+    prepare_profile_backed_optimizer_execution(
+        recipe,
+        &output_profile_bytes,
+        profile_backed_optimizer_ui_build_policy_v1(),
+        &artifact_path,
+    )
 }
 
 /// Build, publish, reopen and capture the exact profile-backed optimizer execution
@@ -139,6 +215,38 @@ pub fn prepare_and_render_profile_backed_candidate(
         capture: prepared.capture,
         build_stats: prepared.build_stats,
     })
+}
+
+/// Unified Candidate Preview entry point. It reopens the Output ICC, builds/publishes
+/// the exact content-addressed artifact using the frozen UI policy, renders through the
+/// persisted capture, and returns that same capture alongside the raster result.
+pub fn prepare_and_render_default_profile_backed_candidate(
+    input: CandidatePreviewInput,
+    cancellation: &ConversionCancellation,
+) -> Result<PreparedProfileBackedCandidate, String> {
+    validate_profile_backed_recipe(&input.recipe)?;
+    let output_path = input
+        .recipe
+        .target
+        .output_profile_path
+        .as_deref()
+        .ok_or_else(|| "Profile-backed optimizer recipe has no Output ICC path.".to_owned())?;
+    let output_profile_bytes = fs::read(output_path).map_err(|error| {
+        format!(
+            "Cannot reopen profile-backed Output ICC {output_path} for Candidate Preview preparation: {error}"
+        )
+    })?;
+    let artifact_path = profile_backed_optimizer_artifact_path(
+        &default_profile_backed_optimizer_artifact_root(),
+        &input.recipe,
+    )?;
+    prepare_and_render_profile_backed_candidate(
+        input,
+        &output_profile_bytes,
+        profile_backed_optimizer_ui_build_policy_v1(),
+        &artifact_path,
+        cancellation,
+    )
 }
 
 fn validate_profile_backed_recipe(recipe: &ConversionRecipe) -> Result<(), String> {
@@ -249,6 +357,29 @@ mod tests {
     }
 
     #[test]
+    fn frozen_ui_policy_is_bounded_and_full_lab_domain() {
+        let policy = profile_backed_optimizer_ui_build_policy_v1();
+        assert!(policy.validate().is_ok());
+        assert_eq!(policy.grid.l_min, 0.0);
+        assert_eq!(policy.grid.l_max, 100.0);
+        assert_eq!(policy.grid.a_min, -128.0);
+        assert_eq!(policy.grid.a_max, 127.0);
+        assert_eq!(policy.grid.b_min, -128.0);
+        assert_eq!(policy.grid.b_max, 127.0);
+        assert_eq!(policy.grid.node_count(), Some(4_913));
+        assert_eq!(
+            policy.continuity_field,
+            InverseLutContinuityFieldMethod::IndependentNodeSolvesV1
+        );
+    }
+
+    #[test]
+    fn persistent_default_artifact_root_is_versioned() {
+        let root = default_profile_backed_optimizer_artifact_root();
+        assert!(root.ends_with(PROFILE_BACKED_UI_CACHE_DIRECTORY));
+    }
+
+    #[test]
     fn measured_recipe_cannot_use_profile_backed_ui_execution() {
         let mut measured = recipe();
         measured.target.characterization_id = Some("sha256:measured".to_owned());
@@ -272,5 +403,7 @@ mod tests {
         assert!(runtime.contains("&prepared.capture.authority"));
         assert!(runtime.contains("&prepared.capture.lut_artifact_path"));
         assert!(runtime.contains("capture: prepared.capture"));
+        assert!(runtime.contains("profile_backed_optimizer_ui_build_policy_v1()"));
+        assert!(runtime.contains("default_profile_backed_optimizer_artifact_root()"));
     }
 }
