@@ -19,6 +19,7 @@ use windows_shade_editor::conversion_transaction::{CapturedOutputPolicy, Capture
 use windows_shade_editor::conversion_workflow::{
     ConversionSourceState, conversion_save_gate,
 };
+use windows_shade_editor::custom_optimizer_config::CustomOptimizerSolverConfig;
 use windows_shade_editor::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;
 use windows_shade_editor::design_source::{
     DesignSourceColorModel, SourceImageFormat, TransparencyState,
@@ -37,8 +38,15 @@ use windows_shade_editor::production_target::{
     ProductionTargetProfileInspection, validate_target_channel_names,
     verify_production_target_profile,
 };
+use windows_shade_editor::profile_backed_optimizer_execution_capture::CapturedProfileBackedOptimizerExecution;
+use windows_shade_editor::profile_backed_optimizer_ui_contract::{
+    ProfileBackedUnifiedRecipeInput, build_profile_backed_unified_recipe,
+};
 use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 use windows_shade_editor::tiff_io::ColorModel as ConversionColorModel;
+use windows_shade_editor::unified_optimizer_job_authority::{
+    UnifiedOptimizerExecutionEvidence, unified_conversion_job_authority,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum UnifiedDestinationMode {
@@ -57,6 +65,8 @@ pub(crate) struct ConversionTargetState {
     pub(crate) output_bit_depth: u8,
     pub(crate) rendering_intent: ConversionRenderingIntent,
     pub(crate) black_point_compensation: bool,
+    pub(crate) optimizer_strategy: SeparationStrategy,
+    pub(crate) optimizer_solver: CustomOptimizerSolverConfig,
 }
 
 impl Default for ConversionTargetState {
@@ -70,6 +80,8 @@ impl Default for ConversionTargetState {
             output_bit_depth: 16,
             rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
             black_point_compensation: true,
+            optimizer_strategy: SeparationStrategy::default(),
+            optimizer_solver: CustomOptimizerSolverConfig::default(),
         }
     }
 }
@@ -348,6 +360,24 @@ pub(crate) fn build_conversion_recipe(
         .profile_identity
         .clone()
         .ok_or_else(|| "Source ICC identity is not ready.".to_owned())?;
+
+    if target.engine_mode == ConversionEngineMode::CustomOptimizer {
+        return build_profile_backed_unified_recipe(ProfileBackedUnifiedRecipeInput {
+            source_profile_identity,
+            source_transparency_policy: transparency_policy,
+            source_model: conversion_color_model(inspection.source_model),
+            target_profile_path: verified.path,
+            target_profile_identity: verified.identity,
+            target_name: target.target_name.clone(),
+            channel_names: target.channel_names.clone(),
+            channel_names_confirmed: target.channel_names_confirmed,
+            output_bit_depth: target.output_bit_depth,
+            rendering_intent: target.rendering_intent,
+            strategy: target.optimizer_strategy.clone(),
+            solver: target.optimizer_solver,
+        });
+    }
+
     let profile_path = verified.path.to_string_lossy().into_owned();
     let profile_identity = verified.identity.clone();
     let (output_profile_path, output_profile_identity, device_link_path, device_link_identity) =
@@ -358,9 +388,7 @@ pub(crate) fn build_conversion_recipe(
             ConversionEngineMode::DeviceLink => {
                 (None, None, Some(profile_path), Some(profile_identity))
             }
-            ConversionEngineMode::CustomOptimizer => {
-                return Err("Custom Optimizer unified execution is not enabled.".to_owned());
-            }
+            ConversionEngineMode::CustomOptimizer => unreachable!("handled above"),
         };
     let recipe = ConversionRecipe {
         source_transparency_policy: transparency_policy,
@@ -412,12 +440,14 @@ pub(crate) fn build_unified_plan(
     allow_production_work_discard: bool,
 ) -> Result<UnifiedConversionPlan, Vec<String>> {
     let custom_optimizer_evidence = BTreeMap::new();
-    build_unified_plan_with_custom_optimizer_evidence(
+    let profile_backed_executions = BTreeMap::new();
+    build_unified_plan_with_optimizer_authorities(
         app,
         scope,
         inspections,
         transparency_policies,
         &custom_optimizer_evidence,
+        &profile_backed_executions,
         target,
         output_folder,
         destination_mode,
@@ -434,6 +464,39 @@ pub(crate) fn build_unified_plan_with_custom_optimizer_evidence(
     inspections: &[ConversionFaceInspection],
     transparency_policies: &BTreeMap<usize, SourceTransparencyPolicy>,
     custom_optimizer_evidence: &BTreeMap<usize, CapturedCustomOptimizerEvidence>,
+    target: &ConversionTargetState,
+    output_folder: &Path,
+    destination_mode: UnifiedDestinationMode,
+    selected_existing: Option<&Path>,
+    candidates: &[ProductionDestinationCandidate],
+    routes: &[ConversionRouteRecord],
+    allow_production_work_discard: bool,
+) -> Result<UnifiedConversionPlan, Vec<String>> {
+    let profile_backed_executions = BTreeMap::new();
+    build_unified_plan_with_optimizer_authorities(
+        app,
+        scope,
+        inspections,
+        transparency_policies,
+        custom_optimizer_evidence,
+        &profile_backed_executions,
+        target,
+        output_folder,
+        destination_mode,
+        selected_existing,
+        candidates,
+        routes,
+        allow_production_work_discard,
+    )
+}
+
+pub(crate) fn build_unified_plan_with_optimizer_authorities(
+    app: &ShadeApp,
+    scope: ConversionBatchScope,
+    inspections: &[ConversionFaceInspection],
+    transparency_policies: &BTreeMap<usize, SourceTransparencyPolicy>,
+    custom_optimizer_evidence: &BTreeMap<usize, CapturedCustomOptimizerEvidence>,
+    profile_backed_executions: &BTreeMap<usize, CapturedProfileBackedOptimizerExecution>,
     target: &ConversionTargetState,
     output_folder: &Path,
     destination_mode: UnifiedDestinationMode,
@@ -465,8 +528,31 @@ pub(crate) fn build_unified_plan_with_custom_optimizer_evidence(
             transparency_policies.get(&inspection.index).copied(),
         ) {
             Ok(recipe) => {
-                let evidence = custom_optimizer_evidence.get(&inspection.index).cloned();
-                match ConversionJobAuthority::for_recipe(&recipe, evidence) {
+                let measured = custom_optimizer_evidence.get(&inspection.index).cloned();
+                let profile_backed = profile_backed_executions.get(&inspection.index).cloned();
+                let authority_evidence = match (measured, profile_backed) {
+                    (Some(_), Some(_)) => {
+                        errors.push(format!(
+                            "Face {} ('{}') has both measured and profile-backed optimizer authority; authority must be unambiguous.",
+                            inspection.index + 1,
+                            inspection.label
+                        ));
+                        None
+                    }
+                    (Some(evidence), None) => {
+                        Some(UnifiedOptimizerExecutionEvidence::Measured(evidence))
+                    }
+                    (None, Some(execution)) => Some(
+                        UnifiedOptimizerExecutionEvidence::ProfileBacked(execution),
+                    ),
+                    (None, None) => None,
+                };
+                if custom_optimizer_evidence.contains_key(&inspection.index)
+                    && profile_backed_executions.contains_key(&inspection.index)
+                {
+                    continue;
+                }
+                match unified_conversion_job_authority(&recipe, authority_evidence) {
                     Ok(authority) => {
                         recipes.push(recipe);
                         authorities.push(authority);
@@ -757,10 +843,29 @@ pub(crate) fn restore_target_from_route(
                 .ok_or_else(|| "Saved DeviceLink route has no profile identity.".to_owned())?,
         ),
         ConversionEngineMode::CustomOptimizer => {
-            return Err(
-                "Saved Custom Optimizer route restore is not enabled in the unified ICC/DeviceLink UI."
-                    .to_owned(),
-            );
+            if recipe
+                .target
+                .characterization_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(
+                    "Saved measured Custom Optimizer route restore remains on the measured qualification path."
+                        .to_owned(),
+                );
+            }
+            (
+                recipe
+                    .target
+                    .output_profile_path
+                    .as_deref()
+                    .ok_or_else(|| "Saved profile-backed optimizer route has no Output ICC path.".to_owned())?,
+                recipe
+                    .target
+                    .output_profile_identity
+                    .as_ref()
+                    .ok_or_else(|| "Saved profile-backed optimizer route has no Output ICC identity.".to_owned())?,
+            )
         }
     };
     let verified = verify_production_target_profile(
@@ -791,6 +896,8 @@ pub(crate) fn restore_target_from_route(
         output_bit_depth: recipe.target.bit_depth,
         rendering_intent: recipe.rendering_intent,
         black_point_compensation: recipe.black_point_compensation,
+        optimizer_strategy: recipe.strategy.clone(),
+        optimizer_solver: recipe.custom_optimizer_solver.unwrap_or_default(),
     })
 }
 
@@ -919,12 +1026,13 @@ mod tests {
     }
 
     #[test]
-    fn unified_plan_has_explicit_per_face_authority_sidecar() {
+    fn unified_plan_has_explicit_per_face_authority_sidecars() {
         let source = include_str!("conversion_plan.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(runtime.contains("authorities: Vec<ConversionJobAuthority>"));
         assert!(runtime.contains("build_unified_plan_with_custom_optimizer_evidence"));
-        assert!(runtime.contains("custom_optimizer_evidence.get(&inspection.index).cloned()"));
-        assert!(runtime.contains("ConversionJobAuthority::for_recipe(&recipe, evidence)"));
+        assert!(runtime.contains("build_unified_plan_with_optimizer_authorities"));
+        assert!(runtime.contains("profile_backed_executions.get(&inspection.index).cloned()"));
+        assert!(runtime.contains("unified_conversion_job_authority(&recipe, authority_evidence)"));
     }
 }
