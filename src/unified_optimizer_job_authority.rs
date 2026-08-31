@@ -2,6 +2,7 @@ use crate::color_conversion::{ConversionEngineMode, ConversionRecipe};
 use crate::conversion_job_authority::ConversionJobAuthority;
 use crate::custom_optimizer_evidence::CapturedCustomOptimizerEvidence;
 use crate::profile_backed_optimizer_execution_capture::CapturedProfileBackedOptimizerExecution;
+use crate::profile_backed_optimizer_ui_execution::load_default_profile_backed_optimizer_execution;
 
 #[derive(Clone, Debug)]
 pub enum UnifiedOptimizerExecutionEvidence {
@@ -12,6 +13,12 @@ pub enum UnifiedOptimizerExecutionEvidence {
 /// Select final conversion authority from the immutable recipe itself rather than
 /// from a UI boolean. Measured and profile-backed Custom Optimizer routes are
 /// intentionally disjoint and Standard ICC/DeviceLink cannot carry either one.
+///
+/// For the unified profile-backed UI only, an omitted explicit sidecar means "reopen
+/// the exact content-addressed Candidate artifact". This path never builds a LUT and
+/// therefore is safe to call from plan recomputation. Missing, stale or tampered cache
+/// state remains a hard error. An explicit sidecar (for example Candidate promotion)
+/// is still validated by `for_profile_backed_recipe` directly.
 pub fn unified_conversion_job_authority(
     recipe: &ConversionRecipe,
     evidence: Option<UnifiedOptimizerExecutionEvidence>,
@@ -51,10 +58,15 @@ pub fn unified_conversion_job_authority(
                     "Measured Custom Optimizer final conversion requires immutable measured production evidence for the exact recipe."
                         .to_owned(),
                 ),
-                (false, None) => Err(
-                    "Profile-backed Custom Optimizer final conversion requires an exact LUT/execution capture for the current recipe."
-                        .to_owned(),
-                ),
+                (false, None) => {
+                    let prepared = load_default_profile_backed_optimizer_execution(recipe)
+                        .map_err(|error| {
+                            format!(
+                                "Profile-backed Custom Optimizer final conversion requires the exact rendered Candidate LUT/execution artifact for the current recipe: {error}"
+                            )
+                        })?;
+                    ConversionJobAuthority::for_profile_backed_recipe(recipe, prepared.capture)
+                }
             }
         }
     }
@@ -113,9 +125,18 @@ mod tests {
     }
 
     #[test]
-    fn profile_backed_recipe_fails_closed_without_exact_capture() {
+    fn profile_backed_recipe_fails_closed_without_exact_candidate_artifact() {
         let error = unified_conversion_job_authority(&profile_recipe(), None).unwrap_err();
-        assert!(error.contains("exact LUT/execution capture"));
+        assert!(error.contains("exact rendered Candidate LUT/execution artifact"));
+    }
+
+    #[test]
+    fn profile_backed_none_path_is_load_only_and_never_builds_lut() {
+        let source = include_str!("unified_optimizer_job_authority.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("load_default_profile_backed_optimizer_execution"));
+        assert!(!runtime.contains("prepare_default_profile_backed_optimizer_execution"));
+        assert!(!runtime.contains("build_output_icc_inverse_lut_payload"));
     }
 
     #[test]
