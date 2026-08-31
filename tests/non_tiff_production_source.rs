@@ -108,6 +108,7 @@ fn capture(
         conversion_recipe: recipe(policy),
         conversion_recipe_sha256: "d".repeat(64),
         custom_optimizer_evidence: None,
+        profile_backed_optimizer_execution: None,
         audit_findings: Vec::new(),
         output_policy: CapturedOutputPolicy::MustNotExist,
         output_tiff_path: base.with_extension("tif"),

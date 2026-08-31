@@ -191,6 +191,7 @@ mod tests {
                 custom_optimizer_solver: None,
             },
             custom_optimizer: None,
+            profile_backed_optimizer: None,
             output_path: output.display().to_string(),
             output_sha256: "output-hash".to_owned(),
             converted_at_unix_ms: 1234,

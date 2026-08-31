@@ -120,5 +120,5 @@ fn legacy_icc_capture_json_omits_optional_custom_optimizer_evidence_and_round_tr
 #[test]
 fn custom_optimizer_cannot_use_legacy_capture_path_without_immutable_evidence() {
     let error = capture_with_recipe(custom_optimizer_recipe()).unwrap_err();
-    assert!(error.contains("requires immutable production evidence"));
+    assert!(error.contains("requires immutable measured or profile-backed production authority"));
 }

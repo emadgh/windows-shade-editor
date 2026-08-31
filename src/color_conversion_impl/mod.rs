@@ -173,6 +173,10 @@ pub struct ProductionProvenance {
     pub recipe: ConversionRecipe,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_optimizer: Option<production_provenance::CustomOptimizerProductionProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_backed_optimizer: Option<
+        crate::profile_backed_optimizer_execution_capture::ProfileBackedOptimizerProductionProvenance,
+    >,
     pub output_path: String,
     pub output_sha256: String,
     pub converted_at_unix_ms: i64,

@@ -16,6 +16,7 @@ use crate::model::ShadeProject;
 use crate::production_project::{
     ProductionProjectSpec, build_production_project_with_audit,
 };
+use crate::profile_backed_optimizer_execution_capture::CapturedProfileBackedOptimizerExecution;
 use crate::tiff_output;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,8 +188,14 @@ pub struct ConversionJobCapture {
     pub source_recipe: ExportRecipe,
     pub conversion_recipe: ConversionRecipe,
     pub conversion_recipe_sha256: String,
+    /// Measured-characterization production authority. This remains the #191/#205
+    /// path and is mutually exclusive with profile-backed execution authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_optimizer_evidence: Option<CapturedCustomOptimizerEvidence>,
+    /// Existing-Output-ICC production authority for Custom Optimizer execution.
+    /// Legacy persisted jobs deserialize this as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_backed_optimizer_execution: Option<CapturedProfileBackedOptimizerExecution>,
     /// Non-blocking findings frozen at queue-capture time. Legacy persisted jobs
     /// deserialize this as empty; new unified conversion jobs populate it from
     /// the typed production preflight report rather than current UI state.
@@ -231,6 +238,7 @@ impl ConversionJobCapture {
             conversion_recipe,
             conversion_recipe_sha256,
             custom_optimizer_evidence: None,
+            profile_backed_optimizer_execution: None,
             audit_findings: Vec::new(),
             output_policy,
             output_tiff_path,
@@ -273,6 +281,50 @@ impl ConversionJobCapture {
             conversion_recipe,
             conversion_recipe_sha256,
             custom_optimizer_evidence: Some(custom_optimizer_evidence),
+            profile_backed_optimizer_execution: None,
+            audit_findings: Vec::new(),
+            output_policy,
+            output_tiff_path,
+            production_project_path,
+            production_project_name,
+            output_face_label,
+        };
+        capture.validate()?;
+        Ok(capture)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_profile_backed_optimizer(
+        source_project: &ShadeProject,
+        source_project_path: PathBuf,
+        source_project_file_sha256: String,
+        source_face_path: PathBuf,
+        source_snapshot_id: Option<u64>,
+        source_file_sha256: String,
+        source_profile: CapturedSourceProfile,
+        conversion_recipe: ConversionRecipe,
+        profile_backed_optimizer_execution: CapturedProfileBackedOptimizerExecution,
+        output_policy: CapturedOutputPolicy,
+        output_tiff_path: PathBuf,
+        production_project_path: PathBuf,
+        production_project_name: String,
+        output_face_label: String,
+    ) -> Result<Self, String> {
+        let conversion_recipe_sha256 = recipe_sha256(&conversion_recipe)?;
+        let output_tiff_path = tiff_output::canonical_destination(&output_tiff_path);
+        let capture = Self {
+            source_project_path,
+            source_project_file_sha256,
+            source_face_path,
+            source_snapshot_id,
+            source_file_sha256,
+            source_profile,
+            source_raster: None,
+            source_recipe: ExportRecipe::from_project(source_project),
+            conversion_recipe,
+            conversion_recipe_sha256,
+            custom_optimizer_evidence: None,
+            profile_backed_optimizer_execution: Some(profile_backed_optimizer_execution),
             audit_findings: Vec::new(),
             output_policy,
             output_tiff_path,
@@ -338,8 +390,9 @@ impl ConversionJobCapture {
         match (
             self.conversion_recipe.engine_mode,
             self.custom_optimizer_evidence.as_ref(),
+            self.profile_backed_optimizer_execution.as_ref(),
         ) {
-            (ConversionEngineMode::CustomOptimizer, Some(evidence)) => {
+            (ConversionEngineMode::CustomOptimizer, Some(evidence), None) => {
                 evidence.validate().map_err(|errors| {
                     format!(
                         "Invalid captured Custom Optimizer evidence: {}",
@@ -347,19 +400,35 @@ impl ConversionJobCapture {
                     )
                 })?;
             }
-            (ConversionEngineMode::CustomOptimizer, None) => {
+            (ConversionEngineMode::CustomOptimizer, None, Some(execution)) => {
+                execution
+                    .validate_for_recipe(&self.conversion_recipe)
+                    .map_err(|errors| {
+                        format!(
+                            "Invalid captured profile-backed Custom Optimizer authority: {}",
+                            errors.join(" ")
+                        )
+                    })?;
+            }
+            (ConversionEngineMode::CustomOptimizer, Some(_), Some(_)) => {
                 return Err(
-                    "Custom Optimizer conversion capture requires immutable production evidence."
+                    "Custom Optimizer conversion capture must carry exactly one authority: measured evidence or profile-backed execution."
                         .to_owned(),
                 );
             }
-            (_, Some(_)) => {
+            (ConversionEngineMode::CustomOptimizer, None, None) => {
                 return Err(
-                    "ICC/DeviceLink conversion capture cannot carry Custom Optimizer evidence."
+                    "Custom Optimizer conversion capture requires immutable measured or profile-backed production authority."
                         .to_owned(),
                 );
             }
-            (_, None) => {}
+            (_, Some(_), _) | (_, _, Some(_)) => {
+                return Err(
+                    "ICC/DeviceLink conversion capture cannot carry Custom Optimizer production authority."
+                        .to_owned(),
+                );
+            }
+            (_, None, None) => {}
         }
         for finding in &self.audit_findings {
             if finding.code.trim().is_empty() || finding.message.trim().is_empty() {
@@ -548,7 +617,24 @@ where
                     production_project_path: capture.production_project_path.clone(),
                     production_project: None,
                     error: format!(
-                        "Cannot persist Custom Optimizer production provenance: {}",
+                        "Cannot persist measured Custom Optimizer production provenance: {}",
+                        errors.join(" ")
+                    ),
+                };
+            }
+        },
+        None => None,
+    };
+    let profile_backed_optimizer = match capture.profile_backed_optimizer_execution.as_ref() {
+        Some(execution) => match execution.production_provenance(&capture.conversion_recipe_sha256) {
+            Ok(provenance) => Some(provenance),
+            Err(errors) => {
+                return ConversionTransactionOutcome::OutputCommittedNeedsRecovery {
+                    committed_output,
+                    production_project_path: capture.production_project_path.clone(),
+                    production_project: None,
+                    error: format!(
+                        "Cannot persist profile-backed Custom Optimizer production provenance: {}",
                         errors.join(" ")
                     ),
                 };
@@ -566,6 +652,7 @@ where
         },
         recipe: capture.conversion_recipe.clone(),
         custom_optimizer,
+        profile_backed_optimizer,
         output_path: committed_output.path.display().to_string(),
         output_sha256: committed_output.sha256.clone(),
         converted_at_unix_ms: committed_output.converted_at_unix_ms,
@@ -837,6 +924,7 @@ mod tests {
         );
         assert_eq!(restored.audit_findings.len(), 1);
         assert_eq!(restored.audit_findings[0].code, "jpeg_lossy_source");
+        assert!(restored.profile_backed_optimizer_execution.is_none());
         assert!(restored.validate().is_ok());
     }
 
@@ -851,6 +939,33 @@ mod tests {
             ))
             .expect_err("RGB capture with four color channels must fail closed");
         assert!(error.contains("RGB model requires 3 channel"));
+    }
+
+    #[test]
+    fn standard_engine_rejects_profile_backed_optimizer_authority() {
+        let mut captured = capture();
+        let serialized = serde_json::json!({
+            "schema_version": 1,
+            "lut_artifact_path": "C:\\Color\\profile.selut.json",
+            "lut_identity_content_id": format!("sha256:{}", "c".repeat(64)),
+            "lut_payload_sha256": "d".repeat(64),
+            "authority": {
+                "schema_version": 1,
+                "output_profile_path": "C:\\Color\\Press.icc",
+                "output_profile_sha256": HASH_B,
+                "forward_model_method": "output_icc_device_to_pcs_v1",
+                "forward_model_id": format!("output-icc-sha256:{HASH_B}"),
+                "recipe_sha256": captured.conversion_recipe_sha256,
+                "channel_names": ["Cyan", "Magenta", "Yellow", "Black"],
+                "target_bit_depth": 16,
+                "inverse_lut_build_identity_sha256": "e".repeat(64),
+                "inverse_lut_payload_sha256": "d".repeat(64)
+            }
+        });
+        captured.profile_backed_optimizer_execution =
+            Some(serde_json::from_value(serialized).unwrap());
+        let error = captured.validate().unwrap_err();
+        assert!(error.contains("ICC/DeviceLink"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::conversion_analytics::{ConversionUsageReport, analyze_conversion_tiff
 use crate::conversion_transaction::{
     CapturedSourceRasterFacts, CommittedConversionOutput, ConversionJobCapture,
 };
+use crate::profile_backed_optimizer_execution_capture::ProfileBackedOptimizerProductionProvenance;
 
 pub const CONVERSION_AUDIT_SCHEMA_VERSION: u32 = 1;
 
@@ -62,10 +63,13 @@ pub struct ConversionAuditRecord {
     pub source: ConversionAuditSource,
     pub target: ConversionAuditTarget,
     pub recipe_sha256: String,
-    /// Exact authority-bearing Custom Optimizer evidence used by the completed
-    /// production conversion. ICC/DeviceLink records must not carry this field.
+    /// Exact measured authority used by a completed Custom Optimizer conversion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_optimizer: Option<CustomOptimizerProductionProvenance>,
+    /// Exact existing-Output-ICC authority used by a completed profile-backed
+    /// Custom Optimizer conversion. It is mutually exclusive with measured evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_backed_optimizer: Option<ProfileBackedOptimizerProductionProvenance>,
     /// Bounded-memory statistics derived from the exact committed TIFF under
     /// the immutable conversion recipe. Legacy/mock records may omit this;
     /// operator surfaces must never reconstruct it from current UI state.
@@ -108,7 +112,18 @@ impl ConversionAuditRecord {
             .transpose()
             .map_err(|errors| {
                 format!(
-                    "Cannot build Custom Optimizer conversion audit evidence: {}",
+                    "Cannot build measured Custom Optimizer conversion audit evidence: {}",
+                    errors.join(" ")
+                )
+            })?;
+        let profile_backed_optimizer = capture
+            .profile_backed_optimizer_execution
+            .as_ref()
+            .map(|execution| execution.production_provenance(&capture.conversion_recipe_sha256))
+            .transpose()
+            .map_err(|errors| {
+                format!(
+                    "Cannot build profile-backed Custom Optimizer conversion audit evidence: {}",
                     errors.join(" ")
                 )
             })?;
@@ -168,6 +183,7 @@ impl ConversionAuditRecord {
             },
             recipe_sha256: capture.conversion_recipe_sha256.clone(),
             custom_optimizer,
+            profile_backed_optimizer,
             usage,
             output: ConversionAuditOutput {
                 path: committed_output.path.to_string_lossy().into_owned(),
@@ -222,11 +238,15 @@ impl ConversionAuditRecord {
             validate_usage_report(usage, &self.target.channel_names)?;
         }
 
-        match (self.target.engine_mode, self.custom_optimizer.as_ref()) {
-            (ConversionEngineMode::CustomOptimizer, Some(custom)) => {
+        match (
+            self.target.engine_mode,
+            self.custom_optimizer.as_ref(),
+            self.profile_backed_optimizer.as_ref(),
+        ) {
+            (ConversionEngineMode::CustomOptimizer, Some(custom), None) => {
                 custom.validate().map_err(|errors| {
                     format!(
-                        "Invalid Custom Optimizer conversion audit evidence: {}",
+                        "Invalid measured Custom Optimizer conversion audit evidence: {}",
                         errors.join(" ")
                     )
                 })?;
@@ -245,19 +265,55 @@ impl ConversionAuditRecord {
                     );
                 }
             }
-            (ConversionEngineMode::CustomOptimizer, None) => {
+            (ConversionEngineMode::CustomOptimizer, None, Some(profile)) => {
+                profile.validate().map_err(|errors| {
+                    format!(
+                        "Invalid profile-backed Custom Optimizer conversion audit evidence: {}",
+                        errors.join(" ")
+                    )
+                })?;
+                if !hashes_match(&profile.conversion_recipe_sha256, &self.recipe_sha256) {
+                    return Err(
+                        "Profile-backed Custom Optimizer conversion audit recipe SHA-256 does not match the audit recipe."
+                            .to_owned(),
+                    );
+                }
+                if self.target.characterization_id.is_some() {
+                    return Err(
+                        "Profile-backed Custom Optimizer conversion audit cannot bind a measured characterization."
+                            .to_owned(),
+                    );
+                }
+                if self.target.output_profile_sha256.as_deref()
+                    != Some(profile.output_profile_sha256.as_str())
+                    || self.target.bit_depth != profile.target_bit_depth
+                    || self.target.channel_names != profile.channel_names
+                {
+                    return Err(
+                        "Profile-backed Custom Optimizer conversion audit target identity does not match immutable authority."
+                            .to_owned(),
+                    );
+                }
+            }
+            (ConversionEngineMode::CustomOptimizer, Some(_), Some(_)) => {
                 return Err(
-                    "Custom Optimizer conversion audit requires immutable LUT/validation/calibration evidence."
+                    "Custom Optimizer conversion audit must carry exactly one authority: measured or profile-backed."
                         .to_owned(),
                 );
             }
-            (_, Some(_)) => {
+            (ConversionEngineMode::CustomOptimizer, None, None) => {
                 return Err(
-                    "ICC/DeviceLink conversion audit cannot carry Custom Optimizer evidence."
+                    "Custom Optimizer conversion audit requires immutable measured or profile-backed authority evidence."
                         .to_owned(),
                 );
             }
-            (_, None) => {}
+            (_, Some(_), _) | (_, _, Some(_)) => {
+                return Err(
+                    "ICC/DeviceLink conversion audit cannot carry Custom Optimizer authority evidence."
+                        .to_owned(),
+                );
+            }
+            (_, None, None) => {}
         }
 
         validate_findings(&self.findings)
@@ -331,9 +387,11 @@ impl ConversionAuditRecord {
                 "Conversion audit target identity does not match Production provenance.".to_owned(),
             );
         }
-        if self.custom_optimizer != provenance.custom_optimizer {
+        if self.custom_optimizer != provenance.custom_optimizer
+            || self.profile_backed_optimizer != provenance.profile_backed_optimizer
+        {
             return Err(
-                "Conversion audit Custom Optimizer evidence does not match Production provenance."
+                "Conversion audit Custom Optimizer authority does not match Production provenance."
                     .to_owned(),
             );
         }
@@ -628,6 +686,7 @@ mod tests {
             },
             recipe: capture.conversion_recipe.clone(),
             custom_optimizer: None,
+            profile_backed_optimizer: None,
             output_path: output.path.to_string_lossy().into_owned(),
             output_sha256: output.sha256.clone(),
             converted_at_unix_ms: output.converted_at_unix_ms,
@@ -704,6 +763,7 @@ mod tests {
         assert_eq!(audit.recipe_sha256, capture.conversion_recipe_sha256);
         assert_eq!(audit.output.sha256, hash('e'));
         assert!(audit.custom_optimizer.is_none());
+        assert!(audit.profile_backed_optimizer.is_none());
         assert!(audit.usage.is_none());
         assert!(audit.findings[0].acknowledged);
         assert!(audit.to_pretty_json().unwrap().contains("Press CMYK"));
@@ -774,11 +834,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_audit_without_raster_facts_remains_readable() {
+    fn legacy_audit_without_raster_or_profile_backed_facts_remains_readable() {
         let capture = capture();
         let output = committed(&capture);
         let audit = ConversionAuditRecord::from_committed_job(&capture, &output, Vec::new()).unwrap();
         let mut value = serde_json::to_value(audit).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("profile_backed_optimizer");
         value
             .get_mut("source")
             .and_then(serde_json::Value::as_object_mut)
@@ -786,6 +848,7 @@ mod tests {
             .remove("raster");
         let restored: ConversionAuditRecord = serde_json::from_value(value).unwrap();
         assert!(restored.source.raster.is_none());
+        assert!(restored.profile_backed_optimizer.is_none());
         restored.validate().unwrap();
     }
 

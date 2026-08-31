@@ -489,6 +489,7 @@ mod tests {
             },
             recipe: recipe(target_hash, source_hash),
             custom_optimizer: None,
+            profile_backed_optimizer: None,
             output_path: output.to_owned(),
             output_sha256: hash('o'),
             converted_at_unix_ms: 10,

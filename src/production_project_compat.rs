@@ -5,10 +5,6 @@ use crate::color_conversion::{ConversionEngineMode, ProductionProvenance, Projec
 use crate::conversion_audit::ConversionAuditRecord;
 use crate::model::{FaceRef, FaceStatus, ShadeProject};
 
-/// Stable target-side identity required for multiple converted Faces to coexist
-/// inside one Production project. Source-side interpretation and per-Face
-/// snapshot details are deliberately excluded: those remain recorded in each
-/// Face's own `ProductionProvenance`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductionCompatibilityKey {
     pub engine_mode: ConversionEngineMode,
@@ -58,9 +54,6 @@ pub struct AppendConvertedFaceSpec<'a> {
     pub provenance: ProductionProvenance,
 }
 
-/// Validate the existing Production project itself without requiring an incoming
-/// Face. This is the canonical read-only baseline used by destination discovery
-/// before an operator chooses Append Existing.
 pub fn validate_existing_production_project_baseline(
     project: &ShadeProject,
     source_project_path: &Path,
@@ -77,9 +70,6 @@ pub fn validate_existing_production_project_baseline(
     )
 }
 
-/// Path-aware baseline validation for a persisted Production `.shade`. Portable
-/// Face paths are resolved against the exact project path before provenance is
-/// checked.
 pub fn validate_existing_production_project_baseline_at_path(
     project: &ShadeProject,
     production_project_path: &Path,
@@ -93,8 +83,6 @@ pub fn validate_existing_production_project_baseline_at_path(
     )
 }
 
-/// Validate that an incoming converted Face can be appended to an existing
-/// Production project without changing the project's target-side semantics.
 pub fn validate_existing_production_project_for_append(
     project: &ShadeProject,
     source_project_path: &Path,
@@ -113,9 +101,6 @@ pub fn validate_existing_production_project_for_append(
     )
 }
 
-/// Validate a Production project loaded from disk. Face paths stored in `.shade`
-/// are portable and therefore must be resolved relative to the exact project
-/// path before comparing them with immutable provenance output identities.
 pub fn validate_existing_production_project_for_append_at_path(
     project: &ShadeProject,
     production_project_path: &Path,
@@ -269,9 +254,6 @@ fn validate_existing_production_project_for_append_with_resolved_paths(
     Ok(canonical)
 }
 
-/// Validate every audit that is present without requiring legacy Production
-/// projects to have one. Audits are sparse by design for pre-#111 projects, but
-/// any stored audit must bind to exactly one immutable provenance record.
 pub fn validate_existing_conversion_audits(project: &ShadeProject) -> Result<(), String> {
     for audit in &project.conversion_audits {
         let matches = project
@@ -312,8 +294,6 @@ pub fn validate_existing_conversion_audits(project: &ShadeProject) -> Result<(),
     Ok(())
 }
 
-/// Append one already-committed converted TIFF and its immutable provenance.
-/// Existing Faces, target adjustments and Snapshots are not rewritten.
 pub fn append_converted_face_to_production_project(
     project: &mut ShadeProject,
     spec: AppendConvertedFaceSpec<'_>,
@@ -328,8 +308,6 @@ pub fn append_converted_face_to_production_project(
     Ok(())
 }
 
-/// Path-aware append for a Production project loaded from disk. This keeps
-/// portable Face paths valid while preserving exact provenance/output checks.
 pub fn append_converted_face_to_production_project_at_path(
     project: &mut ShadeProject,
     production_project_path: &Path,
@@ -346,9 +324,6 @@ pub fn append_converted_face_to_production_project_at_path(
     Ok(())
 }
 
-/// Audited append used by new conversion transactions. The audit is validated
-/// before mutating the project so an invalid producer record cannot leave a
-/// Face/provenance pair partially appended.
 pub fn append_converted_face_with_audit_to_production_project_at_path(
     project: &mut ShadeProject,
     production_project_path: &Path,
@@ -378,10 +353,6 @@ pub fn append_converted_face_with_audit_to_production_project_at_path(
     Ok(())
 }
 
-/// Update the sparse audit collection for a same-route replacement. Legacy
-/// provenance may have no audit; in that case the new committed conversion
-/// simply adds its first durable audit record. A matching old audit is removed
-/// only when both old output path and hash bind it to the replaced provenance.
 pub fn replace_conversion_audit_for_provenance(
     project: &mut ShadeProject,
     previous: &ProductionProvenance,
@@ -566,6 +537,7 @@ mod tests {
                 custom_optimizer_solver: None,
             },
             custom_optimizer: None,
+            profile_backed_optimizer: None,
             output_path: output.display().to_string(),
             output_sha256: hash('o'),
             converted_at_unix_ms: 1234,

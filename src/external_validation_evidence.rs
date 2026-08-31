@@ -364,6 +364,7 @@ mod tests {
             },
             recipe_sha256: hash('5'),
             custom_optimizer: None,
+            profile_backed_optimizer: None,
             usage: None,
             output: ConversionAuditOutput {
                 path: r"D:\production\face-separated.tif".to_owned(),

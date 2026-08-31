@@ -274,6 +274,7 @@ mod tests {
             },
             recipe: recipe(),
             custom_optimizer: None,
+            profile_backed_optimizer: None,
             output_path: output.to_string_lossy().into_owned(),
             output_sha256: hash('o'),
             converted_at_unix_ms: 1,
