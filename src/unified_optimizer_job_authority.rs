@@ -16,9 +16,11 @@ pub enum UnifiedOptimizerExecutionEvidence {
 ///
 /// For the unified profile-backed UI only, an omitted explicit sidecar means "reopen
 /// the exact content-addressed Candidate artifact". This path never builds a LUT and
-/// therefore is safe to call from plan recomputation. Missing, stale or tampered cache
-/// state remains a hard error. An explicit sidecar (for example Candidate promotion)
-/// is still validated by `for_profile_backed_recipe` directly.
+/// therefore is suitable for one-shot final queue construction. It must not be called
+/// by steady-state UI plan preview: reopening and validating engine artifacts belongs
+/// behind the finalization/worker boundary. Missing, stale or tampered cache state
+/// remains a hard error. An explicit sidecar (for example Candidate promotion) is still
+/// validated by `for_profile_backed_recipe` directly.
 pub fn unified_conversion_job_authority(
     recipe: &ConversionRecipe,
     evidence: Option<UnifiedOptimizerExecutionEvidence>,

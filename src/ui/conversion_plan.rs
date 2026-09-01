@@ -24,6 +24,7 @@ use windows_shade_editor::custom_optimizer_evidence::CapturedCustomOptimizerEvid
 use windows_shade_editor::design_source::{
     DesignSourceColorModel, SourceImageFormat, TransparencyState,
 };
+use windows_shade_editor::file_observer::{self, ExternalFileRole};
 use windows_shade_editor::icc_profile_registry::IccProfileRegistry;
 use windows_shade_editor::model::{
     ConversionRouteRecord, IccProfileIdentity as ConversionIccProfileIdentity,
@@ -40,7 +41,7 @@ use windows_shade_editor::production_target::{
 };
 use windows_shade_editor::profile_backed_optimizer_execution_capture::CapturedProfileBackedOptimizerExecution;
 use windows_shade_editor::profile_backed_optimizer_ui_contract::{
-    ProfileBackedUnifiedRecipeInput, build_profile_backed_unified_recipe,
+    ProfileBackedUnifiedRecipeInput, build_profile_backed_unified_recipe_from_verified_target,
 };
 use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 use windows_shade_editor::tiff_io::ColorModel as ConversionColorModel;
@@ -135,6 +136,24 @@ pub(crate) struct UnifiedConversionPlan {
     pub(crate) output_paths: Vec<PathBuf>,
     pub(crate) recipes: Vec<ConversionRecipe>,
     pub(crate) authorities: Vec<ConversionJobAuthority>,
+}
+
+/// UI-only projection of a conversion plan. Engine execution authority is deliberately
+/// absent so steady-state rendering cannot reopen artifacts, compile transforms or run
+/// any other engine-specific preparation. Only final queue construction may resolve
+/// `ConversionJobAuthority`.
+#[derive(Clone)]
+pub(crate) struct UnifiedConversionPlanPreview {
+    pub(crate) production_project_path: PathBuf,
+    pub(crate) output_paths: Vec<PathBuf>,
+}
+
+struct UnifiedConversionPlanDraft {
+    production_project_path: PathBuf,
+    disposition: ProductionProjectDisposition,
+    output_policy: CapturedOutputPolicy,
+    output_paths: Vec<PathBuf>,
+    recipes: Vec<ConversionRecipe>,
 }
 
 pub(crate) fn scope_indices(
@@ -346,6 +365,56 @@ pub(crate) fn build_conversion_recipe(
         target.engine_mode,
         conversion_color_model(inspection.source_model),
     )?;
+    build_conversion_recipe_from_verified_target(
+        target,
+        inspection,
+        transparency_policy,
+        verified,
+    )
+}
+
+/// Render-time recipe derivation from the profile inspection captured at selection.
+///
+/// The shared native observer is the steady-state invalidation boundary: a changed,
+/// missing or unreadable profile fails closed immediately, while unchanged frames do
+/// not reread, parse or hash the ICC. Candidate/final workers still reopen and verify
+/// the exact bytes before producing pixels.
+pub(crate) fn build_conversion_recipe_from_selected_target(
+    target: &ConversionTargetState,
+    inspection: &ConversionFaceInspection,
+    transparency_policy: Option<SourceTransparencyPolicy>,
+) -> Result<ConversionRecipe, String> {
+    let stored = target
+        .target_profile
+        .as_ref()
+        .ok_or_else(|| "Select a production Output ICC or DeviceLink.".to_owned())?;
+    let observed = file_observer::observe(&stored.path, ExternalFileRole::IccProfile);
+    if observed.is_changed() {
+        return Err(
+            "Selected production profile changed on disk. Select it again before preview or conversion."
+                .to_owned(),
+        );
+    }
+    if !observed.is_available() {
+        return Err(format!(
+            "Selected production profile is unavailable: {}.",
+            stored.path.display()
+        ));
+    }
+    build_conversion_recipe_from_verified_target(
+        target,
+        inspection,
+        transparency_policy,
+        stored.clone(),
+    )
+}
+
+fn build_conversion_recipe_from_verified_target(
+    target: &ConversionTargetState,
+    inspection: &ConversionFaceInspection,
+    transparency_policy: Option<SourceTransparencyPolicy>,
+    verified: ProductionTargetProfileInspection,
+) -> Result<ConversionRecipe, String> {
     validate_target_channel_names(&target.channel_names, verified.output_channel_count)?;
     if !verified.channel_names_authoritative && !target.channel_names_confirmed {
         return Err("Confirm the real production channel order.".to_owned());
@@ -362,12 +431,12 @@ pub(crate) fn build_conversion_recipe(
         .ok_or_else(|| "Source ICC identity is not ready.".to_owned())?;
 
     if target.engine_mode == ConversionEngineMode::CustomOptimizer {
-        return build_profile_backed_unified_recipe(ProfileBackedUnifiedRecipeInput {
+        let input = ProfileBackedUnifiedRecipeInput {
             source_profile_identity,
             source_transparency_policy: transparency_policy,
             source_model: conversion_color_model(inspection.source_model),
-            target_profile_path: verified.path,
-            target_profile_identity: verified.identity,
+            target_profile_path: verified.path.clone(),
+            target_profile_identity: verified.identity.clone(),
             target_name: target.target_name.clone(),
             channel_names: target.channel_names.clone(),
             channel_names_confirmed: target.channel_names_confirmed,
@@ -375,7 +444,8 @@ pub(crate) fn build_conversion_recipe(
             rendering_intent: target.rendering_intent,
             strategy: target.optimizer_strategy.clone(),
             solver: target.optimizer_solver,
-        });
+        };
+        return build_profile_backed_unified_recipe_from_verified_target(input, &verified);
     }
 
     let profile_path = verified.path.to_string_lossy().into_owned();
@@ -424,6 +494,47 @@ pub(crate) fn build_conversion_recipe(
     };
     recipe.validate().map_err(|errors| errors.join(" "))?;
     Ok(recipe)
+}
+
+type RecipeBuilder = fn(
+    &ConversionTargetState,
+    &ConversionFaceInspection,
+    Option<SourceTransparencyPolicy>,
+) -> Result<ConversionRecipe, String>;
+
+/// Steady-state plan preview. This intentionally uses the observer-backed selected
+/// profile inspection and performs no fresh ICC parsing/hashing on UI frames.
+pub(crate) fn build_unified_plan_preview(
+    app: &ShadeApp,
+    scope: ConversionBatchScope,
+    inspections: &[ConversionFaceInspection],
+    transparency_policies: &BTreeMap<usize, SourceTransparencyPolicy>,
+    target: &ConversionTargetState,
+    output_folder: &Path,
+    destination_mode: UnifiedDestinationMode,
+    selected_existing: Option<&Path>,
+    candidates: &[ProductionDestinationCandidate],
+    routes: &[ConversionRouteRecord],
+    allow_production_work_discard: bool,
+) -> Result<UnifiedConversionPlanPreview, Vec<String>> {
+    build_unified_plan_draft(
+        app,
+        scope,
+        inspections,
+        transparency_policies,
+        target,
+        output_folder,
+        destination_mode,
+        selected_existing,
+        candidates,
+        routes,
+        allow_production_work_discard,
+        build_conversion_recipe_from_selected_target,
+    )
+    .map(|draft| UnifiedConversionPlanPreview {
+        production_project_path: draft.production_project_path,
+        output_paths: draft.output_paths,
+    })
 }
 
 pub(crate) fn build_unified_plan(
@@ -505,6 +616,128 @@ pub(crate) fn build_unified_plan_with_optimizer_authorities(
     routes: &[ConversionRouteRecord],
     allow_production_work_discard: bool,
 ) -> Result<UnifiedConversionPlan, Vec<String>> {
+    build_unified_plan_with_optimizer_authorities_and_recipe_builder(
+        app,
+        scope,
+        inspections,
+        transparency_policies,
+        custom_optimizer_evidence,
+        profile_backed_executions,
+        target,
+        output_folder,
+        destination_mode,
+        selected_existing,
+        candidates,
+        routes,
+        allow_production_work_discard,
+        build_conversion_recipe,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_unified_plan_with_optimizer_authorities_and_recipe_builder(
+    app: &ShadeApp,
+    scope: ConversionBatchScope,
+    inspections: &[ConversionFaceInspection],
+    transparency_policies: &BTreeMap<usize, SourceTransparencyPolicy>,
+    custom_optimizer_evidence: &BTreeMap<usize, CapturedCustomOptimizerEvidence>,
+    profile_backed_executions: &BTreeMap<usize, CapturedProfileBackedOptimizerExecution>,
+    target: &ConversionTargetState,
+    output_folder: &Path,
+    destination_mode: UnifiedDestinationMode,
+    selected_existing: Option<&Path>,
+    candidates: &[ProductionDestinationCandidate],
+    routes: &[ConversionRouteRecord],
+    allow_production_work_discard: bool,
+    recipe_builder: RecipeBuilder,
+) -> Result<UnifiedConversionPlan, Vec<String>> {
+    let draft = build_unified_plan_draft(
+        app,
+        scope,
+        inspections,
+        transparency_policies,
+        target,
+        output_folder,
+        destination_mode,
+        selected_existing,
+        candidates,
+        routes,
+        allow_production_work_discard,
+        recipe_builder,
+    )?;
+    let authorities = resolve_conversion_authorities(
+        inspections,
+        &draft.recipes,
+        custom_optimizer_evidence,
+        profile_backed_executions,
+    )?;
+    Ok(UnifiedConversionPlan {
+        production_project_path: draft.production_project_path,
+        disposition: draft.disposition,
+        output_policy: draft.output_policy,
+        output_paths: draft.output_paths,
+        recipes: draft.recipes,
+        authorities,
+    })
+}
+
+fn resolve_conversion_authorities(
+    inspections: &[ConversionFaceInspection],
+    recipes: &[ConversionRecipe],
+    custom_optimizer_evidence: &BTreeMap<usize, CapturedCustomOptimizerEvidence>,
+    profile_backed_executions: &BTreeMap<usize, CapturedProfileBackedOptimizerExecution>,
+) -> Result<Vec<ConversionJobAuthority>, Vec<String>> {
+    let mut errors = Vec::new();
+    let mut authorities = Vec::with_capacity(recipes.len());
+    for (inspection, recipe) in inspections.iter().zip(recipes) {
+        let measured = custom_optimizer_evidence.get(&inspection.index).cloned();
+        let profile_backed = profile_backed_executions.get(&inspection.index).cloned();
+        let authority_evidence = match (measured, profile_backed) {
+            (Some(_), Some(_)) => {
+                errors.push(format!(
+                    "Face {} ('{}') has both measured and profile-backed optimizer authority; authority must be unambiguous.",
+                    inspection.index + 1,
+                    inspection.label
+                ));
+                continue;
+            }
+            (Some(evidence), None) => Some(UnifiedOptimizerExecutionEvidence::Measured(evidence)),
+            (None, Some(execution)) => {
+                Some(UnifiedOptimizerExecutionEvidence::ProfileBacked(execution))
+            }
+            (None, None) => None,
+        };
+        match unified_conversion_job_authority(recipe, authority_evidence) {
+            Ok(authority) => authorities.push(authority),
+            Err(error) => errors.push(format!(
+                "Face {} ('{}') final conversion authority: {error}",
+                inspection.index + 1,
+                inspection.label
+            )),
+        }
+    }
+    if errors.is_empty() && authorities.len() == recipes.len() {
+        Ok(authorities)
+    } else {
+        Err(errors)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_unified_plan_draft(
+    app: &ShadeApp,
+    scope: ConversionBatchScope,
+    inspections: &[ConversionFaceInspection],
+    transparency_policies: &BTreeMap<usize, SourceTransparencyPolicy>,
+    target: &ConversionTargetState,
+    output_folder: &Path,
+    destination_mode: UnifiedDestinationMode,
+    selected_existing: Option<&Path>,
+    candidates: &[ProductionDestinationCandidate],
+    routes: &[ConversionRouteRecord],
+    allow_production_work_discard: bool,
+    recipe_builder: RecipeBuilder,
+) -> Result<UnifiedConversionPlanDraft, Vec<String>> {
     let mut errors = Vec::new();
     if inspections.is_empty() {
         return Err(vec!["Select at least one Source Face.".to_owned()]);
@@ -520,50 +753,13 @@ pub(crate) fn build_unified_plan_with_optimizer_authorities(
     }
 
     let mut recipes = Vec::with_capacity(inspections.len());
-    let mut authorities = Vec::with_capacity(inspections.len());
     for inspection in inspections {
-        match build_conversion_recipe(
+        match recipe_builder(
             target,
             inspection,
             transparency_policies.get(&inspection.index).copied(),
         ) {
-            Ok(recipe) => {
-                let measured = custom_optimizer_evidence.get(&inspection.index).cloned();
-                let profile_backed = profile_backed_executions.get(&inspection.index).cloned();
-                let authority_evidence = match (measured, profile_backed) {
-                    (Some(_), Some(_)) => {
-                        errors.push(format!(
-                            "Face {} ('{}') has both measured and profile-backed optimizer authority; authority must be unambiguous.",
-                            inspection.index + 1,
-                            inspection.label
-                        ));
-                        None
-                    }
-                    (Some(evidence), None) => {
-                        Some(UnifiedOptimizerExecutionEvidence::Measured(evidence))
-                    }
-                    (None, Some(execution)) => Some(
-                        UnifiedOptimizerExecutionEvidence::ProfileBacked(execution),
-                    ),
-                    (None, None) => None,
-                };
-                if custom_optimizer_evidence.contains_key(&inspection.index)
-                    && profile_backed_executions.contains_key(&inspection.index)
-                {
-                    continue;
-                }
-                match unified_conversion_job_authority(&recipe, authority_evidence) {
-                    Ok(authority) => {
-                        recipes.push(recipe);
-                        authorities.push(authority);
-                    }
-                    Err(error) => errors.push(format!(
-                        "Face {} ('{}') final conversion authority: {error}",
-                        inspection.index + 1,
-                        inspection.label
-                    )),
-                }
-            }
+            Ok(recipe) => recipes.push(recipe),
             Err(error) => errors.push(format!(
                 "Face {} ('{}'): {error}",
                 inspection.index + 1,
@@ -571,7 +767,7 @@ pub(crate) fn build_unified_plan_with_optimizer_authorities(
             )),
         }
     }
-    if recipes.len() != inspections.len() || authorities.len() != inspections.len() {
+    if recipes.len() != inspections.len() {
         return Err(errors);
     }
 
@@ -681,13 +877,12 @@ pub(crate) fn build_unified_plan_with_optimizer_authorities(
     }
 
     let _ = scope;
-    Ok(UnifiedConversionPlan {
+    Ok(UnifiedConversionPlanDraft {
         production_project_path,
         disposition,
         output_policy,
         output_paths,
         recipes,
-        authorities,
     })
 }
 
@@ -994,6 +1189,8 @@ pub(crate) fn target_channel_rgb(name: &str, index: usize) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn scope_selection_is_deterministic() {
@@ -1026,13 +1223,155 @@ mod tests {
     }
 
     #[test]
+    fn render_time_recipe_uses_selected_inspection_without_reparsing_icc() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "shade-selected-target-no-reparse-{}-{stamp}.icc",
+            std::process::id()
+        ));
+        fs::write(&path, b"available but deliberately not an ICC").unwrap();
+        let target_identity = ConversionIccProfileIdentity {
+            description: "Captured CMYK target".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let target = ConversionTargetState {
+            engine_mode: ConversionEngineMode::Icc,
+            target_profile: Some(ProductionTargetProfileInspection {
+                path: path.clone(),
+                identity: target_identity.clone(),
+                device_class_label: "Output".to_owned(),
+                source_space_label: None,
+                output_space_label: "CMYK".to_owned(),
+                output_channel_count: 4,
+                channel_names: ["Cyan", "Magenta", "Yellow", "Black"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                channel_names_authoritative: true,
+            }),
+            target_name: "Captured CMYK target".to_owned(),
+            channel_names: ["Cyan", "Magenta", "Yellow", "Black"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            channel_names_confirmed: true,
+            output_bit_depth: 16,
+            rendering_intent: ConversionRenderingIntent::RelativeColorimetric,
+            black_point_compensation: true,
+            optimizer_strategy: SeparationStrategy::default(),
+            optimizer_solver: CustomOptimizerSolverConfig::default(),
+        };
+        let inspection = ConversionFaceInspection {
+            index: 0,
+            label: "RGB Face".to_owned(),
+            source_path: PathBuf::from("face.tif"),
+            source_model: RuntimeColorModel::Rgb,
+            source_format: SourceImageFormat::Tiff,
+            bit_depth: 16,
+            channel_count: 3,
+            transparency: TransparencyState::None,
+            profile_identity: Some(ConversionIccProfileIdentity {
+                description: "Source RGB".to_owned(),
+                sha256: "b".repeat(64),
+            }),
+            captured_profile: CapturedSourceProfile::Embedded,
+            profile_label: "Source RGB".to_owned(),
+            execution_supported: true,
+            report: ConversionPreflightReport::default(),
+            error: None,
+        };
+
+        let recipe = build_conversion_recipe_from_selected_target(&target, &inspection, None)
+            .expect("render-time builder must trust the captured inspection");
+        assert_eq!(recipe.target.output_profile_identity, Some(target_identity));
+
+        fs::write(&path, b"changed after the target inspection was captured").unwrap();
+        file_observer::rescan(&path);
+        let error = build_conversion_recipe_from_selected_target(&target, &inspection, None)
+            .expect_err("an observed profile change must invalidate the render-time recipe");
+        assert!(error.contains("changed on disk"));
+        assert!(build_conversion_recipe(&target, &inspection, None).is_err());
+
+        file_observer::release(&path, ExternalFileRole::IccProfile);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn preview_plan_is_wired_to_the_observer_backed_recipe_builder() {
+        let source = include_str!("conversion_plan.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let preview_start = runtime.find("pub(crate) fn build_unified_plan_preview").unwrap();
+        let strict_start = runtime[preview_start..]
+            .find("pub(crate) fn build_unified_plan(")
+            .map(|offset| preview_start + offset)
+            .unwrap();
+        let preview = &runtime[preview_start..strict_start];
+        assert!(preview.contains("build_conversion_recipe_from_selected_target"));
+        assert!(preview.contains("Result<UnifiedConversionPlanPreview"));
+        assert!(preview.contains("build_unified_plan_draft("));
+        assert!(!preview.contains("resolve_conversion_authorities"));
+        assert!(!preview.contains("unified_conversion_job_authority"));
+        assert!(!preview.contains("verify_production_profile_candidate"));
+        assert!(!preview.contains("verify_production_target_profile"));
+    }
+
+    #[test]
+    fn selected_target_recipe_builder_never_reopens_profile_backed_icc() {
+        let source = include_str!("conversion_plan.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let start = runtime
+            .find("pub(crate) fn build_conversion_recipe_from_selected_target")
+            .unwrap();
+        let end = runtime[start..]
+            .find("\nfn build_conversion_recipe_from_verified_target")
+            .map(|offset| start + offset)
+            .unwrap();
+        let selected = &runtime[start..end];
+        assert!(selected.contains("file_observer::observe"));
+        assert!(!selected.contains("verify_profile_backed_output_target"));
+        assert!(!selected.contains("build_profile_backed_unified_recipe("));
+
+        let compose_start = runtime
+            .find("fn build_conversion_recipe_from_verified_target")
+            .unwrap();
+        let compose_end = runtime[compose_start..]
+            .find("\ntype RecipeBuilder")
+            .map(|offset| compose_start + offset)
+            .unwrap();
+        let compose = &runtime[compose_start..compose_end];
+        assert!(compose.contains("build_profile_backed_unified_recipe_from_verified_target"));
+        assert!(!compose.contains("build_profile_backed_unified_recipe("));
+    }
+
+    #[test]
+    fn ui_plan_draft_cannot_resolve_engine_execution_authority() {
+        let source = include_str!("conversion_plan.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let draft_start = runtime.find("fn build_unified_plan_draft(").unwrap();
+        let draft_end = runtime[draft_start..]
+            .find("\nfn deterministic_output_paths(")
+            .map(|offset| draft_start + offset)
+            .unwrap();
+        let draft = &runtime[draft_start..draft_end];
+        assert!(!draft.contains("unified_conversion_job_authority"));
+        assert!(!draft.contains("resolve_conversion_authorities"));
+        assert!(!draft.contains("ConversionJobAuthority"));
+        assert!(!draft.contains("load_default_profile_backed_optimizer_execution"));
+        assert!(!draft.contains("prepare_default_profile_backed_optimizer_execution"));
+    }
+
+    #[test]
     fn unified_plan_has_explicit_per_face_authority_sidecars() {
         let source = include_str!("conversion_plan.rs");
         let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
         assert!(runtime.contains("authorities: Vec<ConversionJobAuthority>"));
         assert!(runtime.contains("build_unified_plan_with_custom_optimizer_evidence"));
         assert!(runtime.contains("build_unified_plan_with_optimizer_authorities"));
+        assert!(runtime.contains("build_unified_plan_preview"));
         assert!(runtime.contains("profile_backed_executions.get(&inspection.index).cloned()"));
-        assert!(runtime.contains("unified_conversion_job_authority(&recipe, authority_evidence)"));
+        assert!(runtime.contains("unified_conversion_job_authority(recipe, authority_evidence)"));
     }
 }

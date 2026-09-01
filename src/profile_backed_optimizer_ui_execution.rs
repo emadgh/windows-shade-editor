@@ -20,6 +20,7 @@ use crate::profile_backed_inverse_lut_artifact::{
 use crate::profile_backed_inverse_lut_builder::{
     BuiltProfileBackedInverseLutPayload, ProfileBackedForwardModelMethod,
     ProfileBackedInverseLutBuildStats, build_output_icc_inverse_lut_payload,
+    build_output_icc_inverse_lut_payload_with_cancellation,
 };
 use crate::profile_backed_optimizer_authority::ProfileBackedOptimizerAuthority;
 use crate::profile_backed_optimizer_execution_capture::CapturedProfileBackedOptimizerExecution;
@@ -128,11 +129,21 @@ pub fn load_default_profile_backed_optimizer_execution(
 pub fn prepare_default_profile_backed_optimizer_execution(
     recipe: &ConversionRecipe,
 ) -> Result<PreparedProfileBackedOptimizerExecution, String> {
+    prepare_default_profile_backed_optimizer_execution_inner(recipe, None)
+}
+
+fn prepare_default_profile_backed_optimizer_execution_inner(
+    recipe: &ConversionRecipe,
+    cancellation: Option<&ConversionCancellation>,
+) -> Result<PreparedProfileBackedOptimizerExecution, String> {
     validate_profile_backed_recipe(recipe)?;
     let artifact_path = profile_backed_optimizer_artifact_path(
         &default_profile_backed_optimizer_artifact_root(),
         recipe,
     )?;
+    if cancellation.is_some_and(ConversionCancellation::is_requested) {
+        return Err("Candidate preview cancelled before profile-backed preparation.".to_owned());
+    }
     if artifact_path.exists() {
         return load_default_profile_backed_optimizer_execution(recipe);
     }
@@ -146,12 +157,20 @@ pub fn prepare_default_profile_backed_optimizer_execution(
             "Cannot reopen profile-backed Output ICC {output_path} for LUT preparation: {error}"
         )
     })?;
-    prepare_profile_backed_optimizer_execution(
+    prepare_profile_backed_optimizer_execution_inner(
         recipe,
         &output_profile_bytes,
         profile_backed_optimizer_ui_build_policy_v1(),
         &artifact_path,
+        cancellation,
     )
+}
+
+fn prepare_default_profile_backed_optimizer_execution_with_cancellation(
+    recipe: &ConversionRecipe,
+    cancellation: &ConversionCancellation,
+) -> Result<PreparedProfileBackedOptimizerExecution, String> {
+    prepare_default_profile_backed_optimizer_execution_inner(recipe, Some(cancellation))
 }
 
 fn load_profile_backed_optimizer_execution(
@@ -227,6 +246,22 @@ pub fn prepare_profile_backed_optimizer_execution(
     build_policy: InverseLutBuildPolicy,
     artifact_path: &Path,
 ) -> Result<PreparedProfileBackedOptimizerExecution, String> {
+    prepare_profile_backed_optimizer_execution_inner(
+        recipe,
+        output_profile_bytes,
+        build_policy,
+        artifact_path,
+        None,
+    )
+}
+
+fn prepare_profile_backed_optimizer_execution_inner(
+    recipe: &ConversionRecipe,
+    output_profile_bytes: &[u8],
+    build_policy: InverseLutBuildPolicy,
+    artifact_path: &Path,
+    cancellation: Option<&ConversionCancellation>,
+) -> Result<PreparedProfileBackedOptimizerExecution, String> {
     validate_profile_backed_recipe(recipe)?;
     build_policy
         .validate()
@@ -249,8 +284,19 @@ pub fn prepare_profile_backed_optimizer_execution(
         output_profile_bytes,
         recipe.rendering_intent,
     )?;
-    let built = build_output_icc_inverse_lut_payload(recipe, &model, build_policy)
-        .map_err(|error| format!("Cannot build profile-backed inverse LUT: {error:?}"))?;
+    let built = match cancellation {
+        Some(cancellation) => build_output_icc_inverse_lut_payload_with_cancellation(
+            recipe,
+            &model,
+            build_policy,
+            cancellation,
+        ),
+        None => build_output_icc_inverse_lut_payload(recipe, &model, build_policy),
+    }
+    .map_err(|error| format!("Cannot build profile-backed inverse LUT: {error:?}"))?;
+    if cancellation.is_some_and(ConversionCancellation::is_requested) {
+        return Err("Candidate preview cancelled during inverse-LUT construction.".to_owned());
+    }
     let artifact = ProfileBackedInverseLutArtifact::from_built(recipe, &built)
         .map_err(|errors| errors.join(" "))?;
     let authority = ProfileBackedOptimizerAuthority::capture(recipe, output_profile_bytes, &built)
@@ -299,11 +345,12 @@ pub fn prepare_and_render_profile_backed_candidate(
             artifact_path,
         )?
     } else {
-        prepare_profile_backed_optimizer_execution(
+        prepare_profile_backed_optimizer_execution_inner(
             &input.recipe,
             output_profile_bytes,
             build_policy,
             artifact_path,
+            Some(cancellation),
         )?
     };
     let result = render_profile_backed_candidate_preview(
@@ -326,7 +373,10 @@ pub fn prepare_and_render_default_profile_backed_candidate(
     input: CandidatePreviewInput,
     cancellation: &ConversionCancellation,
 ) -> Result<PreparedProfileBackedCandidate, String> {
-    let prepared = prepare_default_profile_backed_optimizer_execution(&input.recipe)?;
+    let prepared = prepare_default_profile_backed_optimizer_execution_with_cancellation(
+        &input.recipe,
+        cancellation,
+    )?;
     let result = render_profile_backed_candidate_preview(
         input,
         &prepared.capture.authority,
