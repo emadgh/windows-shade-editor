@@ -65,10 +65,16 @@ pub fn build_profile_backed_unified_recipe(
         &input.target_profile_identity,
         input.source_model,
     )?;
-    compose_profile_backed_unified_recipe(input, &verified)
+    build_profile_backed_unified_recipe_from_verified_target(input, &verified)
 }
 
-fn compose_profile_backed_unified_recipe(
+/// Compose a recipe from a target inspection that the caller has already selected or
+/// freshly verified. This function performs validation only and deliberately does no
+/// profile I/O, parsing or hashing, so it is safe for steady-state UI planning.
+///
+/// Candidate and final conversion workers must continue to use their strict capture
+/// boundaries before producing pixels or publishing output.
+pub fn build_profile_backed_unified_recipe_from_verified_target(
     input: ProfileBackedUnifiedRecipeInput,
     verified: &ProductionTargetProfileInspection,
 ) -> Result<ConversionRecipe, String> {
@@ -198,7 +204,8 @@ mod tests {
     fn verified_output_target_composes_profile_backed_recipe_without_measurement() {
         let input = input();
         let verified = verified_target();
-        let recipe = compose_profile_backed_unified_recipe(input, &verified).unwrap();
+        let recipe =
+            build_profile_backed_unified_recipe_from_verified_target(input, &verified).unwrap();
         assert_eq!(recipe.engine_mode, ConversionEngineMode::CustomOptimizer);
         assert!(recipe.target.characterization_id.is_none());
         assert_eq!(
@@ -226,7 +233,11 @@ mod tests {
         let expected_strategy = input.strategy.clone();
         let expected_solver = input.solver;
 
-        let recipe = compose_profile_backed_unified_recipe(input, &verified_target()).unwrap();
+        let recipe = build_profile_backed_unified_recipe_from_verified_target(
+            input,
+            &verified_target(),
+        )
+        .unwrap();
         assert_eq!(recipe.strategy, expected_strategy);
         assert_eq!(recipe.custom_optimizer_solver, Some(expected_solver));
     }
@@ -237,7 +248,8 @@ mod tests {
         input.channel_names_confirmed = false;
         let mut verified = verified_target();
         verified.channel_names_authoritative = false;
-        let error = compose_profile_backed_unified_recipe(input, &verified).unwrap_err();
+        let error =
+            build_profile_backed_unified_recipe_from_verified_target(input, &verified).unwrap_err();
         assert!(error.contains("Confirm the real production channel order"));
     }
 
@@ -246,13 +258,21 @@ mod tests {
         let sha_drift_input = input();
         let mut verified = verified_target();
         verified.identity.sha256 = hash('c');
-        let error = compose_profile_backed_unified_recipe(sha_drift_input, &verified).unwrap_err();
+        let error = build_profile_backed_unified_recipe_from_verified_target(
+            sha_drift_input,
+            &verified,
+        )
+        .unwrap_err();
         assert!(error.contains("identity does not match"));
 
         let path_drift_input = input();
         let mut verified = verified_target();
         verified.path = PathBuf::from(r"C:\Color\Replacement.icc");
-        let error = compose_profile_backed_unified_recipe(path_drift_input, &verified).unwrap_err();
+        let error = build_profile_backed_unified_recipe_from_verified_target(
+            path_drift_input,
+            &verified,
+        )
+        .unwrap_err();
         assert!(error.contains("path does not match"));
     }
 }

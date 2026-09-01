@@ -703,65 +703,85 @@ impl ShadeApp {
         let source_path = source.source_path.clone();
         let rendered_recipe = recipe.clone();
         let worker_recipe = recipe.clone();
-        let adjusted_planes = match self.faces.get(source.face_index) {
-            Some(face) => render::adjusted_planes(face.preview.as_ref(), &self.project),
+        let preview = match self.faces.get(source.face_index) {
+            Some(face) => face.preview.clone(),
             None => {
                 self.conversion_candidate.error =
                     Some("Candidate Source Face disappeared before rendering.".to_owned());
                 return;
             }
         };
+        let project = self.project.clone();
         let cancellation = ConversionCancellation::default();
         let worker_cancel = cancellation.clone();
-        let input = CandidatePreviewInput {
-            width: source.width,
-            height: source.height,
-            source_model: source.source_model,
-            source_planes: adjusted_planes,
-            source_profile: source.captured_profile,
-            embedded_source_icc: source.embedded_source_icc,
-            recipe,
-        };
         let (tx, rx) = mpsc::channel();
         self.conversion_candidate.generation =
             self.conversion_candidate.generation.wrapping_add(1).max(1);
         let generation = self.conversion_candidate.generation;
         thread::spawn(move || {
-            let profile_backed = worker_recipe.engine_mode == ConversionEngineMode::CustomOptimizer
-                && worker_recipe
-                    .target
-                    .characterization_id
-                    .as_deref()
-                    .is_none_or(|value| value.trim().is_empty());
-            let rendered = if profile_backed {
-                prepare_and_render_default_profile_backed_candidate(input, &worker_cancel)
-                    .and_then(|prepared| {
-                        prepared
-                            .capture
-                            .validate_for_recipe(&worker_recipe)
-                            .map_err(|errors| errors.join(" "))?;
+            let rendered = (|| {
+                if worker_cancel.is_requested() {
+                    return Err(
+                        "Candidate preview cancelled before Source adjustments were prepared."
+                            .to_owned(),
+                    );
+                }
+                let adjusted_planes = render::adjusted_planes(preview.as_ref(), &project);
+                if worker_cancel.is_requested() {
+                    return Err(
+                        "Candidate preview cancelled after Source adjustments were prepared."
+                            .to_owned(),
+                    );
+                }
+                let input = CandidatePreviewInput {
+                    width: source.width,
+                    height: source.height,
+                    source_model: source.source_model,
+                    source_planes: adjusted_planes,
+                    source_profile: source.captured_profile,
+                    embedded_source_icc: source.embedded_source_icc,
+                    recipe: worker_recipe.clone(),
+                };
+                let profile_backed =
+                    worker_recipe.engine_mode == ConversionEngineMode::CustomOptimizer
+                        && worker_recipe
+                            .target
+                            .characterization_id
+                            .as_deref()
+                            .is_none_or(|value| value.trim().is_empty());
+                if profile_backed {
+                    prepare_and_render_default_profile_backed_candidate(input, &worker_cancel)
+                        .and_then(|prepared| {
+                            prepared
+                                .capture
+                                .validate_for_recipe(&worker_recipe)
+                                .map_err(|errors| errors.join(" "))?;
+                            let composite = render_candidate_composite_preview(
+                                &prepared.result,
+                                &worker_recipe,
+                                &worker_cancel,
+                            )?;
+                            Ok(RenderedCandidate {
+                                result: prepared.result,
+                                composite,
+                                profile_backed_execution: Some(prepared.capture),
+                            })
+                        })
+                } else {
+                    render_candidate_preview(input, &worker_cancel).and_then(|result| {
                         let composite = render_candidate_composite_preview(
-                            &prepared.result,
+                            &result,
                             &worker_recipe,
                             &worker_cancel,
                         )?;
                         Ok(RenderedCandidate {
-                            result: prepared.result,
+                            result,
                             composite,
-                            profile_backed_execution: Some(prepared.capture),
+                            profile_backed_execution: None,
                         })
                     })
-            } else {
-                render_candidate_preview(input, &worker_cancel).and_then(|result| {
-                    let composite =
-                        render_candidate_composite_preview(&result, &worker_recipe, &worker_cancel)?;
-                    Ok(RenderedCandidate {
-                        result,
-                        composite,
-                        profile_backed_execution: None,
-                    })
-                })
-            };
+                }
+            })();
             let _ = tx.send(rendered);
         });
         self.conversion_candidate.pending = Some(PendingCandidate {
@@ -1295,5 +1315,21 @@ mod tests {
         assert!(runtime.contains("cache: CandidateLru<CachedCandidate>"));
         assert!(runtime.contains("restore_cached_candidate"));
         assert!(!runtime.contains("fn candidate_rgba"));
+    }
+
+    #[test]
+    fn source_adjustment_preparation_runs_inside_candidate_worker() {
+        let source = include_str!("conversion_candidate_preview.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let start = runtime.find("fn start_candidate_preview").unwrap();
+        let worker = runtime[start..].find("thread::spawn(move ||").unwrap() + start;
+        let adjustments = runtime[start..]
+            .find("render::adjusted_planes(preview.as_ref(), &project)")
+            .unwrap()
+            + start;
+        let input = runtime[start..].find("let input = CandidatePreviewInput").unwrap() + start;
+        assert!(adjustments > worker);
+        assert!(input > adjustments);
+        assert!(runtime[worker..adjustments].contains("worker_cancel.is_requested()"));
     }
 }

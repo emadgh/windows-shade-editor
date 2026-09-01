@@ -1,5 +1,6 @@
 use crate::color_conversion::ConversionRecipe;
 use crate::custom_optimizer_config::{CustomOptimizerObjectiveWeights, CustomOptimizerSolverConfig};
+use crate::conversion_transaction::ConversionCancellation;
 use crate::device_characterization::DeviceForwardModel;
 use crate::inverse_lut_continuity_builder::{
     BuiltJacobiContinuityField, JacobiContinuityBuildError, build_positive_v2_jacobi_field,
@@ -43,6 +44,7 @@ pub struct ProfileBackedInverseLutBuildStats {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProfileBackedInverseLutBuildError {
+    Cancelled,
     InvalidRecipe(Vec<String>),
     MissingSolverConfig,
     MissingObjectiveWeightProvenance(Vec<String>),
@@ -88,6 +90,25 @@ pub fn build_output_icc_inverse_lut_payload(
         model,
         ProfileBackedForwardModelMethod::OutputIccDeviceToPcsV1,
         build_policy,
+        None,
+    )
+}
+
+/// Candidate-facing variant with cooperative cancellation. Engine preparation must
+/// periodically honor the shared Candidate cancellation token so stale generations
+/// cannot keep consuming CPU after the operator changes target or settings.
+pub fn build_output_icc_inverse_lut_payload_with_cancellation(
+    recipe: &ConversionRecipe,
+    model: &OutputIccForwardModel,
+    build_policy: InverseLutBuildPolicy,
+    cancellation: &ConversionCancellation,
+) -> Result<BuiltProfileBackedInverseLutPayload, ProfileBackedInverseLutBuildError> {
+    build_device_forward_model_payload(
+        recipe,
+        model,
+        ProfileBackedForwardModelMethod::OutputIccDeviceToPcsV1,
+        build_policy,
+        Some(cancellation),
     )
 }
 
@@ -96,7 +117,9 @@ fn build_device_forward_model_payload(
     model: &dyn DeviceForwardModel,
     method: ProfileBackedForwardModelMethod,
     build_policy: InverseLutBuildPolicy,
+    cancellation: Option<&ConversionCancellation>,
 ) -> Result<BuiltProfileBackedInverseLutPayload, ProfileBackedInverseLutBuildError> {
+    check_cancellation(cancellation)?;
     recipe
         .validate()
         .map_err(ProfileBackedInverseLutBuildError::InvalidRecipe)?;
@@ -155,6 +178,7 @@ fn build_device_forward_model_payload(
             build_policy,
             solver,
             weights,
+            cancellation,
         )?,
         InverseLutContinuityFieldMethod::JacobiSixNeighborV1 { .. } => build_continuity_payload(
             recipe,
@@ -162,8 +186,10 @@ fn build_device_forward_model_payload(
             build_policy,
             solver,
             weights,
+            cancellation,
         )?,
     };
+    check_cancellation(cancellation)?;
     validate_payload(
         recipe.target.channels.len(),
         build_policy,
@@ -189,6 +215,7 @@ fn build_independent_payload(
     build_policy: InverseLutBuildPolicy,
     solver: CustomOptimizerSolverConfig,
     weights: CandidateScoringWeights,
+    cancellation: Option<&ConversionCancellation>,
 ) -> Result<BuiltPayloadParts, ProfileBackedInverseLutBuildError> {
     let (_shape, labs) = lab_grid_points(build_policy.grid)
         .map_err(ProfileBackedInverseLutBuildError::Grid)?;
@@ -207,6 +234,7 @@ fn build_independent_payload(
     };
 
     for (index, lab) in labs.iter().copied().enumerate() {
+        check_cancellation(cancellation)?;
         match solve_inverse_separation(
             &recipe.target,
             &recipe.strategy,
@@ -251,7 +279,9 @@ fn build_continuity_payload(
     build_policy: InverseLutBuildPolicy,
     solver: CustomOptimizerSolverConfig,
     weights: CandidateScoringWeights,
+    cancellation: Option<&ConversionCancellation>,
 ) -> Result<BuiltPayloadParts, ProfileBackedInverseLutBuildError> {
+    check_cancellation(cancellation)?;
     let field = build_positive_v2_jacobi_field(
         &recipe.target,
         &recipe.strategy,
@@ -262,7 +292,18 @@ fn build_continuity_payload(
         build_policy.continuity_field,
     )
     .map_err(ProfileBackedInverseLutBuildError::ContinuityField)?;
+    check_cancellation(cancellation)?;
     flatten_continuity_field(recipe.target.channels.len(), field)
+}
+
+fn check_cancellation(
+    cancellation: Option<&ConversionCancellation>,
+) -> Result<(), ProfileBackedInverseLutBuildError> {
+    if cancellation.is_some_and(ConversionCancellation::is_requested) {
+        Err(ProfileBackedInverseLutBuildError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn flatten_continuity_field(
@@ -535,6 +576,7 @@ mod tests {
             &model(),
             ProfileBackedForwardModelMethod::OutputIccDeviceToPcsV1,
             policy(),
+            None,
         )
         .unwrap();
         let second = build_device_forward_model_payload(
@@ -542,6 +584,7 @@ mod tests {
             &model(),
             ProfileBackedForwardModelMethod::OutputIccDeviceToPcsV1,
             policy(),
+            None,
         )
         .unwrap();
         assert_eq!(first, second);
@@ -560,12 +603,34 @@ mod tests {
             &wrong,
             ProfileBackedForwardModelMethod::OutputIccDeviceToPcsV1,
             policy(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(
             error,
             ProfileBackedInverseLutBuildError::ForwardModelIdentityMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn stale_candidate_lut_build_honors_cancellation_before_solver_work() {
+        let cancellation = ConversionCancellation::default();
+        cancellation.request();
+        let error = build_device_forward_model_payload(
+            &recipe(),
+            &model(),
+            ProfileBackedForwardModelMethod::OutputIccDeviceToPcsV1,
+            policy(),
+            Some(&cancellation),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProfileBackedInverseLutBuildError::Cancelled));
+
+        let source = include_str!("profile_backed_inverse_lut_builder.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let loop_start = runtime.find("for (index, lab) in labs.iter().copied().enumerate()").unwrap();
+        let solve = runtime[loop_start..].find("solve_inverse_separation(").unwrap();
+        assert!(runtime[loop_start..loop_start + solve].contains("check_cancellation"));
     }
 
     #[test]

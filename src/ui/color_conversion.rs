@@ -22,9 +22,10 @@ use windows_shade_editor::source_transparency::SourceTransparencyPolicy;
 use super::conversion_candidate_preview::CandidatePromotionSelection;
 use super::conversion_plan::{
     ConversionFaceInspection, ConversionTargetState, UnifiedDestinationMode,
-    build_conversion_recipe, build_unified_plan, conversion_color_model, default_output_folder,
-    inspect_conversion_face, production_candidates, production_routes, restore_target_from_route,
-    scope_indices,
+    build_conversion_recipe, build_conversion_recipe_from_selected_target, build_unified_plan,
+    build_unified_plan_preview, conversion_color_model, default_output_folder,
+    inspect_conversion_face, production_candidates, production_routes,
+    restore_target_from_route, scope_indices,
 };
 use super::conversion_presets::{
     ConversionPresetUiState, dispatch_conversion_preset_actions,
@@ -183,7 +184,11 @@ impl ShadeApp {
                 (state.output_folder.as_deref(), final_target_result.as_ref())
             {
                 if let Ok(recipe) =
-                    build_conversion_recipe(final_target, &current_inspection, current_policy)
+                    build_conversion_recipe_from_selected_target(
+                        final_target,
+                        &current_inspection,
+                        current_policy,
+                    )
                 {
                     let matching = routes
                         .iter()
@@ -207,7 +212,7 @@ impl ShadeApp {
                 .as_ref()
                 .map_err(|error| vec![format!("Final Candidate authority is stale: {error}")])
                 .and_then(|final_target| {
-                    build_unified_plan(
+                    build_unified_plan_preview(
                         self,
                         state.scope,
                         &inspections,
@@ -327,8 +332,12 @@ impl ShadeApp {
                                     );
                                 }
                                 if previous_engine != state.target.engine_mode {
+                                    let catalog_family_changed = profile_catalog_family(previous_engine)
+                                        != profile_catalog_family(state.target.engine_mode);
                                     state.target.clear_profile();
-                                    state.clear_profile_catalog();
+                                    if catalog_family_changed {
+                                        state.clear_profile_catalog();
+                                    }
                                     state.selected_existing = None;
                                 }
 
@@ -520,7 +529,7 @@ impl ShadeApp {
                             });
 
                         ui.add_space(6.0);
-                        let preset_recipe = build_conversion_recipe(
+                        let preset_recipe = build_conversion_recipe_from_selected_target(
                             &state.target,
                             &current_inspection,
                             current_policy,
@@ -1014,7 +1023,7 @@ impl ShadeApp {
             }
         }
 
-        let preset_recipe_for_actions = build_conversion_recipe(
+        let preset_recipe_for_actions = build_conversion_recipe_from_selected_target(
             &state.target,
             &current_inspection,
             current_policy,
@@ -1057,7 +1066,7 @@ impl ShadeApp {
 
         let current_policy = state.transparency_policies.get(&self.current_face);
         let current_inspection = inspect_conversion_face(self, self.current_face, current_policy);
-        match build_conversion_recipe(
+        match build_conversion_recipe_from_selected_target(
             &state.target,
             &current_inspection,
             current_policy.copied(),
@@ -1495,14 +1504,26 @@ fn render_profile_backed_optimizer_controls(ui: &mut egui::Ui, target: &mut Conv
         ui.strong("Per-ink preference");
         ui.small("-1 avoids an ink; +1 prefers it. This is optimizer ranking, never post-transform channel multiplication.");
         for name in &channel_names {
-            let value = target
+            let mut value = target
                 .optimizer_strategy
                 .per_ink_bias
-                .entry(name.clone())
-                .or_insert(0.0);
-            changed |= ui
-                .add(egui::Slider::new(value, -1.0..=1.0).text(name))
-                .changed();
+                .get(name)
+                .copied()
+                .unwrap_or(0.0);
+            if ui
+                .add(egui::Slider::new(&mut value, -1.0..=1.0).text(name))
+                .changed()
+            {
+                if value.abs() <= f32::EPSILON {
+                    target.optimizer_strategy.per_ink_bias.remove(name);
+                } else {
+                    target
+                        .optimizer_strategy
+                        .per_ink_bias
+                        .insert(name.clone(), value);
+                }
+                changed = true;
+            }
         }
 
         ui.add_space(4.0);
@@ -1593,7 +1614,11 @@ fn ensure_installed_profile_catalog(
         return;
     }
     let source_model = conversion_color_model(inspection.source_model);
-    let key = format!("{:?}|{:?}", state.target.engine_mode, source_model);
+    // Standard ICC and profile-backed Custom Optimizer browse the exact same Output
+    // profile family. Switching execution engines must not synchronously rescan the
+    // Windows profile registry when the catalog eligibility policy did not change.
+    let catalog_family = profile_catalog_family(state.target.engine_mode);
+    let key = format!("{catalog_family}|{:?}", source_model);
     if state.installed_catalog_key == key {
         return;
     }
@@ -1614,6 +1639,13 @@ fn ensure_installed_profile_catalog(
         }
     }
     state.installed_catalog_key = key;
+}
+
+fn profile_catalog_family(mode: ConversionEngineMode) -> &'static str {
+    match mode {
+        ConversionEngineMode::Icc | ConversionEngineMode::CustomOptimizer => "output",
+        ConversionEngineMode::DeviceLink => "device-link",
+    }
 }
 
 fn render_face_summary(ui: &mut egui::Ui, inspection: &ConversionFaceInspection) {
@@ -1858,7 +1890,11 @@ mod tests {
         assert!(runtime.contains("target: ConversionTargetState"));
         assert!(runtime.contains("promoted_target: Option<PromotedCandidateTarget>"));
         assert!(runtime.contains("final_conversion_target(self, &state)"));
-        assert!(runtime.contains("build_conversion_recipe(\n            &state.target"));
+        assert!(runtime.contains(
+            "build_conversion_recipe_from_selected_target(\n            &state.target"
+        ));
+        assert!(runtime.contains("build_unified_plan_preview("));
+        assert!(runtime.contains("build_unified_plan(\n                                self"));
         assert!(runtime.contains("optimizer_strategy"));
         assert!(runtime.contains("optimizer_solver"));
         assert!(runtime.contains("presets: ConversionPresetUiState"));
@@ -1877,5 +1913,37 @@ mod tests {
         assert!(runtime.contains("verify_production_target_profile"));
         assert!(runtime.contains("Profile-backed Candidate has no Output ICC path"));
         assert!(runtime.contains("Measured Custom Optimizer Candidate promotion remains"));
+    }
+
+    #[test]
+    fn steady_state_window_uses_fast_recipes_and_keeps_strict_queue_boundary() {
+        let source = include_str!("color_conversion.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            runtime
+                .matches("build_conversion_recipe_from_selected_target(")
+                .count()
+                >= 4
+        );
+        assert!(runtime.contains("build_unified_plan_preview("));
+        assert!(runtime.contains("build_unified_plan(\n                                self"));
+        assert!(runtime.contains("let rebuilt = build_conversion_recipe("));
+    }
+
+    #[test]
+    fn custom_controls_do_not_mutate_recipe_while_merely_rendering() {
+        let source = include_str!("color_conversion.rs");
+        let runtime = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        let controls_start = runtime
+            .find("fn render_profile_backed_optimizer_controls")
+            .unwrap();
+        let controls_end = runtime[controls_start..]
+            .find("\nfn source_path_key")
+            .map(|offset| controls_start + offset)
+            .unwrap();
+        let controls = &runtime[controls_start..controls_end];
+        assert!(!controls.contains(".entry(name.clone())"));
+        assert!(controls.contains("if ui\n                .add(egui::Slider::new(&mut value"));
+        assert!(runtime.contains("profile_catalog_family(previous_engine)"));
     }
 }
