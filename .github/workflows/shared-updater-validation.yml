@@ -1,0 +1,37 @@
+name: Shared updater validation
+
+on:
+  push:
+    branches: [refactor/shared-github-updater]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Prepare test artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          $exe = "target/x86_64-pc-windows-msvc/release/ShadeEditor.exe"
+          Copy-Item $exe artifact/ShadeEditor.exe
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  ShadeEditor.exe" | Set-Content -Encoding ascii -NoNewline artifact/ShadeEditor.exe.sha256
+          Copy-Item Cargo.lock artifact/Cargo.lock.resolved
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShadeEditor-shared-updater-test
+          path: artifact
+          if-no-files-found: error
+          retention-days: 30
